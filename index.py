@@ -9,6 +9,7 @@ plantouBomba = ''
 matador = ''
 tScore = 0
 ctScore = 0
+confianca = 0
 
 #/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[1]/div/div
 
@@ -29,7 +30,7 @@ options.add_argument('--profile-directory=Profile 1')
 options.add_argument("start-maximized")
 driver = webdriver.Chrome("/usr/local/bin/chromedriver", chrome_options=options)
 
-driver.get('https://www.hltv.org/matches?predefinedFilter=top_tier')
+driver.get('https://www.hltv.org/matches')
 
 sleep(3)
 partidas = driver.find_elements_by_class_name("liveMatch")
@@ -65,6 +66,9 @@ for x in range(0, numPartidas):
                     todosMatadores.append(matador)
                     if matador == 'T':
                         todosMatadores.pop()
+                        if (todosMatadores == todosMatadoresFinal):
+                            confianca += 1
+                        todosMatadoresFinal = todosMatadores
                         InicioDeRound = 1
                         ctScore = int(driver.find_element_by_class_name('ctScore').text)
                         tScore = int(driver.find_element_by_class_name('tScore').text)
@@ -75,7 +79,9 @@ for x in range(0, numPartidas):
                         matador = ''
                     if matador == 'CT':
                         todosMatadores.pop()
-
+                        if (todosMatadores == todosMatadoresFinal):
+                            confianca += 1
+                        todosMatadoresFinal = todosMatadores
                         InicioDeRound = 1
                         ctScore = int(driver.find_element_by_class_name('ctScore').text)
                         tScore = int(driver.find_element_by_class_name('tScore').text)
@@ -86,6 +92,7 @@ for x in range(0, numPartidas):
                         matador = ''
                     i +=1
                     sleep(0.5)
+                    print(f'o fator de confiança é: {confianca}')
             i = 1
             InicioDeRound = 0
             sleep(0.05)
