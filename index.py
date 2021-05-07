@@ -11,6 +11,8 @@ tScore = 0
 ctScore = 0
 confianca = 0
 
+
+
 #/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[1]/div/div
 
 #/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[1]/div/div/span/span[1]
@@ -49,12 +51,16 @@ for x in range(0, numPartidas):
         sleep(5)
         partidas = driver.find_elements_by_class_name("liveMatch")
     else:
+        print('OK')
         ctScore = int(driver.find_element_by_class_name('ctScore').text)
         tScore = int(driver.find_element_by_class_name('tScore').text)
-        while (ctScore != 16 | tScore !=16):
+        while (ctScore != 16 & tScore !=16):
             while (InicioDeRound == 0):
                 try:
-                    matador = driver.find_element_by_xpath(f'/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[{i}]/div/div/span/span[1]').text                    
+                    matador = driver.find_element_by_xpath(f'/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[{i}]/div/div/span/span[1]').text
+                    teste = driver.find_element_by_xpath(f'/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[1]/div/div/span').text
+
+                                                             #/html/body/div[2]/div/div[2]/div[1]/div[2]/div[7]/div/div[4]/div/div[1]/div/div[1]/div/div/span   #round started             
                 except:
                     try:
                         plantouBomba = driver.find_element_by_xpath(f'/html/body/div[2]/div/div[2]/div[1]/div[2]/div[6]/div/div[4]/div/div[1]/div/div[1]/div/div/span[1]')
@@ -63,11 +69,13 @@ for x in range(0, numPartidas):
                         print("Deu Errado")
                         i=1
                 else:
+                    print(teste)
                     todosMatadores.append(matador)
-                    if matador == 'T':
+                    if teste == 'Round started':
+                        print('Round')
                         todosMatadores.pop()
-                        if (todosMatadores == todosMatadoresFinal):
-                            confianca += 1
+                        if (todosMatadores == []):
+                            print(todosMatadoresFinal)
                         todosMatadoresFinal = todosMatadores
                         InicioDeRound = 1
                         ctScore = int(driver.find_element_by_class_name('ctScore').text)
@@ -77,25 +85,14 @@ for x in range(0, numPartidas):
                         todosMatadores = []
                         i = 0
                         matador = ''
-                    if matador == 'CT':
-                        todosMatadores.pop()
-                        if (todosMatadores == todosMatadoresFinal):
-                            confianca += 1
-                        todosMatadoresFinal = todosMatadores
-                        InicioDeRound = 1
-                        ctScore = int(driver.find_element_by_class_name('ctScore').text)
-                        tScore = int(driver.find_element_by_class_name('tScore').text)
-                        print(f'Todos: {todosMatadores}')
-                        print(f'48: Placar {tScore} X {ctScore}')
-                        todosMatadores = []
-                        i=0
-                        matador = ''
                     i +=1
                     sleep(0.5)
-                    print(f'o fator de confiança é: {confianca}')
+            print('Testes')
             i = 1
             InicioDeRound = 0
             sleep(0.05)
+        print('Acabou Partida')
+        
     
 
 
