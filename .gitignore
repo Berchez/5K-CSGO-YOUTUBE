@@ -1,0 +1,17 @@
+node_modules/
+dist/
+data/buffer/
+data/clips/*.mp4
+!data/clips/*.json
+data/*.sqlite*
+*.log
+logs/
+.env
+token.json
+client_secrets.json
+# bins portáteis de teste (ffmpeg/yt-dlp baixados localmente)
+.tools/*.exe
+.tools/*.zip
+.tools/ffmpeg-extract/
+playwright-report/
+test-results/

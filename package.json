@@ -1,0 +1,37 @@
+{
+  "name": "5k-csgo-youtube",
+  "version": "2.0.0",
+  "description": "Bot automatizado: detecta ACE (5k) em jogos importantes de CS2 via HLTV, grava buffer local e publica corte privado no YouTube.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/src/main.js",
+    "build": "tsc -p tsconfig.json",
+    "auth:youtube": "tsx scripts/auth-youtube.ts",
+    "check:youtube": "tsx scripts/check-youtube.ts",
+    "check:live": "tsx scripts/check-live.ts",
+    "test:vod": "tsx scripts/test-vod.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "playwright:install": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.7",
+    "googleapis": "^144.0.0",
+    "pino": "^9.6.0",
+    "playwright": "^1.49.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

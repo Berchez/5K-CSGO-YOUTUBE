@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ttv2yt — CS2 ACE clips to YouTube</title>
+<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6}footer{margin-top:32px;font-size:.9em;color:#555}</style>
+</head>
+<body>
+<h1>ttv2yt</h1>
+<p>Personal automation tool that watches competitive Counter-Strike 2 matches,
+detects ACE highlights (5 kills in one round), cuts the clip from a local
+recording buffer, and uploads it as a <strong>private</strong> video to the
+operator's own YouTube channel for manual review and publishing.</p>
+<h2>How it works</h2>
+<ol>
+  <li>Monitors live match listings for important games.</li>
+  <li>Records the official broadcast locally in a rolling buffer.</li>
+  <li>On detecting a 5-kill round, exports the clip.</li>
+  <li>Uploads the clip to YouTube as <em>private</em> via the YouTube Data API
+      (scope <code>youtube.upload</code>). Nothing is ever published publicly
+      by the tool.</li>
+</ol>
+<p>This app is for personal use by its operator only. Support contact:
+<a href="mailto:brotheersbr@gmail.com">brotheersbr@gmail.com</a>.</p>
+<footer><a href="privacy.html">Privacy Policy</a></footer>
+</body>
+</html>
