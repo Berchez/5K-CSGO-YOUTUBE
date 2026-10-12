@@ -44,7 +44,7 @@ function hasFlag(name: string): boolean {
  * perde as flags (chega só os valores). Aceita: <url> <at> [player].
  */
 function positionalArgs(): string[] {
-  const withValue = new Set(['--url', '--at', '--pre', '--post', '--player']);
+  const withValue = new Set(['--url', '--at', '--pre', '--post', '--player', '--team1', '--team2', '--pteam', '--map', '--event', '--round', '--score', '--kills', '--firstat', '--ctx', '--playerphoto', '--team1logo', '--team2logo', '--mapimg']);
   const out: string[] = [];
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -91,13 +91,33 @@ async function main(): Promise<void> {
   const atRaw = arg('at') ?? pos[1];
   if (!url || !atRaw) {
     console.error(
-      'Uso: npx tsx scripts/test-vod.ts --url <VOD twitch/youtube> --at 01:23:45 [--pre 60] [--post 15] [--player donk] [--upload]',
+      'Uso: npx tsx scripts/test-vod.ts --url <VOD> --at 01:23:45 [--pre 60] [--post 15] [--player donk] [--team1 Spirit] [--team2 Falcons] [--pteam Spirit] [--map Anubis] [--event "ESL Pro League Season 24"] [--round 9] [--score 6-3] [--kills "donk>a:ak47:hs,..."] [--firstat 01:22:30] [--ctx 10] [--refs] [--playerphoto URL] [--team1logo URL] [--team2logo URL] [--mapimg URL] [--upload]',
     );
     process.exit(2);
   }
   const pre = Number(arg('pre', '60'));
   const post = Number(arg('post', '15'));
   const player = arg('player') ?? pos[2] ?? 'TEST_PLAYER';
+  const team1 = arg('team1', 'TEST_A')!;
+  const team2 = arg('team2', 'TEST_B')!;
+  const pteam = arg('pteam', '')!;
+  const map = arg('map', 'test-map')!;
+  const event = arg('event', '[TESTE] VOD partida acabada')!;
+  const round = Number(arg('round', '1'));
+  const score = arg('score');
+  const killsSpec = arg('kills', '');
+  // --firstat = momento do 1º kill: o clipe começa --ctx (default 10s) antes dele.
+  // Sem --firstat: começa pre segundos antes do 5º kill (pode cair em cima da ação).
+  const firstAtRaw = arg('firstat');
+  const ctx = Number(arg('ctx', '10'));
+  // Referências: --refs busca tudo sozinho; ou URLs explícitas por item.
+  const wantRefs = hasFlag('refs');
+  const refOverrides = {
+    ...(arg('playerphoto') ? { player: arg('playerphoto') as string } : {}),
+    ...(arg('team1logo') ? { team1Logo: arg('team1logo') as string } : {}),
+    ...(arg('team2logo') ? { team2Logo: arg('team2logo') as string } : {}),
+    ...(arg('mapimg') ? { mapImage: arg('mapimg') as string } : {}),
+  };
   const doUpload = hasFlag('upload');
 
   const cfg = getConfig();
@@ -121,9 +141,13 @@ async function main(): Promise<void> {
   console.log('VOD: ' + meta.stdout.trim().slice(0, 160));
 
   const at = parseTs(atRaw);
-  const start = fmt(at - pre);
+  const start = firstAtRaw ? fmt(parseTs(firstAtRaw) - ctx) : fmt(at - pre);
   const end = fmt(at + post);
-  console.log(`Trecho: ${start} → ${end} (ace em ${fmt(at)}, janela ${pre}s+${post}s)`);
+  console.log(
+    firstAtRaw
+      ? `Trecho: ${start} → ${end} (1º kill em ${fmt(parseTs(firstAtRaw))} + ${ctx}s de contexto, ace em ${fmt(at)})`
+      : `Trecho: ${start} → ${end} (ace em ${fmt(at)}, janela ${pre}s+${post}s, sem --firstat: pode começar em cima da ação)`,
+  );
 
   // 2) Baixa SÓ o trecho (rápido, não baixa o VOD inteiro)
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -148,36 +172,92 @@ async function main(): Promise<void> {
   const sizeMb = (fs.statSync(outPath).size / 1024 / 1024).toFixed(1);
   console.log(`Clipe OK: ${outPath} (${sizeMb} MB)`);
 
-  // 3) Thumb + sidecar (mesmo padrão do clipper live)
+  // 3) Thumb composta + sidecar (mesmo padrão do clipper live)
+  // 3) Objeto ace: com kills detalhados (--kills) monta summary real;
+  // sem eles, kills fica vazio (honesto: sem dado, sem invenção).
+  // Defaults honestos: avisa o que ficou placeholder para não confundir com dado real
+  if (map === 'test-map') console.log('(dica: passe --map "Cache" p/ metadados reais)');
+  if (round === 1) console.log('(dica: passe --round N p/ round real)');
+  if (!score) console.log('(dica: passe --score 6-3 p/ placar real)');
+  if (!killsSpec) {
+    console.log('(dica: passe --kills "a>b:ak47:hs,..." p/ kills detalhados; vítimas ? = desconhecida)');
+  }
+  const { parseKillList } = await import('../src/detector/killParse.js');
+  const { buildRoundSummary, describeAce } = await import('../src/detector/aceDetector.js');
+  const { buildSidecar } = await import('../src/clipper/clipBuilder.js');
+  const kills = killsSpec ? parseKillList(killsSpec, round, map) : [];
+  const opponents = pteam
+    ? (pteam === team1 ? team2 : team1)
+    : `${team1} vs ${team2}`;
+  const ace: AceEvent = {
+    matchId: `test-vod-${stamp}`,
+    map,
+    round,
+    player,
+    team1,
+    team2,
+    event,
+    detectedAt: new Date().toISOString(),
+    kills,
+    score: score || undefined,
+    summary: kills.length === 5 ? buildRoundSummary(player, pteam, opponents, kills) : undefined,
+  };
+  if (ace.summary) {
+    console.log('--- RESUMO DO ACE ---');
+    console.log(describeAce(ace.summary, event));
+    console.log('---------------------');
+  } else if (killsSpec) {
+    console.log(`(aviso: --kills com ${kills.length} kills, summary exige 5)`);
+  }
   const thumbPath = path.join(cfg.CLIPS_DIR, `${base}.jpg`);
   try {
-    await execFileAsync(FFMPEG, [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-ss', String(Math.max(1, Math.floor(pre / 2))),
-      '-i', outPath, '-frames:v', '1', thumbPath,
-    ]);
+    const { makeSmartThumbnail } = await import('../src/clipper/thumbnail.js');
+    // Referências visuais (foto/logos/mapa) quando pedidas
+    let references = undefined as
+      | import('../src/clipper/referenceImages.js').ReferenceImages
+      | undefined;
+    if (wantRefs || Object.keys(refOverrides).length > 0) {
+      const { fetchReferenceImages } = await import('../src/clipper/referenceImages.js');
+      references = await fetchReferenceImages({
+        player,
+        team1,
+        team2,
+        map,
+        dir: path.join(cfg.CLIPS_DIR, 'refs', `test-vod-${stamp}`),
+        overrides: Object.keys(refOverrides).length > 0 ? refOverrides : undefined,
+      });
+    }
+    // Frame de ~3s antes do 5º kill (meio do ace), não do meio do clipe
+    await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, pre - 3), {
+      mode: cfg.THUMB_MODE,
+      ai: {
+        order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
+        hfToken: cfg.HF_TOKEN || undefined,
+        hfModel: cfg.HF_IMAGE_MODEL,
+        geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+        geminiModel: cfg.GEMINI_IMAGE_MODEL,
+        geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+        chatgptProfileDir: cfg.CHATGPT_PROFILE,
+        chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
+        grokProfileDir: cfg.GROK_PROFILE,
+        grokMinimized: cfg.GROK_MINIMIZED === '1',
+        references,
+      },
+    });
+    console.log(`Thumb OK (${cfg.THUMB_MODE}): ${thumbPath}`);
   } catch {
     log.warn('thumb falhou (ok p/ teste)');
   }
-  const ace: AceEvent = {
-    matchId: `test-vod-${stamp}`,
-    map: 'test-map',
-    round: 1,
-    player,
-    team1: 'TEST_A',
-    team2: 'TEST_B',
-    event: '[TESTE] VOD partida acabada',
-    detectedAt: new Date().toISOString(),
-    kills: [],
-  };
   fs.writeFileSync(
     path.join(cfg.CLIPS_DIR, `${base}.json`),
-    JSON.stringify({ ...ace, clipFile: path.basename(outPath), vodUrl: url, aceAt: fmt(at) }, null, 2),
+    JSON.stringify(buildSidecar(ace, { clipFile: path.basename(outPath), vodUrl: url, aceAt: fmt(at) }), null, 2),
   );
   getDb(cfg.DB_PATH);
   if (!hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player)) {
     const aceId = insertAce(cfg.DB_PATH, ace);
-    insertClip(cfg.DB_PATH, aceId, outPath, doUpload ? cfg.YT_PRIVACY : 'local-test');
+    if (!doUpload) {
+      insertClip(cfg.DB_PATH, aceId, outPath, 'local-test');
+    }
   }
 
   // 4) Upload (só com --upload + credenciais)
@@ -190,13 +270,17 @@ async function main(): Promise<void> {
       `sem ${cfg.YT_CLIENT_SECRETS}. Crie o OAuth Client no Google Cloud e rode: npm run auth:youtube`,
     );
   }
+  const thumbExists = fs.existsSync(thumbPath) ? thumbPath : undefined;
   const videoId = await uploadClip({ ...ace, event: `[TESTE] ${ace.event}` }, outPath, {
     clientSecretsPath: cfg.YT_CLIENT_SECRETS,
     tokenPath: cfg.YT_TOKEN_PATH,
     privacy: cfg.YT_PRIVACY,
     categoryId: cfg.YT_CATEGORY_ID,
     defaultTags: cfg.YT_DEFAULT_TAGS,
+    thumbnailPath: thumbExists,
   });
+  const aceId = insertAce(cfg.DB_PATH, ace);
+  insertClip(cfg.DB_PATH, aceId, outPath, cfg.YT_PRIVACY, videoId);
   console.log(`\nUPLOAD OK (private): https://youtu.be/${videoId}`);
 }
 

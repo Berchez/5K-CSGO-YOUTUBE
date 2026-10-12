@@ -17,6 +17,8 @@ const ConfigSchema = z.object({
   SEGMENT_WRAP: z.coerce.number().min(6).max(60).default(18),
   CLIP_PRE_ROLL_SEC: z.coerce.number().min(15).max(120).default(60),
   CLIP_POST_ROLL_SEC: z.coerce.number().min(5).max(60).default(15),
+  /** Contexto antes do 1º kill do ace (o clipe começa aqui). */
+  CLIP_CONTEXT_SEC: z.coerce.number().min(0).max(30).default(10),
   CLIPS_DIR: z.string().default('./data/clips'),
 
   DB_PATH: z.string().default('./data/bot.sqlite'),
@@ -30,6 +32,21 @@ const ConfigSchema = z.object({
   YT_TOKEN_PATH: z.string().default('./token.json'),
   YT_CATEGORY_ID: z.string().default('20'),
   YT_DEFAULT_TAGS: z.string().default('cs2,ace,5k,counter-strike,highlights'),
+
+  // Thumbnails: composed = frame + selo (grátis, instantâneo, default).
+  // ai = tenta fundo IA (pollinations grátis e/ou gemini pago) com fallback p/ composed.
+  THUMB_MODE: z.enum(['composed', 'ai']).default('composed'),
+  THUMB_AI_ORDER: z.string().default('huggingface'),
+  HF_TOKEN: z.string().default(''),
+  HF_IMAGE_MODEL: z.string().default('black-forest-labs/FLUX.1-schnell'),
+  GEMINI_API_KEY: z.string().default(''),
+  GEMINI_IMAGE_MODEL: z.string().default('gemini-3.1-flash-lite-image'),
+  GEMINI_WEB_PROFILE: z.string().default('./data/gemini-profile'),
+  CHATGPT_PROFILE: z.string().default('./data/chatgpt-profile'),
+  /** 1 = janela minimizada (corre risco de challenge; 0 = visível, funciona) */
+  CHATGPT_MINIMIZED: z.string().default('0'),
+  GROK_PROFILE: z.string().default('./data/grok-profile'),
+  GROK_MINIMIZED: z.string().default('0'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

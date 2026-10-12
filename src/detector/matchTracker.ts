@@ -1,23 +1,43 @@
 import type { Page } from 'playwright';
 import { getBrowser } from '../monitor/hltvMonitor.js';
-import { RoundTracker } from './aceDetector.js';
+import { RoundTracker, normWeapon } from './aceDetector.js';
+import type { KillEvent } from '../types.js';
 import { getLogger } from '../logger.js';
 
+export interface SnapKill {
+  killer: string;
+  victim: string;
+  weapon: string;
+  headshot: boolean;
+}
+
 export interface RoundSnapshot {
-  kills: Array<{ killer: string; victim: string }>;
+  kills: SnapKill[];
   ctScore: number;
   tScore: number;
   map: string;
   round: number;
 }
 
+/** Nomes de armas para casamento best-effort no texto/alt do killfeed. */
+const WEAPON_HINTS = [
+  'ak-47', 'ak47', 'awp', 'm4a1', 'm4a4', 'desert eagle', 'deagle',
+  'usp-s', 'usp', 'glock', 'famas', 'galil', 'aug', 'sg 553', 'ssg 08',
+  'mac-10', 'mp9', 'mp7', 'ump-45', 'p90', 'nova', 'xm1014', 'mag-7',
+  'sawed-off', 'negev', 'm249', 'tec-9', 'cz75', 'five-seven', 'p250',
+  'dual berettas', 'r8 revolver', 'he grenade', 'molotov', 'incendiary',
+  'flashbang', 'smoke', 'knife', 'zeus', 'g3sg1', 'scar-20',
+];
+
 /**
  * Lê scoreboard + killfeed da página do match.
- * Usa múltiplos seletores candidatos (sem XPath absoluto).
+ * Extração best-effort: killer/vítima quase sempre; arma/HS quando o DOM
+ * expõe (alt de ícone ou texto). Assists e granadas lançadas (sem kill)
+ * NÃO vêm no killfeed live — fidelidade total exige demo (fase 2).
  */
 export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | null> {
   try {
-    return await page.evaluate(() => {
+    return await page.evaluate((weaponHints: string[]) => {
       const text = (sel: string): string => {
         const el = document.querySelector(sel);
         return (el?.textContent ?? '').trim();
@@ -27,30 +47,52 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
       const t =
         Number.parseInt(text('.tScore') || text('[data-t-score]') || '0', 10) || 0;
 
-      const killRows = Array.from(
+      const rows = Array.from(
         document.querySelectorAll(
           '[class*="kill"], [class*="Kill"], [class*="feed"] [class*="player"], .scoreboard [class*="name"]',
         ),
-      )
-        .slice(0, 20)
-        .map((el) => (el.textContent ?? '').trim())
-        .filter(Boolean);
+      ).slice(0, 20);
 
-      // Fallback genérico: procura linhas "Killer ⚔ Victim"
-      const kills: Array<{ killer: string; victim: string }> = killRows
-        .slice(0, 5)
-        .map((line) => {
-          const parts = line.split(/⚔|✖|killed|›|>/).map((s) => s.trim());
-          return { killer: parts[0] ?? '', victim: parts[1] ?? '' };
-        })
-        .filter((k) => k.killer.length > 0);
+      const norm = (s: string): string =>
+        s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+      const kills = rows.slice(0, 5).flatMap((el) => {
+        const line = (el.textContent ?? '').trim();
+        if (!line) return [];
+        const parts = line.split(/⚔|✖|killed|›|>/).map((s) => s.trim());
+        const killer = parts[0] ?? '';
+        if (!killer) return [];
+        const victim = parts[1] ?? '';
+        // Arma: 1) alt/title de ícone, 2) nome no texto da linha
+        let weapon = '';
+        el.querySelectorAll('img').forEach((img) => {
+          const alt = `${img.getAttribute('alt') ?? ''} ${img.getAttribute('title') ?? ''}`;
+          const hit = weaponHints.find((w) => alt.toLowerCase().includes(w));
+          if (hit && !weapon) weapon = hit;
+        });
+        if (!weapon) {
+          const low = line.toLowerCase();
+          const hit = weaponHints.find((w) => low.includes(w));
+          if (hit) weapon = hit;
+        }
+        // Headshot: ícone/classe indicativa
+        const html = el.innerHTML.toLowerCase();
+        const headshot =
+          /headshot/.test(html) ||
+          [...el.querySelectorAll('img')].some((img) =>
+            /headshot|hs\b/.test(
+              `${img.getAttribute('alt') ?? ''} ${img.getAttribute('title') ?? ''} ${img.getAttribute('class') ?? ''}`.toLowerCase(),
+            ),
+          );
+        return [{ killer, victim, weapon, headshot }];
+      });
 
       const map =
         document.querySelector('[class*="mapname"]')?.textContent?.trim() ??
         'map1';
       const round = ct + t + 1;
       return { kills, ctScore: ct, tScore: t, map, round };
-    });
+    }, WEAPON_HINTS);
   } catch {
     return null;
   }
@@ -61,7 +103,9 @@ export interface TrackerCallbacks {
     player: string;
     map: string;
     round: number;
-    kills: Array<{ killer: string; victim: string; round: number; map: string }>;
+    kills: KillEvent[];
+    /** ISO do 1º kill — ancora o início do clipe. */
+    startedAt?: string;
   }) => void;
   shouldStop: () => boolean;
 }
@@ -91,7 +135,12 @@ export async function trackMatch(
         continue;
       }
       tracker.setContext(snap.map, snap.round);
-      for (const k of snap.kills) tracker.addKill(k.killer, k.victim);
+      for (const k of snap.kills) {
+        tracker.addKill(k.killer, k.victim, {
+          weapon: normWeapon(k.weapon) || undefined,
+          headshot: k.headshot || undefined,
+        });
+      }
 
       const total = snap.ctScore + snap.tScore;
       // Virada de round = placar mudou (ou OT: total >= 24 continua valendo)
@@ -99,7 +148,14 @@ export async function trackMatch(
         const { ace, kills } = tracker.closeRound();
         if (ace) {
           log.info({ ace, map: snap.map, round: snap.round }, 'ACE detectado');
-          cb.onAce({ player: ace, map: snap.map, round: snap.round, kills });
+          const firstAt = kills[0]?.at;
+          cb.onAce({
+            player: ace,
+            map: snap.map,
+            round: snap.round,
+            kills,
+            startedAt: firstAt ? new Date(firstAt).toISOString() : undefined,
+          });
         }
         tracker.setContext(snap.map, snap.round);
       }

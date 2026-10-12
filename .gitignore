@@ -1,17 +1,14 @@
 node_modules/
 dist/
-data/buffer/
-data/clips/*.mp4
-!data/clips/*.json
-data/*.sqlite*
+# dados de runtime: buffers, clipes, thumbs, sidecars, refs, perfis de
+# navegador com sessão (logins!) e sqlite — NADA disso vai para o git
+data/
 *.log
 logs/
 .env
 token.json
 client_secrets.json
-# bins portáteis de teste (ffmpeg/yt-dlp baixados localmente)
-.tools/*.exe
-.tools/*.zip
-.tools/ffmpeg-extract/
+# bins portáteis de teste + scripts/JSONs de diagnóstico local (ad-hoc)
+.tools/
 playwright-report/
 test-results/

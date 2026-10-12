@@ -50,6 +50,8 @@ export interface UploadOptions {
   privacy: 'private' | 'unlisted' | 'public';
   categoryId: string;
   defaultTags: string;
+  /** Caminho da thumb 1280x720 (opcional). Sobe via thumbnails.set após o vídeo. */
+  thumbnailPath?: string;
 }
 
 /**
@@ -82,5 +84,21 @@ export async function uploadClip(
   const videoId = res.data.id ?? '';
   if (!videoId) throw new Error('YouTube não retornou videoId');
   log.info({ videoId }, 'upload concluído (privado, aguardando revisão)');
+
+  if (opts.thumbnailPath && fs.existsSync(opts.thumbnailPath)) {
+    try {
+      await youtube.thumbnails.set({
+        videoId,
+        media: {
+          mimeType: 'image/jpeg',
+          body: fs.createReadStream(opts.thumbnailPath),
+        },
+      });
+      log.info({ videoId }, 'thumbnail aplicada');
+    } catch (e) {
+      // Thumb é cosmético: não falha o pipeline (custo 50u de quota, pode estourar antes do upload)
+      log.warn({ err: String(e).slice(0, 200) }, 'falha ao aplicar thumbnail, vídeo segue sem ela');
+    }
+  }
   return videoId;
 }

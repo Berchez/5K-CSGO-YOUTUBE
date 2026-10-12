@@ -74,6 +74,20 @@ npx tsx scripts/test-vod.ts --url "<VOD>" --at 4820 --player donk --upload
 `.json` + registro no sqlite. Tudo sai marcado `[TESTE]` — nunca confunda com clipe real.
 No Windows prefira `npx tsx` direto (o `npm run ... --` às vezes engole as flags).
 
+Metadados ricos (opcionais, mas recomendados — alimentam título, descrição,
+thumb e prompt IA): `--team1/--team2`, `--pteam` (time do autor), `--map`,
+`--event`, `--round`, `--score 6-3` e `--kills` na mini-DSL
+`killer>vítima:arma:mods` (mods: `hs ns wb smoke assist=Nome flash=Nome`,
+vítima `?` = desconhecida):
+```powershell
+npx tsx scripts/test-vod.ts --url "<VOD>" --at 11:07:10 --player donk `
+  --team1 Spirit --team2 Falcons --pteam Spirit --round 9 --score 6-3 `
+  --kills "donk>a:ak47:hs,donk>b:ak47:flash=chopper,donk>c:ak47,donk>d:awp,donk>e:ak47"
+```
+O clipe começa `--ctx` (default 10s) **antes do 1º kill** (`--firstat`; sem ele,
+usa `pre` antes do 5º kill e pode começar em cima da ação). No modo live o bot
+ancora sozinho no 1º kill detectado (`CLIP_CONTEXT_SEC` no `.env`).
+
 ## Estrutura
 
 ```text
@@ -81,12 +95,112 @@ src/config.ts, logger.ts (arquivo), db.ts (sqlite dedup)
 src/monitor/hltvMonitor.ts (stars + preferência official/en)
 src/detector/aceDetector.ts (puro, testado) + matchTracker.ts (poll MR12: 13 pts)
 src/recorder/streamRecorder.ts (buffer circular)
-src/clipper/clipBuilder.ts (concat + thumb + sidecar json)
+src/clipper/clipBuilder.ts (concat + sidecar json)
+src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
+src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/uploader/youtubeUploader.ts (private)
 src/main.ts (supervisor asyncio-like)
 scripts/auth-youtube.ts
 tests/
 ```
+
+## Thumbnails: cadeia de fallback
+
+`THUMB_MODE=ai` ativa a cadeia. `THUMB_AI_ORDER` define a ordem exata de
+tentativa — o primeiro é o seu preferido; qualquer falha (cota, sem login,
+timeout, challenge, imagem inválida) loga e cai para o próximo. Esgotada a
+cadeia, a thumb **composta determinística** (sharp: frame real + selo ACE!)
+fechaa conta — US$0, zero rede, sempre sai.
+
+```text
+THUMB_AI_ORDER=chatgpt,grok,gemini-web
+                │       │      └─ fundo híbrido (overlay sharp por cima)
+                │       └─ thumb completa (layout do canal) — falha se sem login
+                └─ thumb completa — falha se cota esgotada → segue a cadeia
+```
+
+| Provider | Gera | Custo | Precisa |
+|---|---|---|---|
+| `chatgpt` | thumb completa (4 refs anexadas) | grátis (cota diária) | `chatgpt-login.ts` 1x, conta descartável |
+| `grok` | thumb completa (4 refs anexadas) | grátis (cota X) | `grok-login.ts` 1x, conta X descartável |
+| `gemini-web` | thumb completa **policy-safe** (4 refs; retrato estilizado com rosto na sombra; prefixo "Generate an image…" obrigatório — sem ele o app responde em texto) | grátis (cota do app) | `gemini-login.ts` 1x, conta descartável **Gmail** (contas edu/Workspace podem não ter geração de imagem) |
+| `huggingface` | fundo | free **sem créditos** (pago p/ usar) | `HF_TOKEN` + créditos |
+| `gemini` | fundo | ~US$0,13/img | `GEMINI_API_KEY` + billing |
+| `pollinations` | fundo | virou pago (402) | nada (falha rápido) |
+| *(fim da cadeia)* | **composta** (sharp) | US$0 | nada — sempre funciona |
+
+Política por provider: o **Gemini recusa retrato de pessoa real** — por isso,
+no `gemini-web`, o retrato do layout vira **figura estilizada com o rosto na
+sombra** (policy-safe) e as 4 referências seguem anexadas. chatgpt/grok aceitam
+o layout completo com retrato. Logos de times vêm da Liquipedia com busca
+prefixada `"Team <Nome>"` (busca crua casa com páginas homônimas — ex. "Spirit"
+é outro time — e já baixou logo errado; há regressão testada para isso).
+
+### Login web descartável (chatgpt e gemini-web)
+Automatizar UI web viola os Termos (OpenAI e Google) — conta pega pode ser
+suspensa. **Nunca use contas importantes.**
+1. `THUMB_AI_ORDER=chatgpt` (ou `gemini-web`) no `.env`.
+2. `npx tsx scripts/chatgpt-login.ts` (ou `gemini-login.ts`) → faça login com
+   uma **conta descartável** → ENTER (sessão em `data/*-profile/`, ignorada
+   pelo git — nunca commite).
+
+### gemini-web: login descartável, nunca a conta do canal
+Automatizar a UI web viola os Termos da OpenAI/Google — conta pega pode ser
+suspensa. Por isso: **nunca use a conta dona do canal/projeto Cloud**.
+
+## Referências visuais no prompt IA (HLTV + Liquipedia)
+
+Com `--refs` (test-vod) ou sempre no modo live, o bot baixa 4 referências e
+**anexa como imagens** na geração: foto do player, logo do time do autor,
+logo do adversário e imagem do mapa. Fontes: HLTV (logos, via og:image) e
+Liquipedia API (fotos/mapa, infobox `|image=`). Tudo é best-effort — cada
+referência ausente degrada sozinha (sem anexo, o prompt segue).
+
+Política por provider (validada em testes reais):
+- **chatgpt** (thumb completa): recebe as **4 referências** + prompt com
+  seção REFERÊNCIAS. Nota: conta free tem cota diária de imagens.
+- **gemini-web** (fundo híbrido): recebe **só o mapa** e prompt de fundo —
+  o Gemini **recusa** retrato de pessoa real ("retrato em close do jogador X"
+  → erro de diretrizes); rosto vem do frame real via overlay.
+- APIs (huggingface/gemini): fundo, sem anexos.
+
+Arquivos em `data/clips/refs/` (gitignored). Overrides manuais no test-vod:
+`--playerphoto/--team1logo/--team2logo/--mapimg <URL>`.
+1. `THUMB_AI_ORDER=gemini-web` no `.env`.
+2. `npx tsx scripts/gemini-login.ts` → abre o Chrome → faça login com uma
+   **conta Google descartável** → ENTER (sessão salva em `data/gemini-profile/`,
+   ignorada pelo git — nunca commite).
+3. Rode o `test-vod`/bot normalmente; qualquer falha (layout mudou, sem cota,
+   sem login) cai para a thumb composta.
+
+Debug do provider web (rápido, sem baixar VOD): `npx tsx scripts/gemini-probe.ts`
+ou `npx tsx scripts/gemini-probe.ts --order gemini-web`. Os logs mostram cada
+etapa (abertura, login, envio, render, bytes); em falha, abre
+`logs/gemini-fail-*.png` para ver o estado da página.
+
+No nosso volume (poucos aces/semana), qualquer opção paga sairia ~US$1–2/mês;
+por enquanto a composta é o caminho de produção (US$0 e validada no clipe do donk).
+A IA nunca quebra o pipeline: qualquer falha usa a composta.
+
+## Dados do round (o que a IA recebe)
+
+Cada ace carrega `RoundSummary`: jogador, times, mapa, round, as 5 vítimas,
+**arma de cada kill**, headshots, **assists e flash-assists**, granadas de dano
+(HE/molotov) e arma principal. Isso alimenta título (`ACE! donk (AK-47)…`),
+descrição kill-a-kill, texto da thumb e o prompt do fundo IA.
+
+Fidelidade por fonte (live primeiro, resto depois):
+
+| Dado | Live (killfeed HLTV) | Demo GOTV (fase 2) |
+|---|---|---|
+| killer/vítima | ✅ sempre | ✅ |
+| arma/HS | ⚠️ best-effort (ícone/texto no DOM) | ✅ exato |
+| assist/flash-assist | ❌ (killfeed não mostra) | ✅ exato |
+| granadas lançadas (smoke/flash sem kill) | ❌ | ✅ exato |
+
+Fase 2 = baixar a demo da partida acabada e extrair com parser `.dem`
+(`demofile`): fecha 100% da lista (armas, assists, HE/flash/smoke/molotov).
+Campos ausentes vêm como `undefined` e o texto degrada sozinho.
 
 ## Limites conhecidos
 

@@ -9,10 +9,37 @@ import {
   pickPreferredStream,
 } from './monitor/hltvMonitor.js';
 import { trackMatch } from './detector/matchTracker.js';
+import { buildRoundSummary, describeAce } from './detector/aceDetector.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip } from './clipper/clipBuilder.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
 import type { AceEvent } from './types.js';
+import type { ReferenceImages } from './clipper/referenceImages.js';
+
+// Referências por partida (foto/logos/mapa): busca 1x, reusa nos aces seguintes.
+const refsCache = new Map<string, ReferenceImages>();
+
+async function getRefs(
+  matchId: string,
+  player: string,
+  team1: string,
+  team2: string,
+  map: string,
+  clipsDir: string,
+): Promise<ReferenceImages> {
+  const hit = refsCache.get(matchId);
+  if (hit) return hit;
+  const { fetchReferenceImages } = await import('./clipper/referenceImages.js');
+  const refs = await fetchReferenceImages({
+    player,
+    team1,
+    team2,
+    map,
+    dir: `${clipsDir}/refs/${matchId}`,
+  });
+  refsCache.set(matchId, refs);
+  return refs;
+}
 
 const activeRecorders = new Map<string, StreamRecorder>();
 const activeTrackers = new Set<string>();
@@ -49,12 +76,34 @@ async function handleAce(
     return;
   }
   try {
+    // Referências visuais (foto/logos/mapa) — best-effort, em paralelo ao corte
+    const references = await getRefs(matchId, ace.player, ace.team1, ace.team2, ace.map, cfg.CLIPS_DIR).catch(
+      () => ({}) as ReferenceImages,
+    );
     const clip = await buildClip(ace, segments, {
       bufferDir: `${cfg.BUFFER_DIR}/${matchId}`,
       clipsDir: cfg.CLIPS_DIR,
       preRollSec: cfg.CLIP_PRE_ROLL_SEC,
       postRollSec: cfg.CLIP_POST_ROLL_SEC,
       segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+      contextSec: cfg.CLIP_CONTEXT_SEC,
+      aceStartMs: ace.startedAt ? Date.parse(ace.startedAt) : undefined,
+      thumb: {
+        mode: cfg.THUMB_MODE,
+        ai: {
+          order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
+          hfToken: cfg.HF_TOKEN || undefined,
+          hfModel: cfg.HF_IMAGE_MODEL,
+          geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+          geminiModel: cfg.GEMINI_IMAGE_MODEL,
+          geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+          chatgptProfileDir: cfg.CHATGPT_PROFILE,
+          chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
+          grokProfileDir: cfg.GROK_PROFILE,
+          grokMinimized: cfg.GROK_MINIMIZED === '1',
+          references,
+        },
+      },
     });
     let videoId: string | undefined;
     try {
@@ -64,6 +113,7 @@ async function handleAce(
         privacy: cfg.YT_PRIVACY,
         categoryId: cfg.YT_CATEGORY_ID,
         defaultTags: cfg.YT_DEFAULT_TAGS,
+        thumbnailPath: clip.thumbnailPath,
       });
     } catch (e) {
       log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');
@@ -118,8 +168,19 @@ async function pollOnce(): Promise<void> {
       activeTrackers.add(m.matchId);
       trackMatch(m.matchPageUrl, m.matchId, {
         shouldStop: () => stopping || !activeTrackers.has(m.matchId),
-        onAce: (a) =>
-          handleAce(
+        onAce: (a) => {
+          // Time do autor desconhecido no live: resumo com confronto completo.
+          const summary = buildRoundSummary(
+            a.player,
+            '',
+            `${m.team1} vs ${m.team2}`,
+            a.kills,
+          );
+          log.info(
+            { summary: describeAce(summary, m.event).split('\n')[0] },
+            'resumo do ace',
+          );
+          return handleAce(
             {
               matchId: m.matchId,
               map: a.map,
@@ -129,11 +190,14 @@ async function pollOnce(): Promise<void> {
               team2: m.team2,
               event: m.event,
               detectedAt: new Date().toISOString(),
+              startedAt: a.startedAt,
               kills: a.kills.map((kk) => ({ ...kk, map: a.map })),
+              summary,
             },
             m.matchId,
             cfg,
-          ).catch((e) => log.error({ err: String(e) }, 'erro no handleAce')),
+          ).catch((e) => log.error({ err: String(e) }, 'erro no handleAce'));
+        },
       })
         .catch((e) => log.warn({ err: String(e) }, 'tracker encerrou com erro'))
         .finally(() => {
