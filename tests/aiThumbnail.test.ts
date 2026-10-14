@@ -115,18 +115,53 @@ describe('aiThumbnail', () => {
     expect(p).toContain('1. "donk" [AK-47 icon] "?"');
   });
 
-  it('prompt lista referências anexadas quando fornecidas', () => {
+  it('prompt lista referências com nomes específicos, na ordem dos anexos', () => {
     const p = buildThumbnailPrompt(ace, {
       player: './data/clips/refs/x/player.jpg',
+      playerAlt: './data/clips/refs/x/player-alt.jpg',
       team1Logo: './data/clips/refs/x/t1.png',
       team2Logo: './data/clips/refs/x/t2.png',
       mapImage: './data/clips/refs/x/map.jpg',
     });
-    expect(p).toContain('REFERÊNCIAS');
-    expect(p).toContain('Foto do jogador');
-    expect(p).toContain('Logo do time');
-    expect(p).toContain('Logo do adversário');
-    expect(p).toContain('Imagem do mapa');
+    expect(p).toContain('REFERÊNCIAS OBRIGATÓRIAS (as 5 imagens anexadas');
+    expect(p).toContain('NESTA EXATA ORDEM');
+    // nomes específicos de tudo
+    expect(p).toContain(`Foto oficial do jogador "donk"`);
+    expect(p).toContain(`Segunda foto do jogador "donk"`);
+    expect(p).toContain('camisa do Spirit');
+    expect(p).toContain('Logo do time Spirit');
+    expect(p).toContain('Logo do time adversário Falcons');
+    expect(p).toContain('Cenário do mapa anubis');
+    // ordem = ordem dos anexos [player, playerAlt, t1, t2, map]
+    const idx = [
+      p.indexOf('Foto oficial do jogador'),
+      p.indexOf('Segunda foto do jogador'),
+      p.indexOf('Logo do time Spirit'),
+      p.indexOf('Logo do time adversário'),
+      p.indexOf('Cenário do mapa'),
+    ];
+    expect(idx.every((v) => v >= 0)).toBe(true);
+    expect([...idx].sort((a, b) => a - b)).toEqual(idx);
+  });
+
+  it('numeração é dinâmica quando referência do meio falta', () => {
+    const p = buildThumbnailPrompt(ace, {
+      player: './refs/p.jpg',
+      team2Logo: './refs/t2.png',
+    });
+    expect(p).toContain('1. Foto oficial do jogador');
+    expect(p).toContain('2. Logo do time adversário');
+    expect(p).not.toContain('3.');
+    expect(p).toContain('(as 2 imagens anexadas');
+  });
+
+  it('label dinâmico: 3K em vez de ACE/5K para multikills', () => {
+    const three = [1, 2, 3].map(() => ({ killer: 'x', victim: 'y', round: 1, map: 'm' }));
+    const p = buildThumbnailPrompt({ ...ace, kills: three });
+    expect(p).toContain('"3K"');
+    expect(p).toContain('multikill de 3K');
+    expect(p).not.toContain('"5K"');
+    expect(p).not.toContain('ACE');
   });
 
   it('sem referências não cria seção REFERÊNCIAS', () => {

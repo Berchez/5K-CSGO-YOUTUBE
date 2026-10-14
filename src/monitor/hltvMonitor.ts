@@ -1,6 +1,8 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import { type BrowserContext, type Page } from 'playwright';
 import type { LiveMatch, StreamInfo } from '../types.js';
 import { getLogger } from '../logger.js';
+import { getConfig } from '../config.js';
+import { trySolveChallenge } from '../clipper/stealthBrowser.js';
 
 const OFFICIAL_HINTS = ['esl', 'blast', 'pgl', 'starladder', 'faceit', 'major', 'iem', 'eslcs'];
 
@@ -8,13 +10,22 @@ const OFFICIAL_HINTS = ['esl', 'blast', 'pgl', 'starladder', 'faceit', 'major', 
 const TOP_TIER_EVENTS =
   /major|blast|iem |katowice|cologne|esl pro|pgl|starladder|blast\.tv|esports world cup|epl |shanghai|austin|copenhagen/i;
 
-let browser: Browser | null = null;
+let browser: BrowserContext | null = null;
 
-export async function getBrowser(): Promise<Browser> {
+export async function getBrowser(): Promise<BrowserContext> {
   if (browser) return browser;
-  browser = await chromium.launch({
-    headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
+  // HLTV barra Chromium headless comum ("Just a moment..."): usa o contexto
+  // stealth (preferindo o Chrome real) com perfil persistente — o cookie
+  // de clearance do Cloudflare é reaproveitado entre polls.
+  const { launchStealthContext } = await import('../clipper/stealthBrowser.js');
+  const cfg = getConfig();
+  // Headless é barrado pelo Cloudflare ("Just a moment" eterno); headed
+  // minimizado limpa em ~10s. HLTV_HEADLESS=1 volta p/ headless (debug).
+  const headless = cfg.HLTV_HEADLESS === '1';
+  browser = await launchStealthContext({
+    profileDir: cfg.HLTV_PROFILE,
+    headless,
+    extraArgs: headless ? [] : ['--start-minimized'],
   });
   return browser;
 }
@@ -24,6 +35,48 @@ export async function closeBrowser(): Promise<void> {
     await browser.close().catch(() => undefined);
     browser = null;
   }
+}
+
+/**
+ * Aguarda o Cloudflare liberar a página.
+ * Checa TÍTULO (EN e PT-BR: "Just a moment..." / "Um momento…") E conteúdo
+ * real (página de desafio tem ~300 chars) — título sozinho já passou
+ * bloqueadoogs como liberado.
+ * Sem isso, a extração roda sobre a página de desafio e retorna vazio —
+ * parecendo "sem streams", "sem lives" ou zerando o placar do tracker.
+ * Se o desafio escalar para checkbox ("não sou robô"), tenta 1 clique
+ * automático via trySolveChallenge.
+ */
+const BLOCKED_TITLE =
+  /just a moment|um momento|attention required|security check|verifying|cloudflare/i;
+
+export async function waitForClearance(page: Page, timeoutMs = 25000): Promise<boolean> {
+  const start = Date.now();
+  let triedClick = false;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const title = await page.title();
+      if (!BLOCKED_TITLE.test(title)) {
+        const bodyLen = await page
+          .evaluate(() => document.body.innerText.length)
+          .catch(() => 0);
+        if (bodyLen > 1000) return true;
+      }
+    } catch {
+      // página recarregando — tenta de novo
+    }
+    if (!triedClick && Date.now() - start > 8000) {
+      triedClick = true;
+      try {
+        await trySolveChallenge(page, getLogger(), 1);
+      } catch {
+        // segue esperando o timeout
+      }
+    }
+    await page.waitForTimeout(1500);
+  }
+  getLogger().warn({ url: page.url() }, 'Cloudflare não liberou a página a tempo');
+  return false;
 }
 
 /** Conta estrelas cheias (fa-star, excluindo fa-star-o vazias). Mantido p/ compat. */
@@ -63,19 +116,36 @@ export function pickPreferredStream(
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  const wantsOfficial = prefs.includes('official');
-  const wantsEn = prefs.includes('en');
+  let wantsOfficial = prefs.includes('official');
+  let wantsEn = prefs.includes('en');
+  const wantsGaules = prefs.includes('gaules');
+  const hasOfficial = streams.some(
+    (s) => s.isOfficialGuess ?? OFFICIAL_HINTS.some((h) => s.name.toLowerCase().includes(h)),
+  );
+  const hasGaules = streams.some((s) => /gaules/i.test(s.name));
+
+  // Fallback cruzado official <-> gaules: a escolhida indisponível usa a outra.
+  // (Gaules não cobre todos os jogos; e a oficial pode cair.)
+  // Sem nenhuma das duas no ar, vale a pontuação normal (viewers/idioma).
+  const gaulesActive = wantsGaules || ((wantsOfficial || wantsEn) && !hasOfficial);
+  if (wantsGaules && !hasGaules) {
+    wantsOfficial = true;
+    wantsEn = true;
+  }
 
   const scored = streams.map((s) => {
     let score = s.viewers ?? 0;
     const name = s.name.toLowerCase();
     const official =
       s.isOfficialGuess ?? OFFICIAL_HINTS.some((h) => name.includes(h));
+    // Gaules (pedido ou fallback) vence tudo — até oficial + viewers.
+    if (gaulesActive && /gaules/i.test(name)) score += 2_000_000;
     if (wantsOfficial && official) score += 1_000_000;
     if (wantsEn && (s.language?.toLowerCase() === 'en' || name.includes('esl')))
       score += 100_000;
     // Evita restreams BR quando o usuário pediu EN oficial
-    if (wantsEn && /gaules|nak|liminha|bt0|br/i.test(s.name)) score -= 500_000;
+    // (mas não quando o BR — Gaules pedido ou fallback — é o alvo).
+    if (wantsEn && !gaulesActive && /gaules|nak|liminha|bt0|br/i.test(s.name)) score -= 500_000;
     return { s, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -112,21 +182,23 @@ export function cardToLiveMatch(card: MatchCard): LiveMatch {
  * Container: div.match[data-livescore-match] (externo — o interno div.match
  * duplica, por isso o seletor mira só no que tem o atributo).
  * Live = .match-meta-live com texto "Live".
+ * Retorna null se o Cloudflare bloquear (para o ciclo pular sem desmontar
+ * recorders/trackers — [] significaria "sem lives" e derrubaria tudo).
  */
 export async function fetchLiveMatches(
   matchesUrl: string,
   minStars: number,
   topTierOnly: boolean,
-): Promise<LiveMatch[]> {
+): Promise<LiveMatch[] | null> {
   const log = getLogger();
   const b = await getBrowser();
-  const page: Page = await b.newPage({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-  });
+  // Sem userAgent fixo de propósito: o contexto stealth envia UA autêntico
+  // (+ Client Hints consistentes); UA fixo desatualizado é assinatura clássica.
+  const page: Page = await b.newPage();
   try {
     await page.goto(matchesUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(5000);
+    if (!(await waitForClearance(page))) return null;
+    await page.waitForTimeout(3000);
 
     const cards = await page.evaluate(() => {
       const out: Array<{
@@ -198,27 +270,36 @@ export async function fetchLiveMatches(
 
 /**
  * Abre a página do match e extrai streams.
- * Layout 2026: divs .stream-box (texto "NOME + viewers", ex "FRAG10271.0k")
- * com <a> interno para twitch/kick/youtube; .stream-box-embed é só o player.
+ * Layout 2026: div.stream-box com .stream-box-embed (nome) +
+ * .watchbox-right .viewers (número cru "9988" ou "9.9k") +
+ * .external-stream a[href] (link twitch/youtube/kick).
+ * NÃO usar textContent da box inteira (concatena os dois spans de
+ * viewers e gera contagem absurda que quebra o scoring).
  */
 export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInfo[]> {
   const b = await getBrowser();
   const page = await b.newPage();
   try {
     await page.goto(matchPageUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(3000);
+    if (!(await waitForClearance(page))) return [];
+    await page.waitForTimeout(2000);
     const raw = await page.evaluate(() => {
-      const boxes = Array.from(document.querySelectorAll('.stream-box'));
+      const boxes = Array.from(document.querySelectorAll('div.stream-box'));
       return boxes.map((el) => {
-        const anchor =
-          el.querySelector('a[href]') ??
-          (el.closest('a[href]') as HTMLAnchorElement | null);
-        const href =
-          anchor && 'href' in anchor
-            ? (anchor as HTMLAnchorElement).href
-            : '';
-        const text = (el.textContent ?? '').trim().replace(/\s+/g, '');
-        return { text, href };
+        const anchor = el.querySelector(
+          '.external-stream a[href]',
+        ) as HTMLAnchorElement | null;
+        const href = anchor ? anchor.href : '';
+        const name = (
+          el.querySelector('.stream-box-embed')?.textContent ?? ''
+        )
+          .trim()
+          .replace(/\s+/g, ' ')
+          .slice(0, 60);
+        const viewersText = (
+          el.querySelector('.watchbox-right .viewers')?.textContent ?? ''
+        ).trim();
+        return { name: name || 'stream', href, viewersText };
       });
     });
     const out: StreamInfo[] = [];
@@ -228,14 +309,30 @@ export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInf
       if (r.href.includes('hltv.org/live')) continue; // scoreboard, não vídeo
       if (!/twitch\.tv|youtube\.com|youtu\.be|kick\.com/.test(r.href)) continue;
       seen.add(r.href);
-      // "FRAG10271.0k" → name=FRAG, viewers=10270 ; "ESL_CS5.2k" → 5200
-      const m = r.text.match(/^(.*?)(\d+(?:\.\d+)?)k$/i);
-      const name = (m ? m[1] : r.text).slice(0, 60) || 'stream';
-      const viewers = m ? Math.round(Number.parseFloat(m[2]) * 1000) : undefined;
-      out.push({ name, url: r.href, viewers });
+      out.push({ name: r.name, url: r.href, viewers: parseViewers(r.viewersText) });
     }
     return out;
   } finally {
     await page.close().catch(() => undefined);
   }
+}
+
+/** "9988" | "9.9k" | "1,2k" (decimal BR) | "1,200" (milhar US) -> nº. Absurdos (>10M) e vazio = undefined. */
+export function parseViewers(text: string): number | undefined {
+  let t = text.trim();
+  if (!t) return undefined;
+  // Vírgula decimal BR ("1,2k" = 1.2k); resto das vírgulas = milhar US.
+  if (/,\d{1,2}\s*k$/i.test(t)) t = t.replace(',', '.');
+  t = t.replace(/,/g, '');
+  const k = t.match(/^([\d.]+)\s*k$/i);
+  let n: number | undefined;
+  if (k) {
+    n = Math.round(Number.parseFloat(k[1]) * 1000);
+  } else if (/^\d+$/.test(t)) {
+    n = Number.parseInt(t, 10);
+  } else {
+    return undefined;
+  }
+  if (!Number.isFinite(n) || n > 10_000_000) return undefined;
+  return n;
 }

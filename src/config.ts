@@ -3,6 +3,10 @@ import { z } from 'zod';
 
 const ConfigSchema = z.object({
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
+  /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
+  HLTV_PROFILE: z.string().default('./data/hltv-profile'),
+  /** 1 = headless (o Cloudflare costuma barrar; headed minimizado passa). */
+  HLTV_HEADLESS: z.string().default('0'),
   MIN_STARS: z.coerce.number().min(0).max(5).default(4),
   TOP_TIER_ONLY: z
     .string()
@@ -19,6 +23,16 @@ const ConfigSchema = z.object({
   CLIP_POST_ROLL_SEC: z.coerce.number().min(5).max(60).default(15),
   /** Contexto antes do 1º kill do ace (o clipe começa aqui). */
   CLIP_CONTEXT_SEC: z.coerce.number().min(0).max(30).default(10),
+  /** Mínimo de kills no round para gerar clipe (3 = 3k/4k/5k). */
+  MIN_KILLS: z.coerce.number().min(2).max(5).default(3),
+  /**
+   * Atraso estimado do placar live do HLTV em relação ao jogo real. O corte
+   * começa em (1º kill observado − este valor − CLIP_CONTEXT_SEC). Suba se
+   * o clipe começar DEPOIS da 1ª kill; desça se começar muito antes.
+   */
+  SCOREBOARD_DELAY_MS: z.coerce.number().min(0).max(120_000).default(10_000),
+  /** Upscale do clipe p/ forçar VP9/AV1 no YouTube (1440/2160; 0 = desligado). */
+  CLIP_UPSCALE_HEIGHT: z.coerce.number().min(0).max(2160).default(1440),
   CLIPS_DIR: z.string().default('./data/clips'),
 
   DB_PATH: z.string().default('./data/bot.sqlite'),

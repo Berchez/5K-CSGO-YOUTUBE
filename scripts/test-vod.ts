@@ -44,7 +44,7 @@ function hasFlag(name: string): boolean {
  * perde as flags (chega só os valores). Aceita: <url> <at> [player].
  */
 function positionalArgs(): string[] {
-  const withValue = new Set(['--url', '--at', '--pre', '--post', '--player', '--team1', '--team2', '--pteam', '--map', '--event', '--round', '--score', '--kills', '--firstat', '--ctx', '--playerphoto', '--team1logo', '--team2logo', '--mapimg']);
+  const withValue = new Set(['--url', '--at', '--pre', '--post', '--res', '--upscale', '--player', '--team1', '--team2', '--pteam', '--map', '--event', '--round', '--score', '--kills', '--firstat', '--ctx', '--playerphoto', '--team1logo', '--team2logo', '--mapimg']);
   const out: string[] = [];
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -91,12 +91,16 @@ async function main(): Promise<void> {
   const atRaw = arg('at') ?? pos[1];
   if (!url || !atRaw) {
     console.error(
-      'Uso: npx tsx scripts/test-vod.ts --url <VOD> --at 01:23:45 [--pre 60] [--post 15] [--player donk] [--team1 Spirit] [--team2 Falcons] [--pteam Spirit] [--map Anubis] [--event "ESL Pro League Season 24"] [--round 9] [--score 6-3] [--kills "donk>a:ak47:hs,..."] [--firstat 01:22:30] [--ctx 10] [--refs] [--playerphoto URL] [--team1logo URL] [--team2logo URL] [--mapimg URL] [--upload]',
+      'Uso: npx tsx scripts/test-vod.ts --url <VOD> --at 01:23:45 [--pre 60] [--post 15] [--res 1080] [--upscale 1440] [--player donk] [--team1 Spirit] [--team2 Falcons] [--pteam Spirit] [--map Anubis] [--event "ESL Pro League Season 24"] [--round 9] [--score 6-3] [--kills "donk>a:ak47:hs,..."] [--firstat 01:22:30] [--ctx 10] [--refs] [--playerphoto URL] [--team1logo URL] [--team2logo URL] [--mapimg URL] [--upload]',
     );
     process.exit(2);
   }
   const pre = Number(arg('pre', '60'));
   const post = Number(arg('post', '15'));
+  const resWanted = Number(arg('res', '1080'));
+  const res = [720, 1080].includes(resWanted) ? resWanted : 1080;
+  const upscaleWanted = Number(arg('upscale', '1440'));
+  const upscale = [0, 1440, 2160].includes(upscaleWanted) ? upscaleWanted : 1440;
   const player = arg('player') ?? pos[2] ?? 'TEST_PLAYER';
   const team1 = arg('team1', 'TEST_A')!;
   const team2 = arg('team2', 'TEST_B')!;
@@ -153,16 +157,19 @@ async function main(): Promise<void> {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const base = `test-vod_${stamp}_${slug(player)}`;
   const outPath = path.join(cfg.CLIPS_DIR, `${base}.mp4`);
-  console.log('Baixando trecho (720p máx p/ ser rápido)...');
+  console.log(`Baixando trecho (${res}p máx${res === 720 ? ' p/ ser rápido' : ''})...`);
   await execFileAsync(YTDLP, [
     '--no-playlist',
     '--ffmpeg-location',
     path.join(ROOT, '.tools'),
     '--download-sections',
     `*${start}-${end}`,
-    '--force-keyframes-at-cuts',
+    // SEM --force-keyframes-at-cuts de propósito: ele força re-encode total
+    // em CRF 23 (padrão do ffmpeg) e degrada a fonte antes do upscale.
+    // Sem ele o corte é stream copy (limites ajustam p/ o keyframe ±2s, sem
+    // perda). O ÚNICO re-encode do pipeline é o upscale CRF 17 abaixo.
     '-f',
-    'bv*[height<=720]+ba/b[height<=720]/b',
+    `bv*[height<=${res}]+ba/b[height<=${res}]/b`,
     '--merge-output-format',
     'mp4',
     '-o',
@@ -171,6 +178,11 @@ async function main(): Promise<void> {
   ]);
   const sizeMb = (fs.statSync(outPath).size / 1024 / 1024).toFixed(1);
   console.log(`Clipe OK: ${outPath} (${sizeMb} MB)`);
+  if (upscale > 0) {
+    const { upscaleClip } = await import('../src/clipper/clipBuilder.js');
+    await upscaleClip(outPath, upscale);
+    console.log(`Upscale OK: ${outPath} (${(fs.statSync(outPath).size / 1024 / 1024).toFixed(1)} MB, ${upscale}p)`);
+  }
 
   // 3) Thumb composta + sidecar (mesmo padrão do clipper live)
   // 3) Objeto ace: com kills detalhados (--kills) monta summary real;
@@ -200,14 +212,14 @@ async function main(): Promise<void> {
     detectedAt: new Date().toISOString(),
     kills,
     score: score || undefined,
-    summary: kills.length === 5 ? buildRoundSummary(player, pteam, opponents, kills) : undefined,
+    summary: kills.length >= 3 ? buildRoundSummary(player, pteam, opponents, kills) : undefined,
   };
   if (ace.summary) {
     console.log('--- RESUMO DO ACE ---');
     console.log(describeAce(ace.summary, event));
     console.log('---------------------');
   } else if (killsSpec) {
-    console.log(`(aviso: --kills com ${kills.length} kills, summary exige 5)`);
+    console.log(`(aviso: --kills com ${kills.length} kills, summary exige ao menos 3)`);
   }
   const thumbPath = path.join(cfg.CLIPS_DIR, `${base}.jpg`);
   try {

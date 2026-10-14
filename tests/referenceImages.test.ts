@@ -6,6 +6,7 @@ import {
   pickTitle,
   infoboxToAllmodeName,
   parseLogosSectionFiles,
+  parseGalleryFiles,
   removeCornerBackground,
 } from '../src/clipper/referenceImages.js';
 
@@ -157,6 +158,30 @@ describe('removeCornerBackground', () => {
     const c = (4 * 8 + 4) * 4;
     expect(data[c + 3]).toBe(255);
     expect(data[c]).toBe(200);
+  });
+});
+
+describe('parseGalleryFiles', () => {
+  it('extrai fotos da seção Gallery (formato Arquivo|caption)', () => {
+    const wikitext = `==Gear and Settings==
+nada
+==Gallery==
+<gallery mode="packed-hover" heights="200px">
+Donk at BLAST Open Spring 2025.jpg|donk at BLAST Open Spring 2025 with Team Spirit
+Donk 2025 Team Spirit.jpeg|donk with Team Spirit in January 2025
+Donk at ESL Pro League S20.jpg|donk at ESL Pro League Season 20
+</gallery>
+==References==`;
+    const files = parseGalleryFiles(wikitext);
+    expect(files).toEqual([
+      'Donk at BLAST Open Spring 2025.jpg',
+      'Donk 2025 Team Spirit.jpeg',
+      'Donk at ESL Pro League S20.jpg',
+    ]);
+  });
+
+  it('sem seção Gallery retorna vazio', () => {
+    expect(parseGalleryFiles('==Overview==\nNada')).toEqual([]);
   });
 });
 

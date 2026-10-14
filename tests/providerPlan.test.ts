@@ -17,11 +17,18 @@ const ace: AceEvent = {
 
 const refs: ReferenceImages = {
   player: 'refs/player.jpg',
+  playerAlt: 'refs/player-alt.jpg',
   team1Logo: 'refs/t1.png',
   team2Logo: 'refs/t2.png',
   mapImage: 'refs/map.jpg',
 };
-const all = [refs.player!, refs.team1Logo!, refs.team2Logo!, refs.mapImage!];
+const all = [
+  refs.player!,
+  refs.playerAlt!,
+  refs.team1Logo!,
+  refs.team2Logo!,
+  refs.mapImage!,
+];
 
 describe('planForProvider (roteamento da cadeia de fallback)', () => {
   it('chatgpt/grok: thumb completa com todas as referências', () => {

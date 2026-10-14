@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import type { AceEvent } from '../types.js';
+import { killLabel } from '../detector/aceDetector.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,7 +43,7 @@ export function thumbnailOverlay(ace: AceEvent): Buffer {
   <rect width="${W}" height="${H}" fill="url(#g)"/>
   <rect x="48" y="470" width="230" height="92" rx="14" fill="#e10600"/>
   <text x="163" y="537" font-family="Arial Black, Arial, sans-serif" font-size="62"
-        font-weight="900" fill="white" text-anchor="middle">ACE!</text>
+        font-weight="900" fill="white" text-anchor="middle">${esc(killLabel(ace.kills.length))}!</text>
   <text x="300" y="537" font-family="Arial Black, Arial, sans-serif" font-size="64"
         font-weight="900" fill="white">${player}</text>
   <text x="48" y="600" font-family="Arial, sans-serif" font-size="40"

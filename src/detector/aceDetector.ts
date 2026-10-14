@@ -71,23 +71,64 @@ export function prettyWeapon(w: string): string {
 }
 
 /**
+ * Selo do multikill pelo nº de kills: ACE (5+), 3K, 4K — mesma convenção
+ * em título, thumb, descrição e prompt IA. Sem dado (<3) cai no legado ACE!.
+ */
+export function killLabel(killCount: number): string {
+  return killCount >= 5 ? 'ACE' : killCount >= 3 ? `${killCount}K` : 'ACE';
+}
+
+export interface MultiKill {
+  player: string;
+  kills: KillEvent[];
+}
+
+/**
+ * Detecta multikill: jogador com mais kills no round, exigindo ao menos
+ * minKills (default 3: 3k/4k/5k). Desempate: quem chegou primeiro.
+ * Retorna null se ninguém atingir o mínimo.
+ */
+export function detectMultiKill(kills: KillEvent[], minKills = 3): MultiKill | null {
+  const byPlayer = new Map<string, KillEvent[]>();
+  const order: string[] = [];
+  for (const k of kills) {
+    const name = k.killer.trim();
+    if (!name || isRoundMarker(name)) continue;
+    const key = name.toLowerCase();
+    if (!byPlayer.has(key)) {
+      byPlayer.set(key, []);
+      order.push(key);
+    }
+    byPlayer.get(key)!.push(k);
+  }
+  let best: string | null = null;
+  for (const key of order) {
+    const n = byPlayer.get(key)!.length;
+    if (n >= minKills && (!best || n > byPlayer.get(best)!.length)) best = key;
+  }
+  if (!best) return null;
+  const arr = byPlayer.get(best)!;
+  return { player: arr[0].killer.trim(), kills: arr };
+}
+
+/**
  * Detecta ACE num round já fechado.
  * Retorna o nome do jogador se os 5 kills são do mesmo player (ignora markers).
  * Retorna null caso contrário.
  */
 export function detectAceInRound(kills: KillEvent[]): string | null {
-  const killers = kills
-    .map((k) => k.killer.trim())
-    .filter((n) => n.length > 0 && !isRoundMarker(n));
-  if (killers.length !== 5) return null;
-  const first = killers[0].toLowerCase();
-  if (killers.every((k) => k.toLowerCase() === first)) return killers[0];
-  return null;
+  const m = detectMultiKill(kills, 5);
+  return m && m.kills.length === 5 ? m.player : null;
 }
 
 /** Acumulador de kills do round atual. Substitui a lógica frágil de todosMatadores. */
 export class RoundTracker {
   private kills: KillEvent[] = [];
+  private seen = new Set<string>();
+  /** Última contagem de kills vista por jogador (placar) — base do diff. */
+  private lastCounts = new Map<string, number>();
+  /** Última contagem de deaths vista por jogador — alimenta as vítimas. */
+  private lastDeaths = new Map<string, number>();
   private round = 1;
   private map = 'unknown';
 
@@ -97,8 +138,14 @@ export class RoundTracker {
   }
 
   setContext(map: string, round: number): void {
-    this.map = map;
-    this.round = round;
+    if (map !== this.map || round !== this.round) {
+      this.map = map;
+      this.round = round;
+      this.kills = [];
+      this.seen.clear();
+      // lastCounts NÃO zera aqui: é reancorado no próximo syncBaseline
+      // (sem spike falso). round novo começa com os mesmos totais.
+    }
   }
 
   addKill(
@@ -107,6 +154,15 @@ export class RoundTracker {
     detail: Partial<Omit<KillEvent, 'killer' | 'victim' | 'round' | 'map'>> = {},
   ): void {
     if (isRoundMarker(killer)) return;
+    // Polling relê o mesmo killfeed a cada ciclo: dedup por killer+vítima
+    // para a contagem do round ser exata (sem isso um 3k vira 6, 9, 12...).
+    // Kills sintetizados do placar (vítima '') nunca repetem — a guarda
+    // exata é o lastCounts no syncBaseline — então contam sempre.
+    if (victim.trim()) {
+      const key = `${killer.trim().toLowerCase()}|${victim.trim().toLowerCase()}`;
+      if (this.seen.has(key)) return;
+      this.seen.add(key);
+    }
     this.kills.push({
       killer,
       victim,
@@ -123,17 +179,66 @@ export class RoundTracker {
     });
   }
 
-  /** Fecha o round e retorna o nome do autor do ace, se houver. */
-  closeRound(): { ace: string | null; kills: KillEvent[] } {
-    const ace = detectAceInRound(this.kills);
-    const kills = [...this.kills];
+  /**
+   * Sincroniza contadores do placar (chamado a cada poll, após setContext).
+   * Diferenciais da coluna K viram kills sintetizados; os da coluna D
+   * (deaths) alimentam o pool de VÍTIMAS do poll — casadas na ordem do
+   * scoreboard (conjunto correto; pareamento exato exige killfeed).
+   * Nome novo ou contagem menor só reancora (sem spike falso). É a guarda
+   * exata contra re-observação — dispensa dedup para sintetizados.
+   */
+  syncBaseline(players: Array<{ name: string; kills: number; deaths?: number }>): void {
+    const newKills: Array<{ name: string; n: number }> = [];
+    const victimPool: string[] = [];
+    for (const p of players) {
+      const rawName = p.name.trim();
+      if (!rawName || isRoundMarker(rawName)) continue;
+      const key = rawName.toLowerCase();
+      const prevK = this.lastCounts.get(key);
+      if (prevK === undefined || p.kills !== prevK) {
+        if (prevK !== undefined && p.kills > prevK) {
+          newKills.push({ name: rawName, n: p.kills - prevK });
+        }
+        this.lastCounts.set(key, p.kills);
+      }
+      const d = p.deaths ?? 0;
+      const prevD = this.lastDeaths.get(key);
+      if (prevD === undefined || d !== prevD) {
+        if (prevD !== undefined && d > prevD) {
+          for (let i = 0; i < d - prevD; i++) victimPool.push(rawName);
+        }
+        this.lastDeaths.set(key, d);
+      }
+    }
+    // Excesso de mortes = bomba/queda (não vira vítima de ninguém);
+    // falta = kill sem vítima conhecida ('' — honesto nos textos).
+    let vi = 0;
+    for (const k of newKills) {
+      for (let i = 0; i < k.n; i++) {
+        const victim = vi < victimPool.length ? victimPool[vi++] : '';
+        this.addKill(k.name, victim);
+      }
+    }
+  }
+  /**
+   * Fecha o round e retorna o autor do multikill (3k/4k/5k), se houver —
+   * sempre a contagem MÁXIMA do round (um evento por round/jogador, sem
+   * duplicar 3k→4k→5k). kills = SÓ os do autor (metadados honestos).
+   */
+  closeRound(minKills = 3): { player: string | null; kills: KillEvent[] } {
+    const m = detectMultiKill(this.kills, minKills);
+    const kills = m ? m.kills : [];
     this.kills = [];
+    this.seen.clear();
     this.round += 1;
-    return { ace, kills };
+    return { player: m?.player ?? null, kills };
   }
 
   reset(round = 1): void {
     this.kills = [];
+    this.seen.clear();
+    this.lastCounts.clear();
+    this.lastDeaths.clear();
     this.round = round;
   }
 
@@ -142,7 +247,7 @@ export class RoundTracker {
   }
 }
 
-/** Monta o resumo rico de um round de ace (5 kills do mesmo jogador). */
+/** Monta o resumo rico de um round de multikill (3k/4k/5k do mesmo jogador). */
 export function buildRoundSummary(
   player: string,
   team: string,
@@ -199,18 +304,21 @@ function killLine(k: KillEvent, i: number): string {
 }
 
 /**
- * Narrativa completa do ace em PT-BR — alimenta descrição do YouTube,
+ * Narrativa completa do multikill em PT-BR — alimenta descrição do YouTube,
  * prompt da IA de thumbnail e qualquer resumo automático.
  */
 export function describeAce(s: RoundSummary, event: string): string {
+  const n = s.kills.length;
+  const label = killLabel(n);
+  const kn = n >= 5 ? '5K' : `${n}K`;
   const head = s.team
-    ? `ACE! ${s.player} (${s.team}) fez 5K contra ${s.opponents} — ${event}, ${s.map}, round ${s.round}.`
-    : `ACE! ${s.player} fez 5K em ${s.opponents} — ${event}, ${s.map}, round ${s.round}.`;
+    ? `${label}! ${s.player} (${s.team}) fez ${kn} contra ${s.opponents} — ${event}, ${s.map}, round ${s.round}.`
+    : `${label}! ${s.player} fez ${kn} em ${s.opponents} — ${event}, ${s.map}, round ${s.round}.`;
   const lines = [head, ...s.kills.map((k, i) => killLine(k, i))];
-  if (s.headshots > 0) lines.push(`Headshots: ${s.headshots}/5.`);
+  if (s.headshots > 0) lines.push(`Headshots: ${s.headshots}/${n}.`);
   if (s.mainWeapon) {
-    const n = s.weapons.filter((w) => w === s.mainWeapon).length;
-    lines.push(`Arma principal: ${prettyWeapon(s.mainWeapon)} (${n}/5 kills).`);
+    const mw = s.weapons.filter((w) => w === s.mainWeapon).length;
+    lines.push(`Arma principal: ${prettyWeapon(s.mainWeapon)} (${mw}/${n} kills).`);
   }
   if (s.flashAssists.length > 0) {
     lines.push(

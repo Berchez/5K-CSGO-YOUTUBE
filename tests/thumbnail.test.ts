@@ -47,6 +47,20 @@ describe('thumbnail', () => {
     expect(buf).toContain('&lt;img&gt;x');
   });
 
+  it('selo dinâmico: 4K!/3K! conforme os kills (ACE! sem dado)', () => {
+    const four = thumbnailOverlay({
+      ...ace,
+      kills: [1, 2, 3, 4].map((i) => ({ killer: 'flameZ', victim: `v${i}`, round: 3, map: 'm' })),
+    }).toString('utf8');
+    expect(four).toContain('4K!');
+    expect(four).not.toContain('ACE!');
+    const three = thumbnailOverlay({
+      ...ace,
+      kills: [1, 2, 3].map((i) => ({ killer: 'x', victim: `v${i}`, round: 1, map: 'm' })),
+    }).toString('utf8');
+    expect(three).toContain('3K!');
+  });
+
   it('compõe 1280x720 a partir de frame qualquer', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumb-test-'));
     const frame = path.join(dir, 'frame.jpg');

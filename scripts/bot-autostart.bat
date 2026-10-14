@@ -1,0 +1,4 @@
+@echo off
+rem Restaura o bot 5k (pm2 resurrect) no logon — ver dump em %USERPROFILE%\.pm2\dump.pm2
+cd /d D:\GitHub\5K-CSGO-YOUTUBE
+call "C:\Program Files\nodejs\pm2.cmd" resurrect >> logs\pm2-autostart.log 2>&1

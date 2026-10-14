@@ -1,33 +1,35 @@
 # 5K CS2 → YouTube (v2 — reescrita moderna)
 
-Bot 100% automatizado até revisão humana: monitora jogos **live importantes no HLTV** (filtro por estrelas configurável), detecta **ACE (5 kills no mesmo round)**, recorta de um **buffer local contínuo** e sobe como **privado no YouTube** para você revisar/publicar.
+Bot 100% automatizado até revisão humana: monitora jogos **live no HLTV** (filtro por estrelas configurável, `0` = qualquer partida), detecta **multikills (3k/4k/5k no mesmo round)**, recorta de um **buffer local contínuo** e sobe como **privado no YouTube** para você revisar/publicar.
 
 > Legado 2021 (`index.py`, Selenium + XPaths absolutos) foi preservado no repo só como referência. O código novo está em `src/` (Node/TypeScript).
 
 ## Como funciona
 
 ```text
-HLTV /matches (Playwright, 45s) → filtro MIN_STARS
-  → recorder: streamlink (stream oficial EN) → ffmpeg segmentos 10s, últimos ~180s
-  → detector: killfeed live → 5 kills mesmo player = ACE
-  → clipper: ffmpeg -c copy (60s antes + 15s depois), 16:9
+HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
+  → recorder: streamlink (official EN ou Gaules, via STREAM_PRIORITY) → ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~180s
+  → detector: killfeed live → 3+ kills mesmo player no round = multikill (3K!/4K!/ACE!)
+  → clipper: passada única ffmpeg (filtro concat realinha A/V por segmento + trim exato + upscale 1440p)
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Escopo MVP (conforme escolhido): **só 5k live, só horizontal, sem Shorts, sem Discord, só log**.
+Escopo (conforme escolhido): **3k+ live, só horizontal, sem Shorts, sem Discord, só log**. `MIN_KILLS` no `.env` sobe o mínimo (5 = só ace).
 
 ## Pré-requisitos (Windows)
 
 ```powershell
-winget install Gyan.FFmpeg
-winget install Streamlink.Streamlink
 node --version  # >= 20
 npm install
 npx playwright install chromium
 Copy-Item .env.example .env
 ```
+O recorder usa `yt-dlp` + `ffmpeg` vendored em `.tools/` (sem streamlink,
+sem winget) — download na primeira execução.
 
-Edite `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en`, resto com defaults.
+Edite `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en` (ou `gaules` para
+gravar a transmissão do Gaules em PT-BR — com fallback cruzado automático:
+a escolhida indisponível usa a outra), resto com defaults.
 
 ## YouTube (1x)
 
@@ -55,7 +57,9 @@ npm run build; npm start   # produção (dist/main.js)
 npm test        # vitest (detector + filtro stars)
 ```
 
-Manter ligado: use Task Scheduler ou `pm2` (`npm i -g pm2`, `pm2 start dist/main.js --name 5k-bot`, `pm2-startup`).
+Manter ligado: `pm2 start dist/src/main.js --name 5k-bot` + `pm2 save`
+(já ativo; a tarefa agendada `5KBot-Clips` roda `pm2 resurrect` no logon
+via `scripts/bot-autostart.bat`). Comandos úteis: `pm2 list/logs/stop/restart 5k-bot`.
 
 ## Testar com partida acabada (sem esperar live)
 
@@ -70,7 +74,16 @@ npx tsx scripts/test-vod.ts --url "<VOD>" --at 4820 --player donk --upload
 ```
 
 `--at` = momento do 5º kill (aceita `HH:MM:SS` ou segundos). Baixa só a janela
-(`--pre 60 --post 15`, 720p) para `data/clips/test-vod_*.mp4` + thumb + sidecar
+(`--pre 60 --post 15`, `--res 1080` por padrão; `--res 720` p/ baixar mais
+rápido) para `data/clips/test-vod_*.mp4` + thumb + sidecar
+`.json` + registro no sqlite. Depois do download, o clipe passa por
+**upscale p/ 1440p** (`--upscale 1440` por padrão; `0` desliga) — uploads
+>=1440p recebem o codec VP9/AV1 do YouTube, com qualidade percebida muito
+maior mesmo assistindo em 1080p (a fonte Twitch ~8 Mbps continua sendo o
+teto). O upscale inclui restauração leve (denoise antes do scale p/ não
+ampliar blocos + sharpen adaptativo depois) e o download é stream copy
+(sem o re-encode CRF 23 que o `--force-keyframes-at-cuts` impunha).
+O modo live aplica o mesmo tratamento (`CLIP_UPSCALE_HEIGHT` no `.env`).
 `.json` + registro no sqlite. Tudo sai marcado `[TESTE]` — nunca confunda com clipe real.
 No Windows prefira `npx tsx` direto (o `npm run ... --` às vezes engole as flags).
 
@@ -123,9 +136,9 @@ THUMB_AI_ORDER=chatgpt,grok,gemini-web
 
 | Provider | Gera | Custo | Precisa |
 |---|---|---|---|
-| `chatgpt` | thumb completa (4 refs anexadas) | grátis (cota diária) | `chatgpt-login.ts` 1x, conta descartável |
-| `grok` | thumb completa (4 refs anexadas) | grátis (cota X) | `grok-login.ts` 1x, conta X descartável |
-| `gemini-web` | thumb completa **policy-safe** (4 refs; retrato estilizado com rosto na sombra; prefixo "Generate an image…" obrigatório — sem ele o app responde em texto) | grátis (cota do app) | `gemini-login.ts` 1x, conta descartável **Gmail** (contas edu/Workspace podem não ter geração de imagem) |
+| `chatgpt` | thumb completa (5 refs anexadas) | grátis (cota diária) | `chatgpt-login.ts` 1x, conta descartável |
+| `grok` | thumb completa (5 refs anexadas) | grátis (cota X) | `grok-login.ts` 1x, conta X descartável |
+| `gemini-web` | thumb completa **policy-safe** (5 refs; retrato estilizado com rosto na sombra; prefixo "Generate an image…" obrigatório — sem ele o app responde em texto) | grátis (cota do app) | `gemini-login.ts` 1x, conta descartável **Gmail** (contas edu/Workspace podem não ter geração de imagem) |
 | `huggingface` | fundo | free **sem créditos** (pago p/ usar) | `HF_TOKEN` + créditos |
 | `gemini` | fundo | ~US$0,13/img | `GEMINI_API_KEY` + billing |
 | `pollinations` | fundo | virou pago (402) | nada (falha rápido) |
@@ -133,7 +146,7 @@ THUMB_AI_ORDER=chatgpt,grok,gemini-web
 
 Política por provider: o **Gemini recusa retrato de pessoa real** — por isso,
 no `gemini-web`, o retrato do layout vira **figura estilizada com o rosto na
-sombra** (policy-safe) e as 4 referências seguem anexadas. chatgpt/grok aceitam
+sombra** (policy-safe) e as 5 referências seguem anexadas. chatgpt/grok aceitam
 o layout completo com retrato. Logos de times vêm da Liquipedia com busca
 prefixada `"Team <Nome>"` (busca crua casa com páginas homônimas — ex. "Spirit"
 é outro time — e já baixou logo errado; há regressão testada para isso).
@@ -152,14 +165,17 @@ suspensa. Por isso: **nunca use a conta dona do canal/projeto Cloud**.
 
 ## Referências visuais no prompt IA (HLTV + Liquipedia)
 
-Com `--refs` (test-vod) ou sempre no modo live, o bot baixa 4 referências e
-**anexa como imagens** na geração: foto do player, logo do time do autor,
-logo do adversário e imagem do mapa. Fontes: HLTV (logos, via og:image) e
-Liquipedia API (fotos/mapa, infobox `|image=`). Tudo é best-effort — cada
-referência ausente degrada sozinha (sem anexo, o prompt segue).
+Com `--refs` (test-vod) ou sempre no modo live, o bot baixa 5 referências e
+**anexa como imagens** na geração: **duas fotos do player** (infobox + galeria
+da Liquipedia — rosto e uniforme/pose em evento), logo do time do autor,
+logo do adversário e imagem do mapa. Fontes: Liquipedia API (fotos/logos/mapa)
+com HLTV como fallback de logo. O prompt carrega a seção REFERÊNCIAS
+OBRIGATÓRIAS com o nome específico de cada item, na ordem exata dos anexos.
+Tudo é best-effort — cada referência ausente degrada sozinha (sem anexo, o
+prompt segue com renumeração automática).
 
 Política por provider (validada em testes reais):
-- **chatgpt** (thumb completa): recebe as **4 referências** + prompt com
+- **chatgpt** (thumb completa): recebe as **5 referências** + prompt com
   seção REFERÊNCIAS. Nota: conta free tem cota diária de imagens.
 - **gemini-web** (fundo híbrido): recebe **só o mapa** e prompt de fundo —
   o Gemini **recusa** retrato de pessoa real ("retrato em close do jogador X"

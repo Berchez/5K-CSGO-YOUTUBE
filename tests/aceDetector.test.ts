@@ -3,7 +3,9 @@ import {
   buildRoundSummary,
   describeAce,
   detectAceInRound,
+  detectMultiKill,
   isRoundMarker,
+  killLabel,
   normWeapon,
   prettyWeapon,
   RoundTracker,
@@ -44,15 +46,152 @@ describe('detectAceInRound', () => {
   });
 });
 
+describe('detectMultiKill', () => {
+  it('detecta 3k/4k/5k (mínimo configurável)', () => {
+    const three = ['a', 'a', 'a'].map((p) => k(p));
+    expect(detectMultiKill(three, 3)?.player).toBe('a');
+    expect(detectMultiKill(three, 3)?.kills).toHaveLength(3);
+    expect(detectMultiKill(three, 4)).toBeNull();
+    const four = [...three, k('a')];
+    expect(detectMultiKill(four)?.player).toBe('a');
+    expect(detectMultiKill(four)?.kills).toHaveLength(4);
+  });
+
+  it('pega o maior multikill do round (5k vence 3k)', () => {
+    const kills = ['a', 'a', 'a', 'b', 'b', 'b', 'b', 'b'].map((p) => k(p));
+    const m = detectMultiKill(kills);
+    expect(m?.player).toBe('b');
+    expect(m?.kills).toHaveLength(5);
+  });
+
+  it('desempate: quem chegou primeiro ao mínimo', () => {
+    const kills = ['a', 'b', 'a', 'b', 'a', 'b'].map((p) => k(p));
+    expect(detectMultiKill(kills)?.player).toBe('a');
+  });
+
+  it('ignora markers e retorna null abaixo do mínimo', () => {
+    expect(detectMultiKill([k('T'), k('a'), k('a')])).toBeNull();
+    expect(detectMultiKill([])).toBeNull();
+  });
+});
+
+describe('killLabel', () => {
+  it('ACE p/ 5+, 4K/3K abaixo disso', () => {
+    expect(killLabel(5)).toBe('ACE');
+    expect(killLabel(9)).toBe('ACE');
+    expect(killLabel(4)).toBe('4K');
+    expect(killLabel(3)).toBe('3K');
+  });
+});
+
 describe('RoundTracker', () => {
   it('acumula e fecha round com ace', () => {
     const t = new RoundTracker('anubis', 5);
     for (let i = 0; i < 5; i++) t.addKill('m0NESY', `victim${i}`);
     expect(t.pending).toBe(5);
-    const { ace, kills } = t.closeRound();
-    expect(ace).toBe('m0NESY');
+    const { player, kills } = t.closeRound();
+    expect(player).toBe('m0NESY');
     expect(kills).toHaveLength(5);
     expect(t.pending).toBe(0);
+  });
+
+  it('fecha round com 3k (mínimo default) e só os kills do autor', () => {
+    const t = new RoundTracker('mirage', 3);
+    t.addKill('x', 'a');
+    t.addKill('y', 'b');
+    t.addKill('x', 'c');
+    t.addKill('x', 'd');
+    const { player, kills } = t.closeRound();
+    expect(player).toBe('x');
+    expect(kills.map((kk) => kk.victim)).toEqual(['a', 'c', 'd']);
+  });
+
+  it('dedup: polling repetido não infla a contagem', () => {
+    const t = new RoundTracker();
+    for (let i = 0; i < 4; i++) {
+      t.addKill('donk', 'a');
+      t.addKill('donk', 'b');
+      t.addKill('donk', 'c');
+    }
+    expect(t.pending).toBe(3);
+    const { player, kills } = t.closeRound();
+    expect(player).toBe('donk');
+    expect(kills).toHaveLength(3);
+  });
+
+  it('sem multikill: player null e kills vazio', () => {
+    const t = new RoundTracker();
+    t.addKill('a', 'x');
+    t.addKill('b', 'y');
+    const { player, kills } = t.closeRound();
+    expect(player).toBeNull();
+    expect(kills).toHaveLength(0);
+  });
+
+  it('syncBaseline: diferenciais do placar viram kills sintetizados', () => {
+    const t = new RoundTracker('inferno', 7);
+    // ancora sem spike (placar acumulado do mapa até aqui)
+    t.syncBaseline([
+      { name: 'rain', kills: 10 },
+      { name: 'device', kills: 8 },
+    ]);
+    expect(t.pending).toBe(0);
+    // mesmo placar de novo: nada duplica
+    t.syncBaseline([
+      { name: 'rain', kills: 10 },
+      { name: 'device', kills: 8 },
+    ]);
+    expect(t.pending).toBe(0);
+    // +3 kills do rain: 3k sintetizado (vítima desconhecida)
+    t.syncBaseline([
+      { name: 'rain', kills: 13 },
+      { name: 'device', kills: 8 },
+    ]);
+    expect(t.pending).toBe(3);
+    const { player, kills } = t.closeRound();
+    expect(player).toBe('rain');
+    expect(kills).toHaveLength(3);
+    expect(kills.every((kk) => kk.victim === '')).toBe(true);
+    expect(kills[0].at).toBeLessThanOrEqual(kills[2].at!);
+  });
+
+  it('syncBaseline: nome novo ancora sem spike falso', () => {
+    const t = new RoundTracker();
+    t.syncBaseline([{ name: 'novato', kills: 7 }]);
+    expect(t.pending).toBe(0);
+    t.syncBaseline([{ name: 'novato', kills: 8 }]);
+    expect(t.pending).toBe(1);
+  });
+
+  it('syncBaseline: coluna D (deaths) alimenta as vítimas dos kills', () => {
+    const t = new RoundTracker('inferno', 7);
+    t.syncBaseline([
+      { name: 'rain', kills: 10, deaths: 2 },
+      { name: 'vA', kills: 3, deaths: 5 },
+      { name: 'vB', kills: 1, deaths: 7 },
+      { name: 'vC', kills: 0, deaths: 9 },
+    ]);
+    expect(t.pending).toBe(0);
+    // rain +3 kills no mesmo poll em que vA/vB/vC somam +1 death cada
+    t.syncBaseline([
+      { name: 'rain', kills: 13, deaths: 2 },
+      { name: 'vA', kills: 3, deaths: 6 },
+      { name: 'vB', kills: 1, deaths: 8 },
+      { name: 'vC', kills: 0, deaths: 10 },
+    ]);
+    const { player, kills } = t.closeRound();
+    expect(player).toBe('rain');
+    expect(kills.map((k) => k.victim)).toEqual(['vA', 'vB', 'vC']);
+  });
+
+  it('syncBaseline: morte extra (bomba) não rouba vítima; kill sem morte fica "?"', () => {
+    const t = new RoundTracker();
+    t.syncBaseline([{ name: 'x', kills: 0, deaths: 0 }, { name: 'a', kills: 0, deaths: 0 }]);
+    // x +2 kills; só 1 death nova (a) — 2ª vítima desconhecida
+    t.syncBaseline([{ name: 'x', kills: 2, deaths: 0 }, { name: 'a', kills: 0, deaths: 1 }]);
+    const { kills } = t.closeRound(2);
+    expect(kills[0].victim).toBe('a');
+    expect(kills[1].victim).toBe('');
   });
 
   it('pula markers sem contar', () => {
@@ -65,6 +204,7 @@ describe('RoundTracker', () => {
   it('guarda detalhe rico (arma, HS, assist)', () => {    const t = new RoundTracker('anubis', 9);
     t.addKill('donk', 'kyousuke', { weapon: 'AK-47', headshot: true });
     t.addKill('donk', 'NiKo', { weapon: 'ak47', assistBy: 'chopper' });
+    t.addKill('donk', 'm0NESY', { weapon: 'usp-s' });
     const { kills } = t.closeRound();
     expect(kills[0].weapon).toBe('ak47');
     expect(kills[0].headshot).toBe(true);
@@ -76,14 +216,15 @@ describe('RoundTracker', () => {
     const t = new RoundTracker();
     t.addKill('donk', 'a');
     t.addKill('donk', 'b');
+    t.addKill('donk', 'c');
     const { kills } = t.closeRound();
     expect(kills[0].at).toBeGreaterThanOrEqual(before);
     expect(kills[1].at).toBeGreaterThanOrEqual(kills[0].at!);
+    expect(kills[2].at).toBeGreaterThanOrEqual(kills[1].at!);
   });
 });
 
-describe('armas', () => {
-  it('normWeapon canoniza', () => {
+describe('armas', () => {  it('normWeapon canoniza', () => {
     expect(normWeapon('AK-47')).toBe('ak47');
     expect(normWeapon('Desert Eagle')).toBe('deserteagle');
     expect(normWeapon(undefined)).toBe('');
@@ -133,5 +274,14 @@ describe('buildRoundSummary + describeAce', () => {
     expect(describeAce(s, 'EPL').split('\n')[0]).toContain(
       'ACE! donk fez 5K em Spirit vs Falcons',
     );
+  });
+
+  it('describeAce adapta selo e contagem p/ 4k', () => {
+    const four = rich.slice(0, 4);
+    const s = buildRoundSummary('flameZ', 'Vitality', 'MOUZ', four);
+    const txt = describeAce(s, 'ESL Pro League Season 24');
+    expect(txt.split('\n')[0]).toContain('4K! flameZ (Vitality) fez 4K contra MOUZ');
+    expect(txt).toContain('Arma principal: AWP (3/4 kills)');
+    expect(txt).not.toContain('5K');
   });
 });

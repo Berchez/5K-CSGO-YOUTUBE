@@ -5,7 +5,10 @@ import { getLogger } from '../logger.js';
 
 /** Caminhos locais das referências (cada uma opcional — tudo degrada). */
 export interface ReferenceImages {
+  /** Foto oficial do player (infobox da página dele na Liquipedia). */
   player?: string;
+  /** Segunda foto do player (galeria da página — uniforme/pose em evento). */
+  playerAlt?: string;
   team1Logo?: string;
   team2Logo?: string;
   mapImage?: string;
@@ -30,7 +33,7 @@ export async function fetchHtml(url: string): Promise<string> {
     log.info({ url, err: String(e).slice(0, 80) }, 'fetch direto falhou, tentando Playwright');
     const { getBrowser } = await import('../monitor/hltvMonitor.js');
     const b = await getBrowser();
-    const page = await b.newPage({ userAgent: UA });
+    const page = await b.newPage();
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
       await page.waitForTimeout(5000);
@@ -435,7 +438,24 @@ export interface FetchRefsOptions {
 }
 
 /**
- * Baixa as 4 referências (foto do player, logos, mapa). Cada uma é
+ * Extrai os arquivos da seção ==Gallery== do wikitext (fotos do player em
+ * eventos, com uniforme). Linhas no formato "Arquivo.jpg|caption".
+ */
+export function parseGalleryFiles(content: string): string[] {
+  const m = content.match(/==\s*Gallery\s*==([\s\S]*?)(?=\n==[^=]|$)/i);
+  if (!m) return [];
+  const files: string[] = [];
+  for (const mm of m[1].matchAll(
+    /^([^|\n=]+?\.(?:png|jpe?g|svg|webp))\s*\|/gim,
+  )) {
+    const f = mm[1].trim();
+    if (f && !files.includes(f)) files.push(f);
+  }
+  return files;
+}
+
+/**
+ * Baixa as referências (2 fotos do player, logos, mapa). Cada uma é
  * best-effort: falha isolada vira undefined e o prompt degrada sozinho.
  */
 export async function fetchReferenceImages(
@@ -444,26 +464,45 @@ export async function fetchReferenceImages(
   const log = getLogger().child({ player: opts.player });
   fs.mkdirSync(opts.dir, { recursive: true });
   const out: ReferenceImages = {};
-  const jobs: Array<[keyof ReferenceImages, Promise<string | null>, string]> = [];
+  const jobs: Array<[string, Promise<Partial<ReferenceImages>>, string]> = [];
 
   const dl = async (url: string | null, name: string): Promise<string | null> => {
     if (!url) return null;
     return downloadImage(url, path.join(opts.dir, name));
   };
 
-  // Overrides explícitos (test-vod) vencem a busca
+  // Fotos do player: infobox (oficial) + 1ª da galeria (uniforme em evento)
   if (opts.overrides?.player) {
-    jobs.push(['player', dl(opts.overrides.player, `ref-player-${slug(opts.player)}.jpg`), 'override']);
+    jobs.push([
+      'player',
+      (async () => {
+        const primary = await dl(opts.overrides?.player ?? null, `ref-player-${slug(opts.player)}.jpg`);
+        return primary ? { player: primary } : {};
+      })(),
+      'override',
+    ]);
   } else {
     jobs.push([
       'player',
       (async () => {
         const title = await liquipediaTitle(opts.player);
-        if (!title) return null;
-        const file = await liquipediaInfoboxFile(title);
-        if (!file) return null;
-        const url = await liquipediaFileUrl(file);
-        return dl(url, `ref-player-${slug(opts.player)}.jpg`);
+        if (!title) return {};
+        // 1 fetch de wikitext serve as duas fotos
+        const content = await liquipediaPageContent(title);
+        const infoboxFile = content.match(/\|\s*image\s*=\s*([^\n|}]+)/)?.[1]?.trim();
+        const gallery = parseGalleryFiles(content);
+        // dedupe: se a 1ª da galeria = infobox, usa a 2ª
+        const altFile = gallery.find((f) => f !== infoboxFile) ?? null;
+        const [pUrl, aUrl] = await Promise.all([
+          infoboxFile ? liquipediaFileUrl(infoboxFile) : Promise.resolve(null),
+          altFile ? liquipediaFileUrl(altFile) : Promise.resolve(null),
+        ]);
+        const result: Partial<ReferenceImages> = {};
+        const primary = await dl(pUrl, `ref-player-${slug(opts.player)}.jpg`);
+        if (primary) result.player = primary;
+        const alt = await dl(aUrl, `ref-player-alt-${slug(opts.player)}.jpg`);
+        if (alt) result.playerAlt = alt;
+        return result;
       })(),
       'liquipedia',
     ]);
@@ -475,13 +514,21 @@ export async function fetchReferenceImages(
   ] as const) {
     const ov = opts.overrides?.[key];
     if (ov) {
-      jobs.push([key, dl(ov, `ref-${key}.png`), 'override']);
+      jobs.push([
+        key,
+        (async () => {
+          const local = await dl(ov, `ref-${key}.png`);
+          return local ? { [key]: local } : {};
+        })(),
+        'override',
+      ]);
     } else {
       jobs.push([
         key,
         (async () => {
           const url = await resolveTeamLogoUrl(team);
-          return dl(url, `ref-${key}.png`);
+          const local = await dl(url, `ref-${key}.png`);
+          return local ? { [key]: local } : {};
         })(),
         'liquipedia/hltv',
       ]);
@@ -489,17 +536,25 @@ export async function fetchReferenceImages(
   }
 
   if (opts.overrides?.mapImage) {
-    jobs.push(['mapImage', dl(opts.overrides.mapImage, `ref-map-${slug(opts.map)}.jpg`), 'override']);
+    jobs.push([
+      'mapImage',
+      (async () => {
+        const local = await dl(opts.overrides?.mapImage ?? null, `ref-map-${slug(opts.map)}.jpg`);
+        return local ? { mapImage: local } : {};
+      })(),
+      'override',
+    ]);
   } else if (opts.map && !/^test-?map$/i.test(opts.map)) {
     jobs.push([
       'mapImage',
       (async () => {
         const title = await liquipediaTitle(opts.map);
-        if (!title) return null;
+        if (!title) return {};
         const file = await liquipediaInfoboxFile(title);
-        if (!file) return null;
+        if (!file) return {};
         const url = await liquipediaFileUrl(file);
-        return dl(url, `ref-map-${slug(opts.map)}.jpg`);
+        const local = await dl(url, `ref-map-${slug(opts.map)}.jpg`);
+        return local ? { mapImage: local } : {};
       })(),
       'liquipedia',
     ]);
@@ -507,10 +562,13 @@ export async function fetchReferenceImages(
 
   for (const [key, p, src] of jobs) {
     try {
-      const local = await p;
-      if (local) {
-        out[key] = local;
-        log.info({ key, src }, 'referência pronta');
+      const partial = await p;
+      for (const [k, v] of Object.entries(partial)) {
+        if (v) out[k as keyof ReferenceImages] = v as string;
+      }
+      const landed = Object.keys(partial);
+      if (landed.length > 0) {
+        log.info({ keys: landed, src }, 'referências prontas');
       } else {
         log.info({ key, src }, 'referência indisponível, seguindo sem ela');
       }

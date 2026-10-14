@@ -4,6 +4,7 @@ import {
   guessTopTier,
   matchPassesFilter,
   parseStarsFromHtml,
+  parseViewers,
   pickPreferredStream,
 } from '../src/monitor/hltvMonitor.js';
 
@@ -59,6 +60,20 @@ describe('cardToLiveMatch', () => {
   });
 });
 
+describe('parseViewers', () => {
+  it('lê número cru e formato k', () => {
+    expect(parseViewers('9988')).toBe(9988);
+    expect(parseViewers('9.9k')).toBe(9900);
+    expect(parseViewers('1,2k')).toBe(1200);
+  });
+
+  it('vazio e absurdos viram undefined (não quebram o scoring)', () => {
+    expect(parseViewers('')).toBeUndefined();
+    expect(parseViewers('abc')).toBeUndefined();
+    expect(parseViewers('99889.9k')).toBeUndefined();
+  });
+});
+
 describe('pickPreferredStream', () => {
   it('prefere oficial EN quando pedido', () => {
     const s = pickPreferredStream(
@@ -73,5 +88,49 @@ describe('pickPreferredStream', () => {
 
   it('retorna null sem streams', () => {
     expect(pickPreferredStream([], 'official,en')).toBeNull();
+  });
+
+  it('prefere Gaules quando pedido (STREAM_PRIORITY=gaules)', () => {
+    const s = pickPreferredStream(
+      [
+        { name: 'ESL_CS', url: 'https://twitch.tv/esl_cs', viewers: 5000 },
+        { name: 'Gaules', url: 'https://twitch.tv/gaules', viewers: 50000 },
+      ],
+      'gaules',
+    );
+    expect(s?.name).toBe('Gaules');
+  });
+
+  it('gaules vence mesmo com menos viewers que a oficial', () => {
+    const s = pickPreferredStream(
+      [
+        { name: 'ESL_CS', url: 'https://twitch.tv/esl_cs', viewers: 100000 },
+        { name: 'Gaules', url: 'https://twitch.tv/gaules', viewers: 5000 },
+      ],
+      'gaules',
+    );
+    expect(s?.name).toBe('Gaules');
+  });
+
+  it('sem Gaules no ar: fallback para oficial EN (não pega restream)', () => {
+    const s = pickPreferredStream(
+      [
+        { name: 'RandomRestream', url: 'https://twitch.tv/xyz', viewers: 100000 },
+        { name: 'ESL_CS', url: 'https://twitch.tv/esl_cs', viewers: 5000 },
+      ],
+      'gaules',
+    );
+    expect(s?.name).toBe('ESL_CS');
+  });
+
+  it('sem oficial no ar: fallback para Gaules (não pega restream aleatório)', () => {
+    const s = pickPreferredStream(
+      [
+        { name: 'RandomRestream', url: 'https://twitch.tv/xyz', viewers: 200000 },
+        { name: 'Gaules', url: 'https://twitch.tv/gaules', viewers: 5000 },
+      ],
+      'official,en',
+    );
+    expect(s?.name).toBe('Gaules');
   });
 });

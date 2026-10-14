@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import sharp from 'sharp';
 import type { AceEvent } from '../types.js';
-import { prettyWeapon } from '../detector/aceDetector.js';
+import { killLabel, prettyWeapon } from '../detector/aceDetector.js';
 import { getLogger } from '../logger.js';
 import type { ReferenceImages } from './referenceImages.js';
 
@@ -70,14 +70,45 @@ export function buildThumbnailPrompt(
   // Rodapé sem duplicar: com summary, "time vs opp"; sem summary, o confronto direto.
   const footer = s?.team ? `${team} vs ${opp}` : opp;
 
-  const refLines: string[] = [];
-  if (refs?.player) refLines.push(`1. Foto do jogador ${playerName} — use rosto e uniforme como referência visual`);
-  if (refs?.team1Logo) refLines.push(`2. Logo do time ${team} — use formas e cores exatos`);
-  if (refs?.team2Logo) refLines.push(`3. Logo do adversário — use formas e cores exatos`);
-  if (refs?.mapImage) refLines.push(`4. Imagem do mapa ${ace.map} — use o ambiente como cenário`);
+  // REFERÊNCIAS: numeração dinâmica NA MESMA ORDEM dos anexos (o provider
+  // recebe os arquivos nessa sequência). Nomes específicos de tudo —
+  // o gerador precisa saber O QUE é cada anexo e de quem.
+  const refItems: Array<{ key: keyof NonNullable<ReferenceImages>; label: string }> = [];
+  if (refs?.player) {
+    refItems.push({
+      key: 'player',
+      label: `Foto oficial do jogador "${playerName}" — rosto e identidade visual dele`,
+    });
+  }
+  if (refs?.playerAlt) {
+    refItems.push({
+      key: 'playerAlt',
+      label: `Segunda foto do jogador "${playerName}" em evento com a camisa do ${team} — use para o uniforme e a pose`,
+    });
+  }
+  if (refs?.team1Logo) {
+    refItems.push({
+      key: 'team1Logo',
+      label: `Logo do time ${team} — reproduza formas e cores exatos`,
+    });
+  }
+  if (refs?.team2Logo) {
+    refItems.push({
+      key: 'team2Logo',
+      label: `Logo do time adversário ${ace.team2} — reproduza formas e cores exatos`,
+    });
+  }
+  if (refs?.mapImage) {
+    refItems.push({
+      key: 'mapImage',
+      label: `Cenário do mapa ${ace.map} — use como ambiente da cena`,
+    });
+  }
   const refSection =
-    refLines.length > 0
-      ? `\nREFERÊNCIAS (imagens anexadas a esta mensagem, use-as como verdade visual):\n${refLines.join('\n')}\n`
+    refItems.length > 0
+      ? `\nREFERÊNCIAS OBRIGATÓRIAS (as ${refItems.length} imagens anexadas a esta mensagem, NESTA EXATA ORDEM — siga-as como verdade visual para identidade, cores, formas e cenário):\n${refItems
+        .map((r, i) => `${i + 1}. ${r.label}`)
+        .join('\n')}\n`
       : '';
 
   const killfeed = (s?.kills ?? ace.kills)
@@ -108,7 +139,14 @@ export function buildThumbnailPrompt(
     grenades: s?.grenades ?? [],
   };
 
-  return `Gere uma thumbnail de YouTube 16:9 (1920x1080) para um clipe de Counter-Strike 2 que representa o ACE (5K) descrito neste json:
+  // Label dinâmico: ACE (≥5 kills) ou 3K/4K — o "5K" só existe em ace.
+  const label = killLabel(kills);
+  const bigText =
+    kills >= 5
+      ? `texto gigante "ACE" em ${ACCENT} estilo pincelada e "5K" em branco logo abaixo, com um traço de tinta sublinhando`
+      : `texto gigante "${label}" em ${ACCENT} estilo pincelada, com um traço de tinta sublinhando`;
+
+  return `Gere uma thumbnail de YouTube 16:9 (1920x1080) para um clipe de Counter-Strike 2 que representa o ${label === 'ACE' ? 'ACE (5K)' : `multikill de ${label}`} descrito neste json:
 ${JSON.stringify(ctx, null, 2)}
 ${refSection}
 ESTILO
@@ -118,14 +156,14 @@ LAYOUT (3 zonas)
 - ESQUERDA: logo do evento "${ace.event}" no topo; abaixo, logo do time ${team} e o nick "${playerName}" em letras brush/manuscritas brancas.
 - CENTRO: ${portraitSafe
     ? `figura estilizada do jogador (camisa do ${team}), vista de lado com o rosto na sombra/contraluz — NÃO reproduza a semelhança facial de ninguém, é um atleta genérico`
-    : `retrato em close do jogador ${playerName} (camisa do ${team}), olhando de lado, iluminação dramática com rim light`}. À direita dele, texto gigante "ACE" em ${ACCENT} estilo pincelada e "5K" em branco logo abaixo, com um traço de tinta sublinhando.
+    : `retrato em close do jogador ${playerName} (camisa do ${team}), olhando de lado, iluminação dramática com rim light`}. À direita dele, ${bigText}.
 - DIREITA: killfeed estilo CS2 empilhado no topo, com ${kills} linhas (nick em verde, ícone da arma, ícone de headshot só onde indicado, adversário em azul):
 ${killfeed}
   Abaixo do killfeed, cenário do mapa ${ace.map} (ambiente reconhecível, luz quente, ponto de bomba pintado no chão) e a viewmodel em primeira pessoa da ${s?.mainWeapon ? prettyWeapon(s.mainWeapon) : 'arma principal'} com skin temática do ${team} entrando pelo canto inferior direito.
 - RODAPÉ ESQUERDO: logos pequenos "${footer}" com texto em branco.
 
 REGRAS
-- Texto limitado a: evento, ${team}, "${playerName}", "ACE", "5K", killfeed e "${footer}". Sem outros textos.
+- Texto limitado a: evento, ${team}, "${playerName}", "${label}"${kills >= 5 ? ', "5K"' : ''}, killfeed e "${footer}". Sem outros textos.
 - Diagonais de tinta ${ACCENT} costurando as zonas, vinheta escura nas bordas.
 - Sem marca d'água, sem HUD extra.`.trim();
 }
@@ -328,7 +366,7 @@ export async function buildAiBackground(
   const timeoutMs = opts.timeoutMs ?? 600_000;
   const refs = opts.references;
   const availableAttachments = refs
-    ? [refs.player, refs.team1Logo, refs.team2Logo, refs.mapImage].filter(
+    ? [refs.player, refs.playerAlt, refs.team1Logo, refs.team2Logo, refs.mapImage].filter(
         (f): f is string => !!f && fs.existsSync(f),
       )
     : [];

@@ -1,7 +1,9 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { getConfig } from './config.js';
 import { getLogger } from './logger.js';
 import { getDb, hasAce, insertAce, insertClip } from './db.js';
+import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
   fetchLiveMatches,
@@ -13,8 +15,12 @@ import { buildRoundSummary, describeAce } from './detector/aceDetector.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip } from './clipper/clipBuilder.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
-import type { AceEvent } from './types.js';
+import type { AceEvent, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
+
+// Streams por partida (a página do match raramente muda mid-game —
+// buscar 1x evita N page loads por ciclo e rate-limit do Cloudflare).
+const streamsCache = new Map<string, StreamInfo[]>();
 
 // Referências por partida (foto/logos/mapa): busca 1x, reusa nos aces seguintes.
 const refsCache = new Map<string, ReferenceImages>();
@@ -88,6 +94,7 @@ async function handleAce(
       segmentTimeSec: cfg.SEGMENT_TIME_SEC,
       contextSec: cfg.CLIP_CONTEXT_SEC,
       aceStartMs: ace.startedAt ? Date.parse(ace.startedAt) : undefined,
+      upscaleHeight: cfg.CLIP_UPSCALE_HEIGHT || undefined,
       thumb: {
         mode: cfg.THUMB_MODE,
         ai: {
@@ -135,16 +142,35 @@ async function pollOnce(): Promise<void> {
     cfg.MIN_STARS,
     cfg.TOP_TIER_ONLY,
   );
+  if (!matches) {
+    log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
+    return;
+  }
 
   for (const m of matches) {
     if (stopping) break;
 
-    // 1) Recorder (máx MAX_RECORDINGS, só oficiais EN por preferência)
+    // 1) Recorder (máx MAX_RECORDINGS, stream por STREAM_PRIORITY)
+    // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
+    for (const [id, rec] of activeRecorders) {
+      if (!rec.isRunning) {
+        await rec.stop().catch(() => undefined);
+        activeRecorders.delete(id);
+        log.info({ matchId: id }, 'recorder morto, vai recriar');
+      }
+    }
+    // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
     if (!activeRecorders.has(m.matchId) && activeRecorders.size < cfg.MAX_RECORDINGS) {
       try {
-        if (m.streams.length === 0) {
-          m.streams = await fetchMatchStreams(m.matchPageUrl);
+        // Cache: a lista de streams quase não muda mid-match.
+        // Só busca de novo se nunca achou nada (vazia não entra no cache
+        // para tentar de novo quando o Cloudflare liberar).
+        let streams = streamsCache.get(m.matchId);
+        if (!streams) {
+          streams = await fetchMatchStreams(m.matchPageUrl);
+          if (streams.length > 0) streamsCache.set(m.matchId, streams);
         }
+        m.streams = streams;
         const chosen = pickPreferredStream(m.streams, cfg.STREAM_PRIORITY);
         if (!chosen) {
           log.info({ matchId: m.matchId }, 'sem stream disponível, pulando gravação');
@@ -199,7 +225,7 @@ async function pollOnce(): Promise<void> {
             cfg,
           ).catch((e) => log.error({ err: String(e) }, 'erro no handleAce'));
         },
-      })
+      }, cfg.MIN_KILLS)
         .catch((e) => log.warn({ err: String(e) }, 'tracker encerrou com erro'))
         .finally(() => {
           activeTrackers.delete(m.matchId);
@@ -215,6 +241,8 @@ async function pollOnce(): Promise<void> {
       await rec.stop().catch(() => undefined);
       activeRecorders.delete(id);
       activeTrackers.delete(id);
+      streamsCache.delete(id);
+      fs.rmSync(`${cfg.BUFFER_DIR}/${id}`, { recursive: true, force: true });
       log.info({ matchId: id }, 'partida fora do ar, gravação parada');
     }
   }
@@ -222,21 +250,26 @@ async function pollOnce(): Promise<void> {
 
 async function main(): Promise<void> {
   const cfg = getConfig();
+  // Bins vendored (.tools/ffmpeg do repo) no PATH — o clipper chama
+  // 'ffmpeg' pelo nome (concat, thumb, upscale). Igual ao test-vod.
+  process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
   await ensureDirs(cfg);
   const log = getLogger();
   log.info(
     {
       minStars: cfg.MIN_STARS,
+      minKills: cfg.MIN_KILLS,
+      stream: cfg.STREAM_PRIORITY,
       privacy: cfg.YT_PRIVACY,
       maxRec: cfg.MAX_RECORDINGS,
     },
-    '5K bot iniciado (MVP: só 5k live, 16:9, log em arquivo)',
+    `bot iniciado (multikills ${cfg.MIN_KILLS}k+ live, 16:9, log em arquivo)`,
   );
 
   const bins = StreamRecorder.checkBinaries();
-  if (!bins.ffmpeg || !bins.streamlink) {
+  if (!bins.ffmpeg || !bins.ytdlp) {
     log.warn(
-      'ffmpeg/streamlink ausentes. Instale com: winget install Gyan.FFmpeg; winget install Streamlink.Streamlink — e reinicie o terminal.',
+      'ffmpeg/yt-dlp ausentes (nem no PATH nem em .tools/). Sem eles não há buffer local — o bot só detecta, sem cortar clipes.',
     );
   }
 
@@ -244,11 +277,17 @@ async function main(): Promise<void> {
     stopping = true;
     for (const rec of activeRecorders.values()) await rec.stop().catch(() => undefined);
     await closeBrowser();
+    // Mata qualquer ffmpeg restante (render em andamento etc.) — o Windows
+    // NÃO mata filhos quando o pai morre; sem isso viram órfãos de CPU.
+    killAll();
     log.info('encerrado');
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // Última linha de defesa: mortes SEM sinal (kill direto/crash) —
+  // síncrono e best-effort (taskkill por PID dos trackeados).
+  process.on('exit', () => killAll());
 
   while (!stopping) {
     try {
