@@ -37,6 +37,8 @@ const ConfigSchema = z.object({
   // ai = tenta fundo IA (pollinations grátis e/ou gemini pago) com fallback p/ composed.
   THUMB_MODE: z.enum(['composed', 'ai']).default('composed'),
   THUMB_AI_ORDER: z.string().default('huggingface'),
+  /** Timeout por provider IA da thumb (ms). Web (chatgpt/grok/gemini-web) às vezes leva >5min p/ renderizar. */
+  THUMB_AI_TIMEOUT_MS: z.coerce.number().min(60_000).max(3_600_000).default(600_000),
   HF_TOKEN: z.string().default(''),
   HF_IMAGE_MODEL: z.string().default('black-forest-labs/FLUX.1-schnell'),
   GEMINI_API_KEY: z.string().default(''),

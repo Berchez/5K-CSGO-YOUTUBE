@@ -145,7 +145,8 @@ export async function geminiWebBackground(
     // waitForFunction quebra se o SPA do Gemini navegar no meio (contexto destruído).
     // Polling com validação por tamanho de download: previews de anexos são
     // pequenos; fundos gerados têm sido >=50KB. Imune a previews tardios.
-    const deadline = Date.now() + Math.min(timeoutMs, 200_000);
+    // Teto alto de propósito: ver chatgpt.ts (THUMB_AI_TIMEOUT_MS).
+    const deadline = Date.now() + Math.min(timeoutMs, 1_800_000);
     const MIN_BYTES = 50_000;
     let buf: Buffer | null = null;
     const seen = new Set<string>(before);

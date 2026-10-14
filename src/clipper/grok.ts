@@ -109,7 +109,8 @@ export async function grokBackground(
     log.info({ conversa: page.url() }, 'prompt enviado, aguardando render da imagem');
 
     const graceUntil = Date.now() + 20_000;
-    const deadline = Date.now() + Math.min(timeoutMs, 300_000);
+    // Teto alto de propósito: ver chatgpt.ts (THUMB_AI_TIMEOUT_MS).
+    const deadline = Date.now() + Math.min(timeoutMs, 1_800_000);
     const MIN_BYTES = 100_000;
     let buf: Buffer | null = null;
     const seen = new Set<string>(before);

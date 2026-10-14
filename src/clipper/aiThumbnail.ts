@@ -29,7 +29,7 @@ export interface AiThumbOptions {
   grokMinimized?: boolean;
   /** Referências locais (foto, logos, mapa) — anexadas nos providers web. */
   references?: ReferenceImages;
-  /** Timeout por provider (ms). Default 180s. */
+  /** Timeout por provider (ms). Default 600s (THUMB_AI_TIMEOUT_MS). */
   timeoutMs?: number;
   /**
    * 'full' (default no provider chatgpt): a imagem IA JÁ É a thumb
@@ -325,7 +325,7 @@ export async function buildAiBackground(
 ): Promise<AiResult | null> {
   const log = getLogger();
   const order = opts.order ?? ['chatgpt'];
-  const timeoutMs = opts.timeoutMs ?? 240_000;
+  const timeoutMs = opts.timeoutMs ?? 600_000;
   const refs = opts.references;
   const availableAttachments = refs
     ? [refs.player, refs.team1Logo, refs.team2Logo, refs.mapImage].filter(

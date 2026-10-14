@@ -56,7 +56,7 @@ async function main(): Promise<void> {
     geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
     chatgptProfileDir: cfg.CHATGPT_PROFILE,
     grokProfileDir: cfg.GROK_PROFILE,
-    timeoutMs: 240_000,
+    timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
   });
   if (!result) {
     console.log('FALHOU em todos os providers (fallback seria a composta). Veja logs acima.');

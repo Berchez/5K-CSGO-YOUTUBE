@@ -147,7 +147,9 @@ export async function chatgptBackground(
     // são pequenos (<=50KB); imagens GERADAS por este prompt foram 300KB+.
     // Candidato só vale se baixar >=100KB — imune a previews tardios.
     const graceUntil = Date.now() + 20_000;
-    const deadline = Date.now() + Math.min(timeoutMs, 300_000);
+    // Teto alto de propósito: o configurável THUMB_AI_TIMEOUT_MS (default 10min)
+    // precisa valer — render web às vezes passa de 5min.
+    const deadline = Date.now() + Math.min(timeoutMs, 1_800_000);
     const MIN_BYTES = 100_000;
     let buf: Buffer | null = null;
     const seen = new Set<string>(before);

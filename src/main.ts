@@ -92,6 +92,7 @@ async function handleAce(
         mode: cfg.THUMB_MODE,
         ai: {
           order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
+          timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
           hfToken: cfg.HF_TOKEN || undefined,
           hfModel: cfg.HF_IMAGE_MODEL,
           geminiApiKey: cfg.GEMINI_API_KEY || undefined,

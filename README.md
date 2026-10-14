@@ -110,7 +110,9 @@ tests/
 tentativa — o primeiro é o seu preferido; qualquer falha (cota, sem login,
 timeout, challenge, imagem inválida) loga e cai para o próximo. Esgotada a
 cadeia, a thumb **composta determinística** (sharp: frame real + selo ACE!)
-fechaa conta — US$0, zero rede, sempre sai.
+fechaa conta — US$0, zero rede, sempre sai. `THUMB_AI_TIMEOUT_MS` (default
+600000 = 10min por provider) controla quanto tempo cada tentativa aguarda o
+render — render web às vezes passa de 5min.
 
 ```text
 THUMB_AI_ORDER=chatgpt,grok,gemini-web
