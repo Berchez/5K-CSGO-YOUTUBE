@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getConfig } from './config.js';
+import { getConfig, parseStreamOffsets, resolveStaticOffset } from './config.js';
+import { loadCalibrations, resolveSessionOffset } from './recorder/avCalibration.js';
+import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
+import { notifyWindows } from './notify.js';
 import { getLogger } from './logger.js';
 import { getDb, hasAce, insertAce, insertClip } from './db.js';
 import { killAll } from './procRegistry.js';
@@ -11,11 +14,11 @@ import {
   pickPreferredStream,
 } from './monitor/hltvMonitor.js';
 import { trackMatch } from './detector/matchTracker.js';
-import { buildRoundSummary, describeAce } from './detector/aceDetector.js';
+import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
-import { buildClip, computeAceEndMs, newestSegmentEndMs, pickSegments, probeConcatSpan, resolveFfprobeBin } from './clipper/clipBuilder.js';
+import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, pickSegments } from './clipper/clipBuilder.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
-import type { AceEvent, StreamInfo } from './types.js';
+import type { AceEvent, ClipResult, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
 
 // Streams por partida (a página do match raramente muda mid-game —
@@ -79,7 +82,12 @@ async function getRefs(
   return refs;
 }
 
-const activeRecorders = new Map<string, StreamRecorder>();
+interface MatchRecorders {
+  separate: StreamRecorder;
+  muxed: StreamRecorder | null;
+}
+
+const activeRecorders = new Map<string, MatchRecorders>();
 const activeTrackers = new Set<string>();
 let stopping = false;
 
@@ -107,11 +115,14 @@ async function handleAce(
     return;
   }
   const aceId = insertAce(cfg.DB_PATH, ace);
-  const recorder = activeRecorders.get(matchId);
+  const recorders = activeRecorders.get(matchId);
+  const recorder = recorders?.separate;
+  const muxedRecorder = recorders?.muxed;
   pendingClips.add(matchId);
-  let snapDir: string | null = null;
+  const snapDirs: string[] = [];
   try {
     let segments = recorder?.listSegments() ?? [];
+    let muxedSegments = muxedRecorder?.listSegments() ?? [];
     if (segments.length === 0) {
       log.warn('sem buffer para cortar (stream caiu ou iniciou agora), evento salvo sem clipe');
       return;
@@ -129,12 +140,20 @@ async function handleAce(
     // Em timeout/pausa tática o gap estica e a margem só cresce (seguro).
     const endMs = computeAceEndMs(Date.now(), cfg.SCOREBOARD_DELAY_MS, cfg.CLIP_END_AFTER_CLOSE_SEC);
     let endCovered = false;
+    let muxedEndCovered = false;
     const waitUntil = Date.now() + 150_000;
     while (!stopping && Date.now() < waitUntil) {
       segments = recorder?.listSegments() ?? [];
+      muxedSegments = muxedRecorder?.listSegments() ?? [];
       if (segments.length === 0) break;
-      if (newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000) {
-        endCovered = true;
+      endCovered =
+        newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
+      muxedEndCovered =
+        muxedRecorder != null &&
+        newestSegmentEndMs(muxedSegments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
+      const muxedReady =
+        muxedRecorder == null || !muxedRecorder.isRunning || muxedEndCovered;
+      if (endCovered && muxedReady) {
         break;
       }
       await new Promise((r) => setTimeout(r, 2000));
@@ -144,10 +163,78 @@ async function handleAce(
       return;
     }
     const aceEndMs = endCovered ? endMs : undefined;
+    const muxedAceEndMs = muxedEndCovered ? endMs : undefined;
     if (endCovered) {
       ace.endedAt = new Date(endMs).toISOString();
     } else {
       log.warn('buffer não alcançou o fim a tempo, cortando cauda atual (fallback)');
+    }
+
+    // Contexto adaptativo: âncora de início incerta (tracker entrou no meio
+    // do round, resetou a base, ou a 1ª kill veio da janela de assentamento)
+    // = a kill pode não ser a 1ª real — começa mais cedo para não perder a
+    // abertura. Confiança alta mantém os 10s da especificação.
+    const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
+    const lowAnchor = isAnchorLowConfidence(
+      ace.anchorConfidence,
+      ace.kills[0]?.at,
+      Date.now(),
+    );
+    const contextSec = lowAnchor ? cfg.CLIP_CONTEXT_UNCERTAIN_SEC : cfg.CLIP_CONTEXT_SEC;
+    if (lowAnchor) {
+      log.warn({ conf: ace.anchorConfidence }, 'âncora de início incerta — contexto alargado');
+    }
+    // R2: âncora mais velha que o buffer = abertura real fora do alcance.
+    // Sinaliza no sidecar (via ace) em vez de cair no fallback silencioso.
+    ace.truncatedStart = detectTruncatedStart(segments, {
+      segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+      contextSec,
+      aceStartMs,
+    });
+    if (ace.truncatedStart) {
+      log.warn('âncora precede o buffer (truncatedStart): abertura incompleta');
+    }
+    // Correção A/V do clipe, decidida por sessão (log por clipe):
+    // override manual > calibragem do canal válida > nada.
+    // A calibragem vale para a sessão corrente sem restart desde então
+    // (offset re-rola a cada restart do transcode — r4 sync vs r12 +2s).
+    // Sem calibragem aplicável: 0 + flag (spot-check, não revisão total).
+    // (recorder vem do início do handleAce.)
+    const streamOffsets = parseStreamOffsets(cfg.AV_STREAM_OFFSETS);
+    const { ms: staticMs, rule: staticRule } = resolveStaticOffset(
+      cfg.AV_STATIC_OFFSET_MS,
+      cfg.AV_STATIC_MATCHES,
+      matchId,
+      streamOffsets,
+      recorder?.streamName,
+    );
+    const calibrations = loadCalibrations();
+    const calibration = recorder?.streamName ? calibrations[recorder.streamName] : undefined;
+    // Era compartilhada: restart visto por OUTRO recorder do canal também
+    // invalida (mesma fonte). Junta ao array local antes de decidir.
+    const restarts: number[] = [...(recorder?.discontinuities ?? [])];
+    if (calibration?.lastRestartAt) restarts.push(calibration.lastRestartAt);
+    const sess = resolveSessionOffset({
+      staticMs,
+      staticRule,
+      calibration,
+      streamName: recorder?.streamName,
+      sessionStartMs: recorder?.sessionStart,
+      discontinuities: restarts,
+      winStartMs: aceStartMs,
+      winEndMs: aceEndMs,
+    });
+    ace.offsetUnverified = sess.unverified;
+    if (sess.ms > 0) {
+      log.info(
+        { matchId, staticMs: sess.ms, source: sess.source, rule: staticRule, stream: recorder?.streamName },
+        'offset A/V ativo p/ este clipe',
+      );
+    } else if (sess.unverified) {
+      log.warn(
+        { matchId, reason: sess.reason, stream: recorder?.streamName },
+        'sem correção A/V — conferir sync (spot-check)',
+      );
     }
 
     // SNAPSHOT dos segmentos escolhidos: o buffer é CIRCULAR (SEGMENT_WRAP
@@ -155,87 +242,136 @@ async function handleAce(
     // recorder e apaga o buffer) enquanto refs/render/thumb ainda rodam —
     // minutos. Copia preservando mtime (seleção/trim são mtime-driven) e
     // constrói o clipe a partir da cópia imune ao churn do buffer.
-    const picked = pickSegments(segments, {
-      segmentTimeSec: cfg.SEGMENT_TIME_SEC,
-      preRollSec: cfg.CLIP_PRE_ROLL_SEC,
-      postRollSec: cfg.CLIP_POST_ROLL_SEC,
-      contextSec: cfg.CLIP_CONTEXT_SEC,
-      aceStartMs: ace.startedAt ? Date.parse(ace.startedAt) : undefined,
-      aceEndMs,
-    });
-    snapDir = path.join(cfg.CLIPS_DIR, '.build', `${matchId}-r${ace.round}-${Date.now()}`);
-    const snapshot = snapshotSegments(picked, snapDir);
-    log.info({ picked: picked.length, snap: path.basename(snapDir) }, 'segmentos congelados (snapshot)');
-    // Span REAL medido nos ORIGINAIS (birthtime intacto — cópias perdem):
-    // segmento que nunca cortou cobre minutos, não `slot`. Sem medição o
-    // trim assume n × slot e ancora fora do material (clipe gigante).
-    let concatSpanSec: number | undefined;
-    try {
-      const span = await probeConcatSpan(picked, resolveFfprobeBin(), cfg.SEGMENT_TIME_SEC);
-      if (span) {
-        log.info({ spanSec: span.spanSec, reliable: span.reliable, files: picked.length }, 'span do concat medido');
-        if (span.reliable) concatSpanSec = span.spanSec;
+    const buildVariant = async (
+      mode: 'separate' | 'muxed',
+      sourceSegments: string[],
+      sourceEndMs: number | undefined,
+    ): Promise<ClipResult | null> => {
+      if (sourceSegments.length === 0) {
+        log.warn({ matchId, mode }, 'sem segmentos para esta variante de captura');
+        return null;
       }
-    } catch {
-      // best-effort: segue com o cálculo legado
-    }
-
-    try {
-      const references = await refsPromise;
-      const clip = await buildClip(ace, snapshot, {
-        bufferDir: snapDir,
-        clipsDir: cfg.CLIPS_DIR,
+      const variantAce: AceEvent = {
+        ...ace,
+        endedAt: sourceEndMs != null ? new Date(sourceEndMs).toISOString() : undefined,
+        truncatedStart: detectTruncatedStart(sourceSegments, {
+          segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+          contextSec,
+          aceStartMs,
+        }),
+        offsetUnverified: mode === 'separate' ? ace.offsetUnverified : undefined,
+      };
+      const variantPicked = pickSegments(sourceSegments, {
+        segmentTimeSec: cfg.SEGMENT_TIME_SEC,
         preRollSec: cfg.CLIP_PRE_ROLL_SEC,
         postRollSec: cfg.CLIP_POST_ROLL_SEC,
-        segmentTimeSec: cfg.SEGMENT_TIME_SEC,
-        contextSec: cfg.CLIP_CONTEXT_SEC,
-        aceStartMs: ace.startedAt ? Date.parse(ace.startedAt) : undefined,
-        aceEndMs,
-        concatSpanSec,
-        avSync: cfg.CLIP_AV_SYNC,
-        upscaleHeight: cfg.CLIP_UPSCALE_HEIGHT || undefined,
-        thumb: {
-          mode: cfg.THUMB_MODE,
-          ai: {
-            order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
-            timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
-            hfToken: cfg.HF_TOKEN || undefined,
-            hfModel: cfg.HF_IMAGE_MODEL,
-            geminiApiKey: cfg.GEMINI_API_KEY || undefined,
-            geminiModel: cfg.GEMINI_IMAGE_MODEL,
-            geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
-            chatgptProfileDir: cfg.CHATGPT_PROFILE,
-            chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
-            grokProfileDir: cfg.GROK_PROFILE,
-            grokMinimized: cfg.GROK_MINIMIZED === '1',
-            references,
-          },
-        },
+        contextSec,
+        aceStartMs,
+        aceEndMs: sourceEndMs,
       });
+      const variantSnapDir = path.join(
+        cfg.CLIPS_DIR,
+        '.build',
+        `${matchId}-r${ace.round}-${Date.now()}-${mode}`,
+      );
+      snapDirs.push(variantSnapDir);
+      const snapshot = snapshotSegments(variantPicked, variantSnapDir);
+      log.info(
+        { picked: variantPicked.length, snap: path.basename(variantSnapDir), mode },
+        'segmentos congelados (snapshot)',
+      );
+      try {
+        const references = mode === 'separate' ? await refsPromise : undefined;
+        return await buildClip(variantAce, snapshot, {
+          bufferDir: variantSnapDir,
+          clipsDir: cfg.CLIPS_DIR,
+          preRollSec: cfg.CLIP_PRE_ROLL_SEC,
+          postRollSec: cfg.CLIP_POST_ROLL_SEC,
+          segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+          contextSec,
+          aceStartMs,
+          aceEndMs: sourceEndMs,
+          replayAware: cfg.REPLAY_AWARE,
+          avSync: mode === 'separate' ? cfg.CLIP_AV_SYNC : 'off',
+          staticAvOffsetMs: mode === 'separate' ? sess.ms : 0,
+          diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
+          // The muxed capture is already the source's best format; preserve
+          // its native resolution instead of forcing the separate-feed cap.
+          upscaleHeight: mode === 'separate' ? cfg.CLIP_UPSCALE_HEIGHT || undefined : undefined,
+          outputSuffix: mode === 'muxed' ? '_muxed' : undefined,
+          generateThumbnail: mode === 'separate',
+          captureMode: mode,
+          thumb: mode === 'separate'
+            ? {
+                mode: cfg.THUMB_MODE,
+                ai: {
+                  order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
+                  timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
+                  hfToken: cfg.HF_TOKEN || undefined,
+                  hfModel: cfg.HF_IMAGE_MODEL,
+                  geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+                  geminiModel: cfg.GEMINI_IMAGE_MODEL,
+                  geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+                  chatgptProfileDir: cfg.CHATGPT_PROFILE,
+                  chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
+                  grokProfileDir: cfg.GROK_PROFILE,
+                  grokMinimized: cfg.GROK_MINIMIZED === '1',
+                  references: references ?? {},
+                },
+              }
+            : undefined,
+        });
+      } catch (e) {
+        log.error({ err: String(e), matchId, mode }, 'falha ao montar variante do clipe');
+        return null;
+      } finally {
+        fs.rmSync(variantSnapDir, { recursive: true, force: true });
+      }
+    };
+
+    const [separateClip, muxedClip] = await Promise.all([
+      buildVariant('separate', segments, aceEndMs),
+      muxedRecorder
+        ? buildVariant('muxed', muxedSegments, muxedAceEndMs)
+        : Promise.resolve(null),
+    ]);
+    const uploadClipResult = muxedClip ?? separateClip;
+    if (muxedClip) {
+      log.info(
+        { clip: muxedClip.filePath, fallback: separateClip?.filePath },
+        'preferindo a fonte muxed para upload (A/V da mesma variante de origem)',
+      );
+    }
+    if (uploadClipResult) {
       let videoId: string | undefined;
       if (!cfg.YT_UPLOAD) {
-        log.info({ clip: clip.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
+        log.info({ clip: uploadClipResult.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
       } else {
         try {
-          videoId = await uploadClip(ace, clip.filePath, {
+          videoId = await uploadClip(ace, uploadClipResult.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
             tokenPath: cfg.YT_TOKEN_PATH,
             privacy: cfg.YT_PRIVACY,
             categoryId: cfg.YT_CATEGORY_ID,
             defaultTags: cfg.YT_DEFAULT_TAGS,
-            thumbnailPath: clip.thumbnailPath,
+            thumbnailPath: separateClip?.thumbnailPath,
           });
         } catch (e) {
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');
         }
       }
-      insertClip(cfg.DB_PATH, aceId, clip.filePath, cfg.YT_PRIVACY, videoId);
-    } finally {
-      fs.rmSync(snapDir, { recursive: true, force: true });
+      insertClip(cfg.DB_PATH, aceId, uploadClipResult.filePath, cfg.YT_PRIVACY, videoId);
+    }
+    if (separateClip && separateClip.filePath !== uploadClipResult?.filePath) {
+      insertClip(cfg.DB_PATH, aceId, separateClip.filePath, cfg.YT_PRIVACY);
+    }
+    if (muxedClip && muxedClip.filePath !== uploadClipResult?.filePath) {
+      insertClip(cfg.DB_PATH, aceId, muxedClip.filePath, cfg.YT_PRIVACY);
     }
   } catch (e) {
     log.error({ err: String(e) }, 'falha ao montar clipe');
   } finally {
+    for (const dir of snapDirs) fs.rmSync(dir, { recursive: true, force: true });
     pendingClips.delete(matchId);
   }
 }
@@ -260,9 +396,12 @@ async function pollOnce(): Promise<void> {
 
     // 1) Recorder (máx MAX_RECORDINGS, stream por STREAM_PRIORITY)
     // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
-    for (const [id, rec] of activeRecorders) {
-      if (!rec.isRunning) {
-        await rec.stop().catch(() => undefined);
+    for (const [id, recorders] of activeRecorders) {
+      if (!recorders.separate.isRunning) {
+        await Promise.all([
+          recorders.separate.stop().catch(() => undefined),
+          recorders.muxed?.stop().catch(() => undefined),
+        ]);
         activeRecorders.delete(id);
         log.info({ matchId: id }, 'recorder morto, vai recriar');
       }
@@ -300,15 +439,52 @@ async function pollOnce(): Promise<void> {
         if (!chosen) {
           log.info({ matchId: m.matchId }, 'sem stream disponível, pulando gravação');
         } else {
-          const rec = new StreamRecorder({
-            streamUrl: twitchUrlFrom(chosen.url),
-            bufferDir: `${cfg.BUFFER_DIR}/${m.matchId}`,
+          const streamUrl = twitchUrlFrom(chosen.url);
+          const separate = new StreamRecorder({
+            streamUrl,
+            bufferDir: `${cfg.BUFFER_DIR}/${m.matchId}/separate`,
             segmentTimeSec: cfg.SEGMENT_TIME_SEC,
             segmentWrap: cfg.SEGMENT_WRAP,
+            captureMode: 'separate',
+            streamName: chosen.name,
+            diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
           });
-          await rec.start();
-          activeRecorders.set(m.matchId, rec);
-          log.info({ matchId: m.matchId, stream: chosen.name }, 'gravando buffer');
+          const muxed = new StreamRecorder({
+            streamUrl,
+            bufferDir: `${cfg.BUFFER_DIR}/${m.matchId}/muxed`,
+            segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+            segmentWrap: cfg.SEGMENT_WRAP,
+            captureMode: 'muxed',
+            streamName: chosen.name,
+            diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
+          });
+          const [separateStart, muxedStart] = await Promise.allSettled([
+            separate.start(),
+            muxed.start(),
+          ]);
+          if (separateStart.status === 'rejected') {
+            await Promise.all([
+              separate.stop().catch(() => undefined),
+              muxed.stop().catch(() => undefined),
+            ]);
+            throw separateStart.reason;
+          }
+          let muxedRecorder: StreamRecorder | null = null;
+          if (muxedStart.status === 'fulfilled') {
+            muxedRecorder = muxed;
+          } else {
+            await muxed.stop().catch(() => undefined);
+            fs.rmSync(muxed.segmentDir, { recursive: true, force: true });
+            log.warn(
+              { err: String(muxedStart.reason), matchId: m.matchId, stream: chosen.name },
+              'fonte sem variante muxed acessível; mantendo captura separada',
+            );
+          }
+          activeRecorders.set(m.matchId, { separate, muxed: muxedRecorder });
+          log.info(
+            { matchId: m.matchId, stream: chosen.name, muxed: muxedRecorder != null },
+            'gravando buffers separados e muxed',
+          );
         }
       } catch (e) {
         log.warn({ err: String(e), matchId: m.matchId }, 'não foi possível iniciar gravação');
@@ -344,6 +520,7 @@ async function pollOnce(): Promise<void> {
               detectedAt: new Date().toISOString(),
               startedAt: a.startedAt,
               kills: a.kills.map((kk) => ({ ...kk, map: a.map })),
+              anchorConfidence: a.anchorConfidence,
               summary,
             },
             m.matchId,
@@ -361,9 +538,12 @@ async function pollOnce(): Promise<void> {
 
   // 3) Limpa recorders de partidas que saíram do filtro
   const liveIds = new Set(matches.map((m) => m.matchId));
-  for (const [id, rec] of activeRecorders) {
+  for (const [id, recorders] of activeRecorders) {
     if (!liveIds.has(id)) {
-      await rec.stop().catch(() => undefined);
+      await Promise.all([
+        recorders.separate.stop().catch(() => undefined),
+        recorders.muxed?.stop().catch(() => undefined),
+      ]);
       activeRecorders.delete(id);
       activeTrackers.delete(id);
       streamsCache.delete(id);
@@ -407,6 +587,15 @@ async function main(): Promise<void> {
   process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
   await ensureDirs(cfg);
   const log = getLogger();
+  // Faxina de snapshots órfãos: renders só existem com o bot vivo — qualquer
+  // conteúdo em .build no startup é cadáver de sessão morta (kill/restart no
+  // meio do handleAce). Já acumulou 20GB antes desta faxina.
+  try {
+    fs.rmSync(`${cfg.CLIPS_DIR}/.build`, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
+  const loggedOut = loadLoggedOut();
   log.info(
     {
       minStars: cfg.MIN_STARS,
@@ -414,11 +603,36 @@ async function main(): Promise<void> {
       stream: cfg.STREAM_PRIORITY,
       privacy: cfg.YT_PRIVACY,
       avSync: cfg.CLIP_AV_SYNC,
+      replayAware: cfg.REPLAY_AWARE,
+      avStaticMs: cfg.AV_STATIC_OFFSET_MS,
+      avStaticMatches: cfg.AV_STATIC_MATCHES || '(nenhum)',
+      avStreamOffsets: [...parseStreamOffsets(cfg.AV_STREAM_OFFSETS).entries()].map(([k, v]) => `${k}=${v}`).join(',') || '(nenhum)',
+      diskMinFreeGb: cfg.DISK_MIN_FREE_GB,
+      thumbLogin: Object.keys(loggedOut).length > 0
+        ? Object.keys(loggedOut).map((p) => `${p}=LOGOUT!`).join(',')
+        : 'ok',
       upload: cfg.YT_UPLOAD,
       maxRec: cfg.MAX_RECORDINGS,
     },
     `bot iniciado (multikills ${cfg.MIN_KILLS}k+ live, 16:9, log em arquivo)`,
   );
+  if (Object.keys(loggedOut).length > 0) {
+    const providers = Object.keys(loggedOut);
+    log.error(
+      { providers, cmd: providers.map((p) => loginScriptFor(p)).filter(Boolean) },
+      'LOGIN EXPIRADO pendente — rode o script de relogin de cada provider (pulados até lá)',
+    );
+    notifyWindows(
+      '5K Bot: login expirado',
+      `Providers sem login: ${providers.join(', ')}. Rode os scripts de relogin (ex: ${loginScriptFor(providers[0]) ?? 'npx tsx scripts/chatgpt-login.ts'}).`,
+    );
+  }
+  if (cfg.AV_STATIC_OFFSET_MS > 0 && !cfg.AV_STATIC_MATCHES.trim()) {
+    log.warn(
+      { avStaticMs: cfg.AV_STATIC_OFFSET_MS },
+      'offset estático GLOBAL: aplica em todas as partidas, inclusive sem skew — escopete com AV_STATIC_MATCHES',
+    );
+  }
 
   const bins = StreamRecorder.checkBinaries();
   if (!bins.ffmpeg || !bins.ytdlp) {
@@ -429,7 +643,12 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     stopping = true;
-    for (const rec of activeRecorders.values()) await rec.stop().catch(() => undefined);
+    for (const recorders of activeRecorders.values()) {
+      await Promise.all([
+        recorders.separate.stop().catch(() => undefined),
+        recorders.muxed?.stop().catch(() => undefined),
+      ]);
+    }
     await closeBrowser();
     // Mata qualquer ffmpeg restante (render em andamento etc.) — o Windows
     // NÃO mata filhos quando o pai morre; sem isso viram órfãos de CPU.

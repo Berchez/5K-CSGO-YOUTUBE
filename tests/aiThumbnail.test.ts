@@ -172,6 +172,25 @@ describe('aiThumbnail', () => {
     await expect(buildAiBackground(ace, { order: [] })).resolves.toBeNull();
   });
 
+  it('provider com login expirado é PULADO sem abrir browser (rápido)', async () => {
+    const os = await import('node:os');
+    const fsx = await import('node:fs');
+    const pathx = await import('node:path');
+    const { markLoggedOut } = await import('../src/clipper/providerStatus.js');
+    const f = pathx.join(fsx.mkdtempSync(pathx.join(os.tmpdir(), 'pskip-')), 'status.json');
+    try {
+      expect(markLoggedOut('chatgpt', 'sem login', f)).toBe(true);
+      const t0 = Date.now();
+      // Sem o skip isto abriria o Chrome (perfil real) — com ele, null em ms.
+      await expect(
+        buildAiBackground(ace, { order: ['chatgpt'], statusFile: f }),
+      ).resolves.toBeNull();
+      expect(Date.now() - t0).toBeLessThan(5_000);
+    } finally {
+      fsx.rmSync(pathx.dirname(f), { recursive: true, force: true });
+    }
+  });
+
   it('pula providers sem token sem fazer rede', async () => {
     // huggingface e gemini sem token: pula direto → null, nenhuma chamada HTTP
     await expect(

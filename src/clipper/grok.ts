@@ -19,6 +19,20 @@ export const NEED_GROK_LOGIN_MESSAGE =
   '(abre o Chrome — use UMA CONTA X/DESCARTÁVEL, nunca contas importantes) ' +
   'e faça login manualmente.';
 
+/** Marcadores de sessão expirada — reusada na entrada e nas falhas tardias. */
+async function looksLoggedOut(page: Page): Promise<boolean> {
+  try {
+    if (page.url().includes('accounts.x.com') || page.url().includes('accounts.google.com')) {
+      return true;
+    }
+    return /entrar|criar conta|log in|sign in/i.test(
+      (await page.evaluate('(document.body ? document.body.innerText : "").slice(0, 600)')) as string,
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Gera imagem via app web do Grok (grok.com) com Playwright.
  * Mesmo padrão do chatgpt: stealth, janela visível, anexos, validação de
@@ -66,13 +80,7 @@ export async function grokBackground(
 
     await trySolveChallenge(page, log);
 
-    if (
-      page.url().includes('accounts.x.com') ||
-      page.url().includes('accounts.google.com') ||
-      /entrar|criar conta|log in|sign in/i.test(
-        (await page.evaluate('(document.body ? document.body.innerText : "").slice(0, 600)')) as string,
-      )
-    ) {
+    if (await looksLoggedOut(page)) {
       await failShot(page, 'sem login');
       throw new Error(NEED_GROK_LOGIN_MESSAGE);
     }
@@ -89,6 +97,11 @@ export async function grokBackground(
     };
     let box = await findBox();
     if ((await box.count()) === 0) {
+      // Re-checagem: composer sumido pode ser logout tardio.
+      if (await looksLoggedOut(page)) {
+        await failShot(page, 'sem login (tardio)');
+        throw new Error(NEED_GROK_LOGIN_MESSAGE);
+      }
       await failShot(page, 'sem composer');
       throw new Error('composer do Grok não encontrado (layout mudou?)');
     }
@@ -100,6 +113,10 @@ export async function grokBackground(
       if (!res.ok) log.warn('anexos incompletos — prompt segue com texto + o que subiu');
       box = await findBox();
       if ((await box.count()) === 0) {
+        if (await looksLoggedOut(page)) {
+          await failShot(page, 'sem login (tardio, pós-anexo)');
+          throw new Error(NEED_GROK_LOGIN_MESSAGE);
+        }
         await failShot(page, 'sem composer pós-anexo');
         throw new Error('composer do Grok sumiu após anexar (layout mudou?)');
       }

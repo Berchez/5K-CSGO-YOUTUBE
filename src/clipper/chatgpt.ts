@@ -59,6 +59,21 @@ export async function listContentImages(page: Page, minWidth = 256): Promise<str
 }
 
 /**
+ * Marcadores de sessão expirada (mesmos da checagem de entrada). Reusada nos
+ * pontos de falha TARDIA: sessão pode expirar de um jeito que o app carrega
+ * e o estouro só vem no composer/upload — antes o erro genérico escondia
+ * o logout (caso real: "pill não apareceu" em vez de "sem login").
+ */
+async function looksLoggedOut(page: Page): Promise<boolean> {
+  try {
+    if (page.url().includes('auth.openai.com')) return true;
+    return (await page.getByRole('button', { name: /log in|sign up/i }).count()) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Gera imagem via app web do ChatGPT (chatgpt.com) com Playwright.
  *
  * AVISOS:
@@ -114,10 +129,7 @@ export async function chatgptBackground(
       );
     }
 
-    if (
-      page.url().includes('auth.openai.com') ||
-      (await page.getByRole('button', { name: /log in|sign up/i }).count()) > 0
-    ) {
+    if (await looksLoggedOut(page)) {
       await failShot(page, 'sem login');
       throw new Error(NEED_CHATGPT_LOGIN_MESSAGE);
     }
@@ -127,6 +139,11 @@ export async function chatgptBackground(
     if ((await box.count()) === 0) {
       box = page.locator('div[contenteditable="true"], textarea').first();
       if ((await box.count()) === 0) {
+        // Re-checagem: composer sumido pode ser logout que passou na entrada.
+        if (await looksLoggedOut(page)) {
+          await failShot(page, 'sem login (tardio)');
+          throw new Error(NEED_CHATGPT_LOGIN_MESSAGE);
+        }
         await failShot(page, 'sem composer');
         throw new Error('composer do ChatGPT não encontrado (layout mudou?)');
       }
@@ -136,6 +153,12 @@ export async function chatgptBackground(
       const { attachFiles } = await import('./attachFiles.js');
       const res = await attachFiles(page, log, attachments, { newChat: true });
       if (!res.ok) {
+        // Re-checagem: "pill não apareceu no upload" foi o sintoma real de
+        // sessão expirada — classifica como login, não como falha genérica.
+        if (await looksLoggedOut(page)) {
+          await failShot(page, 'sem login (tardio, no upload)');
+          throw new Error(NEED_CHATGPT_LOGIN_MESSAGE);
+        }
         await failShot(page, 'anexos com falha');
         throw new Error(
           'upload de anexos falhou no ChatGPT (' +

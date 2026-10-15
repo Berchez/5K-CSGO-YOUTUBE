@@ -4,6 +4,7 @@ import {
   describeAce,
   detectAceInRound,
   detectMultiKill,
+  isAnchorLowConfidence,
   isRoundMarker,
   killLabel,
   normWeapon,
@@ -283,5 +284,53 @@ describe('buildRoundSummary + describeAce', () => {
     expect(txt.split('\n')[0]).toContain('4K! flameZ (Vitality) fez 4K contra MOUZ');
     expect(txt).toContain('Arma principal: AWP (3/4 kills)');
     expect(txt).not.toContain('5K');
+  });
+});
+
+describe('isAnchorLowConfidence (1ª kill pode não ser a 1ª real)', () => {
+  const NOW = 2_000_000_000;
+  const clean = { joinedMidRound: false, resetThisRound: false, settleKills: 0 };
+
+  it('ausente = confiança alta (legado)', () => {
+    expect(isAnchorLowConfidence(undefined, NOW - 60_000, NOW)).toBe(false);
+  });
+
+  it('sequência antiga, sem sinais: alta', () => {
+    expect(isAnchorLowConfidence(clean, NOW - 90_000, NOW)).toBe(false);
+  });
+
+  it('entrou no meio do round: baixa', () => {
+    expect(isAnchorLowConfidence({ ...clean, joinedMidRound: true }, NOW - 90_000, NOW)).toBe(true);
+  });
+
+  it('resetou a base no round: baixa', () => {
+    expect(isAnchorLowConfidence({ ...clean, resetThisRound: true }, NOW - 90_000, NOW)).toBe(true);
+  });
+
+  it('1ª kill dentro da janela de settle (12s): baixa', () => {
+    expect(isAnchorLowConfidence({ ...clean, settleKills: 3 }, NOW - 5_000, NOW)).toBe(true);
+  });
+
+  it('settle com kills, mas 1ª kill antiga: alta', () => {
+    expect(isAnchorLowConfidence({ ...clean, settleKills: 2 }, NOW - 60_000, NOW)).toBe(false);
+  });
+});
+
+describe('RoundTracker.anchorFlags (ciclo de vida por round)', () => {
+  it('fresco: sem sinais; setContext novo round zera', () => {
+    const tr = new RoundTracker('inferno', 7);
+    expect(tr.anchorFlags()).toEqual({ joinedMidRound: false, resetThisRound: false });
+    tr.markJoinedBlind();
+    expect(tr.anchorFlags().joinedMidRound).toBe(true);
+    tr.setContext('inferno', 8);
+    expect(tr.anchorFlags()).toEqual({ joinedMidRound: false, resetThisRound: false });
+  });
+
+  it('reset marca o round; setContext seguinte limpa', () => {
+    const tr = new RoundTracker('inferno', 7);
+    tr.reset();
+    expect(tr.anchorFlags().resetThisRound).toBe(true);
+    tr.setContext('inferno', 8);
+    expect(tr.anchorFlags().resetThisRound).toBe(false);
   });
 });

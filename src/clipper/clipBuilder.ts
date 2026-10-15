@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_DISK_MIN_FREE_BYTES, gb, getFreeBytes, isFreeSpaceOk } from '../diskSpace.js';
 import type { AceEvent, ClipResult } from '../types.js';
 import { getLogger } from '../logger.js';
 import { makeSmartThumbnail, type SmartThumbOptions } from './thumbnail.js';
@@ -16,22 +17,75 @@ const execFileAsync = promisify(execFile);
  * (restart/crash), o shutdown/exit mata o ffmpeg — sem deixar encode
  * órfão pegando 100% da CPU (Windows não mata filhos sozinho).
  */
-function execTracked(cmd: string, args: string[]): Promise<void> {
+function execTracked(
+  cmd: string,
+  args: string[],
+  onStderrLine?: (line: string) => void,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const p: ChildProcess = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+    let pendingLine = '';
     p.stderr?.on('data', (d: Buffer) => {
-      stderr += d.toString();
+      const chunk = d.toString();
+      stderr += chunk;
       if (stderr.length > 8000) stderr = stderr.slice(-4000);
+      if (onStderrLine) {
+        const lines = `${pendingLine}${chunk}`.split(/\r?\n/);
+        pendingLine = lines.pop() ?? '';
+        for (const line of lines) onStderrLine(line);
+      }
     });
     track(p);
     p.on('error', reject);
     p.on('exit', (code) => {
       untrack(p);
+      if (pendingLine && onStderrLine) onStderrLine(pendingLine);
       if (code === 0) resolve();
       else reject(new Error(`${cmd} exit ${code}: ${stderr.slice(-400)}`));
     });
   });
+}
+
+export interface FreezeInterval {
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
+export function parseFreezeIntervals(log: string): FreezeInterval[] {
+  const intervals: FreezeInterval[] = [];
+  let startSec: number | null = null;
+  let durationSec: number | null = null;
+  for (const line of log.split(/\r?\n/)) {
+    const start = line.match(/freeze_start:\s*([-\d.]+)/);
+    const duration = line.match(/freeze_duration:\s*([-\d.]+)/);
+    const end = line.match(/freeze_end:\s*([-\d.]+)/);
+    if (start) startSec = Number(start[1]);
+    if (duration) durationSec = Number(duration[1]);
+    if (end) {
+      const endSec = Number(end[1]);
+      const resolvedStart = startSec ?? (durationSec != null ? endSec - durationSec : null);
+      if (resolvedStart != null && Number.isFinite(resolvedStart) && Number.isFinite(endSec)) {
+        intervals.push({
+          startSec: Math.round(resolvedStart * 1000) / 1000,
+          endSec: Math.round(endSec * 1000) / 1000,
+          durationSec: Math.round((endSec - resolvedStart) * 1000) / 1000,
+        });
+      }
+      startSec = null;
+      durationSec = null;
+    }
+  }
+  if (startSec != null && durationSec != null && durationSec > 0) {
+    const endSec = startSec + durationSec;
+    intervals.push({
+      startSec: Math.round(startSec * 1000) / 1000,
+      endSec: Math.round(endSec * 1000) / 1000,
+      durationSec: Math.round(durationSec * 1000) / 1000,
+    });
+  }
+  return intervals;
 }
 
 /**
@@ -60,21 +114,44 @@ export interface ClipOptions {
   preRollSec: number;
   postRollSec: number;
   segmentTimeSec: number;
+  /**
+   * Replay-aware SHADOW (Fase 1): 'shadow' (default) detecta a retomada de
+   * ação e LOGA o fim alternativo (ação − 2s) sem aplicar; 'off' pula;
+   * 'on' reservado à Fase 2 (por enquanto comporta-se como shadow).
+   */
+  replayAware?: ReplayAwareMode;
   /** Contexto antes do 1º kill (default 10s). */
   contextSec?: number;
   /** Epoch ms do 1º kill — ancora o início do clipe. Sem ele, usa últimos N. */
   aceStartMs?: number;
   /** Epoch ms do fim do clipe (win panel parcial). Sem ele, usa cauda pós-detect. */
   aceEndMs?: number;
-  /**
-   * Span REAL do concat em segundos, medido nos segmentos ORIGINAIS (não
-   * no snapshot) pelo chamador. Sem ele, assume n × segmentTimeSec — que
-   * mente quando um segmento nunca cortou (input faminto: 1 arquivo cobre
-   * minutos e o trim ancora fora do material → clipe gigante).
-   */
+  /** Optional fallback span; the builder probes its final sanitized inputs first. */
   concatSpanSec?: number;
+  /** Optional fallback result of the span-vs-wall check. */
+  concatSpanReliable?: boolean;
+  /** Optional fallback wall-clock span when PTS measurements are unreliable. */
+  concatWallSec?: number | null;
+  /**
+   * Correção A/V estática (ms de atraso no áudio). Tem precedência sobre a
+   * medição automática: calibração manual p/ skew sistemático conhecido
+   * quando a correlação por conteúdo não decide (gameplay denso).
+   */
+  staticAvOffsetMs?: number;
+  /**
+   * Espaço livre mínimo (bytes) p/ renderizar. Sem ele o encode morre no
+   * meio e entrega mp4 sem moov (corrompido) — aborta com erro claro.
+   * Default 3GB.
+   */
+  diskMinFreeBytes?: number;
   /** Upscale p/ 1440 (default no config): força o pipeline VP9/AV1 do YouTube. */
   upscaleHeight?: number;
+  /** Suffix appended to the base filename for alternate source captures. */
+  outputSuffix?: string;
+  /** Avoid duplicate thumbnail generation for alternate source captures. */
+  generateThumbnail?: boolean;
+  /** Source variant captured into this clip. */
+  captureMode?: 'separate' | 'muxed';
   /**
    * Auto-sync A/V por conteúdo. 'auto' mede E aplica a compensação;
    * 'log' (default) mede e registra no log/sidecar SEM aplicar — modo
@@ -127,7 +204,7 @@ export function resolveFfmpegBin(): string {
 
 export type { ConcatSpan, SegmentAvIssue } from './segmentProbe.js';
 export { classifySegmentAv, inspectSegmentAv, probeConcatSpan, probeSegmentPackets, resolveFfprobeBin } from './segmentProbe.js';
-import { inspectSegmentAv, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
+import { inspectSegmentAv, probeConcatSpan, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
 
 /**
  * Inspeciona A/V de cada segmento SEM decodificar (só cabeçalhos de pacote,
@@ -408,6 +485,27 @@ export function computeAudioCompensation(
 }
 
 /**
+ * Duração (s) de um arquivo via ffprobe — null se ilegível (sem moov, vazio,
+ * inexistente). Alimenta a trava de saída do render (nunca shippar vazio).
+ */
+async function probeFileDurationSec(file: string): Promise<number | null> {
+  const ffprobe = resolveFfprobeBin();
+  if (!ffprobe) return null;
+  try {
+    const out = await execFileAsync(
+      ffprobe,
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file],
+      { timeout: 15_000 },
+    ).then((r) => String(r.stdout ?? '').trim());
+    // csv=p=0 imprime só o valor; 'N/A'/vazio (sem moov) → NaN → null
+    const d = Number.parseFloat(out);
+    return Number.isFinite(d) && d > 0 ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Higieniza segmentos p/ o concat (files em ordem oldest→newest):
  * 1) descarta o MAIS NOVO (está sendo escrito pelo recorder agora);
  * 2) descarta ilegíveis (moov quebrado / parcial de queda de stream).
@@ -485,6 +583,47 @@ export async function upscaleClip(inPath: string, height: number, trimStartSec =
 }
 
 /**
+ * Resolve a timeline do concat (início wall + duração) a partir das
+ * evidências disponíveis. Ordem de preferência (puro/testável):
+ * 1. 'measured' — span de PTS confiável (cruza com wall-clock);
+ * 2. 'wall' — span absurdo (salto de PTS), mas o wall diz a duração real
+ *    do crescimento do arquivo (ex: 18h de PTS em 400s de wall);
+ * 3. 'legacy' — sem medição: n × slot (mente em segmento não-cortado).
+ */
+export type ConcatTimelineMode = 'measured' | 'wall' | 'legacy';
+
+export interface ConcatTimeline {
+  /** Wall ms do início do 1º arquivo. */
+  startMs: number;
+  /** Duração total do concat (s). */
+  lenSec: number;
+  mode: ConcatTimelineMode;
+}
+
+export function resolveConcatTimeline(args: {
+  firstMtimeMs: number;
+  lastMtimeMs: number;
+  fileCount: number;
+  segmentTimeSec: number;
+  spanSec?: number;
+  spanReliable?: boolean;
+  wallSec?: number | null;
+}): ConcatTimeline {
+  const { firstMtimeMs, lastMtimeMs, fileCount, segmentTimeSec, spanSec, spanReliable, wallSec } = args;
+  if (spanSec != null && Number.isFinite(spanSec) && spanSec > 0 && spanReliable) {
+    return { startMs: lastMtimeMs - spanSec * 1000, lenSec: spanSec, mode: 'measured' };
+  }
+  if (wallSec != null && Number.isFinite(wallSec) && wallSec > 0 && wallSec < 86_400) {
+    return { startMs: lastMtimeMs - wallSec * 1000, lenSec: wallSec, mode: 'wall' };
+  }
+  return {
+    startMs: firstMtimeMs - segmentTimeSec * 1000,
+    lenSec: fileCount * segmentTimeSec,
+    mode: 'legacy',
+  };
+}
+
+/**
  * Âncora de fim do clipe (wall ms): volta ao fechamento REAL do round
  * (detecção − lag do placar) e anda AFTER_CLOSE — mirando ~5s antes da
  * ação do round seguinte (win panel + freeze ≈ 13s). Em timeout/pausa o
@@ -511,11 +650,129 @@ export function applyDurationCap(
   concatLenSec: number,
   capSec: number,
 ): { trimEndSec: number | null; clamped: boolean } {
-  const estDurSec = (trimEndSec ?? concatLenSec) - trimStartSec;
+  const estDurSec = trimEndSec ?? (concatLenSec - trimStartSec);
   if (estDurSec > capSec) {
-    return { trimEndSec: trimStartSec + capSec, clamped: true };
+    return { trimEndSec: capSec, clamped: true };
   }
   return { trimEndSec, clamped: false };
+}
+
+export type ReplayAwareMode = 'off' | 'shadow' | 'on';
+
+export interface MotionResume {
+  /** Segundos do início do concat; null quando sem retomada clara. */
+  actionStartSec: number | null;
+  /** MAD mediano na janela quieta (referência). */
+  quietMad: number;
+  /** MAD mediano após a retomada. */
+  activeMad: number;
+  reason: string;
+  /** Duração da janela analisada (s). */
+  windowSec: number;
+}
+
+function medianOf(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+/**
+ * Acha a retomada de ação (fim do freeze) numa série de MAD médio entre
+ * frames consecutivos (fps conhecido). Lógica: a ÚLTIMA transição
+ * quieto→ativo SUSTENTADA (janela quieta seguida de janela ativa) — o
+ * replay no meio vira transição intermediária, superada pela final.
+ * Mediana nas janelas: spike isolado não elege transição. Puro/testável.
+ */
+export function findMotionResume(
+  mad: number[],
+  fps: number,
+  opts: { quietWinSec?: number; activeWinSec?: number; ratio?: number; floor?: number } = {},
+): { index: number | null; quiet: number; active: number; reason: string } {
+  const qn = Math.max(2, Math.round((opts.quietWinSec ?? 3) * fps));
+  const an = Math.max(2, Math.round((opts.activeWinSec ?? 3) * fps));
+  const ratio = opts.ratio ?? 3;
+  const floor = opts.floor ?? 1.5;
+  if (mad.length < qn + an) return { index: null, quiet: 0, active: 0, reason: 'série curta' };
+  let best: number | null = null;
+  let bq = 0;
+  let ba = 0;
+  for (let i = qn; i + an <= mad.length; i++) {
+    const q = medianOf(mad.slice(i - qn, i));
+    const a = medianOf(mad.slice(i, i + an));
+    if (a >= Math.max(floor, q * ratio)) {
+      best = i;
+      bq = q;
+      ba = a;
+    }
+  }
+  if (best == null) return { index: null, quiet: 0, active: 0, reason: 'sem transição sustentada' };
+  return { index: best, quiet: Math.round(bq * 100) / 100, active: Math.round(ba * 100) / 100, reason: 'ok' };
+}
+
+/**
+ * Detecta a retomada de ação (fim do freeze) após o fim do round, para o
+ * modo replay-aware SHADOW (Fase 1: mede e loga, NÃO aplica).
+ *
+ * Método: frames ~1fps/160px na timeline do concat (a MESMA semântica de
+ * emenda do render) → MAD médio entre frames consecutivos → última
+ * transição quieto→ativo sustentada. O freeze congela os jogadores
+ * (mecânica do jogo, igual em toda stream/organizadora); a ação retoma o
+ * movimento. Best-effort: qualquer falha retorna actionStartSec=null e o
+ * chamador usa a âncora fixa (nunca pior que hoje).
+ */
+export async function detectActionResume(
+  files: string[],
+  ffmpegBin: string,
+  opts: { fps?: number } = {},
+): Promise<MotionResume> {
+  const no = (reason: string, windowSec = 0): MotionResume =>
+    ({ actionStartSec: null, quietMad: 0, activeMad: 0, reason, windowSec });
+  if (files.length === 0) return no('sem segmentos');
+  const fps = opts.fps ?? 1;
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'resume-'));
+  try {
+    const inputs: string[] = [];
+    for (const f of files) inputs.push('-i', f);
+    const framesDir = path.join(tmpRoot, 'fr');
+    fs.mkdirSync(framesDir, { recursive: true });
+    const pads = files.map((_, i) => `[${i}:v]`).join('');
+    const graph = `${pads}concat=n=${files.length}:v=1:a=0,fps=${fps},scale=160:-1`;
+    await execFileAsync(
+      ffmpegBin,
+      ['-hide_banner', '-loglevel', 'error', '-y', ...inputs, '-filter_complex', graph, path.join(framesDir, 'fr_%04d.png')],
+      { timeout: 180_000 },
+    );
+    const names = fs.readdirSync(framesDir).filter((f) => f.endsWith('.png')).sort();
+    const windowSec = Math.round((names.length / fps) * 100) / 100;
+    if (names.length < 8) return no(`frames insuficientes (${names.length})`, windowSec);
+    const sharp = (await import('sharp')).default;
+    const mad: number[] = [];
+    let prev: Buffer | null = null;
+    for (const n of names) {
+      const { data } = await sharp(path.join(framesDir, n)).raw().toBuffer({ resolveWithObject: true });
+      const cur = Buffer.from(data);
+      if (prev && prev.length === cur.length) {
+        let s = 0;
+        for (let i = 0; i < cur.length; i++) s += Math.abs(cur[i] - prev[i]);
+        mad.push(s / cur.length);
+      }
+      prev = cur;
+    }
+    if (mad.length < 6) return no('série curta', windowSec);
+    const r = findMotionResume(mad, fps);
+    return {
+      actionStartSec: r.index != null ? Math.round(((r.index + 1) / fps) * 100) / 100 : null,
+      quietMad: r.quiet,
+      activeMad: r.active,
+      reason: r.reason,
+      windowSec,
+    };
+  } catch (e) {
+    return no(`falha na detecção: ${String(e).slice(0, 100)}`);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -598,6 +855,33 @@ export function contiguousTail(files: string[], maxGapSec: number): { ok: string
 }
 
 /**
+ * A âncora de início é mais velha que o buffer? (detector de R2)
+ * Compara o início desejado (1ª kill − contexto) com o início real da
+ * cobertura (segmento mais antigo − slot). true = abertura real fora do
+ * alcance: o clipe começa no material mais antigo disponível (truncado —
+ * a "primeira kill presente no buffer", não a 1ª kill do round).
+ * Puro nos parâmetros (lê mtime como pickSegments). Testável.
+ */
+export function detectTruncatedStart(
+  files: string[],
+  opts: { segmentTimeSec: number; contextSec?: number; aceStartMs?: number },
+): boolean {
+  if (opts.aceStartMs == null || files.length === 0) return false;
+  const desiredStartMs = opts.aceStartMs - (opts.contextSec ?? 10) * 1000;
+  let oldestEndMs = Infinity;
+  for (const f of files) {
+    try {
+      const m = fs.statSync(f).mtimeMs;
+      if (m < oldestEndMs) oldestEndMs = m;
+    } catch {
+      // ignora
+    }
+  }
+  if (!Number.isFinite(oldestEndMs)) return false;
+  return desiredStartMs < oldestEndMs - opts.segmentTimeSec * 1000;
+}
+
+/**
  * Escolhe segmentos por TEMPO (mtime do arquivo ≈ fim do segmento).
  * Com aceStartMs: tudo que termina depois de (1º kill − contexto).
  * Com aceEndMs: só o que começa antes do fim (o trim corta o excedente).
@@ -627,7 +911,12 @@ export function pickSegments(segments: string[], opts: PickOptions): string[] {
   const threshold = cutFrom - opts.segmentTimeSec * 1000;
   const picked = timed.filter((s) => s.endMs <= 0 || s.endMs > threshold).map((s) => s.f);
   if (picked.length === 0) {
-    // ace mais velho que o buffer (ou relógio torto): usa o buffer todo
+    // Ace mais velho que o buffer (ou relógio torto): usa o buffer todo.
+    // NUNCA silencioso: a abertura real ficou fora do alcance (R2).
+    getLogger().warn(
+      { files: segments.length, threshold: new Date(threshold).toISOString() },
+      'âncora mais velha que o buffer, usando buffer todo (abertura incompleta?)',
+    );
     return segments;
   }
   return opts.aceEndMs != null ? cutAfterEnd(picked, opts) : picked;
@@ -707,7 +996,7 @@ export async function buildClip(
     'montando clipe',
   );
 
-  const base = `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}`;
+  const base = `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}${opts.outputSuffix ?? ''}`;
   const outPath = path.join(opts.clipsDir, `${base}.mp4`);
   const sidecarPath = path.join(opts.clipsDir, `${base}.json`);
 
@@ -727,21 +1016,39 @@ export async function buildClip(
       `sem segmentos legíveis no buffer (descartados: ${dropped.map((d) => path.basename(d)).join(', ') || 'nenhum'})`,
     );
   }
+  // Probe exactly the sanitized files used by the concat filter. Measuring
+  // before contiguous-tail/readability filtering anchored trims to a
+  // different timeline (and could shift the start by one full segment).
+  const measuredSpan = await probeConcatSpan(
+    usable,
+    resolveFfprobeBin(),
+    opts.segmentTimeSec,
+  );
   // Cálculos PUROS fora da fila (statSync + aritmética). Tudo que decodifica
   // mídia (diagnóstico, medição A/V, encode) entra na FILA de render junto
   // com o próprio encode — fora dela competia com o render anterior por CPU.
   const firstSegMtimeMs = fs.statSync(usable[0]).mtimeMs;
-  let firstSegStartMs = firstSegMtimeMs - opts.segmentTimeSec * 1000;
-  let concatLenSec = usable.length * opts.segmentTimeSec;
-  // Span MEDIDO (handleAce mediu nos segmentos originais, com birthtime
-  // intacto): quando um segmento nunca cortou, ele cobre minutos, não
-  // `slot` segundos — ancorar o trim em `mtime − slot` desloca tudo para
-  // fora do material e o fallback renderiza o arquivo inteiro (clipe de
-  // 7min/1GB). Sem medição, vale o legado (n × slot).
-  if (opts.concatSpanSec != null && Number.isFinite(opts.concatSpanSec) && opts.concatSpanSec > 0) {
-    firstSegStartMs = fs.statSync(usable[usable.length - 1]).mtimeMs - opts.concatSpanSec * 1000;
-    concatLenSec = opts.concatSpanSec;
-    log.info({ spanSec: opts.concatSpanSec, files: usable.length }, 'trim ancorado no span medido (não em n×slot)');
+  const lastSegMtimeMs = fs.statSync(usable[usable.length - 1]).mtimeMs;
+  // Timeline REAL do concat (span medido ou wall-clock): segmento que nunca
+  // cortou cobre minutos, não `slot` — ancorar o trim em `mtime − slot`
+  // desloca tudo para fora do material e o fallback renderiza o arquivo
+  // inteiro (clipe de 7min/1GB). Sem medição, vale o legado (n × slot).
+  const timeline = resolveConcatTimeline({
+    firstMtimeMs: firstSegMtimeMs,
+    lastMtimeMs: lastSegMtimeMs,
+    fileCount: usable.length,
+    segmentTimeSec: opts.segmentTimeSec,
+    spanSec: measuredSpan?.spanSec ?? opts.concatSpanSec,
+    spanReliable: measuredSpan?.reliable ?? opts.concatSpanReliable,
+    wallSec: measuredSpan?.wallSec ?? opts.concatWallSec,
+  });
+  const firstSegStartMs = timeline.startMs;
+  const concatLenSec = timeline.lenSec;
+  if (timeline.mode !== 'legacy') {
+    log.info(
+      { matchId: ace.matchId, mode: timeline.mode, spanSec: measuredSpan?.spanSec ?? opts.concatSpanSec, wallSec: measuredSpan?.wallSec ?? opts.concatWallSec, files: usable.length },
+      'trim ancorado na timeline real (não em n×slot)',
+    );
   }
   const trimStartSec = computeTrimStartSec(
     firstSegMtimeMs,
@@ -776,10 +1083,27 @@ export async function buildClip(
   // Preenchidos DENTRO da fila (job abaixo); lidos no log/sidecar depois.
   let avMeasuredMs: number | null = null;
   let avAppliedMs = 0;
+  let avSource: 'none' | 'auto' | 'static' = 'none';
   const avMode = opts.avSync ?? 'log';
   let avReason = avMode === 'off' ? 'desligado (CLIP_AV_SYNC=off)' : 'não executado';
   let avIssuesCount = 0;
   let avSegmentIssues: SegmentAvIssue[] = [];
+  let freezeLog = '';
+  let freezeIntervals: FreezeInterval[] = [];
+  // Preenchido no job (shadow replay-aware); lido no log/sidecar depois.
+  let actionResume: MotionResume | null = null;
+  let replayAwareEndMs: number | null = null;
+
+  // Trava anti-disco-cheio: sem espaço o encode morre no meio e entrega mp4
+  // sem moov (corrompido, 0 bytes). Aborta com erro claro — o handleAce
+  // registra e segue (o ace fica no banco; sem retry automático).
+  const diskMinBytes = opts.diskMinFreeBytes ?? DEFAULT_DISK_MIN_FREE_BYTES;
+  const diskFreeBytes = getFreeBytes(opts.clipsDir);
+  if (!isFreeSpaceOk(diskFreeBytes, diskMinBytes)) {
+    throw new Error(
+      `disco cheio para renderizar (livre: ${diskFreeBytes != null ? gb(diskFreeBytes) : 'desconhecido'}, mínimo: ${gb(diskMinBytes)}) — libere espaço`,
+    );
+  }
 
   // PASSADA ÚNICA com FILTRO concat: emenda realinhando A/V arquivo a
   // arquivo. O concat demuxer com -c copy alinhava cada segmento pelo
@@ -787,11 +1111,45 @@ export async function buildClip(
   // fim do clipe. Trim + restauração + upscale entram no MESMO filtro:
   // o re-encode que o upscale exigiria já processa a emenda, então o
   // custo total é o mesmo de antes (uma re-encode, não duas).
-  await enqueueRender(async () => {
+  try {
+    await enqueueRender(async () => {
     // Render fantasma de sessão anterior para ESTE clipe (crash/restart no
     // meio do encode): mata antes de começar outro.
     const stale = killStale(path.resolve(outPath));
     if (stale > 0) log.warn({ stale }, 'render fantasma morto');
+
+    // Replay-aware SHADOW (Fase 1): detecta onde a ação do round seguinte
+    // retoma e LOGA o fim alternativo (ação − 2s, incluindo o replay) vs a
+    // âncora fixa — sem aplicar. 'on' ainda age como shadow (Fase 2 futura).
+    const replayMode = opts.replayAware ?? 'shadow';
+    if (replayMode !== 'off') {
+      try {
+        actionResume = await detectActionResume(usable, resolveFfmpegBin());
+        if (actionResume.actionStartSec != null) {
+          // actionStartSec é relativo ao início do concat (pré-trim).
+          replayAwareEndMs = Math.round(firstSegStartMs + actionResume.actionStartSec * 1000 - 2000);
+        }
+        log.info(
+          {
+            matchId: ace.matchId,
+            mode: replayMode,
+            actionStartSec: actionResume.actionStartSec,
+            replayAwareEnd: replayAwareEndMs != null ? new Date(replayAwareEndMs).toISOString() : null,
+            fixedEnd: opts.aceEndMs != null ? new Date(opts.aceEndMs).toISOString() : null,
+            quietMad: actionResume.quietMad,
+            activeMad: actionResume.activeMad,
+            windowSec: actionResume.windowSec,
+            reason: actionResume.reason,
+          },
+          'retomada de ação (shadow replay-aware)',
+        );
+        if (replayMode === 'on') {
+          log.warn('REPLAY_AWARE=on ainda sem aplicação (Fase 2) — agindo como shadow');
+        }
+      } catch {
+        // best-effort: shadow nunca quebra o pipeline
+      }
+    }
 
     // Diagnóstico A/V (nunca quebra o pipeline): divergência de conteúdo
     // entre trilhas no MESMO segmento (ex: vídeo 1.6s + áudio 10s) vira skew
@@ -837,6 +1195,18 @@ export async function buildClip(
       log.info({ avMode, avOffsetMs: avMeasuredMs }, 'offset medido (modo log: sem compensação)');
     }
     avAppliedMs = Math.round(avDeltaSec * 1000);
+    avSource = avDeltaSec !== 0 ? 'auto' : 'none';
+    // Offset estático (calibração manual): tem precedência sobre a medição.
+    const staticMs = opts.staticAvOffsetMs ?? 0;
+    if (staticMs > 0) {
+      if (avDeltaSec !== 0) {
+        log.warn({ auto: avAppliedMs, static: staticMs }, 'offset estático substitui medição automática');
+      }
+      avDeltaSec = staticMs / 1000;
+      avAppliedMs = staticMs;
+      avSource = 'static';
+      log.info({ avStaticMs: staticMs }, 'offset A/V estático aplicado (calibração manual)');
+    }
 
     const pads = usable.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('');
     // ATENÇÃO à timeline: trim/end do filtro são posições NO CONCAT. O
@@ -887,6 +1257,7 @@ export async function buildClip(
       .join(',');
     const vparts = [
       doTrim ? `trim=${trimParts.join(':')},setpts=PTS-STARTPTS` : '',
+      'freezedetect=n=-50dB:d=0.5',
       'hqdn3d=4:3:7:5',
       height > 0 ? `scale=-2:${height}:flags=lanczos+accurate_rnd+full_chroma_int` : '',
       'cas=0.6',
@@ -896,7 +1267,7 @@ export async function buildClip(
     const filter = `${pads}concat=n=${usable.length}:v=1:a=1[vc][ac];[vc]${vparts}[v];[ac]${aparts || 'anull'}[a]`;
 
     const cpus = os.cpus().length;
-    const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-y'];
+    const args: string[] = ['-hide_banner', '-loglevel', 'info', '-nostats', '-y'];
     for (const f of usable) args.push('-i', f);
     args.push(
       '-filter_complex',
@@ -926,10 +1297,49 @@ export async function buildClip(
       '+faststart',
       outPath,
     );
-    await execTracked('ffmpeg', args);
-  });
+    await execTracked('ffmpeg', args, (line) => {
+      if (line.includes('freezedetect')) freezeLog += `${line}\n`;
+    });
+    freezeIntervals = parseFreezeIntervals(freezeLog);
+    if (freezeIntervals.length > 0) {
+      log.warn(
+        { matchId: ace.matchId, count: freezeIntervals.length, intervals: freezeIntervals },
+        'frames congelados detectados no vídeo pré-encode (investigar feed de origem)',
+      );
+    }
+    });
+  } catch (e) {
+    // ffmpeg morto no meio (sem moov): remove o stub parcial p/ não
+    // permanecer como "clipe" fantasma na pasta, e sobe o erro.
+    try {
+      if (fs.existsSync(outPath)) fs.rmSync(outPath, { force: true });
+    } catch {
+      // best-effort
+    }
+    throw e;
+  }
+  // Trava de SAÍDA: render "bem-sucedido" com janela vazia (trim além do
+  // conteúdo — bug real de timeline: 2399080 r8/r9, stub de 256B) entrega
+  // mp4 ilegível. Aborta com erro claro ANTES de queimar 10-30min de
+  // thumbnail IA num arquivo morto.
+  let outDurSec: number | null = null;
+  try {
+    outDurSec = await probeFileDurationSec(outPath);
+  } catch {
+    outDurSec = null;
+  }
+  if (outDurSec == null || outDurSec < 5) {
+    try {
+      if (fs.existsSync(outPath)) fs.rmSync(outPath, { force: true });
+    } catch {
+      // best-effort
+    }
+    throw new Error(
+      `render vazio (dur=${outDurSec ?? 'ilegível'}s): trim ${trimStartSec.toFixed(1)}s/${trimEndSec != null ? trimEndSec.toFixed(1) + 's' : 'cauda'} em concat de ${concatLenSec.toFixed(0)}s (${timeline.mode}) — timeline inconsistente, revisar âncoras`,
+    );
+  }
   log.info(
-    { segments: usable.length, trimStartSec, trimEndSec, height, avAppliedMs, avIssues: avIssuesCount },
+    { matchId: ace.matchId, segments: usable.length, trimStartSec, trimEndSec, height, avAppliedMs, avSource, avIssues: avIssuesCount, timelineMode: timeline.mode },
     'clipe montado (passada única: emenda A/V realinhada + upscale)',
   );
 
@@ -945,10 +1355,12 @@ export async function buildClip(
   // Thumbnail estilo canal de cortes: frame + selo ACE!/jogador/confronto.
   // Frame de ~3s antes do 5º kill (meio do ace) — meio do clipe costuma ser break/torcida.
   const thumbPath = path.join(opts.clipsDir, `${base}.jpg`);
-  try {
-    await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
-  } catch {
-    log.warn('falha ao gerar thumbnail, seguindo sem ela');
+  if (opts.generateThumbnail !== false) {
+    try {
+      await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
+    } catch {
+      log.warn('falha ao gerar thumbnail, seguindo sem ela');
+    }
   }
 
   fs.writeFileSync(
@@ -956,14 +1368,22 @@ export async function buildClip(
     JSON.stringify(
       buildSidecar(ace, {
         clipFile: path.basename(outPath),
+        captureMode: opts.captureMode ?? 'separate',
+        freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),
         avMode,
         avOffsetMs: avMeasuredMs,
         avAppliedMs,
+        avSource,
+        avStaticMs: opts.staticAvOffsetMs ?? 0,
         avReason,
         avIssues: avIssuesCount,
         avSegmentIssues,
+        timelineMode: timeline.mode,
+        concatLenSec: Math.round(concatLenSec * 100) / 100,
+        replayAwareEndMs,
+        actionResume,
       }),
       null,
       2,

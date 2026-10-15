@@ -1,7 +1,7 @@
 import type { Page } from 'playwright';
 import { waitForClearance } from '../monitor/hltvMonitor.js';
 import { RoundTracker } from './aceDetector.js';
-import type { KillEvent } from '../types.js';
+import type { AnchorConfidence, KillEvent } from '../types.js';
 import { getLogger } from '../logger.js';
 import { getConfig } from '../config.js';
 
@@ -98,6 +98,8 @@ export interface TrackerCallbacks {
     kills: KillEvent[];
     /** ISO do 1º kill — ancora o início do clipe. */
     startedAt?: string;
+    /** Confiança na âncora (1ª kill pode não ser a 1ª real). */
+    anchorConfidence?: AnchorConfidence;
   }) => void;
   shouldStop: () => boolean;
 }
@@ -108,6 +110,8 @@ export interface PollEvent {
   round: number;
   kills: KillEvent[];
   startedAt?: string;
+  /** Confiança na âncora de início (1ª kill pode não ser a 1ª real). */
+  anchorConfidence?: AnchorConfidence;
 }
 
 /** Máximo de kills possíveis num round (5 adversários). Acima = dado corrompido (gap). */
@@ -147,6 +151,12 @@ export function processPoll(
   let event: PollEvent | null = null;
   let dropped: string | null = null;
   let roundClosed: { map: string; round: number; score: string } | null = null;
+  // Estreia com placar > 0 = tracking começou no meio da partida (round já
+  // em andamento): kills anteriores a este poll são invisíveis — a próxima
+  // âncora deste round nasce suspeita.
+  if (lastTotal < 0 && total > 0) {
+    tracker.markJoinedBlind();
+  }
   // Virada de round = placar mudou (ou OT: total >= 24 continua valendo).
   if (lastTotal >= 0 && total !== lastTotal) {
     // ANTES de fechar: a coluna K atrasa em relação ao placar de score —
@@ -155,6 +165,7 @@ export function processPoll(
     // do round novo). Sincronizar DEPOIS do closeRound atribuía os kills
     // do round passado ao novo (falsos "3k" misturando rounds).
     tracker.syncBaseline(snap.players);
+    const flags = tracker.anchorFlags();
     // Fecha o round: no máximo UM evento por round/jogador, sempre na
     // contagem máxima (3k→4k→5k não duplica). kills = SÓ os do autor.
     const { player, kills } = tracker.closeRound(minKills);
@@ -163,6 +174,13 @@ export function processPoll(
         dropped = `${player} com ${kills.length} kills (impossível — gap corrompeu a base)`;
       } else {
         const firstAt = kills[0]?.at;
+        // Kills observadas na janela de assentamento (últimos 12s: settle
+        // de 10s + folga): se a 1ª kill está entre elas, a sequência inteira
+        // foi observada no apagar das luzes — relâmpago legítimo OU kill do
+        // round novo carimbada no antigo. Nos dois casos, âncora suspeita.
+        const closedAtMs = Date.now();
+        const settleKills = kills.filter((k) => (k.at ?? 0) >= closedAtMs - 12_000).length;
+        const anchorConfidence: AnchorConfidence = { ...flags, settleKills };
         // Round VERDADEIRO = o dos kills (snap.round já é o próximo placar).
         const trueRound = kills[0]?.round ?? snap.round;
         event = {
@@ -171,6 +189,7 @@ export function processPoll(
           round: trueRound,
           kills,
           startedAt: firstAt ? new Date(firstAt - delayCompMs).toISOString() : undefined,
+          anchorConfidence,
         };
       }
     } else {

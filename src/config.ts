@@ -25,6 +25,20 @@ const ConfigSchema = z.object({
   /** Contexto antes do 1º kill do ace (o clipe começa aqui). */
   CLIP_CONTEXT_SEC: z.coerce.number().min(0).max(30).default(10),
   /**
+   * Replay-aware (Fase 1: shadow). 'shadow' (default): detecta a retomada
+   * de ação do round seguinte e LOGA o fim alternativo (incluindo o replay)
+   * sem aplicar; 'off': pula a detecção; 'on': reservado à Fase 2
+   * (por enquanto comporta-se como shadow).
+   */
+  REPLAY_AWARE: z.enum(['off', 'shadow', 'on']).default('shadow'),
+  /**
+   * Contexto quando a âncora de início é incerta (tracker entrou no meio
+   * do round, resetou a base, ou a 1ª kill veio da janela de assentamento):
+   * começa mais cedo para não perder a abertura real. Confiança alta usa
+   * CLIP_CONTEXT_SEC.
+   */
+  CLIP_CONTEXT_UNCERTAIN_SEC: z.coerce.number().min(0).max(120).default(25),
+  /**
    * Segundos após o fechamento REAL do round onde o clipe termina:
    * fim = (detecção − SCOREBOARD_DELAY_MS) + este valor. Default 8: mira
    * ~5s antes da ação do round seguinte (win panel + freeze ≈ 13s).
@@ -44,16 +58,45 @@ const ConfigSchema = z.object({
   /** Upscale do clipe p/ forçar VP9/AV1 no YouTube (1440/2160; 0 = desligado). */
   CLIP_UPSCALE_HEIGHT: z.coerce.number().min(0).max(2160).default(1440),
   /**
-   * Auto-sync A/V por conteúdo. 'log' (default): mede o offset real em todo
-   * clipe e registra no log/sidecar SEM aplicar correção (diagnóstico).
-   * 'auto': mede E aplica a compensação (só com medida válida: |δ|≥0.5s,
-   * proeminência ≥1.5 e metades consistentes). 'off': pula a medição.
-   * Em gameplay real a correlação luminância↔loudness raramente produz
-   * medida válida (prom ~1.0-1.6 em produção) — por isso 'auto' NÃO é o
-   * default: um falso positivo aplicaria shift de até ±8s num clipe bom.
+   * Auto-sync A/V por conteúdo. 'auto' (default) mede e aplica apenas
+   * quando o offset passa os gates de confiança e as duas metades concordam.
+   * 'log' mede sem aplicar; 'off' pula a medição.
    */
-  CLIP_AV_SYNC: z.enum(['auto', 'off', 'log']).default('log'),
+  CLIP_AV_SYNC: z.enum(['auto', 'off', 'log']).default('auto'),
+  /**
+   * Correção A/V ESTÁTICA (ms de atraso aplicado ao áudio, 0 = desligado).
+   * Calibração manual para quando a medição automática não decide (gameplay
+   * denso: correlação sem pico dominante) mas o skew é sistemático e conhecido
+   * (ex: áudio ~2s adiantado em toda uma stream). Tem PRECEDÊNCIA sobre o
+   * 'auto'. Workflow: gere variantes com adelay, escolha ouvindo, sete aqui
+   * durante o evento, volte a 0 depois. NÃO é global seguro: o offset varia
+   * por stream (uma partida com 0 e outra com 2000 na mesma semana é normal).
+   */
+  AV_STATIC_OFFSET_MS: z.coerce.number().min(0).max(8000).default(0),
+  /**
+   * Escopo do offset estático: matchIds separados por vírgula (ex:
+   * "2399233,2399204"). Vazio = aplica em TODAS as partidas (global —
+   * perigoso: o offset varia por stream; o bot avisa no startup).
+   * Fluxo: confirme o skew numa variante, escopete o match, reverta a 0
+   * no fim do evento.
+   */
+  AV_STATIC_MATCHES: z.string().default(''),
+  /**
+   * Offset por STREAM (canal), ex: "ESL TV=2000,Gaules=0". O nome é o da
+   * stream escolhida no log ("gravando buffer") — estável por pipeline de
+   * transmissão. Calibre UMA vez por canal (variante + ouvido) e todos os
+   * clipes dele saem corrigidos sem revisão por clipe. Canais diferentes
+   * têm offsets diferentes (um global quebraria os clipes bons).
+   */
+  AV_STREAM_OFFSETS: z.string().default(''),
   CLIPS_DIR: z.string().default('./data/clips'),
+  /**
+   * Espaço livre mínimo em disco (GB) para operar: abaixo disto o render
+   * do clipe é ABORTADO com erro claro (em vez de entregar mp4 sem moov)
+   * e o recorder avisa a cada ciclo. Sem espaço, os segmentos novos também
+   * param de acumular — libere espaço, não reinicie às cegas.
+   */
+  DISK_MIN_FREE_GB: z.coerce.number().min(1).max(100).default(3),
 
   DB_PATH: z.string().default('./data/bot.sqlite'),
   LOG_FILE: z.string().default('./logs/bot.log'),
@@ -98,4 +141,58 @@ export function getConfig(): AppConfig {
   if (cached) return cached;
   cached = ConfigSchema.parse(process.env);
   return cached;
+}
+
+/**
+ * Parse de AV_STREAM_OFFSETS ("ESL TV=2000,Gaules=0") → Map canal→ms.
+ * Entradas inválidas são ignoradas. Puro/testável.
+ */
+export function parseStreamOffsets(csv: string): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const part of csv.split(',')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const name = part.slice(0, eq).trim();
+    const vStr = part.slice(eq + 1).trim();
+    // Valor vazio explícito ("Canal=") é rejeitado: Number('') === 0 seria
+    // um typo silencioso virando calibragem zero.
+    if (!name || !vStr) continue;
+    const ms = Number(vStr);
+    if (!Number.isFinite(ms) || ms < 0 || ms > 8000) continue;
+    out.set(name, Math.round(ms));
+  }
+  return out;
+}
+
+export type StaticOffsetRule = 'off' | 'global' | 'match' | 'stream';
+
+/**
+ * Offset estático efetivo p/ o clipe + qual regra decidiu. Puro/testável.
+ * Precedência: escopo por partida > por stream > global legado.
+ * Escopo protege os clipes bons: offset global aplica em tudo — inclusive
+ * onde não há skew. Sem regra aplicável, 0 (sem correção).
+ */
+export function resolveStaticOffset(
+  offsetMs: number,
+  matchesCsv: string,
+  matchId: string,
+  streamOffsets?: Map<string, number>,
+  streamName?: string,
+): { ms: number; rule: StaticOffsetRule } {
+  const scoped = matchesCsv
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (scoped.length > 0) {
+    return scoped.includes(matchId)
+      ? { ms: offsetMs, rule: 'match' }
+      : { ms: 0, rule: 'off' };
+  }
+  if (streamOffsets && streamName && streamOffsets.has(streamName)) {
+    return { ms: streamOffsets.get(streamName) ?? 0, rule: 'stream' };
+  }
+  if (Number.isFinite(offsetMs) && offsetMs > 0) {
+    return { ms: offsetMs, rule: 'global' };
+  }
+  return { ms: 0, rule: 'off' };
 }

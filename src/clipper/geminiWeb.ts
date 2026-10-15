@@ -18,6 +18,16 @@ export const NEED_LOGIN_MESSAGE =
   '(abre o Chrome com UMA CONTA DESCARTÁVEL — nunca a conta dona do canal) ' +
   'e faça login manualmente.';
 
+/** Marcadores de sessão expirada — reusada na entrada e nas falhas tardias. */
+async function looksLoggedOut(page: Page): Promise<boolean> {
+  try {
+    if (page.url().includes('accounts.google.com')) return true;
+    return (await page.getByRole('button', { name: /sign in|fazer login/i }).count()) > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Gera imagem via app web do Gemini (gemini.google.com) com Playwright.
  *
@@ -74,10 +84,7 @@ export async function geminiWebBackground(
 
     await trySolveChallenge(page, log);
 
-    if (
-      page.url().includes('accounts.google.com') ||
-      (await page.getByRole('button', { name: /sign in|fazer login/i }).count()) > 0
-    ) {
+    if (await looksLoggedOut(page)) {
       await failShot(page, 'sem login');
       throw new Error(NEED_LOGIN_MESSAGE);
     }
@@ -93,6 +100,11 @@ export async function geminiWebBackground(
     };
     let box = await findBox();
     if ((await box.count()) === 0) {
+      // Re-checagem: composer sumido pode ser logout tardio.
+      if (await looksLoggedOut(page)) {
+        await failShot(page, 'sem login (tardio)');
+        throw new Error(NEED_LOGIN_MESSAGE);
+      }
       await failShot(page, 'sem composer');
       throw new Error('composer do Gemini não encontrado (layout mudou?)');
     }
@@ -116,6 +128,10 @@ export async function geminiWebBackground(
       // senão fill+Enter vão para elemento stale e a conversa não nasce.
       box = await findBox();
       if ((await box.count()) === 0) {
+        if (await looksLoggedOut(page)) {
+          await failShot(page, 'sem login (tardio, pós-anexo)');
+          throw new Error(NEED_LOGIN_MESSAGE);
+        }
         await failShot(page, 'sem composer pós-anexo');
         throw new Error('composer do Gemini sumiu após anexar (layout mudou?)');
       }

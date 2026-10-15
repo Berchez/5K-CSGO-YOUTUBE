@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDurationCap, buildClip, computeAceEndMs, computeAudioCompensation, computeTrimEndSec, computeTrimStartSec, contiguousTail, correlateOffset, measureAvOffset, newestSegmentEndMs, pickSegments, probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { applyDurationCap, buildClip, computeAceEndMs, computeAudioCompensation, computeTrimEndSec, computeTrimStartSec, contiguousTail, correlateOffset, detectActionResume, detectTruncatedStart, findMotionResume, measureAvOffset, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
 // executável os e2es pulam (CI Linux sem os bins não falha).
@@ -154,6 +154,37 @@ describe('pickSegments', () => {
   });
 });
 
+describe('findMotionResume (retomada de ação no envelope de movimento)', () => {
+  const HIGH = [20, 21, 19, 22, 20, 21];
+  const LOW = [1, 0.8, 1.2, 0.9, 1.1, 1];
+
+  it('alta→baixa→alta: acha a ÚLTIMA transição (ação, não o ace)', () => {
+    const r = findMotionResume([...HIGH, ...LOW, ...HIGH], 1);
+    expect(r.reason).toBe('ok');
+    // conclusão da transição (janela quieta atrás + ativa à frente),
+    // não o onset — precisão de ~1s, suficiente p/ margem de 2s do shadow
+    expect(r.index).toBe(13);
+    expect(r.quiet).toBeLessThan(2);
+    expect(r.active).toBeGreaterThan(10);
+  });
+
+  it('tudo alto ou tudo baixo: null', () => {
+    expect(findMotionResume([...HIGH, ...HIGH], 1).index).toBeNull();
+    expect(findMotionResume([...LOW, ...LOW], 1).index).toBeNull();
+  });
+
+  it('spike isolado no meio do quieto não elege transição', () => {
+    const mad = [...LOW, 50, ...LOW.slice(0, 5), ...HIGH];
+    const r = findMotionResume(mad, 1);
+    expect(r.reason).toBe('ok');
+    expect(r.index).toBe(13);
+  });
+
+  it('série curta: null com motivo', () => {
+    expect(findMotionResume([1, 2, 3], 1).reason).toBe('série curta');
+  });
+});
+
 describe('computeTrimEndSec', () => {
   it('sem âncora retorna null (cauda atual)', () => {
     expect(computeTrimEndSec(0, 10, 10, undefined, 5)).toBeNull();
@@ -203,9 +234,60 @@ describe('applyDurationCap (teto como alarme)', () => {
     expect(applyDurationCap(10, null, 100, 105)).toEqual({ trimEndSec: null, clamped: false });
   });
   it('estouro: força o corte e sinaliza', () => {
-    // caso Alisson sem span: concat inteiro (null) de 412s → corta em 115s
-    expect(applyDurationCap(10, null, 412, 105)).toEqual({ trimEndSec: 115, clamped: true });
-    expect(applyDurationCap(10, 500, 412, 105)).toEqual({ trimEndSec: 115, clamped: true });
+    // caso Alisson sem span: concat inteiro (null) de 412s → duração limitada a 105s
+    expect(applyDurationCap(10, null, 412, 105)).toEqual({ trimEndSec: 105, clamped: true });
+    expect(applyDurationCap(10, 500, 412, 105)).toEqual({ trimEndSec: 105, clamped: true });
+    // fallback wall sem âncora válida: também dispara (duração física!)
+    // trim 10s num concat de 400s sem fim → 390s > cap → limita duração a 105s
+    expect(applyDurationCap(10, null, 400, 105)).toEqual({ trimEndSec: 105, clamped: true });
+    // trimEndSec is a duration relative to trimStart, not a concat position.
+    expect(applyDurationCap(26.994, 131.994, 200, 105)).toEqual({ trimEndSec: 105, clamped: true });
+    // mas trim 348s no mesmo concat deixa só 52s → sem clamp (correto)
+    expect(applyDurationCap(348, null, 400, 105)).toEqual({ trimEndSec: null, clamped: false });
+  });
+});
+
+describe('resolveConcatTimeline (span medido → wall → legado)', () => {
+  it('span confiável: measured', () => {
+    expect(resolveConcatTimeline({
+      firstMtimeMs: 900_000, lastMtimeMs: 930_000, fileCount: 3,
+      segmentTimeSec: 10, spanSec: 30, spanReliable: true, wallSec: 30,
+    })).toEqual({ startMs: 900_000, lenSec: 30, mode: 'measured' });
+  });
+  it('salto de PTS (r21: 18h em 1 arquivo, wall 400s): wall fallback', () => {
+    const M = 2_000_000_000;
+    expect(resolveConcatTimeline({
+      firstMtimeMs: M, lastMtimeMs: M, fileCount: 1,
+      segmentTimeSec: 10, spanSec: 66874.36, spanReliable: false, wallSec: 400,
+    })).toEqual({ startMs: M - 400_000, lenSec: 400, mode: 'wall' });
+  });
+  it('sem medição: legacy n×slot', () => {
+    expect(resolveConcatTimeline({
+      firstMtimeMs: 900_000, lastMtimeMs: 920_000, fileCount: 3, segmentTimeSec: 10,
+    })).toEqual({ startMs: 890_000, lenSec: 30, mode: 'legacy' });
+  });
+  it('wall absurdo: legacy (não confia em relógio quebrado)', () => {
+    expect(resolveConcatTimeline({
+      firstMtimeMs: 900_000, lastMtimeMs: 930_000, fileCount: 3,
+      segmentTimeSec: 10, spanSec: 99999, spanReliable: false, wallSec: 99_999_999,
+    }).mode).toBe('legacy');
+  });
+  it('caso r21 fim-a-fim (puro): salto de 18h com wall 400s ancora certo', () => {
+    const aceStartMs = Date.parse('2026-10-15T02:32:21.277Z');
+    const aceEndMs = Date.parse('2026-10-15T02:32:45.306Z');
+    const M = aceEndMs + 18_000; // snapshot ~18s após o fim do round
+    const t = resolveConcatTimeline({
+      firstMtimeMs: M, lastMtimeMs: M, fileCount: 1,
+      segmentTimeSec: 10, spanSec: 66874.36, spanReliable: false, wallSec: 400,
+    });
+    expect(t.mode).toBe('wall');
+    // desejado = 1ª kill − 10s; início real = fim − 382s → trim ~348s
+    const trim = computeTrimStartSec(M, 10, aceStartMs, 10, t.startMs);
+    expect(trim).toBeCloseTo(347.97, 1);
+    const trimEnd = computeTrimEndSec(t.startMs, 1, 10, aceEndMs, trim, t.lenSec);
+    expect(trimEnd).toBeCloseTo(34.03, 1);
+    // janela ≈ 34s: cap nem dispara
+    expect(applyDurationCap(trim, trimEnd, t.lenSec, 105).clamped).toBe(false);
   });
 });
 
@@ -311,6 +393,38 @@ describe('contiguousTail', () => {
   });
 });
 
+describe('detectTruncatedStart (âncora mais velha que o buffer)', () => {
+  it('âncora dentro da cobertura: false', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-'));
+    try {
+      const now = Date.now();
+      // cobertura ≈ [now-30s, now]
+      const segs = makeSegments(dir, 3, 10_000, now);
+      // ace há 15s, ctx 10s → desejado now-25s (dentro) → false
+      expect(detectTruncatedStart(segs, { segmentTimeSec: 10, contextSec: 10, aceStartMs: now - 15_000 })).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('âncora além da cobertura (R2): true', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc2-'));
+    try {
+      const now = Date.now();
+      const segs = makeSegments(dir, 3, 10_000, now);
+      // ace há 100s, ctx 10s → desejado now-110s (fora) → true
+      expect(detectTruncatedStart(segs, { segmentTimeSec: 10, contextSec: 10, aceStartMs: now - 100_000 })).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('sem âncora ou sem arquivos: false', () => {
+    expect(detectTruncatedStart([], { segmentTimeSec: 10, aceStartMs: 1_000_000 })).toBe(false);
+    expect(detectTruncatedStart(['x-inexistente.ts'], { segmentTimeSec: 10 })).toBe(false);
+  });
+});
+
 describe('computeTrimStartSec', () => {
   const SEG_MS = 10_000;
   it('sem âncora não trimma', () => {
@@ -380,6 +494,27 @@ describe('correlateOffset', () => {
   it('sinais planos: sem medida (proeminência 0)', () => {
     const { prominence } = correlateOffset(new Array(50).fill(1), new Array(50).fill(1), 10, 5);
     expect(prominence).toBe(0);
+  });
+});
+
+describe('parseFreezeIntervals', () => {
+  it('pairs freeze start/end metadata and closes a trailing freeze', () => {
+    const log = [
+      '[freezedetect] lavfi.freezedetect.freeze_start: 2',
+      '[freezedetect] lavfi.freezedetect.freeze_duration: 1.2',
+      '[freezedetect] lavfi.freezedetect.freeze_end: 3.2',
+      '[freezedetect] lavfi.freezedetect.freeze_start: 8',
+      '[freezedetect] lavfi.freezedetect.freeze_duration: 0.6',
+    ].join('\n');
+    expect(parseFreezeIntervals(log)).toEqual([
+      { startSec: 2, endSec: 3.2, durationSec: 1.2 },
+      { startSec: 8, endSec: 8.6, durationSec: 0.6 },
+    ]);
+  });
+
+  it('ignores partial and non-finite metadata', () => {
+    expect(parseFreezeIntervals('[freezedetect] lavfi.freezedetect.freeze_start: nan')).toEqual([]);
+    expect(parseFreezeIntervals('no freeze metadata')).toEqual([]);
   });
 });
 
@@ -465,7 +600,7 @@ describe.skipIf(!ffmpegOk)('probeConcatSpan (span real p/ ancorar trim)', () => 
     }
   });
 
-  it('salto de PTS entre arquivos: span absurdo, reliable=false', async () => {
+  it('salto de PTS ENTRE arquivos: duração é conteúdo (salto não conta), reliable', async () => {
     if (!resolveFfprobeBin()) {
       console.warn('sem ffprobe, pulando');
       return;
@@ -476,12 +611,137 @@ describe.skipIf(!ffmpegOk)('probeConcatSpan (span real p/ ancorar trim)', () => 
       const b = makeTs(dir, 'b.ts', 3600 + 50000);
       const span = await probeConcatSpan([a, b], resolveFfprobeBin(), 10);
       expect(span).not.toBeNull();
-      expect(span!.spanSec).toBeGreaterThan(40000);
-      expect(span!.reliable).toBe(false);
+      // conteúdo real: 2s + 2s — o salto ENTRE arquivos não é duração
+      expect(span!.spanSec).toBeGreaterThan(3);
+      expect(span!.spanSec).toBeLessThan(6);
+      expect(span!.reliable).toBe(true);
+      // forense: o span BRUTO mostra o salto
+      expect(span!.rawSpanSec ?? 0).toBeGreaterThan(40000);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('salto de PTS DENTRO do arquivo (caso r12): conteúdo exclui o salto', async () => {
+    if (!resolveFfprobeBin()) {
+      console.warn('sem ffprobe, pulando');
+      return;
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spanintra-'));
+    try {
+      // duas eras no MESMO arquivo: 2s @3600 + 2s @50000 (cat de TS é
+      // literalmente o que um restart de transcode produz no buffer)
+      const a = makeTs(dir, 'x.ts', 3600);
+      const b = makeTs(dir, 'y.ts', 50000);
+      const f = path.join(dir, 'jump.ts');
+      fs.writeFileSync(f, fs.readFileSync(a));
+      fs.appendFileSync(f, fs.readFileSync(b));
+      const span = await probeConcatSpan([f], resolveFfprobeBin(), 10);
+      expect(span).not.toBeNull();
+      expect(span!.spanSec).toBeGreaterThan(3);
+      expect(span!.spanSec).toBeLessThan(6);
+      expect(span!.reliable).toBe(true);
+      expect(span!.rawSpanSec ?? 0).toBeGreaterThan(40000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!ffmpegOk)('trava de saída do render (nunca shippar vazio)', () => {
+  it('trim além do conteúdo: aborta com erro e NÃO deixa stub', async () => {
+    if (!resolveFfprobeBin()) {
+      console.warn('sem ffprobe, pulando');
+      return;
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'void-'));
+    const clipsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voidclips-'));
+    try {
+      const seg = path.join(dir, 'seg_000.ts');
+      execFileSync(FF, [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc=duration=6:size=320x180:rate=30',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=6',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
+        '-f', 'mpegts', seg,
+      ]);
+      const ace = {
+        matchId: 'voidclip', map: 'Cache', round: 1, player: 'x',
+        team1: 'A', team2: 'B', event: 'E',
+        detectedAt: new Date().toISOString(),
+        kills: [{ killer: 'x', victim: 'v', round: 1, map: 'Cache' }],
+      };
+      // REGRESSÃO 2399080 r8/r9: âncora ~50s além do conteúdo fazia o
+      // ffmpeg "renderizar" vazio com sucesso (mp4 de 256B, ilegível).
+      await expect(
+        buildClip(ace, [seg], {
+          bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
+          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'off', replayAware: 'off',
+          aceStartMs: Date.now() + 50_000,
+        }),
+      ).rejects.toThrow();
+      // nem stub sobrou na pasta
+      const leftovers = fs.readdirSync(clipsDir).filter((f) => f.endsWith('.mp4'));
+      expect(leftovers).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(clipsDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
+describe.skipIf(!ffmpegOk)('detectActionResume (shadow replay-aware)', () => {
+  function makeMoving(dir: string, name: string, durSec = 4): string {
+    const f = path.join(dir, name);
+    execFileSync(FF, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc=duration=${durSec}:size=320x180:rate=30`,
+      '-c:v', 'libx264', '-preset', 'ultrafast',
+      '-f', 'mpegts', f,
+    ]);
+    return f;
+  }
+
+  function makeStatic(dir: string, name: string, durSec = 4): string {
+    const f = path.join(dir, name);
+    execFileSync(FF, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `color=c=black:s=320x180:r=30:d=${durSec}`,
+      '-c:v', 'libx264', '-preset', 'ultrafast',
+      '-f', 'mpegts', f,
+    ]);
+    return f;
+  }
+
+  it('movimento→parado→movimento: acha a retomada (~8s)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'resume-'));
+    try {
+      const files = [
+        makeMoving(dir, 'a.ts'),
+        makeStatic(dir, 'b.ts'),
+        makeMoving(dir, 'c.ts'),
+      ];
+      const r = await detectActionResume(files, FF);
+      expect(r.reason).toBe('ok');
+      expect(r.actionStartSec).not.toBeNull();
+      expect(r.actionStartSec!).toBeGreaterThan(5.5);
+      expect(r.actionStartSec!).toBeLessThan(10.5);
+      expect(r.activeMad).toBeGreaterThan(r.quietMad * 2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('tudo parado: null (sem transição)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'resumeflat-'));
+    try {
+      const files = [makeStatic(dir, 'a.ts'), makeStatic(dir, 'b.ts')];
+      const r = await detectActionResume(files, FF);
+      expect(r.actionStartSec).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
 describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', () => {
@@ -528,6 +788,16 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           avSync: 'off',
         });
         expect(fs.existsSync(out.filePath)).toBe(true);
+        const sidecar = JSON.parse(fs.readFileSync(out.sidecarPath, 'utf8')) as {
+          captureMode?: string;
+          freezeDetection?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] };
+        };
+        expect(sidecar.captureMode).toBe('separate');
+        expect(sidecar.freezeDetection).toMatchObject({
+          thresholdDb: -50,
+          minDurationSec: 0.5,
+        });
+        expect(Array.isArray(sidecar.freezeDetection?.intervals)).toBe(true);
         // saída precisa ter vídeo E áudio (emenda realinhada)
         let err = '';
         try {
@@ -677,6 +947,32 @@ describe.skipIf(!ffmpegOk)('auto-sync A/V (flash+beep com offset conhecido)', ()
         expect(Math.abs(offCom)).toBeLessThan(0.6);
         // controle: sem compensação o skew original aparece
         expect(Math.abs(offOff)).toBeGreaterThan(1.2);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(clipsDir, { recursive: true, force: true });
+      }
+    },
+    300_000,
+  );
+  it(
+    'offset estático (calibração manual) alinha sem medição',
+    async () => {
+      if (!resolveFfprobeBin()) {
+        console.warn('sem ffprobe, pulando');
+        return;
+      }
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncstatic-'));
+      const clipsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncstaticclips-'));
+      try {
+        const src = await makeOffsetMedia(dir);
+        // avSync off (sem medição!) + estático 2000 = saída alinhada
+        const clip = await buildClip(aceVazio('Nuke'), [src], {
+          bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
+          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'off', staticAvOffsetMs: 2000,
+        });
+        const off = await beepFlashOffset(clip.filePath);
+        expect(Number.isNaN(off)).toBe(false);
+        expect(Math.abs(off)).toBeLessThan(0.6);
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
         fs.rmSync(clipsDir, { recursive: true, force: true });

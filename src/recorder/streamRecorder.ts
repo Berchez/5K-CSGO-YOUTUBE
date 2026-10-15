@@ -9,17 +9,33 @@ import {
   resolveFfprobeBin,
   slopePerStep,
 } from '../clipper/segmentProbe.js';
+import { noteRestart } from './avCalibration.js';
+import { DEFAULT_DISK_MIN_FREE_BYTES, gb, getFreeBytes, isFreeSpaceOk } from '../diskSpace.js';
 
 export interface RecorderOptions {
   streamUrl: string;
   bufferDir: string;
   segmentTimeSec: number;
   segmentWrap: number;
+  /** Separate HLS feeds or the best combined source format. */
+  captureMode?: 'separate' | 'muxed';
+  /** Nome da stream (log "gravando buffer") — chave da calibragem por canal. */
+  streamName?: string;
+  /** Livre mínimo (bytes) — abaixo disto, error a cada ciclo (não para). */
+  diskMinFreeBytes?: number;
 }
 
 /** Linhas do stderr do ffmpeg que indicam falha de input/dessincronia. */
 const FFMPEG_SYNC_WARN_RE =
   /non-monotonous dts|cur_dts is stale|timestamps are unset|discontinuity|failed to open segment|error when loading|invalid timestamp/i;
+
+/** Subconjunto: restart do transcode na fonte (o offset A/V pode mudar). */
+const DISCONTINUITY_RE = /timestamp discontinuity|discontinuity/i;
+
+/** Linha de restart do transcode? Puro/testável (ancora recalibragem). */
+export function isDiscontinuityLine(line: string): boolean {
+  return DISCONTINUITY_RE.test(line);
+}
 
 interface PlaylistHead {
   mediaSeq: number | null;
@@ -27,6 +43,15 @@ interface PlaylistHead {
   segments: number;
   discontinuities: number;
   ended: boolean;
+}
+
+export function capturePlan(mode: 'separate' | 'muxed' = 'separate'): {
+  formats: string[];
+  maps: string[];
+} {
+  return mode === 'muxed'
+    ? { formats: ['best'], maps: ['0:v', '0:a'] }
+    : { formats: ['bv*[height<=1080]/bv*', 'ba/b'], maps: ['0:v', '1:a'] };
 }
 
 /**
@@ -68,11 +93,37 @@ export class StreamRecorder {
   private deltaSeries: number[] = [];
   private sinceSummary = 0;
   private avIssues = 0;
+  /** Walls de restart do transcode (discontinuity): offset pode ter mudado. */
+  private discontinuitiesAt: number[] = [];
+  /** Wall do start desta sessão de gravação (era da calibragem). 0 = nunca iniciou. */
+  private sessionStartMs = 0;
+  /** Último estado do disco (null = desconhecido): avisa só em transição. */
+  private diskOk: boolean | null = null;
 
   constructor(private opts: RecorderOptions) {}
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  /** Restarts do transcode desde o start (cópia, teto 50). */
+  get discontinuities(): number[] {
+    return [...this.discontinuitiesAt];
+  }
+
+  /** Nome da stream (chave da calibragem por canal). */
+  get streamName(): string | undefined {
+    return this.opts.streamName;
+  }
+
+  /** Wall do start desta sessão (0 = nunca iniciou). */
+  get sessionStart(): number {
+    return this.sessionStartMs;
+  }
+
+  /** Marca o início da sessão (era da calibragem). Idempotente. */
+  markSessionStart(nowMs: number = Date.now()): void {
+    if (this.sessionStartMs <= 0) this.sessionStartMs = nowMs;
   }
 
   get segmentDir(): string {
@@ -134,8 +185,8 @@ export class StreamRecorder {
       log.warn({ stale }, 'ffmpegs fantasmas do buffer mortos');
     }
 
-    // Resolve as URLs HLS diretas (vídeo + áudio separados) e deixa o
-    // ffmpeg ler as duas — sem streamlink, só com o que já vem no repo.
+    const plan = capturePlan(this.opts.captureMode);
+    // `best` selects the highest-quality combined format exposed by the source.
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const execFileAsync = promisify(execFile);
@@ -149,18 +200,16 @@ export class StreamRecorder {
       if (!url) throw new Error(`yt-dlp não resolveu o formato ${format}`);
       return url;
     };
-    const [videoUrl, audioUrl] = await Promise.all([
-      grabUrl('bv*[height<=1080]/bv*'),
-      grabUrl('ba/b'),
-    ]);
-    // Borda das playlists na abertura (diagnóstico do offset inicial):
-    // se o áudio abre N sequências à frente do vídeo, o skew já nasce aí.
+    const urls = await Promise.all(plan.formats.map(grabUrl));
+    // Borda das playlists na abertura (diagnóstico do offset inicial).
     try {
-      const [vHead, aHead] = await Promise.all([
-        fetchPlaylistHead(videoUrl),
-        fetchPlaylistHead(audioUrl),
-      ]);
-      log.info({ video: vHead, audio: aHead }, 'playlists HLS na abertura');
+      const heads = await Promise.all(urls.map(fetchPlaylistHead));
+      log.info(
+        this.opts.captureMode === 'muxed'
+          ? { muxed: heads[0] }
+          : { video: heads[0], audio: heads[1] },
+        'playlists HLS na abertura',
+      );
     } catch {
       // best-effort: a gravação não depende disto
     }
@@ -173,18 +222,14 @@ export class StreamRecorder {
     // os .ts e entrega MP4 na saída.
     const segPattern = path.join(this.opts.bufferDir, 'seg_%03d.ts');
 
-    this.ffmpeg = spawn(ffmpegBin, [
+    const ffmpegArgs = [
       '-hide_banner',
       '-loglevel',
       'warning',
-      '-i',
-      videoUrl,
-      '-i',
-      audioUrl,
-      '-map',
-      '0:v',
-      '-map',
-      '1:a',
+    ];
+    for (const url of urls) ffmpegArgs.push('-i', url);
+    ffmpegArgs.push(
+      ...plan.maps.flatMap((mapping) => ['-map', mapping]),
       '-c',
       'copy',
       '-f',
@@ -205,8 +250,11 @@ export class StreamRecorder {
       // trilhas na MESMA linha do tempo (o sync vem de graça; o custo é
       // ≤2s de silêncio no início, cortável pelo trim do render).
       segPattern,
-    ]);
+    );
+    this.ffmpeg = spawn(ffmpegBin, ffmpegArgs);
     this.running = true;
+    // Sessão HLS aberta aqui: era da calibragem de offset por canal.
+    this.markSessionStart();
     const recProc = this.ffmpeg;
     track(recProc);
     // stderr com buffer de linha: avisos de sync (DTS fora de ordem, input
@@ -221,7 +269,21 @@ export class StreamRecorder {
         const t = line.trim().slice(0, 300);
         if (!t) continue;
         if (FFMPEG_SYNC_WARN_RE.test(t)) {
-          log.warn({ src: 'ffmpeg', line: t }, 'ffmpeg sinalizou falha de input/dessincronia');
+          // Restart do transcode na fonte: o offset A/V pode mudar a partir
+          // daqui — carimba o wall para o handleAce sinalizar clipes cuja
+          // janela cruza o restart (offsetUnverified).
+          const restart = isDiscontinuityLine(t);
+          if (restart) {
+            const at = Date.now();
+            this.discontinuitiesAt.push(at);
+            if (this.discontinuitiesAt.length > 50) {
+              this.discontinuitiesAt.splice(0, this.discontinuitiesAt.length - 50);
+            }
+            // Compartilha a era com outros recorders do canal (a calibragem
+            // deles invalida junto — offset re-rola por restart).
+            if (this.opts.streamName) noteRestart(this.opts.streamName, at);
+          }
+          log.warn({ src: 'ffmpeg', line: t, restart }, 'ffmpeg sinalizou falha de input/dessincronia');
         } else {
           log.debug({ src: 'ffmpeg' }, t);
         }
@@ -237,6 +299,9 @@ export class StreamRecorder {
     log.info({ dir: this.opts.bufferDir }, 'recorder iniciado');
     // Dá 10s para os primeiros segmentos aparecerem
     await new Promise((r) => setTimeout(r, 10_000));
+    if (!this.running) {
+      throw new Error(`ffmpeg encerrou durante a inicialização (${this.opts.captureMode ?? 'separate'})`);
+    }
     this.startAvWatch();
   }
 
@@ -261,6 +326,20 @@ export class StreamRecorder {
       this.watchBusy = true;
       (async () => {
         try {
+          // Disco: sem espaço os segmentos novos param de acumular — avisa
+          // (com transição, sem spam) em vez de falhar silencioso.
+          const diskMin = this.opts.diskMinFreeBytes ?? DEFAULT_DISK_MIN_FREE_BYTES;
+          const diskFree = getFreeBytes(this.opts.bufferDir);
+          const ok = isFreeSpaceOk(diskFree, diskMin);
+          if (!ok && this.diskOk !== false) {
+            log.error(
+              { dir: this.opts.bufferDir, livre: diskFree != null ? gb(diskFree) : 'desconhecido', minimo: gb(diskMin) },
+              'disco quase cheio — segmentos vão parar de acumular, libere espaço',
+            );
+          } else if (ok && this.diskOk === false) {
+            log.info('espaço em disco recuperado, gravação segue normal');
+          }
+          this.diskOk = ok;
           const segs = this.listSegments();
           const done = segs.length > 1 ? segs.slice(0, -1) : [];
           for (const f of done) {

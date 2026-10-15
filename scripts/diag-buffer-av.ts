@@ -142,7 +142,7 @@ async function main(): Promise<void> {
     let spanTxt = 'concatSpan=n/a';
     try {
       const span = await probeConcatSpan(segs, ffprobe, slot);
-      if (span) spanTxt = `concatSpan=${span.spanSec}s(${span.reliable ? 'ok' : 'NÃO-CONFIÁVEL'}) vs ${segs.length * slot}s esperados`;
+      if (span) spanTxt = `concatSpan=${span.spanSec}s(${span.reliable ? 'ok' : 'NÃO-CONFIÁVEL'}) wall=${span.wallSec ?? '?'}s vs ${segs.length * slot}s esperados`;
     } catch {
       // segue sem span
     }

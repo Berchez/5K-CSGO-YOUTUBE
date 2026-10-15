@@ -34,6 +34,10 @@ async function main(): Promise<void> {
   );
   await browser.close();
   console.log(`OK! Sessão salva em ${profileDir} (NUNCA commite — está no .gitignore).`);
+  const { clearLoggedOut } = await import('../src/clipper/providerStatus.js');
+  if (clearLoggedOut('gemini-web')) {
+    console.log('Flag de login expirado removida — o bot volta a usar o gemini-web no próximo clipe (sem restart).');
+  }
 }
 
 main().catch((e) => {

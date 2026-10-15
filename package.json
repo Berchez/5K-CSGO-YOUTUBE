@@ -16,6 +16,8 @@
     "check:live": "tsx scripts/check-live.ts",
     "test:vod": "tsx scripts/test-vod.ts",
     "diag:av": "tsx scripts/diag-buffer-av.ts",
+    "fix:av": "tsx scripts/shift-audio.ts",
+    "av:calibrate": "tsx scripts/av-calibrate.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",

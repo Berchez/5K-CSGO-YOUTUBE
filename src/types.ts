@@ -47,6 +47,19 @@ export interface GrenadeUse {
   value?: number;
 }
 
+/**
+ * Confiança na âncora de início do clipe (a "1ª kill" do destaque).
+ * Qualquer sinal ligado = a kill pode não ser a 1ª real do round.
+ */
+export interface AnchorConfidence {
+  /** Tracker começou/retomou no meio do round (kills anteriores invisíveis). */
+  joinedMidRound: boolean;
+  /** Base reancorada (gap) durante este round. */
+  resetThisRound: boolean;
+  /** Kills do evento observadas na janela de assentamento entre rounds. */
+  settleKills: number;
+}
+
 /** Resumo completo do round do ace — alimenta título, descrição, thumb e prompt IA. */
 export interface RoundSummary {
   round: number;
@@ -78,8 +91,25 @@ export interface AceEvent {
   kills: KillEvent[];
   /** ISO do 1º kill da sequência — o clipe começa ~10s antes dele. */
   startedAt?: string;
-  /** ISO do fim do clipe (win panel parcial, ~2s antes do próximo round). */
+  /** ISO do fim do clipe (~5s antes da ação do próximo round). */
   endedAt?: string;
+  /**
+   * Confiança na âncora de início: a "1ª kill" é a primeira OBSERVADA pelo
+   * tracker — se ele entrou no meio do round, resetou a base ou a kill veio
+   * da janela de assentamento entre rounds, pode não ser a 1ª kill real.
+   */
+  anchorConfidence?: AnchorConfidence;
+  /**
+   * A âncora de início é mais velha que o buffer (abertura real fora do
+   * alcance): o clipe começa no material mais antigo disponível — abertura
+   * sabidamente incompleta, nunca silenciosa.
+   */
+  truncatedStart?: boolean;
+  /**
+   * Restart do transcode dentro da janela do clipe: a calibragem de offset
+   * pode ter mudado no meio — conferir sync (spot-check, não revisão total).
+   */
+  offsetUnverified?: boolean;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
   /** Resumo rico (armas, vítimas, assists, granadas). Ausente em modos sem detalhe (ex: VOD). */

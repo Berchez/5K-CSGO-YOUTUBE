@@ -103,3 +103,60 @@ describe('shouldResetTracker', () => {
     expect(shouldResetTracker(7, 10, now - 10_000, now)).toBe(true);
   });
 });
+
+describe('anchorConfidence (confiança na 1ª kill)', () => {
+  it('estreia com placar > 0: joinedMidRound no evento', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    // tracking começou com o jogo já no round 7 (3-3): round em andamento
+    let r = processPoll(tr, snap(3, 3, [{ name: 'rain', kills: 10 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(3, 3, [{ name: 'rain', kills: 13 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'rain', kills: 13 }]), last, 3);
+    expect(r.event?.player).toBe('rain');
+    expect(r.event?.anchorConfidence?.joinedMidRound).toBe(true);
+    expect(r.event?.anchorConfidence?.resetThisRound).toBe(false);
+  });
+
+  it('estreia no 0-0: confiança alta', () => {
+    const tr = new RoundTracker('inferno', 1);
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'x', kills: 0 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(0, 0, [{ name: 'x', kills: 3 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(1, 0, [{ name: 'x', kills: 3 }]), last, 3);
+    expect(r.event?.player).toBe('x');
+    expect(r.event?.anchorConfidence?.joinedMidRound).toBe(false);
+    expect(r.event?.anchorConfidence?.resetThisRound).toBe(false);
+  });
+
+  it('reset no meio do round: resetThisRound no evento', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 0 }]), last, 3);
+    last = r.lastTotal;
+    tr.reset(); // gap: base reancorada, kills anteriores perdidas
+    r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 3 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 6 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'x', kills: 6 }]), last, 3);
+    expect(r.event?.player).toBe('x');
+    expect(r.event?.kills).toHaveLength(3);
+    expect(r.event?.anchorConfidence?.resetThisRound).toBe(true);
+  });
+
+  it('settleKills conta kills da janela de assentamento', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 0 }]), last, 3);
+    last = r.lastTotal;
+    // K observado junto com o placar virado (tudo "agora" em teste):
+    // cai na janela de 12s → contado como settle
+    r = processPoll(tr, snap(4, 3, [{ name: 'x', kills: 3 }]), last, 3);
+    expect(r.event?.player).toBe('x');
+    expect(r.event?.anchorConfidence?.settleKills).toBe(3);
+  });
+});

@@ -1,4 +1,4 @@
-import type { KillEvent, RoundSummary } from '../types.js';
+import type { AnchorConfidence, KillEvent, RoundSummary } from '../types.js';
 
 /** Nomes que indicam fim de round / reset no killfeed (não são killers). */
 const ROUND_MARKERS = new Set(['T', 'CT', 'ROUND STARTED', 'ROUND OVER', 'PLANTED']);
@@ -131,6 +131,14 @@ export class RoundTracker {
   private lastDeaths = new Map<string, number>();
   private round = 1;
   private map = 'unknown';
+  /**
+   * Sinais de (des)confiança na âncora de início, consumidos por round:
+   * startedBlind = tracking começou/retomou no meio do round corrente
+   * (kills anteriores invisíveis); hadReset = base reancorada (gap) neste
+   * round. Lidos ao fechar o round, zerados no round seguinte.
+   */
+  private startedBlind = false;
+  private hadReset = false;
 
   constructor(map = 'unknown', round = 1) {
     this.map = map;
@@ -146,6 +154,20 @@ export class RoundTracker {
       // lastCounts NÃO zera aqui: é reancorado no próximo syncBaseline
       // (sem spike falso). round novo começa com os mesmos totais.
     }
+    // Flags são consumidas por round: setContext roda 1x por virada —
+    // o próximo round começa sem herança de suspeita do anterior.
+    this.startedBlind = false;
+    this.hadReset = false;
+  }
+
+  /** Tracking começou/retomou com o round já em andamento. */
+  markJoinedBlind(): void {
+    this.startedBlind = true;
+  }
+
+  /** Sinais atuais (leitura não consome — setContext zera na virada). */
+  anchorFlags(): { joinedMidRound: boolean; resetThisRound: boolean } {
+    return { joinedMidRound: this.startedBlind, resetThisRound: this.hadReset };
   }
 
   addKill(
@@ -168,7 +190,7 @@ export class RoundTracker {
       victim,
       round: this.round,
       map: this.map,
-      at: Date.now(),
+      at: detail.at ?? Date.now(),
       weapon: normWeapon(detail.weapon) || undefined,
       headshot: detail.headshot,
       assistBy: detail.assistBy,
@@ -240,11 +262,37 @@ export class RoundTracker {
     this.lastCounts.clear();
     this.lastDeaths.clear();
     this.round = round;
+    // Reancoragem (gap) no meio do round: kills anteriores invisíveis —
+    // a próxima âncora deste round nasce suspeita.
+    this.hadReset = true;
   }
 
   get pending(): number {
     return this.kills.length;
   }
+}
+
+/**
+ * Âncora de baixa confiança? Qualquer sinal: entrou no meio do round,
+ * resetou a base, ou a 1ª kill foi observada na janela de assentamento
+ * (últimos 12s antes do fechamento — cobre o settle de 10s + folga).
+ * Ausente = confiança alta (comportamento legado). Puro/testável.
+ */
+export function isAnchorLowConfidence(
+  conf: AnchorConfidence | undefined,
+  firstKillAtMs: number | undefined,
+  closedAtMs: number,
+): boolean {
+  if (!conf) return false;
+  if (conf.joinedMidRound || conf.resetThisRound) return true;
+  if (
+    conf.settleKills > 0 &&
+    firstKillAtMs != null &&
+    closedAtMs - firstKillAtMs < 12_000
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** Monta o resumo rico de um round de multikill (3k/4k/5k do mesmo jogador). */

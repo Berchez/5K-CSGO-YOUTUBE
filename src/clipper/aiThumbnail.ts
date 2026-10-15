@@ -3,7 +3,17 @@ import sharp from 'sharp';
 import type { AceEvent } from '../types.js';
 import { killLabel, prettyWeapon } from '../detector/aceDetector.js';
 import { getLogger } from '../logger.js';
+import { notifyWindows } from '../notify.js';
 import type { ReferenceImages } from './referenceImages.js';
+import {
+  WEB_LOGIN_PROVIDERS,
+  clearLoggedOut,
+  isLoginError,
+  isProviderLoggedOut,
+  loadLoggedOut,
+  loginScriptFor,
+  markLoggedOut,
+} from './providerStatus.js';
 
 export type AiProvider =
   | 'huggingface'
@@ -31,6 +41,8 @@ export interface AiThumbOptions {
   references?: ReferenceImages;
   /** Timeout por provider (ms). Default 600s (THUMB_AI_TIMEOUT_MS). */
   timeoutMs?: number;
+  /** Store de status de login (default data/provider-status.json). Testes injetam tmp. */
+  statusFile?: string;
   /**
    * 'full' (default no provider chatgpt): a imagem IA JÁ É a thumb
    * (só resize p/ 1280x720). 'hybrid': fundo IA + frame real + overlay.
@@ -364,6 +376,14 @@ export async function buildAiBackground(
   const log = getLogger();
   const order = opts.order ?? ['chatgpt'];
   const timeoutMs = opts.timeoutMs ?? 600_000;
+  const statusFile = opts.statusFile;
+  // Login expirado persiste entre clipes: provider flagado é PULADO (zero
+  // browser, zero timeout) até o script de relogin limpar a flag.
+  const loggedOut = loadLoggedOut(statusFile);
+  /** Sucesso = login funciona: limpa flag (auto-correção de falso positivo). */
+  const clearIfFlagged = (p: string): void => {
+    if (isProviderLoggedOut(loggedOut, p)) clearLoggedOut(p, statusFile);
+  };
   const refs = opts.references;
   const availableAttachments = refs
     ? [refs.player, refs.playerAlt, refs.team1Logo, refs.team2Logo, refs.mapImage].filter(
@@ -374,6 +394,13 @@ export async function buildAiBackground(
     log.info({ n: availableAttachments.length }, 'referências prontas p/ anexo');
   }
   for (const provider of order) {
+    if (WEB_LOGIN_PROVIDERS.has(provider) && isProviderLoggedOut(loggedOut, provider)) {
+      log.info(
+        { provider, cmd: loginScriptFor(provider) },
+        'pulando provider: login expirado — relogue para restaurar',
+      );
+      continue;
+    }
     try {
       const plan = planForProvider(provider, ace, refs, availableAttachments);
       if (provider === 'chatgpt' || provider === 'grok') {
@@ -396,6 +423,7 @@ export async function buildAiBackground(
         } as import('./chatgpt.js').ChatGptOptions & import('./grok.js').GrokOptions);
         await assertImage(buf, provider);
         log.info({ provider }, isGrok ? 'thumb IA via grok' : 'thumb IA via chatgpt');
+        clearIfFlagged(provider);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'gemini-web') {
@@ -408,6 +436,7 @@ export async function buildAiBackground(
         });
         await assertImage(buf, 'gemini-web');
         log.info('fundo IA via gemini-web');
+        clearIfFlagged('gemini-web');
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'huggingface') {
@@ -445,7 +474,26 @@ export async function buildAiBackground(
       }
       log.warn({ provider }, 'provider IA desconhecido, ignorando');
     } catch (e) {
-      log.warn({ provider, err: String(e).slice(0, 160) }, 'provider IA falhou, tentando próximo');
+      const errText = String(e);
+      // Login expirado: marca (transição grita 1x + toast) e segue a cadeia.
+      // Falhas transitórias (challenge, backend, timeout) continuam como hoje.
+      if (WEB_LOGIN_PROVIDERS.has(provider) && isLoginError(errText)) {
+        const fresh = markLoggedOut(provider, errText.slice(0, 200), statusFile);
+        if (fresh) {
+          log.error(
+            { provider, cmd: loginScriptFor(provider) },
+            'LOGIN EXPIRADO — rode o script de relogin (provider pulado nos clipes até lá)',
+          );
+          notifyWindows(
+            '5K Bot: login expirado',
+            `O provider "${provider}" está deslogado. Rode: ${loginScriptFor(provider) ?? 'npm run chatgpt:login'} — ele volta sozinho após o relogin.`,
+          );
+        } else {
+          log.warn({ provider }, 'login expirado (já avisado) — tentando próximo');
+        }
+      } else {
+        log.warn({ provider, err: errText.slice(0, 160) }, 'provider IA falhou, tentando próximo');
+      }
     }
   }
   return null;

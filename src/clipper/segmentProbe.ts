@@ -171,56 +171,113 @@ export function resolveFfprobeBin(): string | null {
 }
 
 /**
- * Span REAL do concat (primeiro PTS do 1º arquivo ao último PTS do último).
- * Só os endpoints importam — o meio não altera o span. Sem decodificar.
+ * Duração de CONTEÚDO de uma trilha a partir dos PTS (puro/testável):
+ * span menos os SALTOS (gaps > jumpMinSec — restart de transcode muda a
+ * era dos PTS; starvation tem gaps de segundos e NÃO é salto).
+ */
+export function trackContentSec(pts: number[], jumpMinSec = 30): number {
+  if (pts.length < 2) return 0;
+  const s = [...pts].sort((a, b) => a - b);
+  let span = s[s.length - 1] - s[0];
+  let jumps = 0;
+  for (let i = 1; i < s.length; i++) {
+    const g = s[i] - s[i - 1];
+    if (g > jumpMinSec) jumps += g;
+  }
+  const c = span - jumps;
+  return Number.isFinite(c) && c > 0 ? c : 0;
+}
+
+/**
+ * Duração REAL do concat (s), medida no CONTEÚDO dos pacotes de cada
+ * arquivo — soma dos conteúdos por arquivo, imune a saltos de PTS.
  *
- * Por que existe: o trim assumia `mtime − slot` como início de cada
- * arquivo. Quando o segmento nunca corta (input faminto, sem keyframes),
- * um único .ts cobre MINUTOS — e a conta legada ancora o trim horas fora
- * do lugar, renderizando o arquivo inteiro (clipe de 7min/1GB).
+ * Por que existe: o trim precisa saber onde o conteúdo começa na linha do
+ * tempo (firstSegStart = mtime do último − duração). O legado assumia
+ * n × slot (mquia com segmento faminto: 1 arquivo cobre MINUTOS → clipe
+ * gigante); a 1ª versão deste probe usava span de PTS + birthtime, mas o
+ * buffer é CIRCULAR — os nomes seg_*.ts são reescritos a cada janela e o
+ * NTFS preserva o birthtime ORIGINAL da sessão: em sessões longas o wall
+ * vinha inflado pela idade da sessão (780s p/ 60s reais) → trim além do
+ * conteúdo → render VAZIO de ~256B (bug real: 2399080 r8/r9).
  *
- * Confiabilidade: cruza o span de PTS com o wall-clock do filesystem
- * (birthtime do 1º → mtime do último). Descontinuidade de PTS entre
- * arquivos infla o span sem passar wall time — reliable=false e o
- * chamador usa o cálculo legado (n × slot).
+ * Método atual: por arquivo, conteúdo da trilha = span − Σ saltos(>30s);
+ * conteúdo do arquivo = max(vídeo, áudio) (áudio contínuo é o melhor
+ * relógio em vídeo faminto). Confiabilidade: cruzamento com a SEQUÊNCIA
+ * de mtimes ((últ.−1º)+slot) — verdadeira p/ arquivos cortados, ao
+ * contrário do birthtime. Arquivo único: sem cruzamento possível, o
+ * conteúdo é a única estimativa (e é boa).
  *
- * ATENÇÃO: medir nos arquivos ORIGINAIS do buffer. Cópias (snapshot)
- * preservam mtime mas ganham birthtime novo — a checagem perde o sentido.
- * O handleAce mede nos originais e passa o span pronto ao buildClip.
+ * ATENÇÃO: medir nos arquivos ORIGINAIS do buffer (mtimes vivos). O
+ * handleAce mede nos originais e passa o resultado ao buildClip.
  */
 export interface ConcatSpan {
+  /** Duração do conteúdo (s) — span de PTS corrigido por saltos. */
   spanSec: number;
   reliable: boolean;
+  /** Wall via sequência de mtimes ((últ.−1º)+slot); null se ilegível. */
+  wallSec: number | null;
+  /** Span de PTS BRUTO (sem correção) — forense de saltos no log. */
+  rawSpanSec?: number;
 }
 
 export async function probeConcatSpan(
   files: string[],
-  ffprobeBin: string | null,
+  ffprobeBinNullable: string | null,
   segmentTimeSec: number,
 ): Promise<ConcatSpan | null> {
-  if (!ffprobeBin || files.length === 0) return null;
+  if (!ffprobeBinNullable || files.length === 0) return null;
+  // Narrowing de const não atravessa closures no TS: fixa o tipo.
+  const ffprobeBin: string = ffprobeBinNullable;
   try {
-    const first = await probeSegmentPackets(files[0], ffprobeBin);
-    if (!first || first.video.length + first.audio.length < 2) return null;
-    const last = files.length > 1
-      ? await probeSegmentPackets(files[files.length - 1], ffprobeBin)
-      : first;
-    if (!last || last.video.length + last.audio.length < 2) return null;
-    const start = Math.min(...first.video, ...first.audio);
-    const end = Math.max(...last.video, ...last.audio);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
-    const spanSec = Math.round((end - start) * 100) / 100;
-    // Wall-clock coberto pelos arquivos: birthtime (criação ≈ início da
-    // escrita) do 1º → mtime (fechamento) do último. Sem birthtime (FS sem
-    // suporte), assume o legado (mtime − slot) só p/ o 1º arquivo.
-    const stFirst = fs.statSync(files[0]);
-    const stLast = fs.statSync(files[files.length - 1]);
-    const wallStartMs = stFirst.birthtimeMs > 0
-      ? stFirst.birthtimeMs
-      : stFirst.mtimeMs - segmentTimeSec * 1000;
-    const wallSec = (stLast.mtimeMs - wallStartMs) / 1000;
-    const tolSec = Math.max(5, segmentTimeSec * 1.5);
-    return { spanSec, reliable: Math.abs(spanSec - wallSec) <= tolSec };
+    const CONCURRENCY = 4;
+    const pkts: Array<{ video: number[]; audio: number[] } | null> = new Array(files.length).fill(null);
+    let next = 0;
+    async function worker(): Promise<void> {
+      while (next < files.length) {
+        const i = next++;
+        pkts[i] = await probeSegmentPackets(files[i], ffprobeBin);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, files.length) }, () => worker()));
+    if (!pkts[0]) return null;
+    let contentSec = 0;
+    for (const p of pkts) {
+      if (!p) continue;
+      const c = Math.max(trackContentSec(p.video), trackContentSec(p.audio));
+      contentSec += c;
+    }
+    contentSec = Math.round(contentSec * 100) / 100;
+    if (!(contentSec > 1)) return null;
+    // Span bruto (forense): 1º PTS do 1º ao último PTS do último.
+    let rawSpanSec: number | undefined;
+    const firstP = pkts[0];
+    const lastP = pkts[files.length - 1];
+    if (firstP && lastP) {
+      const all = [...firstP.video, ...firstP.audio, ...lastP.video, ...lastP.audio];
+      if (all.length > 0) {
+        const raw = Math.max(...all) - Math.min(...all);
+        if (Number.isFinite(raw) && raw > 0) rawSpanSec = Math.round(raw * 100) / 100;
+      }
+    }
+    // Wall pela SEQUÊNCIA de mtimes: mtime de arquivo cortado ≈ fim do seu
+    // conteúdo — imune à reescrita circular (birthtime não é).
+    let wallSec: number | null = null;
+    try {
+      const stFirst = fs.statSync(files[0]);
+      const stLast = fs.statSync(files[files.length - 1]);
+      const w = (stLast.mtimeMs - stFirst.mtimeMs) / 1000 + segmentTimeSec;
+      if (Number.isFinite(w) && w > 0) wallSec = Math.round(w * 100) / 100;
+    } catch {
+      wallSec = null;
+    }
+    // Confiável por construção p/ arquivo único (sem cruzamento possível);
+    // p/ múltiplos, o cruzamento com a sequência de mtimes decide.
+    const reliable =
+      files.length === 1
+        ? true
+        : wallSec != null && Math.abs(contentSec - wallSec) <= Math.max(15, 0.5 * wallSec);
+    return { spanSec: contentSec, reliable, wallSec, ...(rawSpanSec != null ? { rawSpanSec } : {}) };
   } catch {
     return null;
   }

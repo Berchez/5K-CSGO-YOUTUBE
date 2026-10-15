@@ -8,9 +8,9 @@ Bot 100% automatizado até revisão humana: monitora jogos **live no HLTV** (fil
 
 ```text
 HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
-  → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
+  → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → captura feeds separados + melhor formato muxed, ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
   → detector: scoreboard live (diff colunas K/D) → 3+ kills mesmo player no round = multikill (3K!/4K!/ACE!)
-  → clipper: passada única ffmpeg (filtro concat realinha A/V por segmento + trim exato de INÍCIO e FIM + upscale 1440p)
+  → clipper: dois MP4 por evento: captura separada (nome padrão) e fonte muxed (`_muxed`, resolução/FPS nativos), com trim exato
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
@@ -30,6 +30,20 @@ sem winget) — download na primeira execução.
 Edite `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en` (ou `gaules` para
 gravar a transmissão do Gaules em PT-BR — com fallback cruzado automático:
 a escolhida indisponível usa a outra), resto com defaults.
+
+Durante cada partida o recorder tenta manter os dois buffers continuamente.
+O buffer separado preserva a captura atual; o muxed usa o melhor formato
+com áudio e vídeo que a fonte expuser, sem limite de resolução/FPS. Se a
+fonte não oferecer um formato combinado, a captura separada continua e o
+motivo fica no log. Os clipes saem como `<match>_<map>_r<round>_<player>.mp4`
+e `<...>_muxed.mp4`. Quando o muxed está disponível, essa variante é a
+preferida para upload; a separada é usada como fallback. A separada usa
+auto-sync por conteúdo com gates de confiança (offsets duvidosos não são
+aplicados). O sidecar registra intervalos de frames congelados detectados
+antes do encode. Eles não são removidos/interpolados automaticamente: se a
+origem já congelou, inventar movimento poderia piorar a evidência do jogo.
+Capturar ambos aumenta o uso de rede e disco aproximadamente em uma stream
+adicional por partida.
 
 ## YouTube (1x)
 
