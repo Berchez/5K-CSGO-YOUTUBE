@@ -8,9 +8,9 @@ Bot 100% automatizado até revisão humana: monitora jogos **live no HLTV** (fil
 
 ```text
 HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
-  → recorder: streamlink (official EN ou Gaules, via STREAM_PRIORITY) → ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~180s
-  → detector: killfeed live → 3+ kills mesmo player no round = multikill (3K!/4K!/ACE!)
-  → clipper: passada única ffmpeg (filtro concat realinha A/V por segmento + trim exato + upscale 1440p)
+  → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
+  → detector: scoreboard live (diff colunas K/D) → 3+ kills mesmo player no round = multikill (3K!/4K!/ACE!)
+  → clipper: passada única ffmpeg (filtro concat realinha A/V por segmento + trim exato de INÍCIO e FIM + upscale 1440p)
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
@@ -172,7 +172,10 @@ logo do adversário e imagem do mapa. Fontes: Liquipedia API (fotos/logos/mapa)
 com HLTV como fallback de logo. O prompt carrega a seção REFERÊNCIAS
 OBRIGATÓRIAS com o nome específico de cada item, na ordem exata dos anexos.
 Tudo é best-effort — cada referência ausente degrada sozinha (sem anexo, o
-prompt segue com renumeração automática).
+prompt segue com renumeração automática). Logos dos times vêm da HLTV
+primeiro (browser com clearance do Cloudflare, `div.profile-team-logo-container`
+da página do time — sempre a logo vigente em PNG); qualquer falha cai no
+fluxo Liquipedia (infobox → seção Logos → commons com scoring).
 
 Política por provider (validada em testes reais):
 - **chatgpt** (thumb completa): recebe as **5 referências** + prompt com

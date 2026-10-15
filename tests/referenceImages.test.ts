@@ -76,6 +76,23 @@ describe('pickAllmodeFile', () => {
     expect(pickAllmodeFile(files, 'Falcons')).toBe('Team Falcons 2022 allmode.png');
   });
 
+  it('simetria gaming/esports: ano desempatam (caso real Aurora)', () => {
+    // regressão real: "Aurora esports allmode.png" (2022, era/org antiga)
+    // vencia a logo vigente da Aurora Gaming porque só "esports" pontuava.
+    expect(
+      pickAllmodeFile(['Aurora esports 2022 allmode.png', 'Aurora Gaming 2024 allmode.png'], 'Aurora'),
+    ).toBe('Aurora Gaming 2024 allmode.png');
+    expect(
+      pickAllmodeFile(['Aurora esports 2024 allmode.png', 'Aurora Gaming 2023 allmode.png'], 'Aurora'),
+    ).toBe('Aurora esports 2024 allmode.png');
+  });
+
+  it('empate: nome mais curto vence (Aurora Gaming > Aurora esports)', () => {
+    expect(
+      pickAllmodeFile(['Aurora esports allmode.png', 'Aurora Gaming allmode.png'], 'Aurora'),
+    ).toBe('Aurora Gaming allmode.png');
+  });
+
   it('sem allmode retorna null', () => {
     expect(pickAllmodeFile(['Team Spirit 2022 full lightmode.png'], 'Team Spirit')).toBeNull();
   });
@@ -91,8 +108,13 @@ describe('infoboxToAllmodeName', () => {
     );
   });
 
-  it('sem sufixo de modo: inalterado', () => {
+  it('sem sufixo de modo: inalterado (inclui allmode já pronto)', () => {
     expect(infoboxToAllmodeName('Team X allmode.png')).toBe('Team X allmode.png');
+    // regressão real: infobox da Aurora Gaming já é allmode — usar direto,
+    // sem derivação (antes caía no commons e pegava logo de 2022).
+    expect(infoboxToAllmodeName('Aurora Gaming 2025 full allmode.png')).toBe(
+      'Aurora Gaming 2025 full allmode.png',
+    );
   });
 });
 

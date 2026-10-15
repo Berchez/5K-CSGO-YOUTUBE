@@ -237,6 +237,7 @@ async function main(): Promise<void> {
         map,
         dir: path.join(cfg.CLIPS_DIR, 'refs', `test-vod-${stamp}`),
         overrides: Object.keys(refOverrides).length > 0 ? refOverrides : undefined,
+        hltvProfileDir: cfg.HLTV_PROFILE,
       });
     }
     // Frame de ~3s antes do 5º kill (meio do ace), não do meio do clipe

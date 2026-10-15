@@ -78,6 +78,8 @@ export interface AceEvent {
   kills: KillEvent[];
   /** ISO do 1º kill da sequência — o clipe começa ~10s antes dele. */
   startedAt?: string;
+  /** ISO do fim do clipe (win panel parcial, ~2s antes do próximo round). */
+  endedAt?: string;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
   /** Resumo rico (armas, vítimas, assists, granadas). Ausente em modos sem detalhe (ex: VOD). */

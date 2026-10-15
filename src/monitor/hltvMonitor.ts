@@ -12,22 +12,114 @@ const TOP_TIER_EVENTS =
 
 let browser: BrowserContext | null = null;
 
+/**
+ * Registro de nascimento das abas: toda about:blank nasce no newPage e só
+ * deveria existir até o goto commitar. Abas presas em branco (navegação que
+ * nunca commitou + dono que nunca fechou) são lixo — o sweeper as recolhe.
+ * A entrada é removida no evento 'close' da aba: sem isso o Map retém o
+ * objeto Page (e a sessão CDP) para sempre — leak em processo 24/7 (abas
+ * fechadas não aparecem em b.pages(), o sweep nunca as visitava).
+ */
+const pageBorn = new Map<Page, number>();
+
+function trackPage(p: Page): Page {
+  pageBorn.set(p, Date.now());
+  p.once('close', () => pageBorn.delete(p));
+  return p;
+}
+
+export async function newTrackedPage(): Promise<Page> {
+  const b = await getBrowser();
+  return trackPage(await b.newPage());
+}
+
+/**
+ * Fecha abas about:blank mais velhas que maxAgeMs (default 2min — bem acima
+ * do goto de 45s, então nunca mata aba em setup legítimo). Chamado a cada
+ * ciclo de poll. Retorna quantas fechou. Também cobre chrome://newtab*
+ * (variantes de blank por versão/flag).
+ */
+const BLANK_URLS = ['about:blank', 'chrome://newtab', 'chrome://new-tab-page'];
+export async function sweepStaleBlankPages(maxAgeMs = 120_000): Promise<number> {
+  const b = await getBrowser().catch(() => null);
+  if (!b) return 0;
+  let closed = 0;
+  let blanks = 0;
+  const now = Date.now();
+  for (const p of b.pages()) {
+    try {
+      if (p.isClosed()) {
+        pageBorn.delete(p);
+        continue;
+      }
+      const born = pageBorn.get(p);
+      if (born === undefined) continue; // aba externa (debug manual): não toca
+      const url = p.url();
+      if (!BLANK_URLS.some((bl) => url === bl || url.startsWith(`${bl}/`))) continue;
+      blanks++;
+      if (now - born > maxAgeMs) {
+        await p.close().catch(() => undefined);
+        pageBorn.delete(p);
+        closed++;
+      }
+    } catch {
+      // segue para a próxima aba
+    }
+  }
+  // Visibilidade permanente: blanks recorrentes indicam churn (ex: rebusca
+  // de streams) ou navegação que nunca commita — o log conta a história.
+  if (blanks > 0 || closed > 0) {
+    getLogger().info({ pages: b.pages().length, blanks, closed }, 'higiene de abas');
+  }
+  return closed;
+}
+
+let browserLaunching: Promise<BrowserContext> | null = null;
+// Single-flight: duas chamadas concorrentes na 1ª vez lançavam 2 contextos
+// no mesmo perfil (o 2º morre). Todas esperam o MESMO launch.
+
 export async function getBrowser(): Promise<BrowserContext> {
   if (browser) return browser;
-  // HLTV barra Chromium headless comum ("Just a moment..."): usa o contexto
-  // stealth (preferindo o Chrome real) com perfil persistente — o cookie
-  // de clearance do Cloudflare é reaproveitado entre polls.
-  const { launchStealthContext } = await import('../clipper/stealthBrowser.js');
-  const cfg = getConfig();
-  // Headless é barrado pelo Cloudflare ("Just a moment" eterno); headed
-  // minimizado limpa em ~10s. HLTV_HEADLESS=1 volta p/ headless (debug).
-  const headless = cfg.HLTV_HEADLESS === '1';
-  browser = await launchStealthContext({
-    profileDir: cfg.HLTV_PROFILE,
-    headless,
-    extraArgs: headless ? [] : ['--start-minimized'],
-  });
-  return browser;
+  if (browserLaunching) return browserLaunching;
+  const launch = (async (): Promise<BrowserContext> => {
+    // HLTV barra Chromium headless comum ("Just a moment..."): usa o contexto
+    // stealth (preferindo o Chrome real) com perfil persistente — o cookie
+    // de clearance do Cloudflare é reaproveitado entre polls.
+    const { launchStealthContext } = await import('../clipper/stealthBrowser.js');
+    const cfg = getConfig();
+    // Headless é barrado pelo Cloudflare ("Just a moment" eterno); headed
+    // minimizado limpa em ~10s. HLTV_HEADLESS=1 volta p/ headless (debug).
+    const headless = cfg.HLTV_HEADLESS === '1';
+    const b = await launchStealthContext({
+      profileDir: cfg.HLTV_PROFILE,
+      headless,
+      extraArgs: headless ? [] : ['--start-minimized'],
+      // HLTV abre popunders de anúncio (viram about:blank presas): bloqueia.
+      // (Logins manuais usam outro perfil/launcher, sem isso.)
+      ignoreDefaultArgs: ['--disable-popup-blocking'],
+    });
+    // Contexto morreu (crash/kill): zera para o próximo getBrowser lançar
+    // de novo — sem isso todas as chamadas falhariam para sempre.
+    b.on('close', () => {
+      if (browser === b) browser = null;
+    });
+    // Registra TODAS as abas (inclusive popups que escaparem): o sweep fecha
+    // as que ficarem em branco. Sem isso, popup não registrado era ignorado.
+    b.on('page', (p) => {
+      if (!pageBorn.has(p)) trackPage(p);
+    });
+    for (const p of b.pages()) {
+      if (!pageBorn.has(p)) trackPage(p);
+    }
+    browser = b;
+    return b;
+  })();
+  browserLaunching = launch;
+  try {
+    return await launch;
+  } finally {
+    browserLaunching = null;
+  }
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -194,7 +286,7 @@ export async function fetchLiveMatches(
   const b = await getBrowser();
   // Sem userAgent fixo de propósito: o contexto stealth envia UA autêntico
   // (+ Client Hints consistentes); UA fixo desatualizado é assinatura clássica.
-  const page: Page = await b.newPage();
+  const page: Page = await newTrackedPage();
   try {
     await page.goto(matchesUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     if (!(await waitForClearance(page))) return null;
@@ -275,13 +367,16 @@ export async function fetchLiveMatches(
  * .external-stream a[href] (link twitch/youtube/kick).
  * NÃO usar textContent da box inteira (concatena os dois spans de
  * viewers e gera contagem absurda que quebra o scoring).
+ *
+ * Retorna NULL quando o Cloudflare bloqueou — "sem streams" ([]) e
+ * "bloqueado" são coisas diferentes: o chamador não deve cachear 10min
+ * de cego por causa de um soluço do challenge.
  */
-export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInfo[]> {
-  const b = await getBrowser();
-  const page = await b.newPage();
+export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInfo[] | null> {
+  const page = await newTrackedPage();
   try {
     await page.goto(matchPageUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    if (!(await waitForClearance(page))) return [];
+    if (!(await waitForClearance(page))) return null;
     await page.waitForTimeout(2000);
     const raw = await page.evaluate(() => {
       const boxes = Array.from(document.querySelectorAll('div.stream-box'));

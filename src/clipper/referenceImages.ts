@@ -31,9 +31,8 @@ export async function fetchHtml(url: string): Promise<string> {
     throw new Error(`HTTP ${res.status} ou challenge`);
   } catch (e) {
     log.info({ url, err: String(e).slice(0, 80) }, 'fetch direto falhou, tentando Playwright');
-    const { getBrowser } = await import('../monitor/hltvMonitor.js');
-    const b = await getBrowser();
-    const page = await b.newPage();
+    const { newTrackedPage } = await import('../monitor/hltvMonitor.js');
+    const page = await newTrackedPage();
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
       await page.waitForTimeout(5000);
@@ -90,8 +89,10 @@ export function parseOgImage(html: string): string | null {
  * Escolhe o arquivo de logo quadrado (allmode) entre os File: do time (puro).
  * Scoring desambigua times homônimos: "Falcons allmode" traz Falcons Esports
  * (CS), Bad News Falcons (PUBM), Atlanta Falcons (NFL) etc.
- * +3 "esports" (convenção de orgs CS) | +2 "full" (versão vigente)
+ * +3 "esports"/"gaming" (convenção de nome de org) | +2 "full" (versão vigente)
  * +1 ano mais alto | -1 "academy".
+ * ("gaming" simétrico a "esports": sem ele, "Aurora esports allmode.png"
+ * de 2022 vencia a logo vigente da Aurora Gaming.)
  */
 export function pickAllmodeFile(files: string[], teamName: string): string | null {
   const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -107,35 +108,40 @@ export function pickAllmodeFile(files: string[], teamName: string): string | nul
       const year = Number(f.match(/(19|20)\d{2}/)?.[0] ?? 0);
       let score = 1;
       if (/esports/i.test(f)) score += 3;
+      if (/gaming/i.test(f)) score += 3;
       if (/full/i.test(f)) score += 2;
       if (/academy/i.test(f)) score -= 1;
       score += year / 10000;
       return { f, score };
     })
     .filter((x): x is { f: string; score: number } => x !== null)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.f.length - b.f.length));
+  // Desempate por nome mais curto ≈ mais próximo do nome do time
+  // ("Aurora Gaming allmode" vence "Aurora esports allmode" em empate).
   return scored[0]?.f ?? null;
 }
 
 /** Busca arquivos File: no repositório COMUNS da Liquipedia (os ícones moram lá). */
 export async function liquipediaCommonsFileSearch(term: string): Promise<string[]> {
-  const url =
-    'https://liquipedia.net/commons/api.php?' +
-    new URLSearchParams({
-      action: 'query',
-      format: 'json',
-      list: 'search',
-      srsearch: term,
-      srnamespace: '6',
-      srlimit: '30',
+  return throttled(async () => {
+    const url =
+      'https://liquipedia.net/commons/api.php?' +
+      new URLSearchParams({
+        action: 'query',
+        format: 'json',
+        list: 'search',
+        srsearch: term,
+        srnamespace: '6',
+        srlimit: '30',
+      });
+    const res = await fetch(url, {
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(20_000),
     });
-  const res = await fetch(url, {
-    headers: { 'User-Agent': UA },
-    signal: AbortSignal.timeout(20_000),
+    if (!res.ok) throw new Error(`liquipedia commons HTTP ${res.status}`);
+    const data = (await res.json()) as { query?: { search?: Array<{ title: string }> } };
+    return (data.query?.search ?? []).map((r) => r.title.replace(/^File:/i, ''));
   });
-  if (!res.ok) throw new Error(`liquipedia commons HTTP ${res.status}`);
-  const data = (await res.json()) as { query?: { search?: Array<{ title: string }> } };
-  return (data.query?.search ?? []).map((r) => r.title.replace(/^File:/i, ''));
 }
 
 /**
@@ -219,7 +225,11 @@ export async function removeCornerBackground(
 
 /**
  * Logo do time (hierarquia validada com o usuário):
- * 1. allmode da MESMA era do infobox ("X full lightmode" → "X allmode")
+ * 0. HLTV via browser (hltvProfileDir): logo vigente em PNG, sempre
+ *    atualizada — div.profile-team-logo-container > img da página do time.
+ *    Fetch puro toma 403 do Cloudflare; usa o perfil do monitor (clearance).
+ *    Qualquer falha cai nos passos abaixo.
+ * 1. infobox JÁ allmode ("Aurora Gaming 2025 full allmode.png"): usa direto
  *    — Falcons: "Team Falcons 2022 allmode.png" ✓
  * 2. última entrada da seção ==Logos== (mais recente da galeria)
  *    — Spirit: "Team Spirit 2021 lightmode.png" ✓ (não há 2022 allmode)
@@ -243,22 +253,36 @@ export async function resolveTeamLogoUrl(teamName: string): Promise<string | nul
     })) as { query?: { search?: Array<{ title: string }> } };
     const titles = (data.query?.search ?? []).map((r) => r.title);
     const title = pickTitle(teamName, titles, true);
-    if (title) {
-      const wikitext = await liquipediaPageContent(title);
-      infoboxFile = wikitext.match(/\|\s*image\s*=\s*([^\n|}]+)/)?.[1]?.trim() ?? null;
-      logosFiles = parseLogosSectionFiles(wikitext);
+    // A busca nem sempre devolve a página do time ("Team Aurora" traz só
+    // pessoas/coach + academia; a página certa é "Aurora Gaming"). Tenta o
+    // título achado + sufixos comuns de org, validando {{Infobox team}} —
+    // sem isso caía na página de uma pessoa e o logo vinha do commons.
+    const candidates = [...new Set([title, `Team ${teamName}`, `${teamName} Gaming`, `${teamName} Esports`].filter(Boolean) as string[])];
+    for (const c of candidates) {
+      try {
+        const wt = await liquipediaPageContent(c);
+        if (!/\{\{\s*Infobox team/i.test(wt)) continue;
+        if (c !== title) log.info({ page: c }, 'página do time via fallback direto');
+        const wikitext = wt;
+        infoboxFile = wikitext.match(/\|\s*image\s*=\s*([^\n|}]+)/)?.[1]?.trim() ?? null;
+        logosFiles = parseLogosSectionFiles(wikitext);
+        break;
+      } catch {
+        // tenta o próximo candidato
+      }
     }
   } catch (e) {
     log.warn({ err: String(e).slice(0, 100) }, 'liquipedia team page falhou');
   }
-  // 1) allmode da mesma era do infobox
+  // 1) allmode da mesma era do infobox (ou o próprio infobox, se já allmode)
   if (infoboxFile) {
-    const allmode = infoboxToAllmodeName(infoboxFile);
-    if (allmode !== infoboxFile) {
+    const directAllmode = /allmode\.(png|svg|webp|jpg)/i.test(infoboxFile) ? infoboxFile : null;
+    const allmode = directAllmode ?? infoboxToAllmodeName(infoboxFile);
+    if (directAllmode || allmode !== infoboxFile) {
       try {
         const url = await liquipediaFileUrl(allmode);
         if (url) {
-          log.info({ file: allmode, kind: 'infobox-allmode' }, 'logo via liquipedia');
+          log.info({ file: allmode, kind: directAllmode ? 'infobox-allmode-direct' : 'infobox-allmode' }, 'logo via liquipedia');
           return url;
         }
       } catch {
@@ -320,6 +344,26 @@ export async function resolveTeamLogoUrl(teamName: string): Promise<string | nul
   return og;
 }
 
+// Throttle global da API da Liquipedia (a política pede ~1 req/2s com UA de
+// contato): um match dispara player + 2 times + mapa em PARALELO, e cada
+// time pode tentar até 4 títulos — sem serializar, é rajada e vem 429.
+let liquipediaQueue: Promise<unknown> = Promise.resolve();
+const LIQUIPEDIA_MIN_INTERVAL_MS = 500;
+let lastLiquipediaAt = 0;
+function throttled<T>(fn: () => Promise<T>): Promise<T> {
+  const run = liquipediaQueue.then(async () => {
+    const wait = lastLiquipediaAt + LIQUIPEDIA_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastLiquipediaAt = Date.now();
+    return fn();
+  });
+  liquipediaQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 /** Conteúdo bruto (wikitext) de uma página da wiki CS da Liquipedia. */
 async function liquipediaPageContent(title: string): Promise<string> {
   const data = (await liquipediaJson({
@@ -337,14 +381,16 @@ async function liquipediaPageContent(title: string): Promise<string> {
 }
 
 async function liquipediaJson(params: Record<string, string>): Promise<unknown> {
-  const url =
-    'https://liquipedia.net/counterstrike/api.php?' + new URLSearchParams(params);
-  const res = await fetch(url, {
-    headers: { 'User-Agent': '5k-csgo-youtube/2.0 (thumbnail reference fetcher)' },
-    signal: AbortSignal.timeout(20_000),
+  return throttled(async () => {
+    const url =
+      'https://liquipedia.net/counterstrike/api.php?' + new URLSearchParams(params);
+    const res = await fetch(url, {
+      headers: { 'User-Agent': '5k-csgo-youtube/2.0 (thumbnail reference fetcher)' },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) throw new Error(`liquipedia HTTP ${res.status}`);
+    return res.json();
   });
-  if (!res.ok) throw new Error(`liquipedia HTTP ${res.status}`);
-  return res.json();
 }
 
 /** Título da página (player ou mapa) via busca Liquipedia. */
@@ -435,6 +481,12 @@ export interface FetchRefsOptions {
   dir: string;
   /** URLs explícitas têm prioridade sobre a busca automática. */
   overrides?: Partial<Record<'player' | 'team1Logo' | 'team2Logo' | 'mapImage', string>>;
+  /**
+   * Perfil COM clearance Cloudflare (o mesmo do monitor). Quando presente,
+   * a logo dos times vem da HLTV primeiro (sempre atualizada); qualquer
+   * falha cai no fluxo Liquipedia de sempre.
+   */
+  hltvProfileDir?: string;
 }
 
 /**
@@ -526,11 +578,30 @@ export async function fetchReferenceImages(
       jobs.push([
         key,
         (async () => {
+          // HLTV primeiro (logo vigente em PNG); Liquipedia como fallback.
+          if (opts.hltvProfileDir) {
+            try {
+              const { fetchHltvTeamLogo } = await import('./hltvLogo.js');
+              const bytes = await fetchHltvTeamLogo(team, { profileDir: opts.hltvProfileDir });
+              if (bytes) {
+                const dest = path.join(opts.dir, `ref-${key}.png`);
+                try {
+                  const sharp = (await import('sharp')).default;
+                  await sharp(bytes).png().toFile(dest);
+                } catch {
+                  fs.writeFileSync(dest, bytes);
+                }
+                return { [key]: dest };
+              }
+            } catch {
+              // cai no liquipedia abaixo
+            }
+          }
           const url = await resolveTeamLogoUrl(team);
           const local = await dl(url, `ref-${key}.png`);
           return local ? { [key]: local } : {};
         })(),
-        'liquipedia/hltv',
+        opts.hltvProfileDir ? 'hltv>liquipedia' : 'liquipedia/hltv',
       ]);
     }
   }

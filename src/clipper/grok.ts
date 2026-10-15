@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Page } from 'playwright';
+import type { ProfileLock } from './stealthBrowser.js';
 import { getLogger } from '../logger.js';
 import { listContentImages, downloadPageImage } from './chatgpt.js';
 
@@ -47,14 +48,18 @@ export async function grokBackground(
   };
 
   let browser: Awaited<ReturnType<typeof import('./stealthBrowser.js').launchStealthContext>> | null = null;
+  let profileLock: ProfileLock | null = null;
   try {
-    const { launchStealthContext, trySolveChallenge } = await import('./stealthBrowser.js');
+    const { launchStealthContext, trySolveChallenge, acquireProfileLock } = await import('./stealthBrowser.js');
+    profileLock = await acquireProfileLock(opts.profileDir, log);
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless: false,
       extraArgs: opts.minimized ? ['--start-minimized'] : [],
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
+    const { closeForeignTabs } = await import('./stealthBrowser.js');
+    await closeForeignTabs(browser, page, log);
     log.info('abrindo grok.com');
     await page.goto('https://grok.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForTimeout(4000);
@@ -91,7 +96,8 @@ export async function grokBackground(
     const attachments = (opts.attachments ?? []).filter(Boolean) as string[];
     if (attachments.length > 0) {
       const { attachFiles } = await import('./attachFiles.js');
-      await attachFiles(page, log, attachments);
+      const res = await attachFiles(page, log, attachments);
+      if (!res.ok) log.warn('anexos incompletos — prompt segue com texto + o que subiu');
       box = await findBox();
       if ((await box.count()) === 0) {
         await failShot(page, 'sem composer pós-anexo');
@@ -148,5 +154,7 @@ export async function grokBackground(
     return buf;
   } finally {
     await browser?.close().catch(() => undefined);
+    const { releaseProfileLock } = await import('./stealthBrowser.js');
+    releaseProfileLock(profileLock);
   }
 }

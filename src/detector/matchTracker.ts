@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import { getBrowser, waitForClearance } from '../monitor/hltvMonitor.js';
+import { waitForClearance } from '../monitor/hltvMonitor.js';
 import { RoundTracker } from './aceDetector.js';
 import type { KillEvent } from '../types.js';
 import { getLogger } from '../logger.js';
@@ -198,16 +198,25 @@ export async function trackMatch(
   minKills = 3,
 ): Promise<void> {
   const log = getLogger().child({ matchId });
-  const b = await getBrowser();
-  const page = await b.newPage();
+  const { newTrackedPage } = await import('../monitor/hltvMonitor.js');
+  const page = await newTrackedPage();
   const tracker = new RoundTracker();
+  const startedAt = Date.now();
   try {
     await page.goto(matchPageUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     // Se o Cloudflare segurar, espera liberando sem martelar navegações
     // (a mesma página é reusada o tracking inteiro — o placar live
-    // atualiza sozinho via scorebot, sem reload).
+    // atualiza sozinho via scorebot, sem reload). Desiste após ~6min sem
+    // clearance: sem isso a aba fica presa (em branco) para sempre enquanto
+    // a partida constar como live.
+    let clearanceWaitedMs = 0;
     while (!cb.shouldStop()) {
       if (await waitForClearance(page, 20000)) break;
+      clearanceWaitedMs += 35_000;
+      if (clearanceWaitedMs > 6 * 60_000) {
+        log.error('clearance nunca liberou, abortando tracking');
+        return;
+      }
       log.warn('aguardando clearance do Cloudflare p/ iniciar tracking');
       await page.waitForTimeout(15000);
     }
@@ -217,6 +226,12 @@ export async function trackMatch(
     log.info('iniciando tracking do match');
 
     while (!cb.shouldStop()) {
+      // Rede de segurança: nenhuma partida dura 5h — tracking preso (página
+      // morta, scorebot parado) fecha a aba em vez de vazar para sempre.
+      if (Date.now() - startedAt > 5 * 3_600_000) {
+        log.warn('tracking passou de 5h, encerrando por segurança');
+        break;
+      }
       let snap = await readMatchSnapshot(page);
       if (!snap) {
         await page.waitForTimeout(5000);

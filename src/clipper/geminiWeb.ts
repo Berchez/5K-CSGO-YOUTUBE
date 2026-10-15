@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Page } from 'playwright';
+import type { ProfileLock } from './stealthBrowser.js';
 import { getLogger } from '../logger.js';
 
 export interface GeminiWebOptions {
@@ -35,6 +36,7 @@ export async function geminiWebBackground(
   fs.mkdirSync(opts.profileDir, { recursive: true });
 
   let browser: Awaited<ReturnType<typeof import('./stealthBrowser.js').launchStealthContext>> | null = null;
+  let profileLock: ProfileLock | null = null;
   const log = getLogger().child({ provider: 'gemini-web' });
   // O prefixo explícito ATIVA o modo de geração — sem ele o app responde com
   // TEXTO ("Sou apenas um modelo de linguagem"). Os textos do layout são
@@ -54,12 +56,15 @@ export async function geminiWebBackground(
     }
   };
   try {
-    const { launchStealthContext, trySolveChallenge } = await import('./stealthBrowser.js');
+    const { launchStealthContext, trySolveChallenge, acquireProfileLock } = await import('./stealthBrowser.js');
+    profileLock = await acquireProfileLock(opts.profileDir, log);
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless,
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
+    const { closeForeignTabs } = await import('./stealthBrowser.js');
+    await closeForeignTabs(browser, page, log);
     log.info('abrindo gemini.google.com/app');
     await page.goto('https://gemini.google.com/app', {
       waitUntil: 'domcontentloaded',
@@ -105,7 +110,8 @@ export async function geminiWebBackground(
     const attachments = (opts.attachments ?? []).filter(Boolean) as string[];
     if (attachments.length > 0) {
       const { attachFiles } = await import('./attachFiles.js');
-      await attachFiles(page, log, attachments);
+      const res = await attachFiles(page, log, attachments);
+      if (!res.ok) log.warn('anexos incompletos — prompt segue com texto + o que subiu');
       // O attach re-renderiza o composer: re-localiza antes de digitar,
       // senão fill+Enter vão para elemento stale e a conversa não nasce.
       box = await findBox();
@@ -191,5 +197,7 @@ export async function geminiWebBackground(
     return buf;
   } finally {
     await browser?.close().catch(() => undefined);
+    const { releaseProfileLock } = await import('./stealthBrowser.js');
+    releaseProfileLock(profileLock);
   }
 }

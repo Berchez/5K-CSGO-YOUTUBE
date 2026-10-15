@@ -2,6 +2,13 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
+import {
+  classifySegmentAv,
+  median,
+  probeSegmentPackets,
+  resolveFfprobeBin,
+  slopePerStep,
+} from '../clipper/segmentProbe.js';
 
 export interface RecorderOptions {
   streamUrl: string;
@@ -10,9 +17,57 @@ export interface RecorderOptions {
   segmentWrap: number;
 }
 
+/** Linhas do stderr do ffmpeg que indicam falha de input/dessincronia. */
+const FFMPEG_SYNC_WARN_RE =
+  /non-monotonous dts|cur_dts is stale|timestamps are unset|discontinuity|failed to open segment|error when loading|invalid timestamp/i;
+
+interface PlaylistHead {
+  mediaSeq: number | null;
+  targetDuration: number | null;
+  segments: number;
+  discontinuities: number;
+  ended: boolean;
+}
+
+/**
+ * Borda atual da playlist HLS (best-effort): a diferença de mediaSeq entre
+ * vídeo e áudio na abertura revela o desalinhamento inicial dos dois
+ * inputs (ex: áudio ~2s adiantado). Sem isso o offset vira "mistério".
+ */
+async function fetchPlaylistHead(url: string): Promise<PlaylistHead | null> {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 15_000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) return null;
+      const text = (await res.text()).slice(0, 16_384);
+      const seq = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+      const target = text.match(/#EXT-X-TARGETDURATION:([\d.]+)/);
+      return {
+        mediaSeq: seq ? Number(seq[1]) : null,
+        targetDuration: target ? Number(target[1]) : null,
+        segments: (text.match(/#EXTINF/g) ?? []).length,
+        discontinuities: (text.match(/#EXT-X-DISCONTINUITY/g) ?? []).length,
+        ended: text.includes('#EXT-X-ENDLIST'),
+      };
+    } finally {
+      clearTimeout(to);
+    }
+  } catch {
+    return null;
+  }
+}
+
 export class StreamRecorder {
   private ffmpeg: ChildProcess | null = null;
   private running = false;
+  private watchTimer: NodeJS.Timeout | null = null;
+  private watchBusy = false;
+  private probedSegs = new Set<string>();
+  private deltaSeries: number[] = [];
+  private sinceSummary = 0;
+  private avIssues = 0;
 
   constructor(private opts: RecorderOptions) {}
 
@@ -98,6 +153,17 @@ export class StreamRecorder {
       grabUrl('bv*[height<=1080]/bv*'),
       grabUrl('ba/b'),
     ]);
+    // Borda das playlists na abertura (diagnóstico do offset inicial):
+    // se o áudio abre N sequências à frente do vídeo, o skew já nasce aí.
+    try {
+      const [vHead, aHead] = await Promise.all([
+        fetchPlaylistHead(videoUrl),
+        fetchPlaylistHead(audioUrl),
+      ]);
+      log.info({ video: vHead, audio: aHead }, 'playlists HLS na abertura');
+    } catch {
+      // best-effort: a gravação não depende disto
+    }
 
     // Segmentos em MPEG-TS (NÃO mp4): MP4 só escreve o moov ao FINALIZAR —
     // qualquer morte abrupta (stop, queda de stream) deixa o arquivo
@@ -143,9 +209,24 @@ export class StreamRecorder {
     this.running = true;
     const recProc = this.ffmpeg;
     track(recProc);
-    this.ffmpeg.stderr?.on('data', (d) =>
-      log.debug({ src: 'ffmpeg' }, String(d).slice(0, 300)),
-    );
+    // stderr com buffer de linha: avisos de sync (DTS fora de ordem, input
+    // estagnado, descontinuidade) viram warn estruturado em vez de se
+    // perderem no debug fatiado — é daqui que sai a evidência do stall.
+    let errTail = '';
+    this.ffmpeg.stderr?.on('data', (d) => {
+      errTail += String(d);
+      const lines = errTail.split(/\r?\n/);
+      errTail = lines.pop() ?? '';
+      for (const line of lines) {
+        const t = line.trim().slice(0, 300);
+        if (!t) continue;
+        if (FFMPEG_SYNC_WARN_RE.test(t)) {
+          log.warn({ src: 'ffmpeg', line: t }, 'ffmpeg sinalizou falha de input/dessincronia');
+        } else {
+          log.debug({ src: 'ffmpeg' }, t);
+        }
+      }
+    });
     const onExit = (src: string) => (code: number | null) => {
       untrack(recProc);
       log.warn({ src, code }, 'processo de gravação encerrou');
@@ -156,10 +237,87 @@ export class StreamRecorder {
     log.info({ dir: this.opts.bufferDir }, 'recorder iniciado');
     // Dá 10s para os primeiros segmentos aparecerem
     await new Promise((r) => setTimeout(r, 10_000));
+    this.startAvWatch();
+  }
+
+  /**
+   * Vigia A/V do buffer: a cada ciclo probeia os segmentos novos (menos o
+   * mais recente, em gravação) e mantém a série temporal do startDelta.
+   * Segmento com problema → warn imediato; a cada 6 segmentos, resumo com
+   * mediano + drift (constante = offset de abertura; crescente = relógios
+   * divergindo; saltos = descontinuidade da fonte). Best-effort puro.
+   */
+  private startAvWatch(): void {
+    const log = getLogger();
+    const slot = this.opts.segmentTimeSec;
+    const ffprobe = resolveFfprobeBin();
+    if (!ffprobe) {
+      log.debug('sem ffprobe, vigia A/V do buffer desligada');
+      return;
+    }
+    const intervalMs = Math.max(10_000, slot * 1000);
+    this.watchTimer = setInterval(() => {
+      if (!this.running || this.watchBusy) return;
+      this.watchBusy = true;
+      (async () => {
+        try {
+          const segs = this.listSegments();
+          const done = segs.length > 1 ? segs.slice(0, -1) : [];
+          for (const f of done) {
+            const base = path.basename(f);
+            if (this.probedSegs.has(base)) continue;
+            this.probedSegs.add(base);
+            const pkts = await probeSegmentPackets(f, ffprobe);
+            if (!pkts) continue;
+            const verdict = classifySegmentAv(pkts.video, pkts.audio, slot);
+            if (verdict) {
+              this.avIssues++;
+              this.sinceSummary++;
+              if (Number.isFinite(verdict.startDeltaSec)) {
+                this.deltaSeries.push(verdict.startDeltaSec);
+              }
+              log.warn({ seg: base, ...verdict }, 'segmento do buffer com divergência A/V');
+            } else {
+              const v0 = Math.min(...pkts.video);
+              const a0 = Math.min(...pkts.audio);
+              if (Number.isFinite(v0) && Number.isFinite(a0)) {
+                this.deltaSeries.push(v0 - a0);
+              }
+              this.sinceSummary++;
+              log.debug({ seg: base }, 'segmento do buffer A/V ok');
+            }
+          }
+          if (this.deltaSeries.length > 600) {
+            this.deltaSeries.splice(0, this.deltaSeries.length - 600);
+          }
+          if (this.sinceSummary >= 6) {
+            this.sinceSummary = 0;
+            log.info(
+              {
+                probed: this.probedSegs.size,
+                issues: this.avIssues,
+                medianDeltaSec: Math.round(median(this.deltaSeries) * 100) / 100,
+                driftPerSegSec: Math.round(slopePerStep(this.deltaSeries) * 1000) / 1000,
+              },
+              'série A/V do buffer (mediano + drift)',
+            );
+          }
+        } catch {
+          // best-effort: nunca derruba o recorder
+        } finally {
+          this.watchBusy = false;
+        }
+      })().catch(() => undefined);
+    }, intervalMs);
+    this.watchTimer.unref?.();
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    if (this.watchTimer) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = null;
+    }
     const ff = this.ffmpeg;
     if (ff) {
       // Stop GRACIOSO: 'q' no stdin manda o ffmpeg finalizar o segmento

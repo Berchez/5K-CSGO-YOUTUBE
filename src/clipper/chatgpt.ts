@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Page } from 'playwright';
+import type { ProfileLock } from './stealthBrowser.js';
 import { getLogger } from '../logger.js';
 
 export interface ChatGptOptions {
@@ -89,14 +90,18 @@ export async function chatgptBackground(
   };
 
   let browser: Awaited<ReturnType<typeof import('./stealthBrowser.js').launchStealthContext>> | null = null;
+  let profileLock: ProfileLock | null = null;
   try {
-    const { launchStealthContext, trySolveChallenge } = await import('./stealthBrowser.js');
+    const { launchStealthContext, trySolveChallenge, acquireProfileLock } = await import('./stealthBrowser.js');
+    profileLock = await acquireProfileLock(opts.profileDir, log);
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless,
       extraArgs: opts.minimized ? ['--start-minimized'] : [],
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
+    const { closeForeignTabs } = await import('./stealthBrowser.js');
+    await closeForeignTabs(browser, page, log);
     log.info('abrindo chatgpt.com');
     await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForTimeout(4000);
@@ -129,7 +134,15 @@ export async function chatgptBackground(
     const attachments = (opts.attachments ?? []).filter(Boolean) as string[];
     if (attachments.length > 0) {
       const { attachFiles } = await import('./attachFiles.js');
-      await attachFiles(page, log, attachments);
+      const res = await attachFiles(page, log, attachments, { newChat: true });
+      if (!res.ok) {
+        await failShot(page, 'anexos com falha');
+        throw new Error(
+          'upload de anexos falhou no ChatGPT (' +
+            res.failed.map((f) => `${f.file}: ${f.reason}`).join(' | ') +
+            ') — abortando antes do envio',
+        );
+      }
     }
     // 'before' DEPOIS do anexo: previews das referências já contam como
     // "imagens de antes" — só a resposta gerada é imagem NOVA.
@@ -188,5 +201,7 @@ export async function chatgptBackground(
     return buf;
   } finally {
     await browser?.close().catch(() => undefined);
+    const { releaseProfileLock } = await import('./stealthBrowser.js');
+    releaseProfileLock(profileLock);
   }
 }
