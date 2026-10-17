@@ -4,7 +4,7 @@ import { capturePlan, isDiscontinuityLine } from '../src/recorder/streamRecorder
 describe('capturePlan', () => {
   it('mantém os feeds de áudio/vídeo separados na captura de referência', () => {
     expect(capturePlan('separate')).toEqual({
-      formats: ['bv*[height<=1080]/bv*', 'ba/b'],
+      formats: ['bv*', 'ba/b'],
       maps: ['0:v', '1:a'],
     });
   });

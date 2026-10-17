@@ -139,7 +139,7 @@ async function main(): Promise<void> {
     '--print',
     '%(title)s || DURATION=%(duration)s',
     url,
-  ]).catch((e) => {
+  ], { windowsHide: true }).catch((e) => {
     throw new Error(`yt-dlp não conseguiu ler a URL (privada/removida/login?): ${String(e).slice(0, 300)}`);
   });
   console.log('VOD: ' + meta.stdout.trim().slice(0, 160));
@@ -156,7 +156,10 @@ async function main(): Promise<void> {
   // 2) Baixa SÓ o trecho (rápido, não baixa o VOD inteiro)
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const base = `test-vod_${stamp}_${slug(player)}`;
-  const outPath = path.join(cfg.CLIPS_DIR, `${base}.mp4`);
+  // Um diretório por clipe (mesmo padrão do clipper live).
+  const clipDir = path.join(cfg.CLIPS_DIR, base);
+  fs.mkdirSync(clipDir, { recursive: true });
+  const outPath = path.join(clipDir, `${base}.mp4`);
   console.log(`Baixando trecho (${res}p máx${res === 720 ? ' p/ ser rápido' : ''})...`);
   await execFileAsync(YTDLP, [
     '--no-playlist',
@@ -175,7 +178,7 @@ async function main(): Promise<void> {
     '-o',
     outPath,
     url,
-  ]);
+  ], { windowsHide: true });
   const sizeMb = (fs.statSync(outPath).size / 1024 / 1024).toFixed(1);
   console.log(`Clipe OK: ${outPath} (${sizeMb} MB)`);
   if (upscale > 0) {
@@ -221,7 +224,7 @@ async function main(): Promise<void> {
   } else if (killsSpec) {
     console.log(`(aviso: --kills com ${kills.length} kills, summary exige ao menos 3)`);
   }
-  const thumbPath = path.join(cfg.CLIPS_DIR, `${base}.jpg`);
+  const thumbPath = path.join(clipDir, `${base}.jpg`);
   try {
     const { makeSmartThumbnail } = await import('../src/clipper/thumbnail.js');
     // Referências visuais (foto/logos/mapa) quando pedidas
@@ -263,7 +266,7 @@ async function main(): Promise<void> {
     log.warn('thumb falhou (ok p/ teste)');
   }
   fs.writeFileSync(
-    path.join(cfg.CLIPS_DIR, `${base}.json`),
+    path.join(clipDir, `${base}.json`),
     JSON.stringify(buildSidecar(ace, { clipFile: path.basename(outPath), vodUrl: url, aceAt: fmt(at) }), null, 2),
   );
   getDb(cfg.DB_PATH);

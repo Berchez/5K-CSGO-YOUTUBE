@@ -47,6 +47,14 @@ const ConfigSchema = z.object({
    * caía 10-20s dentro do round seguinte por causa do lag do placar).
    */
   CLIP_END_AFTER_CLOSE_SEC: z.coerce.number().min(0).max(60).default(8),
+  /**
+   * Mede o atraso da fonte comparando kills do placar com o killfeed OCR.
+   * 'auto' corrige apenas com várias correspondências consistentes; 'log'
+   * mede sem alterar os cortes; 'off' desliga a varredura retrospectiva.
+   */
+  CLIP_STREAM_SYNC: z.enum(['auto', 'log', 'off']).default('auto'),
+  /** Maior atraso da fonte que a calibração espera para encontrar no buffer. */
+  CLIP_STREAM_SYNC_MAX_LAG_SEC: z.coerce.number().min(0).max(180).default(120),
   /** Mínimo de kills no round para gerar clipe (3 = 3k/4k/5k). */
   MIN_KILLS: z.coerce.number().min(2).max(5).default(3),
   /**
@@ -127,10 +135,11 @@ const ConfigSchema = z.object({
   GEMINI_IMAGE_MODEL: z.string().default('gemini-3.1-flash-lite-image'),
   GEMINI_WEB_PROFILE: z.string().default('./data/gemini-profile'),
   CHATGPT_PROFILE: z.string().default('./data/chatgpt-profile'),
-  /** 1 = janela minimizada (corre risco de challenge; 0 = visível, funciona) */
-  CHATGPT_MINIMIZED: z.string().default('0'),
+  /** 1 = janela minimizada (default; sem popup em jogo fullscreen). 0 = visível (se challenge implicar, reverta). */
+  CHATGPT_MINIMIZED: z.string().default('1'),
   GROK_PROFILE: z.string().default('./data/grok-profile'),
-  GROK_MINIMIZED: z.string().default('0'),
+  /** Idem CHATGPT_MINIMIZED. */
+  GROK_MINIMIZED: z.string().default('1'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

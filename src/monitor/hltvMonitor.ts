@@ -94,6 +94,8 @@ export async function getBrowser(): Promise<BrowserContext> {
       profileDir: cfg.HLTV_PROFILE,
       headless,
       extraArgs: headless ? [] : ['--start-minimized'],
+      // Reforço via CDP (o Chrome real às vezes ignora a flag).
+      minimize: !headless,
       // HLTV abre popunders de anúncio (viram about:blank presas): bloqueia.
       // (Logins manuais usam outro perfil/launcher, sem isso.)
       ignoreDefaultArgs: ['--disable-popup-blocking'],

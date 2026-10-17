@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     '-vf',
     `fps=${fps},crop=iw*${cw}:ih*${ch}:iw*${cx}:ih*${cy}`,
     path.join(dir, 'fr_%03d.png'),
-  ]);
+  ], { windowsHide: true });
 
   const files = fs
     .readdirSync(dir)

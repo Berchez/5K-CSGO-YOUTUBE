@@ -7,7 +7,7 @@ import { getLogger } from '../logger.js';
 export interface ChatGptOptions {
   profileDir: string;
   headless?: boolean;
-  /** default false (janela visível): minimizada o Cloudflare encrenca. */
+  /** default true (minimizado, sem popup em jogo): false = visível (debug de challenge). */
   minimized?: boolean;
   timeoutMs?: number;
   /** Caminhos locais de imagens de referência (foto, logos, mapa). */
@@ -112,7 +112,8 @@ export async function chatgptBackground(
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless,
-      extraArgs: opts.minimized ? ['--start-minimized'] : [],
+      extraArgs: (opts.minimized ?? true) ? ['--start-minimized'] : [],
+      minimize: opts.minimized ?? true,
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
     const { closeForeignTabs } = await import('./stealthBrowser.js');

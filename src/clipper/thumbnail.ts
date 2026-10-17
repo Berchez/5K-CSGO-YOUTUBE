@@ -77,7 +77,7 @@ export async function extractFrame(videoPath: string, atSec: number): Promise<st
     '-frames:v',
     '1',
     tmp,
-  ]);
+  ], { windowsHide: true });
   return tmp;
 }
 
@@ -159,6 +159,8 @@ export async function makeSmartThumbnail(
     } catch {
       // fallback silencioso para a composta
     }
+    const { getLogger } = await import('../logger.js');
+    getLogger().info('thumb IA indisponível, usando composta');
   }
   return makeThumbnail(videoPath, outPath, ace, atSec);
 }

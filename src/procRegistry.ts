@@ -22,7 +22,7 @@ export function untrack(child: ChildProcess): void {
 function killPid(pid: number): void {
   try {
     // /T: também mata a árvore do processo (se houver)
-    execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+    execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
   } catch {
     // já morreu — ok
   }
@@ -50,7 +50,7 @@ function listFfmpegs(): ProcInfo[] | null {
           "Get-CimInstance Win32_Process -Filter \"name='ffmpeg.exe'\" | " +
             'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress',
         ],
-        { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20000 },
+        { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20000, windowsHide: true },
       );
       const j = JSON.parse(out) as ProcInfo | ProcInfo[];
       return Array.isArray(j) ? j : [j];

@@ -64,7 +64,7 @@ async function main(): Promise<void> {
       '-af', `adelay=delays=${ms}:all=1`,
       '-c:a', 'aac', '-b:a', '192k',
       out,
-    ], { timeout: 300_000 });
+    ], { timeout: 300_000, windowsHide: true });
     const mb = (fs.statSync(out).size / 1024 / 1024).toFixed(1);
     console.log(`ok: ${out} (${mb}MB, áudio atrasado ${ms}ms)`);
   }

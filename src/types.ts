@@ -93,6 +93,16 @@ export interface AceEvent {
   startedAt?: string;
   /** ISO do fim do clipe (~5s antes da ação do próximo round). */
   endedAt?: string;
+  /** Calibração por killfeed OCR da diferença entre o placar e a fonte gravada. */
+  streamSync?: {
+    mode: 'auto' | 'log' | 'off';
+    applied: boolean;
+    offsetMs: number | null;
+    matchedKills: number;
+    totalKills: number;
+    medianDeviationMs: number | null;
+    reason: string;
+  };
   /**
    * Confiança na âncora de início: a "1ª kill" é a primeira OBSERVADA pelo
    * tracker — se ele entrou no meio do round, resetou a base ou a kill veio

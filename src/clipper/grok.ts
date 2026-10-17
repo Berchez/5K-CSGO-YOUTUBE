@@ -7,7 +7,7 @@ import { listContentImages, downloadPageImage } from './chatgpt.js';
 
 export interface GrokOptions {
   profileDir: string;
-  /** default false (janela visível): mesmo motivo do chatgpt. */
+  /** default true (minimizado, sem popup em jogo): false = visível (debug de challenge). */
   minimized?: boolean;
   timeoutMs?: number;
   /** Caminhos locais de imagens de referência (foto, logos, mapa). */
@@ -69,7 +69,8 @@ export async function grokBackground(
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless: false,
-      extraArgs: opts.minimized ? ['--start-minimized'] : [],
+      extraArgs: (opts.minimized ?? true) ? ['--start-minimized'] : [],
+      minimize: opts.minimized ?? true,
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
     const { closeForeignTabs } = await import('./stealthBrowser.js');

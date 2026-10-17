@@ -8,6 +8,9 @@ import {
   buildAiBackground,
   buildAiThumbnail,
   buildThumbnailPrompt,
+  classifyThumbFailure,
+  createChallengeStreakTracker,
+  thumbWindowMode,
 } from '../src/clipper/aiThumbnail.js';
 import { buildSidecar } from '../src/clipper/clipBuilder.js';
 import { makeSmartThumbnail } from '../src/clipper/thumbnail.js';
@@ -261,5 +264,69 @@ describe('aiThumbnail', () => {
     expect(json.summary.kills).toBeUndefined();
     expect(json.summary.killCount).toBe(1);
     expect(json.summary.mainWeapon).toBe('ak47');
+  });
+});
+
+describe('classifyThumbFailure (causa p/ "precisava estar visível?")', () => {
+  it('login: mensagens NEED_* e URLs de auth', () => {
+    expect(classifyThumbFailure('ChatGPT sem login. Rode uma vez: npx tsx scripts/chatgpt-login.ts')).toBe('login');
+    expect(classifyThumbFailure('Grok sem login. Rode uma vez: npx tsx scripts/grok-login.ts')).toBe('login');
+    expect(classifyThumbFailure('Gemini web sem login. Rode uma vez: npx tsx scripts/gemini-login.ts')).toBe('login');
+    expect(classifyThumbFailure('redirect para auth.openai.com/authorize')).toBe('login');
+    expect(classifyThumbFailure('Login expirado — rode o script')).toBe('login');
+  });
+
+  it('challenge antes de backend (texto de challenge cita retry)', () => {
+    expect(
+      classifyThumbFailure('ChatGPT bloqueado pelo desafio Cloudflare mesmo após tentativas. Tente de novo mais tarde.'),
+    ).toBe('challenge');
+    expect(classifyThumbFailure('Just a moment... turnstile loop')).toBe('challenge');
+  });
+
+  it('timeout, layout, backend, desconhecido', () => {
+    expect(classifyThumbFailure('ChatGPT não retornou imagem a tempo — cota esgotada.')).toBe('timeout');
+    expect(classifyThumbFailure('composer do ChatGPT não encontrado (layout mudou?)')).toBe('layout');
+    expect(
+      classifyThumbFailure('Estamos com problemas para processar uploads no momento. Tente novamente mais tarde.'),
+    ).toBe('backend');
+    expect(
+      classifyThumbFailure('upload de anexos falhou no ChatGPT (x.jpg: pill não apareceu no composer) — abortando'),
+    ).toBe('unknown');
+    expect(classifyThumbFailure('')).toBe('unknown');
+  });
+});
+
+describe('thumbWindowMode (modo efetivo por provider)', () => {
+  it('chatgpt/grok minimizados por default; gemini-web headless', () => {
+    expect(thumbWindowMode('chatgpt', {})).toBe('minimized');
+    expect(thumbWindowMode('chatgpt', { chatgptMinimized: false })).toBe('visible');
+    expect(thumbWindowMode('grok', {})).toBe('minimized');
+    expect(thumbWindowMode('gemini-web', {})).toBe('headless');
+    expect(thumbWindowMode('gemini-web', { geminiWebHeadless: false })).toBe('visible');
+    expect(thumbWindowMode('huggingface', {})).toBe('api');
+  });
+});
+
+describe('createChallengeStreakTracker (alerta 1x a cada 3 challenges)', () => {
+  it('3º challenge seguido em modo sem janela = alerta; 4º não repete', () => {
+    const t = createChallengeStreakTracker(3);
+    expect(t.register('chatgpt', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('chatgpt', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('chatgpt', 'minimized', 'challenge')).toBe(true);
+    expect(t.register('chatgpt', 'minimized', 'challenge')).toBe(false);
+    expect(t.snapshot()).toEqual({ chatgpt: 4 });
+  });
+
+  it('sucesso zera; outras causas e modo visível não contam', () => {
+    const t = createChallengeStreakTracker(3);
+    expect(t.register('chatgpt', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('chatgpt', 'minimized', 'timeout')).toBe(false);
+    expect(t.snapshot()).toEqual({});
+    expect(t.register('grok', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('grok', 'visible', 'challenge')).toBe(false);
+    t.reset('grok');
+    expect(t.register('grok', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('grok', 'minimized', 'challenge')).toBe(false);
+    expect(t.register('grok', 'minimized', 'challenge')).toBe(true);
   });
 });

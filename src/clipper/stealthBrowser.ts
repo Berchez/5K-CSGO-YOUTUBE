@@ -2,6 +2,7 @@ import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { BrowserContext, Page } from 'playwright';
 import type pino from 'pino';
+import { getLogger } from '../logger.js';
 
 chromium.use(StealthPlugin());
 
@@ -9,6 +10,12 @@ export interface StealthContextOptions {
   profileDir: string;
   headless: boolean;
   extraArgs?: string[];
+  /**
+   * Minimiza a janela via CDP após o launch (reforço do --start-minimized,
+   * que o Chrome real às vezes ignora). Sem efeito em headless. Best-effort:
+   * retorna false se falhar — nunca derruba o caller.
+   */
+  minimize?: boolean;
   /**
    * Args default do Playwright a ignorar. O Playwright desliga o bloqueador
    * de popups por padrão (--disable-popup-blocking) — o HLTV abre popunders
@@ -24,6 +31,45 @@ const BASE_ARGS = [
   '--no-first-run',
   '--no-default-browser-check',
 ];
+
+/**
+ * Minimiza a janela do browser via CDP (reforço do --start-minimized).
+ * Puro efeito colateral, best-effort: true se o estado aplicado foi
+ * minimizado, false em qualquer falha (headless, sem janela, CDP indisponível).
+ */
+export async function minimizeBrowserWindow(ctx: BrowserContext): Promise<boolean> {
+  try {
+    const browser = ctx.browser();
+    if (!browser) return false;
+    const session = await browser.newBrowserCDPSession();
+    try {
+      const send = session.send.bind(session) as (
+        method: string,
+        params?: Record<string, unknown>,
+      ) => Promise<unknown>;
+      const targets = (await send('Target.getTargets', {})) as {
+        targetInfos: Array<{ type: string; targetId: string }>;
+      };
+      const pageTarget = targets.targetInfos.find((t) => t.type === 'page');
+      if (!pageTarget) return false;
+      const { windowId } = (await send('Browser.getWindowForTarget', {
+        targetId: pageTarget.targetId,
+      })) as { windowId: number };
+      await send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { windowState: 'minimized' },
+      });
+      const { bounds } = (await send('Browser.getWindowForTarget', {
+        targetId: pageTarget.targetId,
+      })) as { bounds: { windowState?: string } };
+      return bounds.windowState === 'minimized';
+    } finally {
+      await session.detach().catch(() => undefined);
+    }
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Contexto persistente com stealth (puppeteer-extra-plugin-stealth):
@@ -44,15 +90,25 @@ export async function launchStealthContext(
     ...(opts.ignoreDefaultArgs ? { ignoreDefaultArgs: opts.ignoreDefaultArgs } : {}),
   };
   try {
-    return (await chromium.launchPersistentContext(opts.profileDir, {
+    const ctx = (await chromium.launchPersistentContext(opts.profileDir, {
       ...common,
       channel: 'chrome',
     })) as unknown as BrowserContext;
+    if (opts.minimize && !opts.headless) {
+      const ok = await minimizeBrowserWindow(ctx);
+      getLogger().debug({ minimized: ok }, 'janela do browser minimizada (CDP)');
+    }
+    return ctx;
   } catch {
-    return (await chromium.launchPersistentContext(
+    const ctx = (await chromium.launchPersistentContext(
       opts.profileDir,
       common,
     )) as unknown as BrowserContext;
+    if (opts.minimize && !opts.headless) {
+      const ok = await minimizeBrowserWindow(ctx);
+      getLogger().debug({ minimized: ok }, 'janela do browser minimizada (CDP)');
+    }
+    return ctx;
   }
 }
 

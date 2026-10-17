@@ -71,6 +71,8 @@ export async function geminiWebBackground(
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
       headless,
+      // Sem efeito em headless; cobre o caso headless:false.
+      minimize: true,
     });
     const page = browser.pages()[0] ?? (await browser.newPage());
     const { closeForeignTabs } = await import('./stealthBrowser.js');

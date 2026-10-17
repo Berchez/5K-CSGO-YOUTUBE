@@ -32,8 +32,12 @@ gravar a transmissão do Gaules em PT-BR — com fallback cruzado automático:
 a escolhida indisponível usa a outra), resto com defaults.
 
 Durante cada partida o recorder tenta manter os dois buffers continuamente.
-O buffer separado preserva a captura atual; o muxed usa o melhor formato
-com áudio e vídeo que a fonte expuser, sem limite de resolução/FPS. Se a
+O buffer separado usa a melhor faixa de vídeo disponível sem limite de
+resolução, junto ao feed de áudio separado; o muxed usa o melhor formato
+com áudio e vídeo que a fonte expuser, sem limite de resolução/FPS. A
+saída separada mantém a resolução da fonte e só faz upscale quando a fonte
+fica abaixo de `CLIP_UPSCALE_HEIGHT`; nunca reduz uma fonte de resolução
+maior. Se a
 fonte não oferecer um formato combinado, a captura separada continua e o
 motivo fica no log. Os clipes saem como `<match>_<map>_r<round>_<player>.mp4`
 e `<...>_muxed.mp4`. Quando o muxed está disponível, essa variante é a

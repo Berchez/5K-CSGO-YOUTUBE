@@ -23,7 +23,9 @@ function execTracked(
   onStderrLine?: (line: string) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const p: ChildProcess = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    // windowsHide: sem console popup no Windows (cada render/probe abria
+    // uma janela que rouba foco do jogo em fullscreen).
+    const p: ChildProcess = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
     let stderr = '';
     let pendingLine = '';
     p.stderr?.on('data', (d: Buffer) => {
@@ -177,7 +179,7 @@ export interface PickOptions {
  * então o veredito vem do stderr (tem Duration + Stream #0? tem erro fatal?).
  */
 async function isSegmentReadable(file: string): Promise<boolean> {
-  const out = await execFileAsync('ffmpeg', ['-hide_banner', '-i', file], { timeout: 15000 })
+  const out = await execFileAsync('ffmpeg', ['-hide_banner', '-i', file], { timeout: 15000, windowsHide: true })
     .then((r) => String(r.stderr ?? ''))
     .catch((e: unknown) => String((e as { stderr?: unknown }).stderr ?? e));
   if (/moov atom not found|Invalid data found|No such file|does not contain any stream/i.test(out)) {
@@ -345,7 +347,7 @@ export async function measureAvOffset(
       ['-hide_banner', ...inputs, '-filter_complex', aGraph, '-map', '[a]', '-f', 'null', '-'],
       // ebur128 framelog emite ~10 linhas/s: clipes longos passam do
       // maxBuffer default de 1MB e a medição falha em silêncio.
-      { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
+      { timeout: 180_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
     )
       .then((r) => String(r.stderr ?? ''))
       .catch((e) => String((e as { stderr?: unknown }).stderr ?? e));
@@ -368,7 +370,7 @@ export async function measureAvOffset(
     await execFileAsync(
       ffmpegBin,
       ['-hide_banner', '-loglevel', 'error', '-y', ...inputs, '-filter_complex', vGraph, '-map', '[v]', path.join(framesDir, 'fr_%04d.png')],
-      { timeout: 180_000 },
+      { timeout: 180_000, windowsHide: true },
     );
     const frames = fs.readdirSync(framesDir).filter((f) => f.endsWith('.png')).sort();
     if (frames.length < 15) return no(`frames insuficientes (${frames.length})`);
@@ -495,11 +497,27 @@ async function probeFileDurationSec(file: string): Promise<number | null> {
     const out = await execFileAsync(
       ffprobe,
       ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file],
-      { timeout: 15_000 },
+      { timeout: 15_000, windowsHide: true },
     ).then((r) => String(r.stdout ?? '').trim());
     // csv=p=0 imprime só o valor; 'N/A'/vazio (sem moov) → NaN → null
     const d = Number.parseFloat(out);
     return Number.isFinite(d) && d > 0 ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+async function probeVideoHeight(file: string): Promise<number | null> {
+  const ffprobe = resolveFfprobeBin();
+  if (!ffprobe) return null;
+  try {
+    const out = await execFileAsync(
+      ffprobe,
+      ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=height', '-of', 'csv=p=0', file],
+      { timeout: 15_000, windowsHide: true },
+    ).then((r) => String(r.stdout ?? '').trim());
+    const height = Number.parseInt(out, 10);
+    return Number.isFinite(height) && height > 0 ? height : null;
   } catch {
     return null;
   }
@@ -598,6 +616,12 @@ export interface ConcatTimeline {
   /** Duração total do concat (s). */
   lenSec: number;
   mode: ConcatTimelineMode;
+}
+
+export function resolveOutputHeight(sourceHeight: number | null, requestedHeight: number): number {
+  return requestedHeight > 0 && (sourceHeight == null || sourceHeight < requestedHeight)
+    ? requestedHeight
+    : 0;
 }
 
 export function resolveConcatTimeline(args: {
@@ -741,7 +765,7 @@ export async function detectActionResume(
     await execFileAsync(
       ffmpegBin,
       ['-hide_banner', '-loglevel', 'error', '-y', ...inputs, '-filter_complex', graph, path.join(framesDir, 'fr_%04d.png')],
-      { timeout: 180_000 },
+      { timeout: 180_000, windowsHide: true },
     );
     const names = fs.readdirSync(framesDir).filter((f) => f.endsWith('.png')).sort();
     const windowSec = Math.round((names.length / fps) * 100) / 100;
@@ -997,8 +1021,24 @@ export async function buildClip(
   );
 
   const base = `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}${opts.outputSuffix ?? ''}`;
-  const outPath = path.join(opts.clipsDir, `${base}.mp4`);
-  const sidecarPath = path.join(opts.clipsDir, `${base}.json`);
+  // Um diretório por clipe: mp4 + sidecar + thumb (+ variante _muxed, que
+  // compartilha a pasta por ser o mesmo clipe) ficam juntos. Refs de
+  // partida (clipsDir/refs) continuam fora — são compartilhadas entre aces.
+  const clipDir = path.join(
+    opts.clipsDir,
+    `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}`,
+  );
+  fs.mkdirSync(clipDir, { recursive: true });
+  const outPath = path.join(clipDir, `${base}.mp4`);
+  const sidecarPath = path.join(clipDir, `${base}.json`);
+  /** Remove a pasta do clipe se vazia (falha antes de gerar artefatos). */
+  const dropEmptyClipDir = (): void => {
+    try {
+      fs.rmdirSync(clipDir);
+    } catch {
+      // tem conteúdo (ou já sumiu) — mantém
+    }
+  };
 
   // Primeiro a cauda contígua (joga fora intercalação de fantasma),
   // depois a sanitização (legibilidade). Nessa ordem o trim e a duração
@@ -1067,7 +1107,11 @@ export async function buildClip(
     trimStartSec,
     concatLenSec,
   );
-  const height = opts.upscaleHeight ?? 0;
+  const sourceHeight = await probeVideoHeight(usable[0]);
+  const requestedHeight = opts.upscaleHeight ?? 0;
+  // Upscaling smaller sources may help platform codec selection, but
+  // downscaling a higher-resolution feed would throw away captured detail.
+  const height = resolveOutputHeight(sourceHeight, requestedHeight);
   // Teto de duração como ALARME (nunca silencioso): se o trim resultante
   // excede o cap, força o corte e sinaliza — o cap não corrige causa, só
   // impede o clipe gigante enquanto o trim não ancora certo.
@@ -1316,6 +1360,7 @@ export async function buildClip(
     } catch {
       // best-effort
     }
+    dropEmptyClipDir();
     throw e;
   }
   // Trava de SAÍDA: render "bem-sucedido" com janela vazia (trim além do
@@ -1334,12 +1379,13 @@ export async function buildClip(
     } catch {
       // best-effort
     }
+    dropEmptyClipDir();
     throw new Error(
       `render vazio (dur=${outDurSec ?? 'ilegível'}s): trim ${trimStartSec.toFixed(1)}s/${trimEndSec != null ? trimEndSec.toFixed(1) + 's' : 'cauda'} em concat de ${concatLenSec.toFixed(0)}s (${timeline.mode}) — timeline inconsistente, revisar âncoras`,
     );
   }
   log.info(
-    { matchId: ace.matchId, segments: usable.length, trimStartSec, trimEndSec, height, avAppliedMs, avSource, avIssues: avIssuesCount, timelineMode: timeline.mode },
+    { matchId: ace.matchId, segments: usable.length, sourceHeight, trimStartSec, trimEndSec, height, avAppliedMs, avSource, avIssues: avIssuesCount, timelineMode: timeline.mode },
     'clipe montado (passada única: emenda A/V realinhada + upscale)',
   );
 
@@ -1354,12 +1400,14 @@ export async function buildClip(
 
   // Thumbnail estilo canal de cortes: frame + selo ACE!/jogador/confronto.
   // Frame de ~3s antes do 5º kill (meio do ace) — meio do clipe costuma ser break/torcida.
-  const thumbPath = path.join(opts.clipsDir, `${base}.jpg`);
+  const thumbPath = path.join(clipDir, `${base}.jpg`);
   if (opts.generateThumbnail !== false) {
     try {
       await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
-    } catch {
-      log.warn('falha ao gerar thumbnail, seguindo sem ela');
+    } catch (e) {
+      // Com o erro real: "falha ao gerar thumbnail" sozinho já escondeu a
+      // causa raiz mais de uma vez (ex: frame ilegível vs sharp vs fontes).
+      log.warn({ err: String(e).slice(0, 300) }, 'falha ao gerar thumbnail, seguindo sem ela');
     }
   }
 
@@ -1369,6 +1417,8 @@ export async function buildClip(
       buildSidecar(ace, {
         clipFile: path.basename(outPath),
         captureMode: opts.captureMode ?? 'separate',
+        sourceHeight,
+        outputHeight: height || sourceHeight,
         freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),

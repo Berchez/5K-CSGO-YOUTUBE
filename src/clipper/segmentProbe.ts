@@ -163,7 +163,7 @@ export function resolveFfprobeBin(): string | null {
     // segue p/ PATH
   }
   try {
-    execFileSync(exe, ['-version'], { stdio: 'ignore' });
+    execFileSync(exe, ['-version'], { stdio: 'ignore', windowsHide: true });
     return exe;
   } catch {
     return null;
@@ -296,7 +296,7 @@ export async function probeSegmentPackets(
     const out = await execFileAsync(
       ffprobeBin,
       ['-v', 'error', '-show_entries', 'packet=codec_type,pts_time', '-of', 'csv', file],
-      { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
     ).then((r) => String(r.stdout ?? ''));
     const video: number[] = [];
     const audio: number[] = [];

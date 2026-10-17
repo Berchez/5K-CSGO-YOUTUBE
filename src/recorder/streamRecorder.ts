@@ -51,7 +51,7 @@ export function capturePlan(mode: 'separate' | 'muxed' = 'separate'): {
 } {
   return mode === 'muxed'
     ? { formats: ['best'], maps: ['0:v', '0:a'] }
-    : { formats: ['bv*[height<=1080]/bv*', 'ba/b'], maps: ['0:v', '1:a'] };
+    : { formats: ['bv*', 'ba/b'], maps: ['0:v', '1:a'] };
 }
 
 /**
@@ -194,7 +194,8 @@ export class StreamRecorder {
       const { stdout } = await execFileAsync(
         ytdlpBin,
         ['--no-playlist', '--no-warnings', '-g', '-f', format, this.opts.streamUrl],
-        { timeout: 60_000 },
+        // windowsHide: yt-dlp abre console próprio no Windows (rouba foco do jogo)
+        { timeout: 60_000, windowsHide: true },
       );
       const url = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? '';
       if (!url) throw new Error(`yt-dlp não resolveu o formato ${format}`);
@@ -251,7 +252,9 @@ export class StreamRecorder {
       // ≤2s de silêncio no início, cortável pelo trim do render).
       segPattern,
     );
-    this.ffmpeg = spawn(ffmpegBin, ffmpegArgs);
+    // windowsHide: o recorder vive horas — sem isso o Windows abre um
+    // console próprio p/ o ffmpeg (rouba foco do jogo em fullscreen).
+    this.ffmpeg = spawn(ffmpegBin, ffmpegArgs, { windowsHide: true });
     this.running = true;
     // Sessão HLS aberta aqui: era da calibragem de offset por canal.
     this.markSessionStart();

@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDurationCap, buildClip, computeAceEndMs, computeAudioCompensation, computeTrimEndSec, computeTrimStartSec, contiguousTail, correlateOffset, detectActionResume, detectTruncatedStart, findMotionResume, measureAvOffset, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { applyDurationCap, buildClip, computeAceEndMs, computeAudioCompensation, computeTrimEndSec, computeTrimStartSec, contiguousTail, correlateOffset, detectActionResume, detectTruncatedStart, findMotionResume, measureAvOffset, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, resolveOutputHeight, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
 // executável os e2es pulam (CI Linux sem os bins não falha).
@@ -288,6 +288,22 @@ describe('resolveConcatTimeline (span medido → wall → legado)', () => {
     expect(trimEnd).toBeCloseTo(34.03, 1);
     // janela ≈ 34s: cap nem dispara
     expect(applyDurationCap(trim, trimEnd, t.lenSec, 105).clamped).toBe(false);
+  });
+});
+
+describe('resolveOutputHeight', () => {
+  it('upscales smaller sources to the configured target', () => {
+    expect(resolveOutputHeight(1080, 1440)).toBe(1440);
+  });
+
+  it('preserves source resolution at or above the target', () => {
+    expect(resolveOutputHeight(1440, 1440)).toBe(0);
+    expect(resolveOutputHeight(2160, 1440)).toBe(0);
+  });
+
+  it('retains the requested fallback when source metadata is unavailable', () => {
+    expect(resolveOutputHeight(null, 1440)).toBe(1440);
+    expect(resolveOutputHeight(2160, 0)).toBe(0);
   });
 });
 
@@ -680,8 +696,8 @@ describe.skipIf(!ffmpegOk)('trava de saída do render (nunca shippar vazio)', ()
           aceStartMs: Date.now() + 50_000,
         }),
       ).rejects.toThrow();
-      // nem stub sobrou na pasta
-      const leftovers = fs.readdirSync(clipsDir).filter((f) => f.endsWith('.mp4'));
+      // nem stub nem pasta vazia sobraram
+      const leftovers = fs.readdirSync(clipsDir);
       expect(leftovers).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -788,6 +804,12 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           avSync: 'off',
         });
         expect(fs.existsSync(out.filePath)).toBe(true);
+        // layout: um diretório por clipe (mp4 + sidecar + thumb juntos)
+        expect(out.filePath).toBe(path.join(clipsDir, 'bb_Cache_r3_x', 'bb_Cache_r3_x.mp4'));
+        expect(out.sidecarPath).toBe(path.join(clipsDir, 'bb_Cache_r3_x', 'bb_Cache_r3_x.json'));
+        if (out.thumbnailPath) {
+          expect(path.dirname(out.thumbnailPath)).toBe(path.join(clipsDir, 'bb_Cache_r3_x'));
+        }
         const sidecar = JSON.parse(fs.readFileSync(out.sidecarPath, 'utf8')) as {
           captureMode?: string;
           freezeDetection?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] };

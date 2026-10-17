@@ -35,8 +35,10 @@ export function notifyWindows(title: string, message: string): void {
     const enc = Buffer.from(script, 'utf16le').toString('base64');
     const child = spawn(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc],
-      { detached: true, stdio: 'ignore' },
+      // -WindowStyle Hidden: sem ele cada toast pisca um console na tela
+      // (justamente o que o modo gaming tenta eliminar).
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', enc],
+      { detached: true, stdio: 'ignore', windowsHide: true },
     );
     child.unref();
   } catch (e) {

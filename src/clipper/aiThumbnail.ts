@@ -23,6 +23,73 @@ export type AiProvider =
   | 'chatgpt'
   | 'grok';
 
+/** Janela em que o provider rodou (para cruzar visibilidade × resultado). */
+export type ThumbWindowMode = 'minimized' | 'visible' | 'headless' | 'api';
+
+/** Causa da falha (para o diagnóstico "precisava estar visível?"). */
+export type ThumbFailKind = 'challenge' | 'login' | 'timeout' | 'layout' | 'backend' | 'unknown';
+
+/** Modo de janela efetivo do provider nesta tentativa. */
+export function thumbWindowMode(provider: AiProvider, opts: AiThumbOptions): ThumbWindowMode {
+  if (provider === 'chatgpt') return (opts.chatgptMinimized ?? true) ? 'minimized' : 'visible';
+  if (provider === 'grok') return (opts.grokMinimized ?? true) ? 'minimized' : 'visible';
+  if (provider === 'gemini-web') return (opts.geminiWebHeadless ?? true) ? 'headless' : 'visible';
+  return 'api';
+}
+
+/**
+ * Classifica a falha (puro/testável). Ordem importa: login antes de
+ * challenge (mensagem de challenge pode citar retry), challenge antes de
+ * backend (texto de challenge cita "tente de novo").
+ */
+export function classifyThumbFailure(errText: string): ThumbFailKind {
+  if (isLoginError(errText)) return 'login';
+  if (/desafio cloudflare|challenge|turnstile|captcha|just a moment/i.test(errText)) return 'challenge';
+  if (/não retornou .* a tempo|timeout|timed out|expir/i.test(errText)) return 'timeout';
+  // Layout: só os formatos reais ("não encontrado"/"sumiu") — "pill não
+  // apareceu no composer" é falha de upload, não de layout.
+  if (/composer[^.!?]*(não encontrado|sumiu)|layout mudou/i.test(errText)) return 'layout';
+  if (/problemas para processar uploads|try again later|tente novamente|429|throttl/i.test(errText)) return 'backend';
+  return 'unknown';
+}
+
+export interface ChallengeStreakTracker {
+  /** Registra falha; true UMA vez ao atingir o limiar (sem spam). */
+  register: (provider: string, mode: ThumbWindowMode, failKind: ThumbFailKind) => boolean;
+  reset: (provider: string) => void;
+  snapshot: () => Record<string, number>;
+}
+
+/**
+ * Conta falhas de challenge SEM janela visível por provider. Quando o bot
+ * roda minimizado e o challenge dispara em sequência, é o sinal de que
+ * aquele provider precisava estar visível — o chamador emite ERROR + toast.
+ * Sucesso zera. Puro/testável (estado encapsulado).
+ */
+export function createChallengeStreakTracker(threshold = 3): ChallengeStreakTracker {
+  const fails = new Map<string, number>();
+  return {
+    register(provider, mode, failKind) {
+      if (failKind !== 'challenge' || mode === 'visible') {
+        fails.delete(provider);
+        return false;
+      }
+      const n = (fails.get(provider) ?? 0) + 1;
+      fails.set(provider, n);
+      return n === threshold;
+    },
+    reset(provider) {
+      fails.delete(provider);
+    },
+    snapshot() {
+      return Object.fromEntries(fails);
+    },
+  };
+}
+
+/** Contador global da cadeia (reinicia com o processo — heurística, não estado). */
+const challengeStreaks = createChallengeStreakTracker(3);
+
 export interface AiThumbOptions {
   /** Ordem de tentativa. Default: chatgpt. */
   order?: AiProvider[];
@@ -384,6 +451,26 @@ export async function buildAiBackground(
   const clearIfFlagged = (p: string): void => {
     if (isProviderLoggedOut(loggedOut, p)) clearLoggedOut(p, statusFile);
   };
+  /**
+   * Linha-resumo por tentativa (lida pelo diag:thumbs): provider × modo de
+   * janela × resultado × causa. É o que responde "precisava estar visível?".
+   */
+  const note = (provider: AiProvider, outcome: 'ok' | 'fail', failKind: ThumbFailKind | null): void => {
+    const mode = thumbWindowMode(provider, opts);
+    log.info({ provider, windowMode: mode, outcome, failKind }, 'thumb IA: tentativa');
+    if (outcome === 'ok') {
+      challengeStreaks.reset(provider);
+    } else if (challengeStreaks.register(provider, mode, failKind ?? 'unknown')) {
+      log.error(
+        { provider, mode, fails: 3 },
+        'challenge repetido sem janela visível — considere voltar visível (CHATGPT_MINIMIZED=0, GROK_MINIMIZED=0)',
+      );
+      notifyWindows(
+        '5K Bot: thumbs caindo no fallback',
+        `Provider "${provider}" falhou 3x seguidas em challenge (${mode}). Considere voltar a janela visível.`,
+      );
+    }
+  };
   const refs = opts.references;
   const availableAttachments = refs
     ? [refs.player, refs.playerAlt, refs.team1Logo, refs.team2Logo, refs.mapImage].filter(
@@ -424,6 +511,7 @@ export async function buildAiBackground(
         await assertImage(buf, provider);
         log.info({ provider }, isGrok ? 'thumb IA via grok' : 'thumb IA via chatgpt');
         clearIfFlagged(provider);
+        note(provider, 'ok', null);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'gemini-web') {
@@ -437,6 +525,7 @@ export async function buildAiBackground(
         await assertImage(buf, 'gemini-web');
         log.info('fundo IA via gemini-web');
         clearIfFlagged('gemini-web');
+        note('gemini-web', 'ok', null);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'huggingface') {
@@ -451,6 +540,7 @@ export async function buildAiBackground(
           timeoutMs,
         );
         log.info('fundo IA via huggingface');
+        note('huggingface', 'ok', null);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'gemini') {
@@ -465,16 +555,20 @@ export async function buildAiBackground(
           timeoutMs,
         );
         log.info('fundo IA via gemini');
+        note('gemini', 'ok', null);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       if (provider === 'pollinations') {
         const buf = await pollinationsBackground(plan.prompt, timeoutMs);
         log.info('fundo IA via pollinations');
+        note('pollinations', 'ok', null);
         return { image: buf, provider, fullThumb: plan.fullThumb };
       }
       log.warn({ provider }, 'provider IA desconhecido, ignorando');
     } catch (e) {
       const errText = String(e);
+      const failKind = classifyThumbFailure(errText);
+      note(provider, 'fail', failKind);
       // Login expirado: marca (transição grita 1x + toast) e segue a cadeia.
       // Falhas transitórias (challenge, backend, timeout) continuam como hoje.
       if (WEB_LOGIN_PROVIDERS.has(provider) && isLoginError(errText)) {
@@ -492,7 +586,7 @@ export async function buildAiBackground(
           log.warn({ provider }, 'login expirado (já avisado) — tentando próximo');
         }
       } else {
-        log.warn({ provider, err: errText.slice(0, 160) }, 'provider IA falhou, tentando próximo');
+        log.warn({ provider, err: errText.slice(0, 160), failKind }, 'provider IA falhou, tentando próximo');
       }
     }
   }
