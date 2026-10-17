@@ -1,10 +1,10 @@
-# 5K CS2 → YouTube (v2 — reescrita moderna)
+# 5K CS2 → YouTube (v2 — modern rewrite)
 
-Bot 100% automatizado até revisão humana: monitora jogos **live no HLTV** (filtro por estrelas configurável, `0` = qualquer partida), detecta **multikills (3k/4k/5k no mesmo round)**, recorta de um **buffer local contínuo** e sobe como **privado no YouTube** para você revisar/publicar.
+A 100% automated bot up to human review: it monitors **live matches on HLTV** (configurable star filter, `0` = any match), detects **multikills (3k/4k/5k in the same round)**, cuts from a **continuous local buffer** and uploads as **private on YouTube** for you to review/publish.
 
-> Legado 2021 (`index.py`, Selenium + XPaths absolutos) foi preservado no repo só como referência. O código novo está em `src/` (Node/TypeScript).
+> The 2021 legacy (`index.py`, Selenium + absolute XPaths) was kept in the repo only as reference. The new code lives in `src/` (Node/TypeScript).
 
-## Como funciona
+## How it works
 
 ```text
 HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
@@ -14,9 +14,9 @@ HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Escopo (conforme escolhido): **3k+ live, só horizontal, sem Shorts, sem Discord, só log**. `MIN_KILLS` no `.env` sobe o mínimo (5 = só ace).
+Scope (as chosen): **3k+ live, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` in `.env` raises the minimum (5 = ace only).
 
-## Pré-requisitos (Windows)
+## Prerequisites (Windows)
 
 ```powershell
 node --version  # >= 20
@@ -24,50 +24,51 @@ npm install
 npx playwright install chromium
 Copy-Item .env.example .env
 ```
-O recorder usa `yt-dlp` + `ffmpeg` vendored em `.tools/` (sem streamlink,
-sem winget) — download na primeira execução.
+The recorder uses `yt-dlp` + `ffmpeg` vendored in `.tools/` (no streamlink,
+no winget) — downloaded on the first run.
 
-Edite `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en` (ou `gaules` para
-gravar a transmissão do Gaules em PT-BR — com fallback cruzado automático:
-a escolhida indisponível usa a outra), resto com defaults.
+Edit `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en` (or `gaules` to
+record the Gaules broadcast in PT-BR — with automatic cross-fallback:
+if the chosen one is unavailable, the other is used), the rest keeps the
+defaults.
 
-Durante cada partida o recorder tenta manter os dois buffers continuamente.
-O buffer separado usa a melhor faixa de vídeo disponível sem limite de
-resolução, junto ao feed de áudio separado; o muxed usa o melhor formato
-com áudio e vídeo que a fonte expuser, sem limite de resolução/FPS. A
-saída separada mantém a resolução da fonte e só faz upscale quando a fonte
-fica abaixo de `CLIP_UPSCALE_HEIGHT`; nunca reduz uma fonte de resolução
-maior. Se a
-fonte não oferecer um formato combinado, a captura separada continua e o
-motivo fica no log. Os clipes saem como `<match>_<map>_r<round>_<player>.mp4`
-e `<...>_muxed.mp4`. Quando o muxed está disponível, essa variante é a
-preferida para upload; a separada é usada como fallback. A separada usa
-auto-sync por conteúdo com gates de confiança (offsets duvidosos não são
-aplicados). O sidecar registra intervalos de frames congelados detectados
-antes do encode. Eles não são removidos/interpolados automaticamente: se a
-origem já congelou, inventar movimento poderia piorar a evidência do jogo.
-Capturar ambos aumenta o uso de rede e disco aproximadamente em uma stream
-adicional por partida.
+During each match the recorder tries to keep both buffers continuously.
+The separate buffer uses the best available video track with no resolution
+limit, alongside the separate audio feed; the muxed one uses the best
+format with audio and video that the source exposes, with no resolution/FPS
+limit. The separate output keeps the source resolution and only upscales
+when the source drops below `CLIP_UPSCALE_HEIGHT`; it never downscales a
+higher-resolution source. If the
+source does not offer a combined format, the separate capture continues and
+the reason is written to the log. Clips are saved as `<match>_<map>_r<round>_<player>.mp4`
+and `<...>_muxed.mp4`. When the muxed one is available, that variant is
+preferred for upload; the separate one is used as a fallback. The separate
+one uses content-based auto-sync with confidence gates (dubious offsets are not
+applied). The sidecar records frozen-frame intervals detected before
+encoding. They are not removed/interpolated automatically: if the
+source already froze, inventing motion could make the game evidence worse.
+Capturing both increases network and disk usage by roughly one extra
+stream per match.
 
-## YouTube (1x)
+## YouTube (once)
 
-1. Google Cloud Console → habilite **YouTube Data API v3** → crie **OAuth Client (Desktop)** → baixe como `client_secrets.json` na raiz.
-2. **Tela de consentimento OAuth → publique o app (modo produção).** Em modo "Teste",
-   o Google costuma recusar consentimento via conta de marca (`Service unavailable`).
-   Em produção com escopo sensível (`youtube.upload`) aparece o aviso de "app não verificado"
-   (clique Avançado → continuar) e há limite de 100 contas — suficiente para uso próprio.
-3. `npm run auth:youtube` → abra URL, cole o código → gera `token.json`.
-4. Uploads saem como **private**. Publique manualmente no YouTube Studio após revisar (evita strike/auditoria de projeto novo).
+1. Google Cloud Console → enable **YouTube Data API v3** → create an **OAuth Client (Desktop)** → download it as `client_secrets.json` in the root.
+2. **OAuth consent screen → publish the app (production mode).** In "Test" mode,
+   Google often refuses consent via a brand account (`Service unavailable`).
+   In production with a sensitive scope (`youtube.upload`), the "unverified app" warning appears
+   (click Advanced → continue) and there is a 100-account limit — enough for personal use.
+3. `npm run auth:youtube` → open the URL, paste the code → generates `token.json`.
+4. Uploads go out as **private**. Publish manually in YouTube Studio after reviewing (avoids a strike/audit on a new project).
 
-### Canal de marca (ex: conta-mãe + canal filho)
-A API posta no canal **escolhido na tela de consentimento** — o token amarra no canal.
-Refaça o auth e escolha o canal filho (`Remove-Item token.json` antes para forçar
-a tela de escolha). Confira com `npx tsx scripts/check-youtube.ts`: o `CANAL-NOME`
-precisa ser o canal de cortes. Se a escolha do canal-filho falhar, publique o app
-(item 2) e tente de novo; em último caso, transfira a titularidade da marca para um
-Gmail adulto dedicado e autentique com ele.
+### Brand channel (e.g. parent account + child channel)
+The API posts to the channel **selected on the consent screen** — the token is bound to the channel.
+Re-run the auth and choose the child channel (run `Remove-Item token.json` first to force
+the selection screen). Check with `npx tsx scripts/check-youtube.ts`: `CANAL-NOME`
+must be the clips channel. If choosing the child channel fails, publish the app
+(item 2) and try again; as a last resort, transfer brand ownership to a dedicated
+adult Gmail and authenticate with it.
 
-## Rodar
+## Running
 
 ```powershell
 npm run dev     # desenvolvimento (tsx watch)
@@ -75,13 +76,13 @@ npm run build; npm start   # produção (dist/main.js)
 npm test        # vitest (detector + filtro stars)
 ```
 
-Manter ligado: `pm2 start dist/src/main.js --name 5k-bot` + `pm2 save`
-(já ativo; a tarefa agendada `5KBot-Clips` roda `pm2 resurrect` no logon
-via `scripts/bot-autostart.bat`). Comandos úteis: `pm2 list/logs/stop/restart 5k-bot`.
+Keep it running: `pm2 start dist/src/main.js --name 5k-bot` + `pm2 save`
+(already active; the scheduled task `5KBot-Clips` runs `pm2 resurrect` at logon
+via `scripts/bot-autostart.bat`). Useful commands: `pm2 list/logs/stop/restart 5k-bot`.
 
-## Testar com partida acabada (sem esperar live)
+## Testing with a finished match (without waiting for live)
 
-O modo real é LIVE, mas dá para validar download → clipe → upload com um VOD:
+The real mode is LIVE, but you can validate download → clip → upload with a VOD:
 
 ```powershell
 # bins portáteis (uma vez; ficam em .tools/, ignorados pelo git)
@@ -91,35 +92,35 @@ npx tsx scripts/test-vod.ts --url "<VOD twitch/youtube>" --at 01:23:45 --player 
 npx tsx scripts/test-vod.ts --url "<VOD>" --at 4820 --player donk --upload
 ```
 
-`--at` = momento do 5º kill (aceita `HH:MM:SS` ou segundos). Baixa só a janela
-(`--pre 60 --post 15`, `--res 1080` por padrão; `--res 720` p/ baixar mais
-rápido) para `data/clips/test-vod_*.mp4` + thumb + sidecar
-`.json` + registro no sqlite. Depois do download, o clipe passa por
-**upscale p/ 1440p** (`--upscale 1440` por padrão; `0` desliga) — uploads
->=1440p recebem o codec VP9/AV1 do YouTube, com qualidade percebida muito
-maior mesmo assistindo em 1080p (a fonte Twitch ~8 Mbps continua sendo o
-teto). O upscale inclui restauração leve (denoise antes do scale p/ não
-ampliar blocos + sharpen adaptativo depois) e o download é stream copy
-(sem o re-encode CRF 23 que o `--force-keyframes-at-cuts` impunha).
-O modo live aplica o mesmo tratamento (`CLIP_UPSCALE_HEIGHT` no `.env`).
-`.json` + registro no sqlite. Tudo sai marcado `[TESTE]` — nunca confunda com clipe real.
-No Windows prefira `npx tsx` direto (o `npm run ... --` às vezes engole as flags).
+`--at` = time of the 5th kill (accepts `HH:MM:SS` or seconds). It downloads only the window
+(`--pre 60 --post 15`, `--res 1080` by default; `--res 720` to download
+faster) to `data/clips/test-vod_*.mp4` + thumb + sidecar
+`.json` + sqlite entry. After the download, the clip goes through
+**upscale to 1440p** (`--upscale 1440` by default; `0` disables it) — uploads
+>=1440p get YouTube's VP9/AV1 codec, with much higher perceived
+quality even when watching at 1080p (the ~8 Mbps Twitch source remains the
+ceiling). The upscale includes light restoration (denoise before the scale
+so blocks are not amplified + adaptive sharpen afterwards) and the download is a stream copy
+(without the CRF 23 re-encode that `--force-keyframes-at-cuts` imposed).
+Live mode applies the same treatment (`CLIP_UPSCALE_HEIGHT` in `.env`).
+`.json` + sqlite entry. Everything comes out tagged `[TESTE]` — never confuse it with a real clip.
+On Windows prefer `npx tsx` directly (the `npm run ... --` sometimes swallows the flags).
 
-Metadados ricos (opcionais, mas recomendados — alimentam título, descrição,
-thumb e prompt IA): `--team1/--team2`, `--pteam` (time do autor), `--map`,
-`--event`, `--round`, `--score 6-3` e `--kills` na mini-DSL
-`killer>vítima:arma:mods` (mods: `hs ns wb smoke assist=Nome flash=Nome`,
-vítima `?` = desconhecida):
+Rich metadata (optional, but recommended — they feed the title, description,
+thumb and AI prompt): `--team1/--team2`, `--pteam` (killer's team), `--map`,
+`--event`, `--round`, `--score 6-3` and `--kills` in the mini-DSL
+`killer>victim:weapon:mods` (mods: `hs ns wb smoke assist=Name flash=Name`,
+victim `?` = unknown):
 ```powershell
 npx tsx scripts/test-vod.ts --url "<VOD>" --at 11:07:10 --player donk `
   --team1 Spirit --team2 Falcons --pteam Spirit --round 9 --score 6-3 `
   --kills "donk>a:ak47:hs,donk>b:ak47:flash=chopper,donk>c:ak47,donk>d:awp,donk>e:ak47"
 ```
-O clipe começa `--ctx` (default 10s) **antes do 1º kill** (`--firstat`; sem ele,
-usa `pre` antes do 5º kill e pode começar em cima da ação). No modo live o bot
-ancora sozinho no 1º kill detectado (`CLIP_CONTEXT_SEC` no `.env`).
+The clip starts `--ctx` (default 10s) **before the 1st kill** (`--firstat`; without it,
+it uses `pre` before the 5th kill and may start right on the action). In live mode the bot
+anchors itself on the 1st detected kill (`CLIP_CONTEXT_SEC` in `.env`).
 
-## Estrutura
+## Structure
 
 ```text
 src/config.ts, logger.ts (arquivo), db.ts (sqlite dedup)
@@ -135,15 +136,15 @@ scripts/auth-youtube.ts
 tests/
 ```
 
-## Thumbnails: cadeia de fallback
+## Thumbnails: fallback chain
 
-`THUMB_MODE=ai` ativa a cadeia. `THUMB_AI_ORDER` define a ordem exata de
-tentativa — o primeiro é o seu preferido; qualquer falha (cota, sem login,
-timeout, challenge, imagem inválida) loga e cai para o próximo. Esgotada a
-cadeia, a thumb **composta determinística** (sharp: frame real + selo ACE!)
-fechaa conta — US$0, zero rede, sempre sai. `THUMB_AI_TIMEOUT_MS` (default
-600000 = 10min por provider) controla quanto tempo cada tentativa aguarda o
-render — render web às vezes passa de 5min.
+`THUMB_MODE=ai` enables the chain. `THUMB_AI_ORDER` sets the exact attempt
+order — the first one is your preferred; any failure (quota, no login,
+timeout, challenge, invalid image) logs and falls through to the next. Once the
+chain is exhausted, the **deterministic composite** thumb (sharp: real frame + ACE!
+badge) closes the loop — US$0, zero network, always succeeds. `THUMB_AI_TIMEOUT_MS` (default
+600000 = 10min per provider) controls how long each attempt waits for the
+render — web render sometimes takes over 5min.
 
 ```text
 THUMB_AI_ORDER=chatgpt,grok,gemini-web
@@ -152,98 +153,100 @@ THUMB_AI_ORDER=chatgpt,grok,gemini-web
                 └─ thumb completa — falha se cota esgotada → segue a cadeia
 ```
 
-| Provider | Gera | Custo | Precisa |
+| Provider | Generates | Cost | Needs |
 |---|---|---|---|
-| `chatgpt` | thumb completa (5 refs anexadas) | grátis (cota diária) | `chatgpt-login.ts` 1x, conta descartável |
-| `grok` | thumb completa (5 refs anexadas) | grátis (cota X) | `grok-login.ts` 1x, conta X descartável |
-| `gemini-web` | thumb completa **policy-safe** (5 refs; retrato estilizado com rosto na sombra; prefixo "Generate an image…" obrigatório — sem ele o app responde em texto) | grátis (cota do app) | `gemini-login.ts` 1x, conta descartável **Gmail** (contas edu/Workspace podem não ter geração de imagem) |
-| `huggingface` | fundo | free **sem créditos** (pago p/ usar) | `HF_TOKEN` + créditos |
-| `gemini` | fundo | ~US$0,13/img | `GEMINI_API_KEY` + billing |
-| `pollinations` | fundo | virou pago (402) | nada (falha rápido) |
-| *(fim da cadeia)* | **composta** (sharp) | US$0 | nada — sempre funciona |
+| `chatgpt` | full thumb (5 refs attached) | free (daily quota) | `chatgpt-login.ts` once, throwaway account |
+| `grok` | full thumb (5 refs attached) | free (X quota) | `grok-login.ts` once, throwaway X account |
+| `gemini-web` | full **policy-safe** thumb (5 refs; stylized portrait with the face in shadow; the prefix "Generate an image…" is mandatory — without it the app replies with text) | free (app quota) | `gemini-login.ts` once, throwaway **Gmail** account (edu/Workspace accounts may not have image generation) |
+| `huggingface` | background | free **without credits** (paid to use) | `HF_TOKEN` + credits |
+| `gemini` | background | ~US$0.13/img | `GEMINI_API_KEY` + billing |
+| `pollinations` | background | became paid (402) | nothing (fails fast) |
+| *(end of chain)* | **composite** (sharp) | US$0 | nothing — always works |
 
-Política por provider: o **Gemini recusa retrato de pessoa real** — por isso,
-no `gemini-web`, o retrato do layout vira **figura estilizada com o rosto na
-sombra** (policy-safe) e as 5 referências seguem anexadas. chatgpt/grok aceitam
-o layout completo com retrato. Logos de times vêm da Liquipedia com busca
-prefixada `"Team <Nome>"` (busca crua casa com páginas homônimas — ex. "Spirit"
-é outro time — e já baixou logo errado; há regressão testada para isso).
+Policy per provider: **Gemini refuses portraits of real people** — that is why,
+in `gemini-web`, the layout portrait becomes a **stylized figure with the face in
+shadow** (policy-safe) and the 5 references stay attached. chatgpt/grok accept
+the full layout with the portrait. Team logos come from Liquipedia with a prefixed
+search `"Team <Name>"` (raw search matches homonymous pages — e.g. "Spirit"
+is another team — and has already downloaded the wrong logo; there is a tested
+regression for this).
 
-### Login web descartável (chatgpt e gemini-web)
-Automatizar UI web viola os Termos (OpenAI e Google) — conta pega pode ser
-suspensa. **Nunca use contas importantes.**
-1. `THUMB_AI_ORDER=chatgpt` (ou `gemini-web`) no `.env`.
-2. `npx tsx scripts/chatgpt-login.ts` (ou `gemini-login.ts`) → faça login com
-   uma **conta descartável** → ENTER (sessão em `data/*-profile/`, ignorada
-   pelo git — nunca commite).
+### Throwaway web login (chatgpt and gemini-web)
+Automating the web UI violates the Terms (OpenAI and Google) — a caught account can be
+suspended. **Never use important accounts.**
+1. `THUMB_AI_ORDER=chatgpt` (or `gemini-web`) in `.env`.
+2. `npx tsx scripts/chatgpt-login.ts` (or `gemini-login.ts`) → log in with
+   a **throwaway account** → ENTER (session in `data/*-profile/`, ignored
+   by git — never commit).
 
-### gemini-web: login descartável, nunca a conta do canal
-Automatizar a UI web viola os Termos da OpenAI/Google — conta pega pode ser
-suspensa. Por isso: **nunca use a conta dona do canal/projeto Cloud**.
+### gemini-web: throwaway login, never the channel account
+Automating the web UI violates OpenAI/Google's Terms — a caught account can be
+suspended. Therefore: **never use the account that owns the channel/Cloud project**.
 
-## Referências visuais no prompt IA (HLTV + Liquipedia)
+## Visual references in the AI prompt (HLTV + Liquipedia)
 
-Com `--refs` (test-vod) ou sempre no modo live, o bot baixa 5 referências e
-**anexa como imagens** na geração: **duas fotos do player** (infobox + galeria
-da Liquipedia — rosto e uniforme/pose em evento), logo do time do autor,
-logo do adversário e imagem do mapa. Fontes: Liquipedia API (fotos/logos/mapa)
-com HLTV como fallback de logo. O prompt carrega a seção REFERÊNCIAS
-OBRIGATÓRIAS com o nome específico de cada item, na ordem exata dos anexos.
-Tudo é best-effort — cada referência ausente degrada sozinha (sem anexo, o
-prompt segue com renumeração automática). Logos dos times vêm da HLTV
-primeiro (browser com clearance do Cloudflare, `div.profile-team-logo-container`
-da página do time — sempre a logo vigente em PNG); qualquer falha cai no
-fluxo Liquipedia (infobox → seção Logos → commons com scoring).
+With `--refs` (test-vod) or always in live mode, the bot downloads 5 references and
+**attaches them as images** to the generation: **two photos of the player** (Liquipedia
+infobox + gallery — face and uniform/pose at an event), the killer's team
+logo, the opponent's logo and the map image. Sources: Liquipedia API (photos/logos/map)
+with HLTV as a logo fallback. The prompt carries the MANDATORY
+REFERENCES section with the specific name of each item, in the exact
+order of the attachments. Everything is best-effort — each missing reference
+degrades on its own (without the attachment, the prompt continues with automatic
+renumbering). Team logos come from HLTV
+first (browser with Cloudflare clearance, `div.profile-team-logo-container`
+from the team page — always the current logo in PNG); any failure falls back to the
+Liquipedia flow (infobox → Logos section → commons with scoring).
 
-Política por provider (validada em testes reais):
-- **chatgpt** (thumb completa): recebe as **5 referências** + prompt com
-  seção REFERÊNCIAS. Nota: conta free tem cota diária de imagens.
-- **gemini-web** (fundo híbrido): recebe **só o mapa** e prompt de fundo —
-  o Gemini **recusa** retrato de pessoa real ("retrato em close do jogador X"
-  → erro de diretrizes); rosto vem do frame real via overlay.
-- APIs (huggingface/gemini): fundo, sem anexos.
+Policy per provider (validated in real tests):
+- **chatgpt** (full thumb): receives the **5 references** + prompt with a
+  REFERENCES section. Note: a free account has a daily image quota.
+- **gemini-web** (hybrid background): receives **only the map** and a background prompt —
+  Gemini **refuses** portraits of real people ("close-up portrait of player X"
+  → guideline error); the face comes from the real frame via overlay.
+- APIs (huggingface/gemini): background, no attachments.
 
-Arquivos em `data/clips/refs/` (gitignored). Overrides manuais no test-vod:
+Files in `data/clips/refs/` (gitignored). Manual overrides in test-vod:
 `--playerphoto/--team1logo/--team2logo/--mapimg <URL>`.
-1. `THUMB_AI_ORDER=gemini-web` no `.env`.
-2. `npx tsx scripts/gemini-login.ts` → abre o Chrome → faça login com uma
-   **conta Google descartável** → ENTER (sessão salva em `data/gemini-profile/`,
-   ignorada pelo git — nunca commite).
-3. Rode o `test-vod`/bot normalmente; qualquer falha (layout mudou, sem cota,
-   sem login) cai para a thumb composta.
+1. `THUMB_AI_ORDER=gemini-web` in `.env`.
+2. `npx tsx scripts/gemini-login.ts` → opens Chrome → log in with a
+   **throwaway Google account** → ENTER (session saved in `data/gemini-profile/`,
+   ignored by git — never commit).
+3. Run `test-vod`/the bot normally; any failure (layout changed, no quota,
+   no login) falls back to the composite thumb.
 
-Debug do provider web (rápido, sem baixar VOD): `npx tsx scripts/gemini-probe.ts`
-ou `npx tsx scripts/gemini-probe.ts --order gemini-web`. Os logs mostram cada
-etapa (abertura, login, envio, render, bytes); em falha, abre
-`logs/gemini-fail-*.png` para ver o estado da página.
+Web provider debug (fast, without downloading a VOD): `npx tsx scripts/gemini-probe.ts`
+or `npx tsx scripts/gemini-probe.ts --order gemini-web`. The logs show each
+step (open, login, submit, render, bytes); on failure, it opens
+`logs/gemini-fail-*.png` to show the page state.
 
-No nosso volume (poucos aces/semana), qualquer opção paga sairia ~US$1–2/mês;
-por enquanto a composta é o caminho de produção (US$0 e validada no clipe do donk).
-A IA nunca quebra o pipeline: qualquer falha usa a composta.
+At our volume (a few aces/week), any paid option would come to ~US$1–2/month;
+for now the composite is the production path (US$0 and validated on donk's clip).
+The AI never breaks the pipeline: any failure uses the composite.
 
-## Dados do round (o que a IA recebe)
+## Round data (what the AI receives)
 
-Cada ace carrega `RoundSummary`: jogador, times, mapa, round, as 5 vítimas,
-**arma de cada kill**, headshots, **assists e flash-assists**, granadas de dano
-(HE/molotov) e arma principal. Isso alimenta título (`ACE! donk (AK-47)…`),
-descrição kill-a-kill, texto da thumb e o prompt do fundo IA.
+Each ace carries a `RoundSummary`: player, teams, map, round, the 5 victims,
+**weapon of each kill**, headshots, **assists and flash-assists**, damage
+grenades (HE/molotov) and primary weapon. This feeds the title (`ACE! donk (AK-47)…`),
+the kill-by-kill description, the thumb text and the AI background prompt.
 
-Fidelidade por fonte (live primeiro, resto depois):
+Fidelity per source (live first, the rest later):
 
-| Dado | Live (killfeed HLTV) | Demo GOTV (fase 2) |
+| Data | Live (HLTV killfeed) | GOTV demo (phase 2) |
 |---|---|---|
-| killer/vítima | ✅ sempre | ✅ |
-| arma/HS | ⚠️ best-effort (ícone/texto no DOM) | ✅ exato |
-| assist/flash-assist | ❌ (killfeed não mostra) | ✅ exato |
-| granadas lançadas (smoke/flash sem kill) | ❌ | ✅ exato |
+| killer/victim | ✅ always | ✅ |
+| weapon/HS | ⚠️ best-effort (icon/text in the DOM) | ✅ exact |
+| assist/flash-assist | ❌ (killfeed does not show it) | ✅ exact |
+| grenades thrown (smoke/flash without a kill) | ❌ | ✅ exact |
 
-Fase 2 = baixar a demo da partida acabada e extrair com parser `.dem`
-(`demofile`): fecha 100% da lista (armas, assists, HE/flash/smoke/molotov).
-Campos ausentes vêm como `undefined` e o texto degrada sozinho.
+Phase 2 = download the finished match demo and parse it with a `.dem` parser
+(`demofile`): completes 100% of the list (weapons, assists, HE/flash/smoke/molotov).
+Missing fields come as `undefined` and the text degrades on its own.
 
-## Limites conhecidos
+## Known limits
 
-- HLTV tem Cloudflare: seletores são por classe/`data-*` com fallback, mas layout pode quebrar — veja `logs/bot.log`.
-- Máx `MAX_RECORDINGS=2` por padrão para não sobrecarregar o PC.
-- Sem buffer = sem clipe (evento fica salvo no sqlite, dá para cortar via VOD depois — fora do MVP).
-- Direitos: mesmo stream oficial pode gerar Content ID. Começar privado + revisar título/descrição é intencional.
+- HLTV has Cloudflare: selectors are by class/`data-*` with fallback, but the layout can break — see `logs/bot.log`.
+- Max `MAX_RECORDINGS=2` by default so as not to overload the PC.
+- No buffer = no clip (the event is saved in sqlite, you can cut it later via VOD — outside the MVP).
+- Rights: even an official stream can trigger Content ID. Starting private + reviewing the title/description is intentional.
