@@ -90,17 +90,37 @@ export function parseThumbLogLine(line: string): ThumbAttemptRow | null {
   return parseThumbAttemptLine(line) ?? parseLegacyThumbLine(line);
 }
 
+/**
+ * Filtro barato (sem JSON.parse) p/ linhas candidatas a tentativa de thumb.
+ * Fonte única da verdade: o script de diagnóstico usa isto para não repetir
+ * os prefixos de mensagem (que já mudaram uma vez).
+ */
+export function isThumbLogLine(line: string): boolean {
+  return (
+    line.includes('thumb IA') ||
+    line.includes('fundo IA via') ||
+    line.includes('provider IA falhou')
+  );
+}
+
 export interface ThumbDiagCell {
   attempts: number;
   ok: number;
   failKinds: Record<string, number>;
 }
 
+const KEY_SEP = ' | ';
+
+/** Chave de agregação "provider | modo" (fonte única p/ summarize/format). */
+function thumbDiagKey(provider: string, mode: string): string {
+  return `${provider}${KEY_SEP}${mode}`;
+}
+
 /** Agrega por "provider | modo". */
 export function summarizeAttempts(rows: ThumbAttemptRow[]): Record<string, ThumbDiagCell> {
   const out: Record<string, ThumbDiagCell> = {};
   for (const r of rows) {
-    const key = `${r.provider} | ${r.windowMode}`;
+    const key = thumbDiagKey(r.provider, r.windowMode);
     const cell = (out[key] ??= { attempts: 0, ok: 0, failKinds: {} });
     cell.attempts++;
     if (r.outcome === 'ok') {
@@ -124,7 +144,9 @@ export function formatThumbDiagTable(summary: Record<string, ThumbDiagCell>): st
     '-'.repeat(80),
   ];
   for (const k of keys) {
-    const [provider, mode] = k.split(' | ');
+    const sep = k.indexOf(KEY_SEP);
+    const provider = sep >= 0 ? k.slice(0, sep) : k;
+    const mode = sep >= 0 ? k.slice(sep + KEY_SEP.length) : '';
     const c = summary[k];
     const pct = c.attempts > 0 ? `${Math.round((c.ok / c.attempts) * 100)}%` : '-';
     const kinds = Object.entries(c.failKinds)

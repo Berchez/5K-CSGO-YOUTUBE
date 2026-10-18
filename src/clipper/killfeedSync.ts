@@ -4,10 +4,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { KillEvent } from '../types.js';
+import { resolveFfmpegBin } from './clipBuilder.js';
 import { resolveFfprobeBin } from './segmentProbe.js';
 
 const execFileAsync = promisify(execFile);
-const SAMPLE_RATE = 1;
+/** Frames extraídos por segundo de vídeo (fps do filtro + passo do OCR). */
+const SAMPLE_FPS = 1;
 const EARLY_TOLERANCE_MS = 15_000;
 const CONSISTENCY_TOLERANCE_MS = 2_500;
 const MAX_MEDIAN_DEVIATION_MS = 1_500;
@@ -45,6 +47,28 @@ function median(values: number[]): number {
     : sorted[middle];
 }
 
+/** Kill observada no killfeed com o offset candidato que ela implica. */
+interface OffsetCandidate {
+  killIndex: number;
+  offsetMs: number;
+}
+
+/**
+ * Maior agrupamento de candidatos mutuamente consistentes (voto por maioria:
+ * kills mal lidas/isoladas ficam fora). A ordem interna não importa — só o
+ * tamanho e o conjunto alimentam a mediana.
+ */
+function largestConsistentCluster(candidates: OffsetCandidate[]): OffsetCandidate[] {
+  let best: OffsetCandidate[] = [];
+  for (const candidate of candidates) {
+    const cluster = candidates.filter(
+      (item) => Math.abs(item.offsetMs - candidate.offsetMs) <= CONSISTENCY_TOLERANCE_MS,
+    );
+    if (cluster.length > best.length) best = cluster;
+  }
+  return best;
+}
+
 export function estimateStreamOffset(
   kills: KillEvent[],
   observations: KillfeedObservation[],
@@ -72,26 +96,20 @@ export function estimateStreamOffset(
     }
   }
   const candidates = [...earliestObservationByKill]
-    .map(([killIndex, streamAtMs]) => {
+    .map(([killIndex, streamAtMs]): OffsetCandidate | null => {
       const kill = kills[killIndex];
       if (!kill || !Number.isFinite(kill.at) || !Number.isFinite(streamAtMs)) return null;
       const offsetMs = streamAtMs - (kill.at! - scoreboardDelayMs);
       if (offsetMs < MIN_ALLOWED_OFFSET_MS || offsetMs > maxLagSec * 1000) return null;
       return { killIndex, offsetMs };
     })
-    .filter((candidate): candidate is { killIndex: number; offsetMs: number } => candidate !== null);
+    .filter((candidate): candidate is OffsetCandidate => candidate !== null);
 
   const minimumMatches = Math.min(
     timestamped.length,
     Math.max(3, Math.ceil(timestamped.length * 0.6)),
   );
-  let best: Array<{ killIndex: number; offsetMs: number }> = [];
-  for (const candidate of candidates) {
-    const cluster = candidates
-      .filter((item) => Math.abs(item.offsetMs - candidate.offsetMs) <= CONSISTENCY_TOLERANCE_MS)
-      .sort((a, b) => Math.abs(a.offsetMs - candidate.offsetMs) - Math.abs(b.offsetMs - candidate.offsetMs));
-    if (cluster.length > best.length) best = cluster;
-  }
+  const best = largestConsistentCluster(candidates);
 
   const observedKillCount = new Set(candidates.map((candidate) => candidate.killIndex)).size;
   const matchedKills = best.length;
@@ -125,39 +143,45 @@ export function estimateStreamOffset(
   };
 }
 
-function normalizeNickname(value: string): string[] {
-  return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+/** Minúsculo sem pontuação: "Player-A" → "playera". */
+function normalizeNickname(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+/** Tokens do texto OCR (o killfeed pode quebrar um nick em pedaços). */
+function textTokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/**
+ * True se o nick aparece no texto, inclusive reconstruído por até 4 tokens
+ * adjacentes — o OCR às vezes separa "N Q Z" de "nqz".
+ */
 function containsNickname(tokens: string[], nickname: string): boolean {
-  const parts = normalizeNickname(nickname);
-  if (parts.length === 0) return false;
+  const target = normalizeNickname(nickname);
+  if (target.length === 0) return false;
   for (let start = 0; start < tokens.length; start++) {
     let candidate = '';
     for (let end = start; end < Math.min(tokens.length, start + 4); end++) {
       candidate += tokens[end];
-      if (candidate === parts.join('')) return true;
-      if (candidate.length >= parts.join('').length) break;
+      if (candidate === target) return true;
+      if (candidate.length >= target.length) break;
     }
   }
   return false;
 }
 
+/** Índices das kills cujo killer E victim aparecem no texto lido pelo OCR. */
 export function matchKillfeedText(text: string, kills: KillEvent[]): number[] {
-  const tokens = normalizeNickname(text);
-  return kills.flatMap((kill, index) => {
-    const killer = normalizeNickname(kill.killer).join('');
-    const victim = normalizeNickname(kill.victim).join('');
-    return killer.length >= 3 && victim.length >= 3 &&
-      containsNickname(tokens, kill.killer) && containsNickname(tokens, kill.victim)
+  const tokens = textTokens(text);
+  return kills.flatMap((kill, index) =>
+    normalizeNickname(kill.killer).length >= 3 &&
+    normalizeNickname(kill.victim).length >= 3 &&
+    containsNickname(tokens, kill.killer) &&
+    containsNickname(tokens, kill.victim)
       ? [index]
-      : [];
-  });
-}
-
-function ffmpegPath(): string {
-  const local = path.resolve('.tools', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-  return fs.existsSync(local) ? local : 'ffmpeg';
+      : [],
+  );
 }
 
 async function probeDuration(file: string, ffprobe: string): Promise<number> {
@@ -173,17 +197,25 @@ async function probeDuration(file: string, ffprobe: string): Promise<number> {
   return durationSec;
 }
 
-async function scanSegment(
-  file: string,
-  durationSec: number,
-  directory: string,
-  ffmpeg: string,
-  worker: OcrWorker,
-  sharp: typeof import('sharp').default,
-  kills: KillEvent[],
-  segmentEndMs: number,
-): Promise<KillfeedObservation[]> {
-  const framesDir = path.join(directory, `${path.basename(file, path.extname(file))}-${Math.round(segmentEndMs)}`);
+interface ScanSegmentArgs {
+  file: string;
+  durationSec: number;
+  /** Diretório-pai dos frames temporários do segmento. */
+  framesRoot: string;
+  ffmpeg: string;
+  worker: OcrWorker;
+  sharp: typeof import('sharp').default;
+  kills: KillEvent[];
+  /** Instante (epoch ms) em que o segmento terminou de ser gravado. */
+  segmentEndMs: number;
+}
+
+async function scanSegment(args: ScanSegmentArgs): Promise<KillfeedObservation[]> {
+  const { file, durationSec, framesRoot, ffmpeg, worker, sharp, kills, segmentEndMs } = args;
+  const framesDir = path.join(
+    framesRoot,
+    `${path.basename(file, path.extname(file))}-${Math.round(segmentEndMs)}`,
+  );
   fs.mkdirSync(framesDir, { recursive: true });
   await execFileAsync(
     ffmpeg,
@@ -194,8 +226,9 @@ async function scanSegment(
       '-y',
       '-i',
       file,
+      // Região superior direita, onde o killfeed do CS2 é desenhado.
       '-vf',
-      'fps=1,crop=iw*0.30:ih*0.25:iw*0.70:ih*0.05',
+      `fps=${SAMPLE_FPS},crop=iw*0.30:ih*0.25:iw*0.70:ih*0.05`,
       path.join(framesDir, 'frame_%04d.png'),
     ],
     { timeout: Math.max(30_000, Math.ceil(durationSec * 10_000)), windowsHide: true },
@@ -212,7 +245,7 @@ async function scanSegment(
       .png()
       .toBuffer();
     const { data } = await worker.recognize(image);
-    const streamAtMs = segmentStartMs + (i * 1000) / SAMPLE_RATE;
+    const streamAtMs = segmentStartMs + (i * 1000) / SAMPLE_FPS;
     for (const killIndex of matchKillfeedText(String(data.text ?? ''), kills)) {
       observations.push({ killIndex, streamAtMs });
     }
@@ -248,7 +281,7 @@ export async function scanKillfeedForStreamOffset(
     const { createWorker, PSM } = await import('tesseract.js');
     worker = await createWorker('eng');
     await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
-    const ffmpeg = ffmpegPath();
+    const ffmpeg = resolveFfmpegBin();
 
     while (!options.shouldStop?.() && Date.now() <= deadlineMs) {
       const listed = listSegments();
@@ -263,15 +296,24 @@ export async function scanKillfeedForStreamOffset(
         const key = `${file}:${stat.size}:${stat.mtimeMs}`;
         if (seen.has(key)) continue;
         seen.add(key);
+        // Antes da janela de interesse: pula sem gastar ffprobe/OCR.
         if (stat.mtimeMs < scanStartMs) continue;
 
         const durationSec = await probeDuration(file, ffprobe);
         const segmentStartMs = stat.mtimeMs - durationSec * 1000;
         if (segmentStartMs > scanEndMs) continue;
-        if (stat.mtimeMs < scanStartMs || segmentStartMs > scanEndMs) continue;
 
         observations.push(
-          ...(await scanSegment(file, durationSec, dir, ffmpeg, worker, sharp, kills, stat.mtimeMs)),
+          ...(await scanSegment({
+            file,
+            durationSec,
+            framesRoot: dir,
+            ffmpeg,
+            worker,
+            sharp,
+            kills,
+            segmentEndMs: stat.mtimeMs,
+          })),
         );
         const estimate = estimateStreamOffset(kills, observations, scoreboardDelayMs, maxLagSec);
         if (estimate.reason === 'confident') return estimate;

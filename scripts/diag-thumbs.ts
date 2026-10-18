@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import {
   formatThumbDiagTable,
+  isThumbLogLine,
   parseThumbLogLine,
   summarizeAttempts,
   type ThumbAttemptRow,
@@ -36,7 +37,7 @@ async function main(): Promise<void> {
   const rows: ThumbAttemptRow[] = [];
   let scanned = 0;
   for (const line of fs.readFileSync(file, 'utf-8').split('\n')) {
-    if (!line.includes('thumb IA') && !line.includes('fundo IA via') && !line.includes('provider IA falhou')) continue;
+    if (!isThumbLogLine(line)) continue;
     scanned++;
     const r = parseThumbLogLine(line);
     if (r && (r.time === 0 || r.time >= cutoff)) rows.push(r);

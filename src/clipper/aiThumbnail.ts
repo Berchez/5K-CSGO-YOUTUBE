@@ -60,13 +60,18 @@ export interface ChallengeStreakTracker {
   snapshot: () => Record<string, number>;
 }
 
+/** Falhas de challenge seguidas (sem janela) que disparam o alerta. */
+export const CHALLENGE_ALERT_THRESHOLD = 3;
+
 /**
  * Conta falhas de challenge SEM janela visível por provider. Quando o bot
  * roda minimizado e o challenge dispara em sequência, é o sinal de que
  * aquele provider precisava estar visível — o chamador emite ERROR + toast.
  * Sucesso zera. Puro/testável (estado encapsulado).
  */
-export function createChallengeStreakTracker(threshold = 3): ChallengeStreakTracker {
+export function createChallengeStreakTracker(
+  threshold = CHALLENGE_ALERT_THRESHOLD,
+): ChallengeStreakTracker {
   const fails = new Map<string, number>();
   return {
     register(provider, mode, failKind) {
@@ -88,7 +93,7 @@ export function createChallengeStreakTracker(threshold = 3): ChallengeStreakTrac
 }
 
 /** Contador global da cadeia (reinicia com o processo — heurística, não estado). */
-const challengeStreaks = createChallengeStreakTracker(3);
+const challengeStreaks = createChallengeStreakTracker();
 
 export interface AiThumbOptions {
   /** Ordem de tentativa. Default: chatgpt. */
@@ -462,12 +467,12 @@ export async function buildAiBackground(
       challengeStreaks.reset(provider);
     } else if (challengeStreaks.register(provider, mode, failKind ?? 'unknown')) {
       log.error(
-        { provider, mode, fails: 3 },
+        { provider, mode, fails: CHALLENGE_ALERT_THRESHOLD },
         'challenge repetido sem janela visível — considere voltar visível (CHATGPT_MINIMIZED=0, GROK_MINIMIZED=0)',
       );
       notifyWindows(
         '5K Bot: thumbs caindo no fallback',
-        `Provider "${provider}" falhou 3x seguidas em challenge (${mode}). Considere voltar a janela visível.`,
+        `Provider "${provider}" falhou ${CHALLENGE_ALERT_THRESHOLD}x seguidas em challenge (${mode}). Considere voltar a janela visível.`,
       );
     }
   };

@@ -105,6 +105,78 @@ function twitchUrlFrom(streamUrl: string): string {
   return streamUrl;
 }
 
+/** Offset aplicável + registro persistido (ace.streamSync) da calibração OCR. */
+interface StreamSyncMeasurement {
+  /** Offset a somar às âncoras; 0 quando não aplicado (log/off/sem confiança). */
+  offsetMs: number;
+  /** Registro gravado no sidecar independentemente de o offset ser aplicado. */
+  sync: NonNullable<AceEvent['streamSync']>;
+}
+
+/**
+ * Mede o atraso da fonte comparando as kills do placar com o killfeed OCR e
+ * decide se aplica (só em 'auto' e com confiança). Nunca lança: em erro ou
+ * indisponibilidade devolve offset 0 + motivo. (Extraído de handleAce para
+ * manter o fluxo do clipe legível.)
+ */
+async function measureStreamOffset(
+  ace: AceEvent,
+  cfg: ReturnType<typeof getConfig>,
+  recorder: StreamRecorder | undefined,
+  shouldStop: () => boolean,
+): Promise<StreamSyncMeasurement> {
+  const log = getLogger();
+  const mode = cfg.CLIP_STREAM_SYNC;
+  const totalKills = ace.kills.filter((kill) => Number.isFinite(kill.at)).length;
+  const skip = (reason: string): StreamSyncMeasurement => ({
+    offsetMs: 0,
+    sync: { mode, applied: false, offsetMs: null, matchedKills: 0, totalKills, medianDeviationMs: null, reason },
+  });
+
+  if (mode === 'off') return skip('disabled');
+  if (!recorder?.isRunning) {
+    log.warn(
+      { matchId: ace.matchId, stream: recorder?.streamName },
+      'calibragem OCR indisponível — mantendo âncoras originais',
+    );
+    return skip('recorder-unavailable');
+  }
+
+  try {
+    const estimate = await scanKillfeedForStreamOffset({
+      kills: ace.kills,
+      scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+      maxLagSec: cfg.CLIP_STREAM_SYNC_MAX_LAG_SEC,
+      segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+      listSegments: () => recorder.listSegments(),
+      shouldStop,
+    });
+    const applied = mode === 'auto' && estimate.offsetMs != null;
+    const sync: StreamSyncMeasurement['sync'] = {
+      mode,
+      applied,
+      offsetMs: estimate.offsetMs,
+      matchedKills: estimate.matchedKills,
+      totalKills: estimate.totalKills,
+      medianDeviationMs: estimate.medianDeviationMs,
+      reason: estimate.reason,
+    };
+    const details = { matchId: ace.matchId, stream: recorder.streamName, ...sync };
+    if (applied) {
+      log.info(details, 'atraso da fonte medido por OCR');
+    } else {
+      log.warn(details, 'calibragem OCR sem confiança — mantendo âncoras originais');
+    }
+    return { offsetMs: applied ? estimate.offsetMs! : 0, sync };
+  } catch (e) {
+    log.warn(
+      { err: String(e), matchId: ace.matchId, stream: recorder.streamName },
+      'calibragem OCR falhou — mantendo âncoras originais',
+    );
+    return skip('scan-error');
+  }
+}
+
 async function handleAce(
   ace: AceEvent,
   matchId: string,
@@ -135,78 +207,13 @@ async function handleAce(
     );
     const aceDetectedAtMs = Date.now();
     const syncRecorder = muxedRecorder ?? recorder;
-    let streamOffsetMs = 0;
-    if (cfg.CLIP_STREAM_SYNC !== 'off' && syncRecorder?.isRunning) {
-      try {
-        const estimate = await scanKillfeedForStreamOffset({
-          kills: ace.kills,
-          scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
-          maxLagSec: cfg.CLIP_STREAM_SYNC_MAX_LAG_SEC,
-          segmentTimeSec: cfg.SEGMENT_TIME_SEC,
-          listSegments: () => syncRecorder.listSegments(),
-          shouldStop: () => stopping,
-        });
-        const applied = cfg.CLIP_STREAM_SYNC === 'auto' && estimate.offsetMs != null;
-        if (applied && estimate.offsetMs != null) {
-          streamOffsetMs = estimate.offsetMs;
-        }
-        ace.streamSync = {
-          mode: cfg.CLIP_STREAM_SYNC,
-          applied,
-          offsetMs: estimate.offsetMs,
-          matchedKills: estimate.matchedKills,
-          totalKills: estimate.totalKills,
-          medianDeviationMs: estimate.medianDeviationMs,
-          reason: estimate.reason,
-        };
-        const details = {
-          matchId,
-          stream: syncRecorder.streamName,
-          mode: cfg.CLIP_STREAM_SYNC,
-          applied,
-          offsetMs: estimate.offsetMs,
-          matchedKills: estimate.matchedKills,
-          totalKills: estimate.totalKills,
-          medianDeviationMs: estimate.medianDeviationMs,
-          reason: estimate.reason,
-        };
-        if (applied) {
-          log.info(details, 'atraso da fonte medido por OCR');
-        } else {
-          log.warn(details, 'calibragem OCR sem confiança — mantendo âncoras originais');
-        }
-      } catch (e) {
-        ace.streamSync = {
-          mode: cfg.CLIP_STREAM_SYNC,
-          applied: false,
-          offsetMs: null,
-          matchedKills: 0,
-          totalKills: ace.kills.filter((kill) => Number.isFinite(kill.at)).length,
-          medianDeviationMs: null,
-          reason: 'scan-error',
-        };
-        log.warn(
-          { err: String(e), matchId, stream: syncRecorder.streamName },
-          'calibragem OCR falhou — mantendo âncoras originais',
-        );
-      }
-    } else {
-      ace.streamSync = {
-        mode: cfg.CLIP_STREAM_SYNC,
-        applied: false,
-        offsetMs: null,
-        matchedKills: 0,
-        totalKills: ace.kills.filter((kill) => Number.isFinite(kill.at)).length,
-        medianDeviationMs: null,
-        reason: cfg.CLIP_STREAM_SYNC === 'off' ? 'disabled' : 'recorder-unavailable',
-      };
-      if (cfg.CLIP_STREAM_SYNC !== 'off') {
-        log.warn(
-          { matchId, stream: syncRecorder?.streamName },
-          'calibragem OCR indisponível — mantendo âncoras originais',
-        );
-      }
-    }
+    const { offsetMs: streamOffsetMs, sync: streamSync } = await measureStreamOffset(
+      ace,
+      cfg,
+      syncRecorder,
+      () => stopping,
+    );
+    ace.streamSync = streamSync;
     const uncorrectedStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
     const aceStartMs =
       uncorrectedStartMs != null ? uncorrectedStartMs + streamOffsetMs : undefined;

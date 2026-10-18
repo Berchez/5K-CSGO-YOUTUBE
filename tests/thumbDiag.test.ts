@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   formatThumbDiagTable,
+  isThumbLogLine,
   parseThumbLogLine,
   summarizeAttempts,
 } from '../src/clipper/thumbDiag.js';
@@ -47,6 +48,16 @@ describe('parseThumbLogLine (nova + legada)', () => {
     expect(parseThumbLogLine(NOISE)).toBeNull();
     expect(parseThumbLogLine(NOT_JSON)).toBeNull();
     expect(parseThumbLogLine('')).toBeNull();
+  });
+});
+
+describe('isThumbLogLine (pré-filtro barato)', () => {
+  it('aceita as três formas e rejeita ruído', () => {
+    expect(isThumbLogLine(NEW_OK)).toBe(true);
+    expect(isThumbLogLine(LEGACY_OK)).toBe(true);
+    expect(isThumbLogLine(LEGACY_FAIL)).toBe(true);
+    expect(isThumbLogLine(NOISE)).toBe(false);
+    expect(isThumbLogLine(NOT_JSON)).toBe(false);
   });
 });
 

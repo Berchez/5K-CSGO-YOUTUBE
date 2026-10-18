@@ -134,6 +134,7 @@ export async function makeSmartThumbnail(
   opts: SmartThumbOptions = {},
 ): Promise<string> {
   if (opts.mode === 'ai') {
+    let aiError: unknown;
     try {
       const { buildAiBackground } = await import('./aiThumbnail.js');
       const result = await buildAiBackground(ace, opts.ai);
@@ -156,11 +157,16 @@ export async function makeSmartThumbnail(
           fs.rmSync(frame, { force: true });
         }
       }
-    } catch {
-      // fallback silencioso para a composta
+    } catch (e) {
+      aiError = e;
     }
+    // A cadeia IA já loga cada provider; aqui fica o desfecho agregado — com
+    // o erro real, uma falha inesperada (ex: sharp) não some no silêncio.
     const { getLogger } = await import('../logger.js');
-    getLogger().info('thumb IA indisponível, usando composta');
+    getLogger().info(
+      { err: aiError != null ? String(aiError).slice(0, 300) : undefined },
+      'thumb IA indisponível, usando composta',
+    );
   }
   return makeThumbnail(videoPath, outPath, ace, atSec);
 }

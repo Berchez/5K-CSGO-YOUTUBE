@@ -89,26 +89,26 @@ export async function launchStealthContext(
     viewport: { width: 1366, height: 900 },
     ...(opts.ignoreDefaultArgs ? { ignoreDefaultArgs: opts.ignoreDefaultArgs } : {}),
   };
+  // Minimiza best-effort após o launch (nos dois caminhos de fallback).
+  const withMinimize = async (ctx: BrowserContext): Promise<BrowserContext> => {
+    if (opts.minimize && !opts.headless) {
+      const ok = await minimizeBrowserWindow(ctx);
+      getLogger().debug({ minimized: ok }, 'janela do browser minimizada (CDP)');
+    }
+    return ctx;
+  };
   try {
     const ctx = (await chromium.launchPersistentContext(opts.profileDir, {
       ...common,
       channel: 'chrome',
     })) as unknown as BrowserContext;
-    if (opts.minimize && !opts.headless) {
-      const ok = await minimizeBrowserWindow(ctx);
-      getLogger().debug({ minimized: ok }, 'janela do browser minimizada (CDP)');
-    }
-    return ctx;
+    return await withMinimize(ctx);
   } catch {
     const ctx = (await chromium.launchPersistentContext(
       opts.profileDir,
       common,
     )) as unknown as BrowserContext;
-    if (opts.minimize && !opts.headless) {
-      const ok = await minimizeBrowserWindow(ctx);
-      getLogger().debug({ minimized: ok }, 'janela do browser minimizada (CDP)');
-    }
-    return ctx;
+    return await withMinimize(ctx);
   }
 }
 
