@@ -201,6 +201,19 @@ export function matchPassesFilter(
   return true;
 }
 
+/**
+ * Política de kills por estrela: partida com pelo menos 1 estrela rende
+ * clipe a partir de 4k; partida SEM estrela (0 = sem avaliação no listing)
+ * só rende com 5k. O limite de estrelas em si continua em MIN_STARS.
+ */
+export function minKillsForStars(
+  stars: number,
+  starredMinKills: number,
+  unstarredMinKills: number,
+): number {
+  return stars >= 1 ? starredMinKills : unstarredMinKills;
+}
+
 export function pickPreferredStream(
   streams: StreamInfo[],
   priority: string,
@@ -355,6 +368,9 @@ export async function fetchLiveMatches(
       }
       matches.push(m);
     }
+    // Partidas com estrela primeiro: com MAX_RECORDINGS limitado, elas não
+    // podem perder o slot para um jogo sem estrela (que só rende 5k).
+    matches.sort((a, b) => b.stars - a.stars);
     log.info({ live: cards.filter((c) => c.isLive).length, kept: matches.length, minStars }, 'live matches filtradas');
     return matches;
   } finally {

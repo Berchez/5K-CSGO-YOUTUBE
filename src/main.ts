@@ -11,6 +11,7 @@ import {
   closeBrowser,
   fetchLiveMatches,
   fetchMatchStreams,
+  minKillsForStars,
   pickPreferredStream,
 } from './monitor/hltvMonitor.js';
 import { trackMatch } from './detector/matchTracker.js';
@@ -584,7 +585,9 @@ async function pollOnce(): Promise<void> {
 
     // 2) Tracker de ace (1 por partida)
     if (!activeTrackers.has(m.matchId)) {
+      const minKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
       activeTrackers.add(m.matchId);
+      log.info({ matchId: m.matchId, stars: m.stars, minKills }, 'iniciando tracker de multikill');
       trackMatch(m.matchPageUrl, m.matchId, {
         shouldStop: () => stopping || !activeTrackers.has(m.matchId),
         onAce: (a) => {
@@ -618,7 +621,7 @@ async function pollOnce(): Promise<void> {
             cfg,
           ).catch((e) => log.error({ err: String(e) }, 'erro no handleAce'));
         },
-      }, cfg.MIN_KILLS)
+      }, minKills)
         .catch((e) => log.warn({ err: String(e) }, 'tracker encerrou com erro'))
         .finally(() => {
           activeTrackers.delete(m.matchId);
@@ -691,6 +694,7 @@ async function main(): Promise<void> {
     {
       minStars: cfg.MIN_STARS,
       minKills: cfg.MIN_KILLS,
+      minKillsNoStars: cfg.MIN_KILLS_NO_STARS,
       stream: cfg.STREAM_PRIORITY,
       privacy: cfg.YT_PRIVACY,
       avSync: cfg.CLIP_AV_SYNC,
@@ -705,7 +709,7 @@ async function main(): Promise<void> {
       upload: cfg.YT_UPLOAD,
       maxRec: cfg.MAX_RECORDINGS,
     },
-    `bot iniciado (multikills ${cfg.MIN_KILLS}k+ live, 16:9, log em arquivo)`,
+    `bot iniciado (multikills ${cfg.MIN_KILLS}k+ com estrela / ${cfg.MIN_KILLS_NO_STARS}k sem estrela live, 16:9, log em arquivo)`,
   );
   if (Object.keys(loggedOut).length > 0) {
     const providers = Object.keys(loggedOut);

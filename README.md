@@ -1,6 +1,6 @@
 # 5K CS2 → YouTube (v2 — modern rewrite)
 
-A 100% automated bot up to human review: it monitors **live matches on HLTV** (configurable star filter, `0` = any match), detects **multikills (3k/4k/5k in the same round)**, cuts from a **continuous local buffer** and uploads as **private on YouTube** for you to review/publish.
+A 100% automated bot up to human review: it monitors **live matches on HLTV** (configurable star filter, `0` = any match), detects **multikills** — 4k/5k in matches with **at least 1 star**, and only 5k in matches **without a star** — cuts from a **continuous local buffer** and uploads as **private on YouTube** for you to review/publish.
 
 > The 2021 legacy (`index.py`, Selenium + absolute XPaths) was kept in the repo only as reference. The new code lives in `src/` (Node/TypeScript).
 
@@ -9,12 +9,12 @@ A 100% automated bot up to human review: it monitors **live matches on HLTV** (c
 ```text
 HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
   → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → captura feeds separados + melhor formato muxed, ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
-  → detector: scoreboard live (diff colunas K/D) → 3+ kills mesmo player no round = multikill (3K!/4K!/ACE!)
+  → detector: live scoreboard (K/D column diff) → 4+ kills with a star / 5 kills without a star in the round = multikill (4K!/ACE!)
   → clipper: dois MP4 por evento: captura separada (nome padrão) e fonte muxed (`_muxed`, resolução/FPS nativos), com trim exato
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Scope (as chosen): **3k+ live, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` in `.env` raises the minimum (5 = ace only).
+Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds.
 
 ## Prerequisites (Windows)
 
@@ -27,7 +27,7 @@ Copy-Item .env.example .env
 The recorder uses `yt-dlp` + `ffmpeg` vendored in `.tools/` (no streamlink,
 no winget) — downloaded on the first run.
 
-Edit `.env`: `MIN_STARS=4`, `STREAM_PRIORITY=official,en` (or `gaules` to
+Edit `.env`: `MIN_STARS=0`, `MIN_KILLS=4`, `MIN_KILLS_NO_STARS=5`, `STREAM_PRIORITY=official,en` (or `gaules` to
 record the Gaules broadcast in PT-BR — with automatic cross-fallback:
 if the chosen one is unavailable, the other is used), the rest keeps the
 defaults.

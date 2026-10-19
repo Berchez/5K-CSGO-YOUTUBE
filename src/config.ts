@@ -7,7 +7,7 @@ const ConfigSchema = z.object({
   HLTV_PROFILE: z.string().default('./data/hltv-profile'),
   /** 1 = headless (o Cloudflare costuma barrar; headed minimizado passa). */
   HLTV_HEADLESS: z.string().default('0'),
-  MIN_STARS: z.coerce.number().min(0).max(5).default(4),
+  MIN_STARS: z.coerce.number().min(0).max(5).default(0),
   TOP_TIER_ONLY: z
     .string()
     .default('false')
@@ -55,8 +55,14 @@ const ConfigSchema = z.object({
   CLIP_STREAM_SYNC: z.enum(['auto', 'log', 'off']).default('auto'),
   /** Maior atraso da fonte que a calibração espera para encontrar no buffer. */
   CLIP_STREAM_SYNC_MAX_LAG_SEC: z.coerce.number().min(0).max(180).default(120),
-  /** Mínimo de kills no round para gerar clipe (3 = 3k/4k/5k). */
-  MIN_KILLS: z.coerce.number().min(2).max(5).default(3),
+  /** Mínimo de kills no round em partidas com >= 1 estrela (4 = 4k/5k). */
+  MIN_KILLS: z.coerce.number().min(2).max(5).default(4),
+  /**
+   * Mínimo de kills em partidas SEM estrela (0 no listing): 5 = só ace.
+   * A política é 4k+ só em jogos com pelo menos 1 estrela; jogo sem estrela
+   * ainda é monitorado, mas rende clipe apenas com 5k.
+   */
+  MIN_KILLS_NO_STARS: z.coerce.number().min(2).max(5).default(5),
   /**
    * Atraso estimado do placar live do HLTV em relação ao jogo real. O corte
    * começa em (1º kill observado − este valor − CLIP_CONTEXT_SEC). Suba se

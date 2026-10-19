@@ -3,6 +3,7 @@ import {
   cardToLiveMatch,
   guessTopTier,
   matchPassesFilter,
+  minKillsForStars,
   parseStarsFromHtml,
   parseViewers,
   pickPreferredStream,
@@ -38,6 +39,17 @@ describe('stars filter', () => {
     expect(guessTopTier('BLAST Premier', 0)).toBe(true);
     expect(guessTopTier('FRAG University 2026', 0)).toBe(false);
     expect(guessTopTier('qualquer coisa', 5)).toBe(true);
+  });
+});
+
+describe('minKillsForStars', () => {
+  it('com pelo menos 1 estrela: 4k+', () => {
+    expect(minKillsForStars(1, 4, 5)).toBe(4);
+    expect(minKillsForStars(5, 4, 5)).toBe(4);
+  });
+
+  it('sem estrela: só 5k', () => {
+    expect(minKillsForStars(0, 4, 5)).toBe(5);
   });
 });
 
