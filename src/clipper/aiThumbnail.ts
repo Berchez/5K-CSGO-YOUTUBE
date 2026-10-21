@@ -143,7 +143,8 @@ export function buildThumbnailPrompt(
   portraitSafe = false,
 ): string {
   const s = ace.summary;
-  const kills = s?.kills.length ?? ace.kills.length;
+  // Sidecar antigo/serializado pode ter summary sem 'kills': cai no ace.kills.
+  const kills = s?.kills?.length ?? ace.kills.length;
   const opp = s?.team
     ? s.team === ace.team1
       ? ace.team2
@@ -270,7 +271,7 @@ export function buildBackgroundPrompt(ace: AceEvent): string {
           ? 'massive fire explosion and thick smoke dominating the scene, embers flying,'
           : 'rifles on a weapon rack glowing in the foreground,';
   const nades = [...new Set((s?.grenades ?? []).map((g) => g.kind.toUpperCase()))];
-  const hasFlash = (s?.flashAssists.length ?? 0) > 0;
+  const hasFlash = (s?.flashAssists?.length ?? 0) > 0;
   const mood =
     (s?.headshots ?? 0) >= 3
       ? 'Emphasize headshots: red impact effects, skull/crosshair accents.'

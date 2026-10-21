@@ -91,17 +91,22 @@ export interface AceEvent {
   kills: KillEvent[];
   /** ISO do 1º kill da sequência — o clipe começa ~10s antes dele. */
   startedAt?: string;
-  /** ISO do fim do clipe (~5s antes da ação do próximo round). */
+  /** ISO do fim do clipe (placar do round + CLIP_END_AFTER_CLOSE_SEC). */
   endedAt?: string;
-  /** Calibração por killfeed OCR da diferença entre o placar e a fonte gravada. */
+  /** Calibração do fim do clipe pelo placar do round no vídeo. */
   streamSync?: {
     mode: 'auto' | 'log' | 'off';
     applied: boolean;
+    source?: 'scoreboard';
+    marker?: 'score' | 'round' | null;
     offsetMs: number | null;
     matchedKills: number;
     totalKills: number;
     medianDeviationMs: number | null;
     reason: string;
+    roundEndAt?: string | null;
+    scoreBefore?: string | null;
+    scoreAfter?: string | null;
   };
   /**
    * Confiança na âncora de início: a "1ª kill" é a primeira OBSERVADA pelo
@@ -122,6 +127,9 @@ export interface AceEvent {
   offsetUnverified?: boolean;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
+  /** Placar antes/depois do fechamento do round, ex "5-2" / "6-2". */
+  scoreBefore?: string;
+  scoreAfter?: string;
   /** Resumo rico (armas, vítimas, assists, granadas). Ausente em modos sem detalhe (ex: VOD). */
   summary?: RoundSummary;
 }

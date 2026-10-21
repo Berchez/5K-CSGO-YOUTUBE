@@ -1115,7 +1115,7 @@ export async function buildClip(
   // Teto de duração como ALARME (nunca silencioso): se o trim resultante
   // excede o cap, força o corte e sinaliza — o cap não corrige causa, só
   // impede o clipe gigante enquanto o trim não ancora certo.
-  const LEN_CAP_SEC = opts.preRollSec + opts.postRollSec + 30;
+  const LEN_CAP_SEC = Math.max(opts.preRollSec + opts.postRollSec + 30, 180);
   const capped = applyDurationCap(trimStartSec, trimEndSec, concatLenSec, LEN_CAP_SEC);
   if (capped.clamped) {
     log.error(

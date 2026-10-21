@@ -18,7 +18,7 @@ import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, pickSegments } from './clipper/clipBuilder.js';
-import { scanKillfeedForStreamOffset } from './clipper/killfeedSync.js';
+import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
 import type { AceEvent, ClipResult, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
@@ -69,7 +69,10 @@ async function getRefs(
   clipsDir: string,
   hltvProfileDir?: string,
 ): Promise<ReferenceImages> {
-  const hit = refsCache.get(matchId);
+  // Cache por jogador: a mesma partida gera clipes de jogadores diferentes,
+  // e as fotos do primeiro não servem para os outros.
+  const cacheKey = `${matchId}:${player.toLowerCase()}`;
+  const hit = refsCache.get(cacheKey);
   if (hit) return hit;
   const { fetchReferenceImages } = await import('./clipper/referenceImages.js');
   const refs = await fetchReferenceImages({
@@ -80,7 +83,7 @@ async function getRefs(
     dir: `${clipsDir}/refs/${matchId}`,
     hltvProfileDir,
   });
-  refsCache.set(matchId, refs);
+  refsCache.set(cacheKey, refs);
   return refs;
 }
 
@@ -106,73 +109,93 @@ function twitchUrlFrom(streamUrl: string): string {
   return streamUrl;
 }
 
-/** Offset aplicável + registro persistido (ace.streamSync) da calibração OCR. */
-interface StreamSyncMeasurement {
-  /** Offset a somar às âncoras; 0 quando não aplicado (log/off/sem confiança). */
-  offsetMs: number;
-  /** Registro gravado no sidecar independentemente de o offset ser aplicado. */
+/** Fim detectado no vídeo + registro persistido (ace.streamSync). */
+interface RoundEndMeasurement {
+  /** Timestamp wall do frame de virada do placar; null se não encontrado. */
+  detectedEndMs: number | null;
+  /** Registro gravado no sidecar independentemente de o fim ser aplicado. */
   sync: NonNullable<AceEvent['streamSync']>;
 }
 
 /**
- * Mede o atraso da fonte comparando as kills do placar com o killfeed OCR e
- * decide se aplica (só em 'auto' e com confiança). Nunca lança: em erro ou
- * indisponibilidade devolve offset 0 + motivo. (Extraído de handleAce para
- * manter o fluxo do clipe legível.)
+ * Procura a virada do placar do round no topo do vídeo e decide se aplica
+ * (só em 'auto'). Nunca lança: em erro/indisponibilidade devolve null + motivo.
  */
-async function measureStreamOffset(
+async function measureRoundEnd(
   ace: AceEvent,
   cfg: ReturnType<typeof getConfig>,
   recorder: StreamRecorder | undefined,
   shouldStop: () => boolean,
-): Promise<StreamSyncMeasurement> {
+  scanFromMs: number,
+): Promise<RoundEndMeasurement> {
   const log = getLogger();
   const mode = cfg.CLIP_STREAM_SYNC;
   const totalKills = ace.kills.filter((kill) => Number.isFinite(kill.at)).length;
-  const skip = (reason: string): StreamSyncMeasurement => ({
-    offsetMs: 0,
-    sync: { mode, applied: false, offsetMs: null, matchedKills: 0, totalKills, medianDeviationMs: null, reason },
+  const skip = (reason: string): RoundEndMeasurement => ({
+    detectedEndMs: null,
+    sync: {
+      mode,
+      applied: false,
+      source: 'scoreboard',
+      marker: null,
+      offsetMs: null,
+      matchedKills: 0,
+      totalKills,
+      medianDeviationMs: null,
+      reason,
+      roundEndAt: null,
+      scoreBefore: ace.scoreBefore ?? null,
+      scoreAfter: ace.scoreAfter ?? null,
+    },
   });
 
   if (mode === 'off') return skip('disabled');
   if (!recorder?.isRunning) {
     log.warn(
       { matchId: ace.matchId, stream: recorder?.streamName },
-      'calibragem OCR indisponível — mantendo âncoras originais',
+      'calibragem do placar indisponível — mantendo âncora original',
     );
     return skip('recorder-unavailable');
   }
 
   try {
-    const estimate = await scanKillfeedForStreamOffset({
-      kills: ace.kills,
-      scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+    const estimate = await scanRoundEndForScoreboard({
+      expectedBefore: ace.scoreBefore,
+      expectedAfter: ace.scoreAfter,
+      expectedRound: ace.round,
       maxLagSec: cfg.CLIP_STREAM_SYNC_MAX_LAG_SEC,
       segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+      scanFromMs,
+      crop: cfg.CLIP_SCOREBOARD_CROP,
       listSegments: () => recorder.listSegments(),
       shouldStop,
     });
-    const applied = mode === 'auto' && estimate.offsetMs != null;
-    const sync: StreamSyncMeasurement['sync'] = {
+    const applied = mode === 'auto' && estimate.roundEndMs != null;
+    const sync: RoundEndMeasurement['sync'] = {
       mode,
       applied,
-      offsetMs: estimate.offsetMs,
-      matchedKills: estimate.matchedKills,
-      totalKills: estimate.totalKills,
-      medianDeviationMs: estimate.medianDeviationMs,
+      source: 'scoreboard',
+      marker: estimate.marker,
+      offsetMs: null,
+      matchedKills: estimate.roundEndMs != null ? 1 : 0,
+      totalKills,
+      medianDeviationMs: null,
       reason: estimate.reason,
+      roundEndAt: estimate.roundEndMs != null ? new Date(estimate.roundEndMs).toISOString() : null,
+      scoreBefore: estimate.scoreBefore,
+      scoreAfter: estimate.scoreAfter,
     };
     const details = { matchId: ace.matchId, stream: recorder.streamName, ...sync };
     if (applied) {
-      log.info(details, 'atraso da fonte medido por OCR');
+      log.info(details, 'fim do round ancorado no placar do vídeo');
     } else {
-      log.warn(details, 'calibragem OCR sem confiança — mantendo âncoras originais');
+      log.warn(details, 'placar do round não aplicado — mantendo âncora original');
     }
-    return { offsetMs: applied ? estimate.offsetMs! : 0, sync };
+    return { detectedEndMs: estimate.roundEndMs, sync };
   } catch (e) {
     log.warn(
       { err: String(e), matchId: ace.matchId, stream: recorder.streamName },
-      'calibragem OCR falhou — mantendo âncoras originais',
+      'calibragem do placar falhou — mantendo âncora original',
     );
     return skip('scan-error');
   }
@@ -208,33 +231,31 @@ async function handleAce(
     );
     const aceDetectedAtMs = Date.now();
     const syncRecorder = muxedRecorder ?? recorder;
-    const { offsetMs: streamOffsetMs, sync: streamSync } = await measureStreamOffset(
+    const { detectedEndMs, sync: streamSync } = await measureRoundEnd(
       ace,
       cfg,
       syncRecorder,
       () => stopping,
+      aceDetectedAtMs - 30_000,
     );
     ace.streamSync = streamSync;
-    const uncorrectedStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
-    const aceStartMs =
-      uncorrectedStartMs != null ? uncorrectedStartMs + streamOffsetMs : undefined;
-    if (aceStartMs != null && streamOffsetMs !== 0) {
-      ace.startedAt = new Date(aceStartMs).toISOString();
-    }
-    // Fim ancorado no PRÓXIMO round: volta ao fechamento REAL do round
-    // (detecção − lag do placar) e anda CLIP_END_AFTER_CLOSE_SEC — mirando
-    // ~5s antes da ação do round seguinte (win panel + freeze ≈ 13s). A
-    // âncora antiga (detecção + delay + cauda) caía 10-20s DENTRO do próximo
-    // round por causa do lag do placar — clipe sangrava rounds seguintes.
-    // Em timeout/pausa tática o gap estica e a margem só cresce (seguro).
-    const endMs =
-      computeAceEndMs(aceDetectedAtMs, cfg.SCOREBOARD_DELAY_MS, cfg.CLIP_END_AFTER_CLOSE_SEC) +
-      streamOffsetMs;
+    if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
+    const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
+    const useScoreboardEnd = streamSync.applied && detectedEndMs != null;
+    const useFallback =
+      cfg.CLIP_STREAM_SYNC === 'auto' &&
+      !streamSync.applied &&
+      streamSync.reason !== 'disabled' &&
+      streamSync.reason !== 'recorder-unavailable';
+    const endMs = useScoreboardEnd
+      ? detectedEndMs + cfg.CLIP_END_AFTER_CLOSE_SEC * 1000
+      : computeAceEndMs(aceDetectedAtMs, cfg.SCOREBOARD_DELAY_MS, cfg.CLIP_END_AFTER_CLOSE_SEC) +
+        (useFallback ? cfg.CLIP_STREAM_SYNC_FALLBACK_SEC * 1000 : 0);
     let endCovered = false;
     let muxedEndCovered = false;
     const waitUntil =
       Date.now() +
-      Math.max(150_000, Math.max(0, streamOffsetMs) + cfg.SEGMENT_TIME_SEC * 1000 + 20_000);
+      Math.max(150_000, endMs - Date.now() + cfg.SEGMENT_TIME_SEC * 1000 + 20_000);
     while (!stopping && Date.now() < waitUntil) {
       segments = recorder?.listSegments() ?? [];
       muxedSegments = muxedRecorder?.listSegments() ?? [];
@@ -615,6 +636,9 @@ async function pollOnce(): Promise<void> {
               startedAt: a.startedAt,
               kills: a.kills.map((kk) => ({ ...kk, map: a.map })),
               anchorConfidence: a.anchorConfidence,
+              scoreBefore: a.scoreBefore,
+              scoreAfter: a.scoreAfter,
+              score: a.scoreBefore,
               summary,
             },
             m.matchId,
@@ -642,7 +666,9 @@ async function pollOnce(): Promise<void> {
       activeTrackers.delete(id);
       streamsCache.delete(id);
       streamsMiss.delete(id);
-      refsCache.delete(id);
+      for (const key of refsCache.keys()) {
+        if (key === id || key.startsWith(`${id}:`)) refsCache.delete(key);
+      }
       if (pendingClips.has(id)) {
         // Ace do round final ainda em construção: o snapshot protege o
         // build, mas apagar o buffer agora mataria recorders legítimos de

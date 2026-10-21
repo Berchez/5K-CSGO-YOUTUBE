@@ -76,9 +76,10 @@ npm run build; npm start   # produção (dist/main.js)
 npm test        # vitest (detector + filtro stars)
 ```
 
-Keep it running: `pm2 start dist/src/main.js --name 5k-bot` + `pm2 save`
-(already active; the scheduled task `5KBot-Clips` runs `pm2 resurrect` at logon
-via `scripts/bot-autostart.bat`). Useful commands: `pm2 list/logs/stop/restart 5k-bot`.
+Keep it running: `pm2 start dist/src/main.js --name 5k-bot` + `pm2 save`.
+Autostart/tray: the Startup shortcut `5K Bot.lnk` runs `scripts/bot-autostart.bat`
+at logon (`pm2 resurrect` + system-tray icon via `scripts/bot-tray.ps1`).
+Useful commands: `pm2 list/logs/stop/restart 5k-bot`.
 
 ## Testing with a finished match (without waiting for live)
 

@@ -39,22 +39,22 @@ const ConfigSchema = z.object({
    */
   CLIP_CONTEXT_UNCERTAIN_SEC: z.coerce.number().min(0).max(120).default(25),
   /**
-   * Segundos após o fechamento REAL do round onde o clipe termina:
-   * fim = (detecção − SCOREBOARD_DELAY_MS) + este valor. Default 8: mira
-   * ~5s antes da ação do round seguinte (win panel + freeze ≈ 13s).
-   * Em timeout/pausa tática o gap estica e a margem só cresce — nunca
-   * sangra para o próximo round (a âncora antiga, detecção + delay + cauda,
-   * caía 10-20s dentro do round seguinte por causa do lag do placar).
+   * Segundos após a virada do placar do round onde o clipe termina.
+   * Default 8: cobre o win panel/freeze sem entrar muito no próximo round.
    */
   CLIP_END_AFTER_CLOSE_SEC: z.coerce.number().min(0).max(60).default(8),
   /**
-   * Mede o atraso da fonte comparando kills do placar com o killfeed OCR.
-   * 'auto' corrige apenas com várias correspondências consistentes; 'log'
-   * mede sem alterar os cortes; 'off' desliga a varredura retrospectiva.
+   * Ancora o fim do clipe na virada do placar do round no vídeo.
+   * 'auto' aplica quando encontra a transição; 'log' mede sem alterar os
+   * cortes; 'off' desliga a varredura.
    */
   CLIP_STREAM_SYNC: z.enum(['auto', 'log', 'off']).default('auto'),
-  /** Maior atraso da fonte que a calibração espera para encontrar no buffer. */
+  /** Maior espera pela transição do placar no buffer. */
   CLIP_STREAM_SYNC_MAX_LAG_SEC: z.coerce.number().min(0).max(180).default(120),
+  /** Crop normalizado x:y:w:h do placar no topo do vídeo. */
+  CLIP_SCOREBOARD_CROP: z.string().default('0.30:0.03:0.40:0.10'),
+  /** Cauda extra quando a transição do placar não é encontrada. */
+  CLIP_STREAM_SYNC_FALLBACK_SEC: z.coerce.number().min(0).max(120).default(35),
   /** Mínimo de kills no round em partidas com >= 1 estrela (4 = 4k/5k). */
   MIN_KILLS: z.coerce.number().min(2).max(5).default(4),
   /**

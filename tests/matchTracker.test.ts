@@ -91,6 +91,16 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.event).toBeNull();
     expect(r.dropped).toContain('22 kills');
   });
+  it('grava o placar antes/depois do round no evento', () => {
+    const tr = new RoundTracker('inferno', 7);
+    const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
+    const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
+    let r = processPoll(tr, before, -1, 3, 10_000, before);
+    expect(r.event).toBeNull();
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before);
+    expect(r.event?.scoreBefore).toBe('5-2');
+    expect(r.event?.scoreAfter).toBe('6-2');
+  });
 });
 
 describe('shouldResetTracker', () => {

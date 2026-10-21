@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { Page } from 'playwright';
 import type { ProfileLock } from './stealthBrowser.js';
 import { getLogger } from '../logger.js';
+import { findNearReference, hashReferences } from './imageFingerprint.js';
 
 export interface ChatGptOptions {
   profileDir: string;
@@ -46,16 +47,35 @@ export async function downloadPageImage(page: Page, src: string): Promise<Buffer
   return Buffer.from(dataUrl.replace(/^data:image\/\w+;base64,/, ''), 'base64');
 }
 
-/** Lista srcs de imagens GRANDES (>=minWidth), ignorando UI/avatares. */
+/** Lista srcs de imagens GRANDES (>=minWidth), ignorando UI/avatares/anexos. */
 export async function listContentImages(page: Page, minWidth = 256): Promise<string[]> {
   const expr = `Array.from(document.querySelectorAll('img'))
     .filter((i) => {
       const w = i.naturalWidth || 0;
       const s = ((i.currentSrc || i.src) + ' ' + (i.alt || '') + ' ' + (i.className || '')).toLowerCase();
-      return w >= ${minWidth} && !/avatar|profile|logo|icon|emoji|badge/.test(s);
+      return w >= ${minWidth} && !/avatar|profile|logo|icon|emoji|badge|attachment/.test(s);
     })
     .map((i) => i.currentSrc || i.src)`;
   return (await page.evaluate(`(${expr})`)) as string[];
+}
+
+/**
+ * Só a imagem GERADA pelo ChatGPT. O DOM atual marca os anexos do usuário
+ * (mapa/foto/logo) com alt="User attachment" e a arte com alt="Generated
+ * image N" dentro de [data-testid="generated-image-preview"]. Sem esse
+ * escopo, o polling aceitava o preview de um anexo antes da arte renderizar.
+ */
+export async function listGeneratedImages(page: Page, minWidth = 512): Promise<string[]> {
+  const expr = `Array.from(document.querySelectorAll('img'))
+    .filter((i) => {
+      if ((i.naturalWidth || 0) < ${minWidth}) return false;
+      const alt = (i.alt || '').toLowerCase();
+      const inPreview = !!i.closest('[data-testid*="generated-image"]');
+      return inPreview || /generated image|imagem gerada/.test(alt);
+    })
+    .map((i) => i.currentSrc || i.src)`;
+  const srcs = (await page.evaluate(`(${expr})`)) as string[];
+  return [...new Set(srcs)];
 }
 
 /**
@@ -150,6 +170,7 @@ export async function chatgptBackground(
       }
     }
     const attachments = (opts.attachments ?? []).filter(Boolean) as string[];
+    const referenceHashes = await hashReferences(attachments, log);
     if (attachments.length > 0) {
       const { attachFiles } = await import('./attachFiles.js');
       const res = await attachFiles(page, log, attachments, { newChat: true });
@@ -168,9 +189,9 @@ export async function chatgptBackground(
         );
       }
     }
-    // 'before' DEPOIS do anexo: previews das referências já contam como
-    // "imagens de antes" — só a resposta gerada é imagem NOVA.
-    const before = await listContentImages(page);
+    // 'before' DEPOIS do anexo, mas só imagens GERADAS: previews das
+    // referências (alt="User attachment") não entram — só a arte é nova.
+    const before = await listGeneratedImages(page, 256);
     log.info({ imagensAntes: before.length, anexos: attachments.length }, 'enviando prompt de imagem');
     await box.click({ timeout: 15_000 });
     await page.keyboard.press('Escape').catch(() => undefined);
@@ -180,14 +201,16 @@ export async function chatgptBackground(
     await page.waitForTimeout(8000);
     log.info({ conversa: page.url() }, 'prompt enviado, aguardando render da imagem');
 
-    // Carência de 20s + validação por TAMANHO DE DOWNLOAD: previews dos anexos
-    // são pequenos (<=50KB); imagens GERADAS por este prompt foram 300KB+.
-    // Candidato só vale se baixar >=100KB — imune a previews tardios.
+    // O DOM do ChatGPT não expõe mais data-message-author-role: as fotos/mapa
+    // anexados e a arte gerada aparecem todos como <img> grandes (blob:).
+    // O mapa (800x450, ~102KB) era baixado antes da arte terminar de renderizar.
+    // Agora comparamos o dHash do candidato com os anexos: referência (0-2 de
+    // distância) é descartada e o polling continua até a arte NOVA aparecer.
     const graceUntil = Date.now() + 20_000;
     // Teto alto de propósito: o configurável THUMB_AI_TIMEOUT_MS (default 10min)
     // precisa valer — render web às vezes passa de 5min.
     const deadline = Date.now() + Math.min(timeoutMs, 1_800_000);
-    const MIN_BYTES = 100_000;
+    const MIN_BYTES = 20_000;
     let buf: Buffer | null = null;
     const seen = new Set<string>(before);
     while (Date.now() < deadline && !buf) {
@@ -195,22 +218,31 @@ export async function chatgptBackground(
       if (Date.now() < graceUntil) continue;
       let fresh: string[] = [];
       try {
-        const after = await listContentImages(page, 512);
+        const after = await listGeneratedImages(page, 512);
         fresh = after.filter((s) => !seen.has(s));
       } catch {
         continue; // navegação do SPA: tenta de novo
       }
-      // Testa do mais novo pro mais velho; srcs testados entram em 'seen'
+      // Testa do mais novo pro mais velho. Download que falha NÃO entra em
+      // 'seen': preview transitório precisa de nova chance no próximo poll.
       for (const src of fresh.reverse()) {
-        seen.add(src);
         try {
           const cand = await downloadPageImage(page, src);
-          if (cand.length >= MIN_BYTES) {
-            buf = cand;
-            break;
+          if (cand.length < MIN_BYTES) continue;
+          const near = await findNearReference(cand, referenceHashes);
+          if (near) {
+            seen.add(src);
+            log.warn(
+              { bytes: cand.length, ref: path.basename(near.name), distance: near.distance },
+              'candidato igual à referência anexada — ignorando',
+            );
+            continue;
           }
+          seen.add(src);
+          buf = cand;
+          break;
         } catch {
-          // preview inválido/revogado: segue
+          // preview inválido/revogado: segue sem queimar o src
         }
       }
     }

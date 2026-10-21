@@ -171,6 +171,18 @@ describe('aiThumbnail', () => {
     expect(buildThumbnailPrompt(ace)).not.toContain('REFERÊNCIAS');
   });
 
+  it('sidecar com summary sem kills/flashAssists não quebra o prompt', () => {
+    const three = [1, 2, 3].map(() => ({ killer: 'x', victim: 'y', round: 1, map: 'm' }));
+    const sidecar = {
+      ...ace,
+      kills: three,
+      summary: { round: 1, map: 'm', player: 'x', team: 'A', opponents: 'B', victims: [] },
+    } as unknown as typeof ace;
+    expect(() => buildThumbnailPrompt(sidecar)).not.toThrow();
+    expect(buildThumbnailPrompt(sidecar)).toContain('multikill de 3K');
+    expect(() => aiBackgroundPrompt(sidecar)).not.toThrow();
+  });
+
   it('retorna null sem providers (fallback seguro, sem rede)', async () => {
     await expect(buildAiBackground(ace, { order: [] })).resolves.toBeNull();
   });

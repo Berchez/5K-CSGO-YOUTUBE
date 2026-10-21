@@ -100,6 +100,9 @@ export interface TrackerCallbacks {
     startedAt?: string;
     /** Confiança na âncora (1ª kill pode não ser a 1ª real). */
     anchorConfidence?: AnchorConfidence;
+    /** Placar antes/depois do fechamento do round. */
+    scoreBefore?: string;
+    scoreAfter?: string;
   }) => void;
   shouldStop: () => boolean;
 }
@@ -112,6 +115,9 @@ export interface PollEvent {
   startedAt?: string;
   /** Confiança na âncora de início (1ª kill pode não ser a 1ª real). */
   anchorConfidence?: AnchorConfidence;
+  /** Placar antes/depois do fechamento do round. */
+  scoreBefore?: string;
+  scoreAfter?: string;
 }
 
 /** Máximo de kills possíveis num round (5 adversários). Acima = dado corrompido (gap). */
@@ -146,6 +152,7 @@ export function processPoll(
   lastTotal: number,
   minKills: number,
   delayCompMs = 10_000,
+  lastSnapshot?: RoundSnapshot | null,
 ): { event: PollEvent | null; dropped: string | null; roundClosed: { map: string; round: number; score: string } | null; lastTotal: number } {
   const total = snap.ctScore + snap.tScore;
   let event: PollEvent | null = null;
@@ -183,6 +190,10 @@ export function processPoll(
         const anchorConfidence: AnchorConfidence = { ...flags, settleKills };
         // Round VERDADEIRO = o dos kills (snap.round já é o próximo placar).
         const trueRound = kills[0]?.round ?? snap.round;
+        const scoreBefore =
+          lastSnapshot && lastSnapshot.map === snap.map
+            ? `${lastSnapshot.ctScore}-${lastSnapshot.tScore}`
+            : undefined;
         event = {
           player,
           map: snap.map,
@@ -190,6 +201,8 @@ export function processPoll(
           kills,
           startedAt: firstAt ? new Date(firstAt - delayCompMs).toISOString() : undefined,
           anchorConfidence,
+          scoreBefore,
+          scoreAfter: `${snap.ctScore}-${snap.tScore}`,
         };
       }
     } else {
@@ -240,6 +253,7 @@ export async function trackMatch(
       await page.waitForTimeout(15000);
     }
     let lastTotal = -1;
+    let lastSnap: RoundSnapshot | null = null;
     let lastSeenRound = -1;
     let lastGoodAt = 0;
     log.info('iniciando tracking do match');
@@ -280,8 +294,10 @@ export async function trackMatch(
         lastTotal,
         minKills,
         getConfig().SCOREBOARD_DELAY_MS,
+        lastSnap,
       );
       lastTotal = next;
+      lastSnap = snap;
       if (event) {
         log.info(
           { player: event.player, kills: event.kills.length, map: event.map, round: event.round },

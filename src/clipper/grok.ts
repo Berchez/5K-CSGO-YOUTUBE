@@ -4,6 +4,7 @@ import type { Page } from 'playwright';
 import type { ProfileLock } from './stealthBrowser.js';
 import { getLogger } from '../logger.js';
 import { listContentImages, downloadPageImage } from './chatgpt.js';
+import { findNearReference, hashReferences } from './imageFingerprint.js';
 
 export interface GrokOptions {
   profileDir: string;
@@ -108,6 +109,7 @@ export async function grokBackground(
     }
 
     const attachments = (opts.attachments ?? []).filter(Boolean) as string[];
+    const referenceHashes = await hashReferences(attachments, log);
     if (attachments.length > 0) {
       const { attachFiles } = await import('./attachFiles.js');
       const res = await attachFiles(page, log, attachments);
@@ -135,7 +137,7 @@ export async function grokBackground(
     const graceUntil = Date.now() + 20_000;
     // Teto alto de propósito: ver chatgpt.ts (THUMB_AI_TIMEOUT_MS).
     const deadline = Date.now() + Math.min(timeoutMs, 1_800_000);
-    const MIN_BYTES = 100_000;
+    const MIN_BYTES = 20_000;
     let buf: Buffer | null = null;
     const seen = new Set<string>(before);
     while (Date.now() < deadline && !buf) {
@@ -148,14 +150,24 @@ export async function grokBackground(
       } catch {
         continue;
       }
+      // Candidatos idênticos aos anexos (mapa/foto) são descartados: só a
+      // imagem NOVA gerada interessa. Download com falha não queima o src.
       for (const src of fresh.slice().reverse()) {
-        seen.add(src);
         try {
           const cand = await downloadPageImage(page, src);
-          if (cand.length >= MIN_BYTES) {
-            buf = cand;
-            break;
+          if (cand.length < MIN_BYTES) continue;
+          const near = await findNearReference(cand, referenceHashes);
+          if (near) {
+            seen.add(src);
+            log.warn(
+              { bytes: cand.length, ref: path.basename(near.name), distance: near.distance },
+              'candidato igual à referência anexada — ignorando',
+            );
+            continue;
           }
+          seen.add(src);
+          buf = cand;
+          break;
         } catch {
           // preview inválido/revogado: segue
         }
