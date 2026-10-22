@@ -969,6 +969,24 @@ function cutAfterEnd(files: string[], opts: PickOptions): string[] {
   return kept;
 }
 
+/**
+ * Início (wall-clock) do segmento mais antigo do buffer: mtime é o FIM do
+ * segmento, então subtraímos a duração. null se nenhum mtime legível.
+ */
+export function oldestSegmentStartMs(files: string[], segmentTimeSec: number): number | null {
+  let oldestEndMs = Infinity;
+  for (const f of files) {
+    try {
+      const m = fs.statSync(f).mtimeMs;
+      if (m > 0 && m < oldestEndMs) oldestEndMs = m;
+    } catch {
+      // ignora
+    }
+  }
+  if (!Number.isFinite(oldestEndMs)) return null;
+  return oldestEndMs - segmentTimeSec * 1000;
+}
+
 /** Maior mtime dos segmentos (fim do buffer). 0 se vazio/ilegível. */
 export function newestSegmentEndMs(files: string[]): number {
   let max = 0;

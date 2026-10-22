@@ -91,6 +91,25 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.event).toBeNull();
     expect(r.dropped).toContain('22 kills');
   });
+  it('REGRESSÃO: stats reiniciadas no break descartam kills fantasmas (5K do jcobbb)', () => {
+    const tr = new RoundTracker('Nuke', 1);
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'jcobbb', kills: 0 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    // Coluna K repovoada com stats do mapa anterior durante o break (+5),
+    // sem o placar virar (0-0): tudo isso ficava pendente para o round 1.
+    r = processPoll(tr, snap(0, 0, [{ name: 'jcobbb', kills: 5 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    expect(tr.pending).toBe(5);
+    // Mapa novo começa e a coluna K zera: época nova — kills antigas caem.
+    r = processPoll(tr, snap(0, 0, [{ name: 'jcobbb', kills: 0 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    expect(tr.pending).toBe(0);
+    // Round 1 fecha 0-1 sem kills reais: nada dispara.
+    r = processPoll(tr, snap(1, 0, [{ name: 'jcobbb', kills: 0 }], 'Nuke'), last, 3);
+    expect(r.event).toBeNull();
+  });
+
   it('grava o placar antes/depois do round no evento', () => {
     const tr = new RoundTracker('inferno', 7);
     const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);

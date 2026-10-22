@@ -4,6 +4,7 @@ import { getConfig, parseStreamOffsets, resolveStaticOffset } from './config.js'
 import { loadCalibrations, resolveSessionOffset } from './recorder/avCalibration.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
+import { ensureTray } from './tray.js';
 import { getLogger } from './logger.js';
 import { getDb, hasAce, insertAce, insertClip } from './db.js';
 import { killAll } from './procRegistry.js';
@@ -17,7 +18,7 @@ import {
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
-import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, pickSegments } from './clipper/clipBuilder.js';
+import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
 import type { AceEvent, ClipResult, StreamInfo } from './types.js';
@@ -374,6 +375,22 @@ async function handleAce(
         }),
         offsetUnverified: mode === 'separate' ? ace.offsetUnverified : undefined,
       };
+      // A 1ª kill já saiu do buffer? Sem ela o clipe não é o ace que o
+      // sidecar promete (foi o caso do 5K do jcobbb: round fechou minutos
+      // depois e o corte pegou só o intervalo seguinte). Melhor não gerar.
+      const oldestStartMs = oldestSegmentStartMs(sourceSegments, cfg.SEGMENT_TIME_SEC);
+      if (aceStartMs != null && oldestStartMs != null && aceStartMs < oldestStartMs) {
+        log.warn(
+          {
+            matchId,
+            mode,
+            aceStart: new Date(aceStartMs).toISOString(),
+            oldestStart: new Date(oldestStartMs).toISOString(),
+          },
+          'primeira kill fora do buffer — clipe descartado (não conteria o ace)',
+        );
+        return null;
+      }
       const variantPicked = pickSegments(sourceSegments, {
         segmentTimeSec: cfg.SEGMENT_TIME_SEC,
         preRollSec: cfg.CLIP_PRE_ROLL_SEC,
@@ -701,6 +718,7 @@ async function pollOnce(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  ensureTray();
   const cfg = getConfig();
   // Bins vendored (.tools/ffmpeg do repo) no PATH — o clipper chama
   // 'ffmpeg' pelo nome (concat, thumb, upscale). Igual ao test-vod.

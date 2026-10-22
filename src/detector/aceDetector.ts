@@ -208,8 +208,37 @@ export class RoundTracker {
    * scoreboard (conjunto correto; pareamento exato exige killfeed).
    * Nome novo ou contagem menor só reancora (sem spike falso). É a guarda
    * exata contra re-observação — dispensa dedup para sintetizados.
+   *
+   * Retorna true quando alguma contagem DIMINUIU (o HLTV zerou/reiniciou as
+   * stats: troca de mapa ou repopulação durante o break). Nesse caso não
+   * sintetiza diffs e deixa o chamador decidir se as kills pendentes ainda
+   * valem (virada de round) ou são de outra época (mudança só de stats).
    */
-  syncBaseline(players: Array<{ name: string; kills: number; deaths?: number }>): void {
+  syncBaseline(players: Array<{ name: string; kills: number; deaths?: number }>): boolean {
+    let statsReset = false;
+    for (const p of players) {
+      const rawName = p.name.trim();
+      if (!rawName || isRoundMarker(rawName)) continue;
+      const key = rawName.toLowerCase();
+      const prevK = this.lastCounts.get(key);
+      if (prevK !== undefined && p.kills < prevK) statsReset = true;
+      const prevD = this.lastDeaths.get(key);
+      if (prevD !== undefined && (p.deaths ?? 0) < prevD) statsReset = true;
+    }
+    if (statsReset) {
+      // Época nova de stats: reancora sem gerar kills. As pendentes ficam
+      // com o chamador (round fechando ainda pode emitir o que já viu).
+      this.lastCounts.clear();
+      this.lastDeaths.clear();
+      for (const p of players) {
+        const rawName = p.name.trim();
+        if (!rawName || isRoundMarker(rawName)) continue;
+        const key = rawName.toLowerCase();
+        this.lastCounts.set(key, p.kills);
+        this.lastDeaths.set(key, p.deaths ?? 0);
+      }
+      return true;
+    }
     const newKills: Array<{ name: string; n: number }> = [];
     const victimPool: string[] = [];
     for (const p of players) {
@@ -241,6 +270,18 @@ export class RoundTracker {
         this.addKill(k.name, victim);
       }
     }
+    return false;
+  }
+
+  /**
+   * Descarta as kills pendentes do round (stats reiniciaram no meio dele:
+   * break/troca de mapa sem virada de placar). Marca hadReset para a próxima
+   * âncora nascer suspeita — nada de emitir clipe de kills de outra época.
+   */
+  discardPending(): void {
+    this.kills = [];
+    this.seen.clear();
+    this.hadReset = true;
   }
   /**
    * Fecha o round e retorna o autor do multikill (3k/4k/5k), se houver —

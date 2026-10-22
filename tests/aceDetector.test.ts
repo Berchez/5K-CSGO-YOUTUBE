@@ -156,6 +156,16 @@ describe('RoundTracker', () => {
     expect(kills[0].at).toBeLessThanOrEqual(kills[2].at!);
   });
 
+  it('syncBaseline: queda na coluna K reancora sem sintetizar kills', () => {
+    const t = new RoundTracker('nuke', 1);
+    t.syncBaseline([{ name: 'x', kills: 10 }]);
+    expect(t.syncBaseline([{ name: 'x', kills: 0 }])).toBe(true);
+    expect(t.pending).toBe(0);
+    // novo epoch: +2 a partir do zero conta normal
+    expect(t.syncBaseline([{ name: 'x', kills: 2 }])).toBe(false);
+    expect(t.pending).toBe(2);
+  });
+
   it('syncBaseline: nome novo ancora sem spike falso', () => {
     const t = new RoundTracker();
     t.syncBaseline([{ name: 'novato', kills: 7 }]);

@@ -214,7 +214,10 @@ export function processPoll(
   } else {
     // Diferenciais da coluna K viram kills sintetizados; os da coluna D
     // (deaths) alimentam as vítimas. Round corrente.
-    tracker.syncBaseline(snap.players);
+    // Se as stats DIMINUÍRAM sem o placar virar (break/repopulação do HLTV),
+    // as kills pendentes são de outra época: descarta (evita 5K fantasma
+    // montado com stats do mapa anterior).
+    if (tracker.syncBaseline(snap.players)) tracker.discardPending();
   }
   return { event, dropped, roundClosed, lastTotal: total };
 }
