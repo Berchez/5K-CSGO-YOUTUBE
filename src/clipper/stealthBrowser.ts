@@ -9,6 +9,12 @@ chromium.use(StealthPlugin());
 export interface StealthContextOptions {
   profileDir: string;
   headless: boolean;
+  /**
+   * Perfil do Chrome dentro do user-data-dir (ex.: "Default", "Profile 2").
+   * Sem isso o Chromium pode abrir o perfil errado quando o diretório tem
+   * vários perfis (login salvo em um, bot lendo outro).
+   */
+  chromeProfileDirectory?: string;
   extraArgs?: string[];
   /**
    * Minimiza a janela via CDP após o launch (reforço do --start-minimized,
@@ -80,7 +86,13 @@ export async function minimizeBrowserWindow(ctx: BrowserContext): Promise<boolea
 export async function launchStealthContext(
   opts: StealthContextOptions,
 ): Promise<BrowserContext> {
-  const args = [...BASE_ARGS, ...(opts.extraArgs ?? [])];
+  const args = [
+    ...BASE_ARGS,
+    ...(opts.chromeProfileDirectory
+      ? [`--profile-directory=${opts.chromeProfileDirectory}`]
+      : []),
+    ...(opts.extraArgs ?? []),
+  ];
   // SEM userAgent fixo de propósito: o navegador real envia o UA autêntico
   // (+ Client Hints consistentes). UA fixo desatualizado é assinatura clássica.
   const common = {

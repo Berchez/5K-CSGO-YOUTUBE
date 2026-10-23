@@ -110,6 +110,21 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.event).toBeNull();
   });
 
+  it('descarta multikill com 1ª kill fora da janela do round (stats de outra época)', () => {
+    const tr = new RoundTracker('Nuke', 1);
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'jcobbb', kills: 0 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    // 5 kills sintetizadas há 5 min (repovoamento do HLTV) e NENHUMA queda
+    // depois: o guard de reset não vê, mas a janela do round rejeita.
+    const oldAt = Date.now() - 300_000;
+    for (let i = 0; i < 5; i++) tr.addKill('jcobbb', `v${i}`, { at: oldAt + i * 5000 });
+    r = processPoll(tr, snap(1, 0, [{ name: 'jcobbb', kills: 0 }], 'Nuke'), last, 3);
+    expect(r.event).toBeNull();
+    expect(r.dropped).toContain('fora da janela');
+    expect(tr.pending).toBe(0);
+  });
+
   it('grava o placar antes/depois do round no evento', () => {
     const tr = new RoundTracker('inferno', 7);
     const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);

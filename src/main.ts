@@ -6,7 +6,7 @@ import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
 import { ensureTray } from './tray.js';
 import { getLogger } from './logger.js';
-import { getDb, hasAce, insertAce, insertClip } from './db.js';
+import { deleteAce, getDb, hasAce, insertAce, insertClip } from './db.js';
 import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
@@ -212,10 +212,32 @@ async function handleAce(
     log.info('ace duplicado, ignorando');
     return;
   }
-  const aceId = insertAce(cfg.DB_PATH, ace);
   const recorders = activeRecorders.get(matchId);
   const recorder = recorders?.separate;
   const muxedRecorder = recorders?.muxed;
+  const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
+  // Valida ANTES de gravar: stats velhas (repovoamento no break) podem
+  // produzir um ace cuja 1ª kill já saiu do buffer — sem isso a linha
+  // ficaria no banco e o hasAce bloquearia uma detecção legítima futura.
+  const initialStartMs = oldestSegmentStartMs(
+    recorder?.listSegments() ?? [],
+    cfg.SEGMENT_TIME_SEC,
+  );
+  if (aceStartMs != null && initialStartMs != null && aceStartMs < initialStartMs) {
+    log.warn(
+      {
+        matchId,
+        player: ace.player,
+        map: ace.map,
+        round: ace.round,
+        aceStart: new Date(aceStartMs).toISOString(),
+        oldestStart: new Date(initialStartMs).toISOString(),
+      },
+      'primeira kill fora do buffer — evento fantasma descartado (não gravado)',
+    );
+    return;
+  }
+  const aceId = insertAce(cfg.DB_PATH, ace);
   pendingClips.add(matchId);
   const snapDirs: string[] = [];
   try {
@@ -241,7 +263,6 @@ async function handleAce(
     );
     ace.streamSync = streamSync;
     if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
-    const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
     const useScoreboardEnd = streamSync.applied && detectedEndMs != null;
     const useFallback =
       cfg.CLIP_STREAM_SYNC === 'auto' &&
@@ -356,6 +377,7 @@ async function handleAce(
     // recorder e apaga o buffer) enquanto refs/render/thumb ainda rodam —
     // minutos. Copia preservando mtime (seleção/trim são mtime-driven) e
     // constrói o clipe a partir da cópia imune ao churn do buffer.
+    let staleDiscard = false;
     const buildVariant = async (
       mode: 'separate' | 'muxed',
       sourceSegments: string[],
@@ -389,6 +411,7 @@ async function handleAce(
           },
           'primeira kill fora do buffer — clipe descartado (não conteria o ace)',
         );
+        staleDiscard = true;
         return null;
       }
       const variantPicked = pickSegments(sourceSegments, {
@@ -442,6 +465,8 @@ async function handleAce(
                   geminiApiKey: cfg.GEMINI_API_KEY || undefined,
                   geminiModel: cfg.GEMINI_IMAGE_MODEL,
                   geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+                  geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
+                  geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS !== '0',
                   chatgptProfileDir: cfg.CHATGPT_PROFILE,
                   chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
                   grokProfileDir: cfg.GROK_PROFILE,
@@ -465,6 +490,15 @@ async function handleAce(
         ? buildVariant('muxed', muxedSegments, muxedAceEndMs)
         : Promise.resolve(null),
     ]);
+    // Nenhuma variante sobreviveu por âncora fora do buffer: o evento era
+    // fantasma — remove a linha para não bloquear um ace legítimo futuro.
+    if (!separateClip && !muxedClip && staleDiscard) {
+      deleteAce(cfg.DB_PATH, aceId);
+      log.warn(
+        { matchId, player: ace.player, map: ace.map, round: ace.round },
+        'ace fantasma removido do banco (1ª kill fora do buffer)',
+      );
+    }
     const uploadClipResult = muxedClip ?? separateClip;
     if (muxedClip) {
       log.info(

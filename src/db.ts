@@ -80,6 +80,17 @@ export function insertAce(dbFile: string, ace: AceEvent): number {
   return row.id;
 }
 
+/**
+ * Remove um ace (e clipes associados). Usado quando o evento se revela
+ * fantasma (1ª kill fora do buffer) e não deve bloquear detecções futuras
+ * da mesma chave via hasAce.
+ */
+export function deleteAce(dbFile: string, aceId: number): void {
+  const d = getDb(dbFile);
+  d.prepare('DELETE FROM clips WHERE ace_id=?').run(aceId);
+  d.prepare('DELETE FROM ace_events WHERE id=?').run(aceId);
+}
+
 export function insertClip(
   dbFile: string,
   aceId: number,

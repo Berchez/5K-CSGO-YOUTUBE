@@ -54,6 +54,8 @@ async function main(): Promise<void> {
     geminiApiKey: cfg.GEMINI_API_KEY || undefined,
     geminiModel: cfg.GEMINI_IMAGE_MODEL,
     geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+    geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
+    geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS !== '0',
     chatgptProfileDir: cfg.CHATGPT_PROFILE,
     grokProfileDir: cfg.GROK_PROFILE,
     timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,

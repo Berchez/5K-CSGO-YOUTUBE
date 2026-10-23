@@ -103,6 +103,7 @@ export interface AiThumbOptions {
   geminiApiKey?: string;
   geminiModel?: string;
   geminiWebProfileDir?: string;
+  geminiWebChromeProfile?: string;
   geminiWebHeadless?: boolean;
   chatgptProfileDir?: string;
   chatgptHeadless?: boolean;
@@ -524,6 +525,7 @@ export async function buildAiBackground(
         const { geminiWebBackground } = await import('./geminiWeb.js');
         const buf = await geminiWebBackground(plan.prompt, {
           profileDir: opts.geminiWebProfileDir ?? './data/gemini-profile',
+          chromeProfileDirectory: opts.geminiWebChromeProfile,
           headless: opts.geminiWebHeadless ?? true,
           timeoutMs,
           attachments: plan.attachments,

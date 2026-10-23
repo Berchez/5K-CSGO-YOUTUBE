@@ -124,6 +124,14 @@ export interface PollEvent {
 export const MAX_KILLS_PER_ROUND = 5;
 
 /**
+ * Janela máxima plausível de um round (freeze ~20s + round 1:55 + atraso
+ * do placar/assentamento). Multikill cuja 1ª kill observada está mais
+ * distante que isso do fechamento veio de stats de outra época (ex.: HLTV
+ * repovoando o mapa anterior no break) e não deve gerar evento/clipe.
+ */
+export const MAX_ROUND_SPAN_MS = 240_000;
+
+/**
  * Decide se o tracker deve resetar sem emitir: ficou cego tempo demais
  * (>150s cobrem qualquer round incl. bomb) ou pulou round (>1 de salto =
  * rounds perdidos no apagão). Evita falsos multikills gigantes com kills
@@ -177,15 +185,18 @@ export function processPoll(
     // contagem máxima (3k→4k→5k não duplica). kills = SÓ os do autor.
     const { player, kills } = tracker.closeRound(minKills);
     if (player && kills.length >= minKills) {
+      const firstAt = kills[0]?.at;
+      const closedAtMs = Date.now();
+      const spanMs = firstAt != null ? closedAtMs - firstAt : 0;
       if (kills.length > MAX_KILLS_PER_ROUND) {
         dropped = `${player} com ${kills.length} kills (impossível — gap corrompeu a base)`;
+      } else if (spanMs > MAX_ROUND_SPAN_MS) {
+        dropped = `${player} com ${kills.length} kills, 1ª kill há ${Math.round(spanMs / 1000)}s (fora da janela do round)`;
       } else {
-        const firstAt = kills[0]?.at;
         // Kills observadas na janela de assentamento (últimos 12s: settle
         // de 10s + folga): se a 1ª kill está entre elas, a sequência inteira
         // foi observada no apagar das luzes — relâmpago legítimo OU kill do
         // round novo carimbada no antigo. Nos dois casos, âncora suspeita.
-        const closedAtMs = Date.now();
         const settleKills = kills.filter((k) => (k.at ?? 0) >= closedAtMs - 12_000).length;
         const anchorConfidence: AnchorConfidence = { ...flags, settleKills };
         // Round VERDADEIRO = o dos kills (snap.round já é o próximo placar).

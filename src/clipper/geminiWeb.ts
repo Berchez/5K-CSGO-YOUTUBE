@@ -7,6 +7,8 @@ import { findNearReference, hashReferences } from './imageFingerprint.js';
 
 export interface GeminiWebOptions {
   profileDir: string;
+  /** Perfil do Chrome dentro do user-data-dir (ex.: "Default", "Profile 2"). */
+  chromeProfileDirectory?: string;
   /** default true (sem janela). Se o Google barrar headless, rode headed. */
   headless?: boolean;
   timeoutMs?: number;
@@ -71,6 +73,7 @@ export async function geminiWebBackground(
     profileLock = await acquireProfileLock(opts.profileDir, log);
     browser = await launchStealthContext({
       profileDir: opts.profileDir,
+      chromeProfileDirectory: opts.chromeProfileDirectory,
       headless,
       // Sem efeito em headless; cobre o caso headless:false.
       minimize: true,

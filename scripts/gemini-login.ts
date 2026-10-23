@@ -12,11 +12,15 @@ import readline from 'node:readline';
 import { getConfig } from '../src/config.js';
 
 const cfg = getConfig();
-const profileDir = process.env.GEMINI_WEB_PROFILE ?? './data/gemini-profile';
+const profileDir = process.env.GEMINI_WEB_PROFILE ?? cfg.GEMINI_WEB_PROFILE;
 
 async function main(): Promise<void> {
   const { launchStealthContext } = await import('../src/clipper/stealthBrowser.js');
-  const browser = await launchStealthContext({ profileDir, headless: false });
+  const browser = await launchStealthContext({
+    profileDir,
+    chromeProfileDirectory: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
+    headless: false,
+  });
   const page = browser.pages()[0] ?? (await browser.newPage());
   await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded' });
   console.log('1) No Chrome aberto, faça login com a conta DESCARTÁVEL.');

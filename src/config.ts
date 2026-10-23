@@ -140,6 +140,10 @@ const ConfigSchema = z.object({
   GEMINI_API_KEY: z.string().default(''),
   GEMINI_IMAGE_MODEL: z.string().default('gemini-3.1-flash-lite-image'),
   GEMINI_WEB_PROFILE: z.string().default('./data/gemini-profile'),
+  /** Perfil do Chrome dentro do user-data-dir (ex.: "Profile 2"). Vazio = default do Chromium. */
+  GEMINI_WEB_CHROME_PROFILE: z.string().default(''),
+  /** 1 = headless (default). Use 0 para o perfil persistente ser lido corretamente. */
+  GEMINI_WEB_HEADLESS: z.string().default('1'),
   CHATGPT_PROFILE: z.string().default('./data/chatgpt-profile'),
   /** 1 = janela minimizada (default; sem popup em jogo fullscreen). 0 = visível (se challenge implicar, reverta). */
   CHATGPT_MINIMIZED: z.string().default('1'),
