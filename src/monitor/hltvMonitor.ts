@@ -173,11 +173,12 @@ export async function waitForClearance(page: Page, timeoutMs = 25000): Promise<b
   return false;
 }
 
-/** Conta estrelas cheias (fa-star, excluindo fa-star-o vazias). Mantido p/ compat. */
+/** Conta estrelas cheias (fa-star), ignorando vazias (fa-star-o/faded/unselected). */
 export function parseStarsFromHtml(starHtml: string, starCount: number): number {
   if (starCount > 0) return Math.min(5, starCount);
-  const m = starHtml.match(/fa-star(?!-o)/g);
-  return m ? Math.min(5, m.length) : 0;
+  const tags = starHtml.match(/<i\b[^>]*class="[^"]*\bfa-star\b[^"]*"[^>]*>/gi) ?? [];
+  const filled = tags.filter((t) => !/\bfa-star-o\b|\bfaded\b|\bunselected\b/i.test(t));
+  return Math.min(5, filled.length);
 }
 
 export function guessTopTier(event: string, stars: number): boolean {
@@ -214,10 +215,44 @@ export function minKillsForStars(
   return stars >= 1 ? starredMinKills : unstarredMinKills;
 }
 
-export function pickPreferredStream(
-  streams: StreamInfo[],
-  priority: string,
-): StreamInfo | null {
+const COUNTRY_ALIASES: Record<string, string> = {
+  BRASIL: 'BR',
+  BRAZIL: 'BR',
+  RUSSIA: 'RU',
+  ARGENTINA: 'AR',
+  OTHER: 'WORLD',
+  WORLD: 'WORLD',
+};
+
+export function normalizeCountry(value: string | undefined): string {
+  const raw = (value ?? '').trim().toUpperCase();
+  return COUNTRY_ALIASES[raw] ?? raw;
+}
+
+export function parseStreamCountry(flagSrc: string, flagTitle = ''): string | undefined {
+  const fromSrc = flagSrc.match(/\/flags\/[^/]+\/([A-Za-z]{2,5})\.(?:gif|png|svg)/i)?.[1];
+  if (fromSrc) return normalizeCountry(fromSrc);
+  const fromTitle = normalizeCountry(flagTitle);
+  return fromTitle.length > 0 && fromTitle.length <= 5 ? fromTitle : undefined;
+}
+
+export interface StreamPreference {
+  country?: string;
+  minViewers?: number;
+}
+
+export type StreamChoiceReason = 'preferred' | 'main' | 'fallback';
+
+export interface StreamChoice {
+  stream: StreamInfo;
+  reason: StreamChoiceReason;
+}
+
+function byViewersDesc(a: StreamInfo, b: StreamInfo): number {
+  return (b.viewers ?? 0) - (a.viewers ?? 0) || a.name.localeCompare(b.name);
+}
+
+function scoreMainStream(streams: StreamInfo[], priority: string): StreamInfo | null {
   if (streams.length === 0) return null;
   const prefs = priority
     .split(',')
@@ -252,11 +287,52 @@ export function pickPreferredStream(
       score += 100_000;
     // Evita restreams BR quando o usuário pediu EN oficial
     // (mas não quando o BR — Gaules pedido ou fallback — é o alvo).
-    if (wantsEn && !gaulesActive && /gaules|nak|liminha|bt0|br/i.test(s.name)) score -= 500_000;
+    if (wantsEn && !gaulesActive && /gaules|nak|liminha|bt0|br/i.test(name)) score -= 500_000;
     return { s, score };
   });
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0].s;
+  scored.sort((a, b) => b.score - a.score || a.s.name.localeCompare(b.s.name));
+  return scored[0]?.s ?? null;
+}
+
+function isPreferredBelowMin(
+  stream: StreamInfo,
+  country: string,
+  minViewers: number,
+): boolean {
+  return normalizeCountry(stream.country) === country && (stream.viewers ?? 0) < minViewers;
+}
+
+export function selectStream(
+  streams: StreamInfo[],
+  priority: string,
+  preference?: StreamPreference,
+): StreamChoice | null {
+  if (streams.length === 0) return null;
+  const country = normalizeCountry(preference?.country);
+  const minViewers = Math.max(0, preference?.minViewers ?? 0);
+
+  if (country) {
+    const preferred = streams
+      .filter((s) => normalizeCountry(s.country) === country && (s.viewers ?? 0) >= minViewers)
+      .sort(byViewersDesc)[0];
+    if (preferred) return { stream: preferred, reason: 'preferred' };
+  }
+
+  const mainCandidates = country
+    ? streams.filter((s) => !isPreferredBelowMin(s, country, minViewers))
+    : streams;
+  const main = scoreMainStream(mainCandidates, priority);
+  if (main) return { stream: main, reason: 'main' };
+
+  const fallback = [...streams].sort(byViewersDesc)[0];
+  return fallback ? { stream: fallback, reason: 'fallback' } : null;
+}
+
+export function pickPreferredStream(
+  streams: StreamInfo[],
+  priority: string,
+): StreamInfo | null {
+  return selectStream(streams, priority)?.stream ?? null;
 }
 
 export interface MatchCard {
@@ -341,11 +417,19 @@ export async function fetchLiveMatches(
           w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
         const liveEl = w.querySelector('.match-meta-live');
         const isLive = /live/i.test(liveEl?.textContent ?? '');
-        let stars = 0;
-        w.querySelectorAll('i.fa-star').forEach((s) => {
-          const cls = s.getAttribute('class') ?? '';
-          if (!cls.includes('fa-star-o') && !cls.includes('unselected')) stars += 1;
-        });
+        // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
+        // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
+        const starsAttr = w.closest('[data-stars]')?.getAttribute('data-stars') ?? '';
+        const starsFromAttr = Number.parseInt(starsAttr, 10);
+        let stars = Number.isFinite(starsFromAttr)
+          ? Math.max(0, Math.min(5, starsFromAttr))
+          : 0;
+        if (!Number.isFinite(starsFromAttr)) {
+          w.querySelectorAll('i.fa-star').forEach((s) => {
+            const cls = s.getAttribute('class') ?? '';
+            if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
+          });
+        }
         out.push({
           matchId,
           href,
@@ -412,7 +496,12 @@ export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInf
         const viewersText = (
           el.querySelector('.watchbox-right .viewers')?.textContent ?? ''
         ).trim();
-        return { name: name || 'stream', href, viewersText };
+        const flag = el.querySelector(
+          '.stream-box-embed .stream-flag, .stream-flag',
+        ) as HTMLImageElement | null;
+        const flagSrc = flag?.getAttribute('src') ?? '';
+        const flagTitle = flag?.getAttribute('title') ?? flag?.alt ?? '';
+        return { name: name || 'stream', href, viewersText, flagSrc, flagTitle };
       });
     });
     const out: StreamInfo[] = [];
@@ -422,7 +511,12 @@ export async function fetchMatchStreams(matchPageUrl: string): Promise<StreamInf
       if (r.href.includes('hltv.org/live')) continue; // scoreboard, não vídeo
       if (!/twitch\.tv|youtube\.com|youtu\.be|kick\.com/.test(r.href)) continue;
       seen.add(r.href);
-      out.push({ name: r.name, url: r.href, viewers: parseViewers(r.viewersText) });
+      out.push({
+        name: r.name,
+        url: r.href,
+        country: parseStreamCountry(r.flagSrc, r.flagTitle),
+        viewers: parseViewers(r.viewersText),
+      });
     }
     return out;
   } finally {

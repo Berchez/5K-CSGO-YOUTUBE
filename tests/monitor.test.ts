@@ -5,8 +5,10 @@ import {
   matchPassesFilter,
   minKillsForStars,
   parseStarsFromHtml,
+  parseStreamCountry,
   parseViewers,
   pickPreferredStream,
+  selectStream,
 } from '../src/monitor/hltvMonitor.js';
 
 describe('stars filter', () => {
@@ -32,6 +34,13 @@ describe('stars filter', () => {
     expect(parseStarsFromHtml('x', 5)).toBe(5);
     expect(parseStarsFromHtml('<i class="fa fa-star"></i><i class="fa fa-star"></i>', 0)).toBe(2);
     expect(parseStarsFromHtml('<i class="fa fa-star-o"></i>', 0)).toBe(0);
+    // Layout 2026: 5 <i>, sendo 4 "faded" — 1★ real.
+    expect(
+      parseStarsFromHtml(
+        '<i class="fa fa-star"></i><i class="fa fa-star faded"></i><i class="fa fa-star faded"></i><i class="fa fa-star faded"></i><i class="fa fa-star faded"></i>',
+        0,
+      ),
+    ).toBe(1);
   });
 
   it('guessTopTier reconhece eventos grandes', () => {
@@ -144,5 +153,71 @@ describe('pickPreferredStream', () => {
       'official,en',
     );
     expect(s?.name).toBe('Gaules');
+  });
+});
+
+describe('parseStreamCountry', () => {
+  it('extrai o código da bandeira do HLTV', () => {
+    expect(parseStreamCountry('/img/static/flags/30x20/BR.gif', 'Brazil')).toBe('BR');
+    expect(parseStreamCountry('/img/static/flags/30x20/RU.gif', 'Russia')).toBe('RU');
+    expect(parseStreamCountry('/img/static/flags/30x20/WORLD.gif', 'Other')).toBe('WORLD');
+  });
+
+  it('usa o título como fallback', () => {
+    expect(parseStreamCountry('', 'Brazil')).toBe('BR');
+    expect(parseStreamCountry('', 'Brasil')).toBe('BR');
+  });
+});
+
+describe('selectStream', () => {
+  const streams = [
+    { name: 'lentbb', url: 'https://twitch.tv/lentbb', country: 'RU', viewers: 2289 },
+    { name: 'mch', url: 'https://twitch.tv/mch', country: 'BR', viewers: 2229 },
+    { name: 'CircuitX', url: 'https://twitch.tv/circuitx', country: 'BR', viewers: 1587 },
+    { name: 'ESL_CS', url: 'https://twitch.tv/esl_cs', viewers: 5000 },
+  ];
+
+  it('prefere o país com audiência mínima, mesmo sem ser o maior geral', () => {
+    const choice = selectStream(streams, 'official,en', {
+      country: 'BR',
+      minViewers: 2000,
+    });
+    expect(choice?.stream.name).toBe('mch');
+    expect(choice?.reason).toBe('preferred');
+  });
+
+  it('sem stream do país acima do mínimo, usa a principal', () => {
+    const choice = selectStream(
+      streams.filter((s) => s.name !== 'mch'),
+      'official,en',
+      { country: 'BR', minViewers: 2000 },
+    );
+    expect(choice?.stream.name).toBe('ESL_CS');
+    expect(choice?.reason).toBe('main');
+  });
+
+  it('sem principal, usa qualquer stream de maior audiência', () => {
+    const choice = selectStream(
+      [
+        { name: 'CircuitX', url: 'https://twitch.tv/circuitx', country: 'BR', viewers: 1587 },
+      ],
+      'official,en',
+      { country: 'BR', minViewers: 2000 },
+    );
+    expect(choice?.stream.name).toBe('CircuitX');
+    expect(choice?.reason).toBe('fallback');
+  });
+
+  it('não aplica preferência quando o país está vazio', () => {
+    const choice = selectStream(streams, 'official,en', {
+      country: '',
+      minViewers: 2000,
+    });
+    expect(choice?.stream.name).toBe('ESL_CS');
+    expect(choice?.reason).toBe('main');
+  });
+
+  it('retorna null sem streams', () => {
+    expect(selectStream([], 'official,en', { country: 'BR', minViewers: 2000 })).toBeNull();
   });
 });

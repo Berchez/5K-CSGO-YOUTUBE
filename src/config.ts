@@ -15,6 +15,8 @@ const ConfigSchema = z.object({
   POLL_INTERVAL_MS: z.coerce.number().min(5000).default(45000),
 
   STREAM_PRIORITY: z.string().default('official,en'),
+  STREAM_PREFERRED_COUNTRY: z.string().default(''),
+  STREAM_PREFERRED_MIN_VIEWERS: z.coerce.number().min(0).max(10_000_000).default(0),
   MAX_RECORDINGS: z.coerce.number().min(1).max(4).default(2),
   BUFFER_DIR: z.string().default('./data/buffer'),
   SEGMENT_TIME_SEC: z.coerce.number().min(5).max(30).default(10),

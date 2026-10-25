@@ -13,7 +13,7 @@ import {
   fetchLiveMatches,
   fetchMatchStreams,
   minKillsForStars,
-  pickPreferredStream,
+  selectStream,
 } from './monitor/hltvMonitor.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
@@ -35,6 +35,34 @@ const streamsCache = new Map<string, StreamInfo[]>();
 const streamsMiss = new Map<string, { at: number; blocked: boolean }>();
 const STREAMS_MISS_TTL_MS = 10 * 60_000;
 const STREAMS_BLOCKED_TTL_MS = 60_000;
+const failedStreams = new Map<string, Map<string, number>>();
+const STREAM_FAILED_TTL_MS = 5 * 60_000;
+
+function failedStreamUrls(matchId: string): Set<string> {
+  const entries = failedStreams.get(matchId);
+  if (!entries) return new Set();
+  const now = Date.now();
+  const active = new Set<string>();
+  for (const [url, at] of entries) {
+    if (now - at < STREAM_FAILED_TTL_MS) active.add(url);
+    else entries.delete(url);
+  }
+  if (entries.size === 0) failedStreams.delete(matchId);
+  return active;
+}
+
+function markStreamFailed(matchId: string, url: string): void {
+  const entries = failedStreams.get(matchId) ?? new Map<string, number>();
+  entries.set(url, Date.now());
+  failedStreams.set(matchId, entries);
+}
+
+function clearStreamFailed(matchId: string, url: string): void {
+  const entries = failedStreams.get(matchId);
+  if (!entries) return;
+  entries.delete(url);
+  if (entries.size === 0) failedStreams.delete(matchId);
+}
 
 // Referências por partida (foto/logos/mapa): busca 1x, reusa nos aces
 // seguintes. Evictada quando a partida sai do ar (guarda bytes de imagens).
@@ -567,11 +595,14 @@ async function pollOnce(): Promise<void> {
           recorders.muxed?.stop().catch(() => undefined),
         ]);
         activeRecorders.delete(id);
-        log.info({ matchId: id }, 'recorder morto, vai recriar');
+        streamsCache.delete(id);
+        streamsMiss.delete(id);
+        log.info({ matchId: id }, 'recorder morto, vai recriar com streams frescas');
       }
     }
     // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
     if (!activeRecorders.has(m.matchId) && activeRecorders.size < cfg.MAX_RECORDINGS) {
+      let attemptedStream: StreamInfo | null = null;
       try {
         // Cache: a lista de streams quase não muda mid-match.
         // Vazia/bloqueada entra com TTL negativo em vez de rebuscar a cada
@@ -591,6 +622,7 @@ async function pollOnce(): Promise<void> {
               streams = [];
             } else if (fetched.length > 0) {
               streamsCache.set(m.matchId, fetched);
+              streamsMiss.delete(m.matchId);
               streams = fetched;
             } else {
               streamsMiss.set(m.matchId, { at: Date.now(), blocked: false });
@@ -599,10 +631,20 @@ async function pollOnce(): Promise<void> {
           }
         }
         m.streams = streams;
-        const chosen = pickPreferredStream(m.streams, cfg.STREAM_PRIORITY);
-        if (!chosen) {
-          log.info({ matchId: m.matchId }, 'sem stream disponível, pulando gravação');
+        const failedUrls = failedStreamUrls(m.matchId);
+        const available = streams.filter((s) => !failedUrls.has(s.url));
+        const choice = selectStream(available, cfg.STREAM_PRIORITY, {
+          country: cfg.STREAM_PREFERRED_COUNTRY,
+          minViewers: cfg.STREAM_PREFERRED_MIN_VIEWERS,
+        });
+        if (!choice) {
+          log.info(
+            { matchId: m.matchId, streams: streams.length, failed: failedUrls.size },
+            'sem stream disponível, pulando gravação',
+          );
         } else {
+          const chosen = choice.stream;
+          attemptedStream = chosen;
           const streamUrl = twitchUrlFrom(chosen.url);
           const separate = new StreamRecorder({
             streamUrl,
@@ -645,18 +687,39 @@ async function pollOnce(): Promise<void> {
             );
           }
           activeRecorders.set(m.matchId, { separate, muxed: muxedRecorder });
+          clearStreamFailed(m.matchId, chosen.url);
           log.info(
-            { matchId: m.matchId, stream: chosen.name, muxed: muxedRecorder != null },
+            {
+              matchId: m.matchId,
+              stream: chosen.name,
+              country: chosen.country,
+              viewers: chosen.viewers,
+              reason: choice.reason,
+              muxed: muxedRecorder != null,
+            },
             'gravando buffers separados e muxed',
           );
         }
       } catch (e) {
-        log.warn({ err: String(e), matchId: m.matchId }, 'não foi possível iniciar gravação');
+        if (attemptedStream) markStreamFailed(m.matchId, attemptedStream.url);
+        streamsCache.delete(m.matchId);
+        log.warn(
+          {
+            err: String(e),
+            matchId: m.matchId,
+            stream: attemptedStream?.name,
+          },
+          'não foi possível iniciar gravação',
+        );
       }
     }
 
     // 2) Tracker de ace (1 por partida)
-    if (!activeTrackers.has(m.matchId)) {
+    if (!activeRecorders.has(m.matchId)) {
+      if (activeTrackers.delete(m.matchId)) {
+        log.info({ matchId: m.matchId }, 'sem recorder, tracking encerrado');
+      }
+    } else if (!activeTrackers.has(m.matchId)) {
       const minKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
       activeTrackers.add(m.matchId);
       log.info({ matchId: m.matchId, stars: m.stars, minKills }, 'iniciando tracker de multikill');
@@ -717,6 +780,7 @@ async function pollOnce(): Promise<void> {
       activeTrackers.delete(id);
       streamsCache.delete(id);
       streamsMiss.delete(id);
+      failedStreams.delete(id);
       for (const key of refsCache.keys()) {
         if (key === id || key.startsWith(`${id}:`)) refsCache.delete(key);
       }
@@ -774,6 +838,8 @@ async function main(): Promise<void> {
       minKills: cfg.MIN_KILLS,
       minKillsNoStars: cfg.MIN_KILLS_NO_STARS,
       stream: cfg.STREAM_PRIORITY,
+      streamPreferredCountry: cfg.STREAM_PREFERRED_COUNTRY || '(off)',
+      streamPreferredMinViewers: cfg.STREAM_PREFERRED_MIN_VIEWERS,
       privacy: cfg.YT_PRIVACY,
       avSync: cfg.CLIP_AV_SYNC,
       replayAware: cfg.REPLAY_AWARE,

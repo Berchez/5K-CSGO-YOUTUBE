@@ -9,7 +9,7 @@ const SCOPES = ['https://www.googleapis.com/auth/youtube.upload'];
 export function loadOAuthClient(
   clientSecretsPath: string,
   tokenPath: string,
-) {
+): InstanceType<typeof google.auth.OAuth2> {
   if (!fs.existsSync(clientSecretsPath)) {
     throw new Error(
       `client_secrets.json não encontrado em ${clientSecretsPath}. Crie no Google Cloud Console (OAuth Client Desktop) e rode: npm run auth:youtube`,

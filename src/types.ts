@@ -3,6 +3,7 @@ export interface StreamInfo {
   name: string;
   /** URL do embed/página (pode ser twitch url ou link HLTV) */
   url: string;
+  country?: string;
   language?: string;
   viewers?: number;
   /** true se parece stream oficial do evento (ESL, BLAST, PGL, StarLadder...) */
