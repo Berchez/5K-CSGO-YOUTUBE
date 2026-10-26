@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
-const ConfigSchema = z.object({
+export const ConfigSchema = z.object({
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
   /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
   HLTV_PROFILE: z.string().default('./data/hltv-profile'),

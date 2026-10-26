@@ -21,7 +21,19 @@ import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
-import type { AceEvent, ClipResult, StreamInfo } from './types.js';
+import { getFreeBytes } from './diskSpace.js';
+import {
+  initTrayStatus,
+  patchTrayStatus,
+  publishTraySnapshot,
+  setTrayStatusClip,
+  setTrayStatusError,
+  setTrayStatusPhase,
+  shutdownTrayStatus,
+  startTrayStatusHeartbeat,
+} from './trayStatus.js';
+import type { TrayMatchState, TrayStatusMatch } from './trayStatus.js';
+import type { AceEvent, ClipResult, LiveMatch, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
 
 // Streams por partida (a página do match raramente muda mid-game —
@@ -123,6 +135,7 @@ interface MatchRecorders {
 
 const activeRecorders = new Map<string, MatchRecorders>();
 const activeTrackers = new Set<string>();
+const selectedStreams = new Map<string, StreamInfo>();
 let stopping = false;
 
 async function ensureDirs(cfg: ReturnType<typeof getConfig>): Promise<void> {
@@ -130,6 +143,65 @@ async function ensureDirs(cfg: ReturnType<typeof getConfig>): Promise<void> {
   fs.mkdirSync(cfg.CLIPS_DIR, { recursive: true });
   fs.mkdirSync('./logs', { recursive: true });
   fs.mkdirSync('./data', { recursive: true });
+}
+
+function trayMatchState(m: LiveMatch): TrayMatchState {
+  const recorders = activeRecorders.get(m.matchId);
+  if (recorders?.separate.isRunning) return 'recording';
+  if (activeTrackers.has(m.matchId)) return 'tracking';
+  const miss = streamsMiss.get(m.matchId);
+  if (m.streams.length === 0 && miss && !miss.blocked) return 'no-stream';
+  return 'waiting';
+}
+
+function trayMatchesFrom(
+  matches: LiveMatch[],
+  cfg: ReturnType<typeof getConfig>,
+): TrayStatusMatch[] {
+  return matches.map((m) => {
+    const recorders = activeRecorders.get(m.matchId);
+    const stream = selectedStreams.get(m.matchId);
+    const state = trayMatchState(m);
+    return {
+      matchId: m.matchId,
+      team1: m.team1,
+      team2: m.team2,
+      event: m.event,
+      stars: m.stars,
+      minKills: minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
+      matchPageUrl: m.matchPageUrl,
+      state,
+      stream: stream
+        ? { name: stream.name, country: stream.country, viewers: stream.viewers }
+        : undefined,
+      recorder: recorders
+        ? {
+            separate: recorders.separate.isRunning,
+            muxed: recorders.muxed?.isRunning ?? false,
+          }
+        : undefined,
+      tracker: activeTrackers.has(m.matchId),
+    };
+  });
+}
+
+function publishTrayStatus(
+  matches: LiveMatch[] | null,
+  cfg: ReturnType<typeof getConfig>,
+  opts?: { lastError?: string | null },
+): void {
+  const now = new Date().toISOString();
+  if (!matches) {
+    patchTrayStatus({ lastPollAt: now, lastError: opts?.lastError ?? null });
+    return;
+  }
+  const free = getFreeBytes(cfg.CLIPS_DIR);
+  publishTraySnapshot({
+    matches: trayMatchesFrom(matches, cfg),
+    lastPollAt: now,
+    lastError: opts?.lastError ?? null,
+    diskFreeGb: free == null ? null : Math.round((free / 1024 ** 3) * 10) / 10,
+  });
 }
 
 function twitchUrlFrom(streamUrl: string): string {
@@ -553,6 +625,17 @@ async function handleAce(
         }
       }
       insertClip(cfg.DB_PATH, aceId, uploadClipResult.filePath, cfg.YT_PRIVACY, videoId);
+      setTrayStatusClip({
+        at: new Date().toISOString(),
+        matchId: ace.matchId,
+        player: ace.player,
+        map: ace.map,
+        round: ace.round,
+        filePath: uploadClipResult.filePath,
+        videoId,
+        uploaded: Boolean(videoId),
+        privacy: cfg.YT_PRIVACY,
+      });
     }
     if (separateClip && separateClip.filePath !== uploadClipResult?.filePath) {
       insertClip(cfg.DB_PATH, aceId, separateClip.filePath, cfg.YT_PRIVACY);
@@ -580,6 +663,7 @@ async function pollOnce(): Promise<void> {
   );
   if (!matches) {
     log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
+    publishTrayStatus(null, cfg, { lastError: 'listing bloqueado pelo Cloudflare' });
     return;
   }
 
@@ -595,6 +679,7 @@ async function pollOnce(): Promise<void> {
           recorders.muxed?.stop().catch(() => undefined),
         ]);
         activeRecorders.delete(id);
+        selectedStreams.delete(id);
         streamsCache.delete(id);
         streamsMiss.delete(id);
         log.info({ matchId: id }, 'recorder morto, vai recriar com streams frescas');
@@ -687,6 +772,7 @@ async function pollOnce(): Promise<void> {
             );
           }
           activeRecorders.set(m.matchId, { separate, muxed: muxedRecorder });
+          selectedStreams.set(m.matchId, chosen);
           clearStreamFailed(m.matchId, chosen.url);
           log.info(
             {
@@ -702,6 +788,7 @@ async function pollOnce(): Promise<void> {
         }
       } catch (e) {
         if (attemptedStream) markStreamFailed(m.matchId, attemptedStream.url);
+        selectedStreams.delete(m.matchId);
         streamsCache.delete(m.matchId);
         log.warn(
           {
@@ -777,6 +864,7 @@ async function pollOnce(): Promise<void> {
         recorders.muxed?.stop().catch(() => undefined),
       ]);
       activeRecorders.delete(id);
+      selectedStreams.delete(id);
       activeTrackers.delete(id);
       streamsCache.delete(id);
       streamsMiss.delete(id);
@@ -805,6 +893,8 @@ async function pollOnce(): Promise<void> {
     }
   }
 
+  publishTrayStatus(matches, cfg);
+
   // 4) Faxina de abas about:blank presas (navegação que nunca commitou).
   // Best-effort: nunca derruba o poll.
   try {
@@ -822,6 +912,9 @@ async function main(): Promise<void> {
   // 'ffmpeg' pelo nome (concat, thumb, upscale). Igual ao test-vod.
   process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
   await ensureDirs(cfg);
+  initTrayStatus(cfg);
+  startTrayStatusHeartbeat();
+  setTrayStatusPhase('monitoring');
   const log = getLogger();
   // Faxina de snapshots órfãos: renders só existem com o bot vivo — qualquer
   // conteúdo em .build no startup é cadáver de sessão morta (kill/restart no
@@ -882,6 +975,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     stopping = true;
+    shutdownTrayStatus();
     for (const recorders of activeRecorders.values()) {
       await Promise.all([
         recorders.separate.stop().catch(() => undefined),
@@ -906,6 +1000,7 @@ async function main(): Promise<void> {
       await pollOnce();
     } catch (e) {
       log.error({ err: String(e) }, 'erro no ciclo de poll');
+      setTrayStatusError(String(e));
     }
     await new Promise((r) => setTimeout(r, cfg.POLL_INTERVAL_MS));
   }
@@ -913,5 +1008,7 @@ async function main(): Promise<void> {
 
 main().catch((e) => {
   console.error(e);
+  setTrayStatusError(String(e));
+  setTrayStatusPhase('error');
   process.exit(1);
 });

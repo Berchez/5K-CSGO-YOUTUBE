@@ -6,6 +6,7 @@ data/
 *.log
 logs/
 .env
+.env.bak
 token.json
 client_secrets.json
 # bins portáteis de teste + scripts/JSONs de diagnóstico local (ad-hoc)

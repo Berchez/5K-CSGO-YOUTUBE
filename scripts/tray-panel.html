@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>5K Bot · Painel</title>
+  <link rel="icon" href="/favicon.svg">
+  <style>
+    :root {
+      --bg: #070b14;
+      --bg-soft: #0b1220;
+      --panel: rgba(15, 23, 42, .78);
+      --panel-strong: #111a2c;
+      --line: rgba(148, 163, 184, .14);
+      --line-strong: rgba(148, 163, 184, .24);
+      --text: #e5edf9;
+      --muted: #8da0bb;
+      --faint: #64748b;
+      --green: #22c55e;
+      --green-soft: rgba(34, 197, 94, .13);
+      --blue: #38bdf8;
+      --blue-soft: rgba(56, 189, 248, .13);
+      --amber: #f59e0b;
+      --amber-soft: rgba(245, 158, 11, .14);
+      --red: #f43f5e;
+      --red-soft: rgba(244, 63, 94, .13);
+      --violet: #a78bfa;
+      --violet-soft: rgba(167, 139, 250, .13);
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(900px 500px at 18% -10%, rgba(56, 189, 248, .12), transparent 62%),
+        radial-gradient(800px 460px at 100% 0%, rgba(167, 139, 250, .11), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, select { font: inherit; }
+    button { color: inherit; }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .app { display: grid; grid-template-columns: 252px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar {
+      position: sticky; top: 0; height: 100vh;
+      display: flex; flex-direction: column; gap: 18px;
+      padding: 24px 18px 18px;
+      background: linear-gradient(180deg, rgba(11, 18, 32, .94), rgba(7, 11, 20, .9));
+      border-right: 1px solid var(--line);
+      backdrop-filter: blur(18px);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
+    .logo {
+      width: 44px; height: 44px; border-radius: 13px;
+      display: grid; place-items: center;
+      font-size: 16px; font-weight: 800; letter-spacing: -.5px;
+      color: #f8fafc;
+      background: linear-gradient(145deg, #1d4ed8, #0f172a 72%);
+      border: 1px solid rgba(147, 197, 253, .28);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.12), 0 8px 24px rgba(29, 78, 216, .28);
+    }
+    .brand strong { display: block; font-size: 15px; letter-spacing: .1px; }
+    .brand span { display: block; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; margin-top: 2px; }
+    .side-status {
+      display: flex; align-items: center; gap: 9px;
+      margin: 4px 6px; padding: 9px 11px;
+      border: 1px solid var(--line); border-radius: 11px;
+      background: rgba(148, 163, 184, .045);
+      color: var(--muted); font-size: 12px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 3px rgba(148, 163, 184, .1); flex: 0 0 auto; }
+    .dot.online { background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+    .dot.recording { background: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+    .dot.warn { background: var(--amber); box-shadow: 0 0 0 3px var(--amber-soft); }
+    .dot.error { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+    .nav { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+    .nav-item {
+      width: 100%; display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border: 1px solid transparent; border-radius: 10px;
+      background: transparent; color: var(--muted); text-align: left; cursor: pointer;
+      transition: background .16s ease, color .16s ease, border-color .16s ease;
+    }
+    .nav-item::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .5; }
+    .nav-item:hover { background: rgba(148, 163, 184, .06); color: var(--text); }
+    .nav-item.active { background: rgba(56, 189, 248, .09); border-color: rgba(56, 189, 248, .2); color: #dff5ff; }
+    .nav-item.active::before { background: var(--blue); opacity: 1; }
+    .side-foot { margin-top: auto; padding: 12px 6px 0; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; display: flex; justify-content: space-between; gap: 8px; }
+    .main { width: 100%; max-width: 1480px; margin: 0 auto; padding: 30px 34px 54px; }
+    .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; margin-bottom: 22px; }
+    .eyebrow { margin: 0 0 5px; color: var(--blue); font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+    h2, h3, h4, p { margin: 0; }
+    h2 { font-size: clamp(24px, 2.5vw, 32px); line-height: 1.15; letter-spacing: -.03em; }
+    h3 { font-size: 15px; letter-spacing: -.01em; }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 11px; color: var(--faint); }
+    .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 8px 12px; border-radius: 999px;
+      border: 1px solid var(--line); background: rgba(148, 163, 184, .07);
+      color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap;
+    }
+    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .pill.online { color: #86efac; border-color: rgba(34, 197, 94, .26); background: var(--green-soft); }
+    .pill.recording { color: #7dd3fc; border-color: rgba(56, 189, 248, .28); background: var(--blue-soft); }
+    .pill.warn { color: #fcd34d; border-color: rgba(245, 158, 11, .28); background: var(--amber-soft); }
+    .pill.error { color: #fda4af; border-color: rgba(244, 63, 94, .28); background: var(--red-soft); }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+      min-height: 38px; padding: 0 14px; border-radius: 10px;
+      border: 1px solid rgba(56, 189, 248, .28);
+      background: linear-gradient(180deg, rgba(56, 189, 248, .22), rgba(56, 189, 248, .12));
+      color: #e8f8ff; font-weight: 600; cursor: pointer;
+      transition: transform .12s ease, background .16s ease, border-color .16s ease, opacity .16s ease;
+    }
+    .btn:hover:not(:disabled) { background: linear-gradient(180deg, rgba(56, 189, 248, .3), rgba(56, 189, 248, .16)); border-color: rgba(56, 189, 248, .44); }
+    .btn:active:not(:disabled) { transform: translateY(1px); }
+    .btn.ghost { background: rgba(148, 163, 184, .055); border-color: var(--line-strong); color: var(--text); }
+    .btn.ghost:hover:not(:disabled) { background: rgba(148, 163, 184, .1); }
+    .btn.danger { background: var(--red-soft); border-color: rgba(244, 63, 94, .28); color: #fecdd3; }
+    .btn.small { min-height: 31px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+    .btn:disabled { opacity: .38; cursor: not-allowed; }
+    .banner {
+      display: flex; align-items: flex-start; gap: 10px;
+      margin-bottom: 16px; padding: 12px 14px;
+      border: 1px solid rgba(245, 158, 11, .26); border-radius: 12px;
+      background: var(--amber-soft); color: #fde68a; font-size: 12.5px;
+    }
+    .banner.error { border-color: rgba(244, 63, 94, .3); background: var(--red-soft); color: #fecdd3; }
+    .banner strong { font-weight: 700; }
+    .hidden { display: none !important; }
+    .view { display: none; animation: fade .18s ease; }
+    .view.active { display: block; }
+    @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+    .card {
+      min-width: 0; padding: 19px 20px;
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(19, 30, 50, .72), rgba(10, 17, 30, .72));
+      box-shadow: var(--shadow);
+    }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+    .card-head .muted { font-size: 12px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 13px; margin-bottom: 16px; }
+    .metric { position: relative; overflow: hidden; min-height: 126px; }
+    .metric::after { content: ""; position: absolute; width: 90px; height: 90px; right: -28px; bottom: -32px; border-radius: 50%; background: var(--glow, rgba(56, 189, 248, .1)); filter: blur(6px); }
+    .metric-label { display: block; color: var(--muted); font-size: 11.5px; font-weight: 600; letter-spacing: .02em; }
+    .metric strong { display: block; margin: 9px 0 4px; font-size: 34px; line-height: 1; letter-spacing: -.05em; }
+    .metric small { color: var(--faint); font-size: 11px; }
+    .metric.blue { --glow: rgba(56, 189, 248, .18); }
+    .metric.green { --glow: rgba(34, 197, 94, .16); }
+    .metric.violet { --glow: rgba(167, 139, 250, .16); }
+    .metric.amber { --glow: rgba(245, 158, 11, .16); }
+    .two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+    .detail-list { display: grid; gap: 10px; }
+    .detail-row { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 9px; border-bottom: 1px solid rgba(148, 163, 184, .09); }
+    .detail-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .detail-row span { color: var(--muted); font-size: 12px; }
+    .detail-row strong { font-size: 12.5px; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+    .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+    .chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border-radius: 999px; border: 1px solid var(--line); background: rgba(148, 163, 184, .055); color: var(--muted); font-size: 11.5px; }
+    .chip b { color: var(--text); font-weight: 650; }
+    .empty { padding: 30px 16px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--faint); text-align: center; font-size: 12.5px; }
+    .matches-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .match-card { padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(15, 23, 42, .52); }
+    .match-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .match-teams { font-size: 15px; font-weight: 700; letter-spacing: -.01em; line-height: 1.3; }
+    .match-event { margin-top: 3px; color: var(--muted); font-size: 11.5px; }
+    .match-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 12px; color: var(--muted); font-size: 11.5px; }
+    .match-meta span { display: inline-flex; align-items: center; gap: 5px; }
+    .match-meta b { color: var(--text); font-weight: 600; }
+    .match-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, .1); }
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 7px; font-size: 10.5px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; border: 1px solid transparent; }
+    .badge.recording { color: #7dd3fc; background: var(--blue-soft); border-color: rgba(56, 189, 248, .22); }
+    .badge.tracking { color: #c4b5fd; background: var(--violet-soft); border-color: rgba(167, 139, 250, .22); }
+    .badge.waiting { color: var(--muted); background: rgba(148, 163, 184, .07); border-color: var(--line); }
+    .badge.no-stream { color: var(--faint); background: rgba(148, 163, 184, .045); border-color: rgba(148, 163, 184, .1); }
+    .badge.ok { color: #86efac; background: var(--green-soft); border-color: rgba(34, 197, 94, .22); }
+    .badge.warn { color: #fcd34d; background: var(--amber-soft); border-color: rgba(245, 158, 11, .22); }
+    .badge.error { color: #fda4af; background: var(--red-soft); border-color: rgba(244, 63, 94, .22); }
+    .stars { color: var(--amber); letter-spacing: .08em; font-size: 12px; }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 4px 0 14px; }
+    .section-head p { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .settings-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 16px; }
+    .settings-toolbar p { margin-top: 4px; color: var(--muted); font-size: 12px; max-width: 640px; }
+    .settings-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .check { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; }
+    .check input { accent-color: var(--blue); }
+    .settings-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 18px; align-items: start; }
+    .settings-nav { position: sticky; top: 22px; display: flex; flex-direction: column; gap: 4px; }
+    .group-btn {
+      width: 100%; text-align: left; padding: 10px 12px; border-radius: 9px;
+      border: 1px solid transparent; background: transparent; color: var(--muted); cursor: pointer;
+    }
+    .group-btn:hover { background: rgba(148, 163, 184, .055); color: var(--text); }
+    .group-btn.active { background: rgba(56, 189, 248, .08); border-color: rgba(56, 189, 248, .18); color: #dff5ff; }
+    .settings-panel { min-width: 0; }
+    .group-help { margin: -2px 0 12px; color: var(--muted); font-size: 12px; }
+    .field { display: grid; grid-template-columns: minmax(190px, 250px) minmax(0, 1fr); gap: 18px; padding: 14px 0; border-bottom: 1px solid rgba(148, 163, 184, .09); }
+    .field:last-child { border-bottom: 0; }
+    .field-label label { display: block; color: var(--text); font-size: 12.5px; font-weight: 650; }
+    .field-label .field-help { margin-top: 4px; color: var(--faint); font-size: 11px; line-height: 1.4; }
+    .field-control { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .input, select.input {
+      width: 100%; max-width: 430px; min-height: 38px; padding: 0 11px;
+      border: 1px solid var(--line-strong); border-radius: 9px;
+      background: rgba(2, 6, 23, .58); color: var(--text); outline: none;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .input:focus { border-color: rgba(56, 189, 248, .5); box-shadow: 0 0 0 3px rgba(56, 189, 248, .1); }
+    .input.invalid { border-color: rgba(244, 63, 94, .6); box-shadow: 0 0 0 3px rgba(244, 63, 94, .1); }
+    .input.number { max-width: 190px; }
+    .unit { color: var(--faint); font-size: 11px; }
+    .field-error { width: 100%; color: #fda4af; font-size: 11px; }
+    .advanced-tag { margin-left: 6px; color: var(--faint); font-size: 9.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; vertical-align: 1px; }
+    .switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; user-select: none; }
+    .switch input { position: absolute; opacity: 0; pointer-events: none; }
+    .switch-track { position: relative; width: 42px; height: 24px; border-radius: 999px; background: rgba(148, 163, 184, .16); border: 1px solid var(--line-strong); transition: background .16s ease, border-color .16s ease; }
+    .switch-thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #cbd5e1; transition: transform .16s ease, background .16s ease; }
+    .switch input:checked + .switch-track { background: rgba(34, 197, 94, .3); border-color: rgba(34, 197, 94, .4); }
+    .switch input:checked + .switch-track .switch-thumb { transform: translateX(18px); background: #dcfce7; }
+    .switch-label { color: var(--muted); font-size: 12px; min-width: 58px; }
+    .savebar {
+      position: sticky; bottom: 0; z-index: 5;
+      display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+      margin-top: 18px; padding: 13px 15px;
+      border: 1px solid var(--line-strong); border-radius: 13px;
+      background: rgba(8, 14, 27, .94); backdrop-filter: blur(14px);
+      box-shadow: 0 -12px 30px rgba(0, 0, 0, .2);
+    }
+    .save-note { color: var(--muted); font-size: 12px; }
+    .save-note.dirty { color: #fcd34d; }
+    .save-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .log-toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
+    .log-toolbar .input { max-width: 220px; }
+    .logs {
+      height: min(64vh, 680px); overflow: auto; margin: 0; padding: 12px 0;
+      border: 1px solid var(--line); border-radius: 14px;
+      background: #04070d; color: #a9b7cc;
+      font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 11.5px; line-height: 1.6;
+    }
+    .log-line { display: flex; gap: 12px; padding: 0 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .log-line:hover { background: rgba(56, 189, 248, .04); }
+    .log-line .ln { flex: 0 0 38px; color: #3a4a62; text-align: right; user-select: none; }
+    .log-line.error { color: #fda4af; }
+    .log-line.warn { color: #fcd34d; }
+    .log-line.info { color: #a9b7cc; }
+    .clips-list { display: grid; gap: 9px; }
+    .clip-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(15, 23, 42, .5); }
+    .clip-name { font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+    .clip-meta { margin-top: 3px; color: var(--faint); font-size: 11px; }
+    .toast {
+      position: fixed; right: 22px; bottom: 22px; z-index: 50;
+      max-width: min(420px, calc(100vw - 44px)); padding: 12px 15px;
+      border: 1px solid var(--line-strong); border-radius: 12px;
+      background: rgba(8, 14, 27, .96); box-shadow: var(--shadow);
+      color: var(--text); font-size: 12.5px;
+      opacity: 0; transform: translateY(10px); pointer-events: none;
+      transition: opacity .18s ease, transform .18s ease;
+    }
+    .toast.show { opacity: 1; transform: none; }
+    .toast.error { border-color: rgba(244, 63, 94, .4); color: #fecdd3; }
+    .toast.success { border-color: rgba(34, 197, 94, .4); color: #dcfce7; }
+    .toast.warn { border-color: rgba(245, 158, 11, .4); color: #fde68a; }
+    .invalid-token { min-height: 100vh; display: grid; place-items: center; padding: 30px; text-align: center; }
+    .invalid-token .card { max-width: 480px; }
+    @media (max-width: 1120px) {
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .matches-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { position: static; height: auto; flex-direction: row; align-items: center; flex-wrap: wrap; padding: 14px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .brand { margin-right: auto; }
+      .side-status { order: 3; margin: 0; }
+      .nav { order: 4; width: 100%; flex-direction: row; overflow-x: auto; padding-top: 4px; }
+      .nav-item { width: auto; white-space: nowrap; }
+      .side-foot { display: none; }
+      .main { padding: 22px 18px 46px; }
+      .topbar { flex-direction: column; }
+      .top-actions { justify-content: flex-start; }
+      .two-col { grid-template-columns: 1fr; }
+      .settings-layout { grid-template-columns: 1fr; }
+      .settings-nav { position: static; flex-direction: row; overflow-x: auto; }
+      .group-btn { width: auto; white-space: nowrap; }
+    }
+    @media (max-width: 620px) {
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+      .metric { min-height: 112px; }
+      .field { grid-template-columns: 1fr; gap: 8px; }
+      .savebar { align-items: stretch; }
+      .save-actions { width: 100%; }
+      .save-actions .btn { flex: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">5K</div>
+        <div><strong>5K Bot</strong><span>CS2 highlight desk</span></div>
+      </div>
+      <div class="side-status"><span class="dot" id="sideDot"></span><span id="sideStatus">Verificando...</span></div>
+      <nav class="nav" aria-label="Seções">
+        <button class="nav-item active" data-tab="overview">Visão geral</button>
+        <button class="nav-item" data-tab="matches">Partidas</button>
+        <button class="nav-item" data-tab="settings">Configurações</button>
+        <button class="nav-item" data-tab="logs">Logs</button>
+        <button class="nav-item" data-tab="clips">Clipes</button>
+      </nav>
+      <div class="side-foot"><span>Painel local</span><span id="panelVersion">v1.0</span></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Controle da operação</p>
+          <h2 id="pageTitle">Visão geral</h2>
+          <p class="muted" id="pageSubtitle">Carregando estado do bot...</p>
+        </div>
+        <div class="top-actions">
+          <span class="pill" id="statusPill">Verificando</span>
+          <button class="btn ghost" id="btnStart">Iniciar</button>
+          <button class="btn ghost" id="btnStop">Parar</button>
+          <button class="btn" id="btnRestart">Reiniciar</button>
+        </div>
+      </header>
+
+      <div class="banner hidden" id="alertBanner"></div>
+
+      <section class="view active" id="view-overview">
+        <div class="metric-grid">
+          <article class="card metric blue"><span class="metric-label">Partidas ao vivo</span><strong id="mLive">—</strong><small id="mLiveHint">Aguardando o primeiro poll</small></article>
+          <article class="card metric green"><span class="metric-label">Gravando agora</span><strong id="mRecording">—</strong><small id="mRecordingHint">Buffers ativos</small></article>
+          <article class="card metric violet"><span class="metric-label">Trackers</span><strong id="mTrackers">—</strong><small id="mTrackersHint">Detecção de multikills</small></article>
+          <article class="card metric amber"><span class="metric-label">Disco livre</span><strong id="mDisk">—</strong><small id="mDiskHint">Mínimo configurado</small></article>
+        </div>
+
+        <div class="two-col">
+          <article class="card">
+            <div class="card-head"><h3>Estado da operação</h3><span class="badge waiting" id="phaseBadge">—</span></div>
+            <div class="detail-list" id="statusDetail"></div>
+          </article>
+          <article class="card">
+            <div class="card-head"><h3>Resumo da config</h3><button class="btn ghost small" data-tab-link="settings">Ajustar</button></div>
+            <div id="configSummary"><div class="empty">Carregando configuração...</div></div>
+          </article>
+        </div>
+
+        <article class="card" style="margin-bottom:16px">
+          <div class="card-head"><h3>Partidas monitoradas</h3><button class="btn ghost small" data-tab-link="matches">Ver todas</button></div>
+          <div id="overviewMatches"><div class="empty">Nenhuma partida no status ainda.</div></div>
+        </article>
+
+        <div class="two-col">
+          <article class="card">
+            <div class="card-head"><h3>Último clipe</h3><span class="tiny" id="lastClipAt"></span></div>
+            <div id="lastClip"><div class="empty">Nenhum clipe gerado nesta sessão.</div></div>
+          </article>
+          <article class="card">
+            <div class="card-head"><h3>Sistema</h3><span class="tiny" id="panelVersionInline"></span></div>
+            <div id="systemInfo"><div class="empty">Carregando...</div></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-matches">
+        <div class="section-head">
+          <div><h3>Partidas monitoradas</h3><p>Estado do recorder, stream escolhida e tracker de cada partida.</p></div>
+          <button class="btn ghost small" id="btnRefreshMatches">Atualizar</button>
+        </div>
+        <div class="matches-grid" id="matchesGrid"><div class="empty">Carregando...</div></div>
+      </section>
+
+      <section class="view" id="view-settings">
+        <div class="settings-toolbar">
+          <div><h3>Ajustes do bot</h3><p>As alterações são gravadas no <b>.env</b> e validadas antes de salvar. O bot precisa reiniciar para aplicar — o botão “Salvar e reiniciar” faz isso quando ele está online.</p></div>
+          <div class="settings-tools">
+            <label class="check"><input type="checkbox" id="showAdvanced"> Mostrar avançados</label>
+            <button class="btn ghost small" id="btnOpenEnv">Abrir .env</button>
+          </div>
+        </div>
+        <div class="settings-layout">
+          <aside class="settings-nav" id="groupNav"></aside>
+          <div class="settings-panel">
+            <div id="settingsFields"><div class="empty">Carregando configuração...</div></div>
+            <div class="savebar">
+              <span class="save-note" id="saveNote">Carregando...</span>
+              <div class="save-actions">
+                <button class="btn ghost" id="btnSave">Salvar</button>
+                <button class="btn" id="btnSaveRestart">Salvar e reiniciar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-logs">
+        <div class="section-head">
+          <div><h3>Saída do bot</h3><p>Inspeção rápida do log do bot e do tray sem sair do painel.</p></div>
+          <button class="btn ghost small" id="btnOpenLogs">Abrir pasta</button>
+        </div>
+        <div class="log-toolbar">
+          <select class="input" id="logSource" style="max-width:170px">
+            <option value="bot">bot.log</option>
+            <option value="tray">bot-tray.log</option>
+          </select>
+          <label class="check"><input type="checkbox" id="logAuto" checked> Atualizar</label>
+          <input class="input" id="logFilter" placeholder="Filtrar linhas..." style="max-width:230px">
+          <button class="btn ghost small" id="btnRefreshLogs">Atualizar agora</button>
+        </div>
+        <div class="logs" id="logOutput"><div class="empty">Carregando log...</div></div>
+      </section>
+
+      <section class="view" id="view-clips">
+        <div class="section-head">
+          <div><h3>Clipes recentes</h3><p>Arquivos .mp4 encontrados em <b>data/clips</b>.</p></div>
+          <button class="btn ghost small" id="btnOpenClips">Abrir pasta</button>
+        </div>
+        <div class="clips-list" id="clipsList"><div class="empty">Carregando...</div></div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    (() => {
+      const TOKEN = new URLSearchParams(location.search).get('token') || '';
+      if (!TOKEN) {
+        document.body.innerHTML = '<div class="invalid-token"><div class="card"><h2>Link inválido</h2><p class="muted" style="margin-top:8px">Abra o painel pelo ícone do 5K Bot na bandeja do Windows.</p></div></div>';
+        return;
+      }
+
+      const $ = (selector) => document.querySelector(selector);
+      const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+      const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[char]));
+
+      const state = {
+        tab: 'overview',
+        payload: null,
+        bot: null,
+        status: null,
+        config: null,
+        initialValues: {},
+        formValues: {},
+        activeGroup: 'capture',
+        showAdvanced: false,
+        dirty: false,
+        clips: [],
+        logs: null,
+        logFilter: '',
+        statusBusy: false,
+        logsBusy: false,
+        configLoaded: false,
+        connectionError: null,
+      };
+
+      const TITLES = {
+        overview: ['Visão geral', 'O que o bot está fazendo agora.'],
+        matches: ['Partidas', 'Streams escolhidas, buffers ativos e trackers.'],
+        settings: ['Configurações', 'Ajuste fino sem editar o .env na mão.'],
+        logs: ['Logs', 'Diagnóstico em tempo real.'],
+        clips: ['Clipes', 'Últimos arquivos gerados no disco.'],
+      };
+
+      const GROUPS = {
+        capture: 'Captura',
+        stream: 'Stream',
+        clips: 'Clipes e thumbs',
+        youtube: 'YouTube',
+        system: 'Sistema',
+      };
+
+      function toast(message, kind) {
+        const element = $('#toast');
+        if (!element) return;
+        element.textContent = message;
+        element.className = 'toast show ' + (kind || '');
+        clearTimeout(toast._timer);
+        toast._timer = setTimeout(() => { element.className = 'toast'; }, 4200);
+      }
+
+      async function api(path, options) {
+        const opts = options || {};
+        const headers = Object.assign({ 'x-tray-token': TOKEN }, opts.headers || {});
+        if (opts.body) headers['content-type'] = 'application/json';
+        const response = await fetch(path, Object.assign({}, opts, { headers }));
+        let data = null;
+        try { data = await response.json(); } catch { data = null; }
+        if (!response.ok || (data && data.ok === false)) {
+          const error = new Error((data && data.error) || ('Falha HTTP ' + response.status));
+          error.data = data;
+          throw error;
+        }
+        return data;
+      }
+
+      function formatUptime(ms) {
+        if (ms == null || !Number.isFinite(ms) || ms < 0) return '—';
+        const total = Math.floor(ms / 1000);
+        const days = Math.floor(total / 86400);
+        const hours = Math.floor((total % 86400) / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        if (days > 0) return days + 'd ' + hours + 'h';
+        if (hours > 0) return hours + 'h ' + minutes + 'm';
+        if (minutes > 0) return minutes + 'm';
+        return total + 's';
+      }
+
+      function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return '—';
+        if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(2) + ' GB';
+        if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(1) + ' MB';
+        if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
+        return bytes + ' B';
+      }
+
+      function relativeTime(iso) {
+        const time = Date.parse(iso);
+        if (!Number.isFinite(time)) return '—';
+        const diff = Date.now() - time;
+        if (diff < 15_000) return 'agora';
+        if (diff < 60_000) return Math.floor(diff / 1000) + 's atrás';
+        if (diff < 3_600_000) return Math.floor(diff / 60_000) + 'min atrás';
+        if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + 'h atrás';
+        return new Date(time).toLocaleString('pt-BR');
+      }
+
+      function formatDate(iso) {
+        const time = Date.parse(iso);
+        return Number.isFinite(time) ? new Date(time).toLocaleString('pt-BR') : '—';
+      }
+
+      function statusVisual() {
+        const bot = state.bot;
+        const status = state.status;
+        if (!bot) return { key: 'warn', label: 'Verificando' };
+        if (bot.status === 'pm2-error') return { key: 'error', label: 'PM2 indisponível' };
+        if (!bot.online) return { key: 'offline', label: 'Parado' };
+        if (!status) return { key: 'warn', label: 'Iniciando...' };
+        const heartbeat = Date.parse(status.heartbeatAt || status.startedAt || '');
+        const age = Number.isFinite(heartbeat) ? Date.now() - heartbeat : Infinity;
+        if (!Number.isFinite(age) || age > 90_000) return { key: 'warn', label: 'Sem resposta' };
+        if (status.phase === 'recording' || (status.totals && status.totals.recording > 0)) return { key: 'recording', label: 'Gravando' };
+        if (status.lastError) {
+          const errorAge = Date.now() - Date.parse(status.lastError.at || '');
+          if (Number.isFinite(errorAge) && errorAge < 120_000) return { key: 'warn', label: 'Atenção' };
+        }
+        return { key: 'online', label: 'Monitorando' };
+      }
+
+      function matchStateLabel(stateName) {
+        return ({ recording: 'Gravando', tracking: 'Tracker', waiting: 'Aguardando', 'no-stream': 'Sem stream' })[stateName] || stateName || '—';
+      }
+
+      function matchBadgeClass(stateName) {
+        return stateName === 'recording' ? 'recording' : stateName === 'tracking' ? 'tracking' : stateName === 'no-stream' ? 'no-stream' : 'waiting';
+      }
+
+      function starsLabel(count) {
+        if (!Number.isFinite(count) || count <= 0) return '0★';
+        return '★'.repeat(Math.min(5, count));
+      }
+
+      function renderGlobal() {
+        const visual = statusVisual();
+        const pill = $('#statusPill');
+        pill.className = 'pill ' + (visual.key === 'offline' ? '' : visual.key);
+        pill.textContent = visual.label;
+        const dot = $('#sideDot');
+        dot.className = 'dot ' + (visual.key === 'offline' ? '' : visual.key);
+        $('#sideStatus').textContent = visual.label;
+
+        const bot = state.bot;
+        const status = state.status;
+        const online = Boolean(bot && bot.online);
+        $('#btnStart').disabled = online || (bot && bot.status === 'pm2-error');
+        $('#btnStop').disabled = !online;
+        $('#btnRestart').disabled = !online;
+
+        const uptime = bot && bot.uptimeMs != null ? formatUptime(bot.uptimeMs) : (status && status.startedAt ? formatUptime(Date.now() - Date.parse(status.startedAt)) : '—');
+        const pid = bot && bot.pid ? 'pid ' + bot.pid : 'sem processo';
+        $('#pageSubtitle').textContent = online ? (pid + ' · ' + uptime + ' no ar') : (state.connectionError ? 'Painel sem conexão com o servidor local' : 'Bot parado — inicie para voltar a monitorar.');
+
+        const banner = $('#alertBanner');
+        if (state.connectionError) {
+          banner.className = 'banner error';
+          banner.innerHTML = '<div><strong>Painel offline.</strong> ' + esc(state.connectionError) + '</div>';
+        } else if (status && status.lastError) {
+          const age = Date.now() - Date.parse(status.lastError.at || '');
+          if (Number.isFinite(age) && age < 10 * 60_000) {
+            banner.className = 'banner';
+            banner.innerHTML = '<div><strong>Atenção do bot:</strong> ' + esc(status.lastError.message) + ' <span class="tiny">(' + esc(relativeTime(status.lastError.at)) + ')</span></div>';
+          } else {
+            banner.className = 'banner hidden';
+          }
+        } else if (!online) {
+          banner.className = 'banner';
+          banner.innerHTML = '<div><strong>Bot parado.</strong> Os buffers e trackers estão desligados. Use “Iniciar” para retomar.</div>';
+        } else {
+          banner.className = 'banner hidden';
+        }
+      }
+
+      function renderOverview() {
+        const status = state.status;
+        const online = Boolean(state.bot && state.bot.online);
+        const totals = online && status && status.totals ? status.totals : { live: 0, recording: 0, trackers: 0 };
+        $('#mLive').textContent = String(totals.live || 0);
+        $('#mLiveHint').textContent = !online ? 'Bot parado' : (status && status.lastPollAt ? 'Ultimo poll ' + relativeTime(status.lastPollAt) : 'Aguardando o primeiro poll');
+        $('#mRecording').textContent = String(totals.recording || 0);
+        $('#mRecordingHint').textContent = totals.recording > 0 ? 'Buffer sendo gravado' : 'Nenhum buffer ativo';
+        $('#mTrackers').textContent = String(totals.trackers || 0);
+        $('#mTrackersHint').textContent = totals.trackers > 0 ? 'Detectando multikills' : 'Nenhum tracker ativo';
+        const disk = online && status ? status.diskFreeGb : null;
+        $('#mDisk').textContent = disk == null ? '-' : String(disk).replace('.', ',') + ' GB';
+        $('#mDiskHint').textContent = !online ? 'Bot parado' : (status && status.config ? 'Mínimo ' + status.config.diskMinFreeGb + ' GB' : 'Sem leitura');
+
+        const visual = statusVisual();
+        $('#phaseBadge').className = 'badge ' + (visual.key === 'online' ? 'ok' : visual.key === 'recording' ? 'recording' : visual.key === 'warn' ? 'warn' : visual.key === 'error' ? 'error' : 'waiting');
+        $('#phaseBadge').textContent = visual.label;
+
+        const rows = [
+          ['Fase', status ? esc(status.phase) : '—'],
+          ['Processo', online && state.bot.pid ? 'pid ' + state.bot.pid : '—'],
+          ['Uptime', online && state.bot.uptimeMs != null ? formatUptime(state.bot.uptimeMs) : '—'],
+          ['Último poll', status && status.lastPollAt ? formatDate(status.lastPollAt) : '—'],
+          ['Reinícios (PM2)', state.bot ? String(state.bot.restarts ?? 0) : '—'],
+          ['Memória', online && state.bot.memoryBytes ? formatBytes(state.bot.memoryBytes) : '—'],
+        ];
+        $('#statusDetail').innerHTML = rows.map(([label, value]) => '<div class="detail-row"><span>' + esc(label) + '</span><strong>' + value + '</strong></div>').join('');
+
+        const env = state.config && state.config.values ? state.config.values : null;
+        let config = status && status.config ? status.config : null;
+        if (!config && env) {
+          config = {
+            minStars: env.MIN_STARS,
+            minKills: env.MIN_KILLS,
+            minKillsNoStars: env.MIN_KILLS_NO_STARS,
+            maxRecordings: env.MAX_RECORDINGS,
+            upload: env.YT_UPLOAD === 'true',
+            privacy: env.YT_PRIVACY,
+            streamPreferredCountry: env.STREAM_PREFERRED_COUNTRY,
+            streamPreferredMinViewers: env.STREAM_PREFERRED_MIN_VIEWERS,
+            thumbMode: env.THUMB_MODE,
+            diskMinFreeGb: env.DISK_MIN_FREE_GB,
+          };
+        }
+        if (!config) {
+          $('#configSummary').innerHTML = '<div class="empty">Configuração ainda não carregada.</div>';
+        } else {
+          const country = config.streamPreferredCountry || 'sem preferência';
+          $('#configSummary').innerHTML =
+            '<div class="chips">' +
+              '<span class="chip">Estrelas <b>' + esc(config.minStars) + '★+</b></span>' +
+              '<span class="chip">Kills <b>' + esc(config.minKills) + ' com estrela</b></span>' +
+              '<span class="chip">Kills <b>' + esc(config.minKillsNoStars) + ' sem estrela</b></span>' +
+              '<span class="chip">Gravações <b>' + esc(config.maxRecordings) + '</b></span>' +
+              '<span class="chip">Stream <b>' + esc(country) + (config.streamPreferredCountry ? ' &ge; ' + esc(config.streamPreferredMinViewers) : '') + '</b></span>' +
+              '<span class="chip">Upload <b>' + (config.upload ? 'ligado' : 'desligado') + '</b></span>' +
+              '<span class="chip">Privacidade <b>' + esc(config.privacy) + '</b></span>' +
+              '<span class="chip">Thumb <b>' + esc(config.thumbMode) + '</b></span>' +
+            '</div>';
+        }
+
+        const matches = online && status && Array.isArray(status.matches) ? status.matches : [];
+        $('#overviewMatches').innerHTML = matches.length
+          ? '<div class="matches-grid">' + matches.slice(0, 4).map((match) => renderMatchCard(match, true)).join('') + '</div>'
+          : '<div class="empty">Nenhuma partida no filtro agora.</div>';
+
+        const clip = status && status.lastClip;
+        if (!clip) {
+          $('#lastClipAt').textContent = '';
+          $('#lastClip').innerHTML = '<div class="empty">Nenhum clipe gerado nesta sessão.</div>';
+        } else {
+          $('#lastClipAt').textContent = relativeTime(clip.at);
+          const link = clip.videoId ? '<a href="https://youtu.be/' + encodeURIComponent(clip.videoId) + '" target="_blank" rel="noreferrer">Abrir no YouTube</a>' : '';
+          $('#lastClip').innerHTML =
+            '<div class="detail-list">' +
+              '<div class="detail-row"><span>Jogador</span><strong>' + esc(clip.player) + '</strong></div>' +
+              '<div class="detail-row"><span>Mapa / round</span><strong>' + esc(clip.map) + ' · r' + esc(clip.round) + '</strong></div>' +
+              '<div class="detail-row"><span>Status</span><strong>' + (clip.uploaded ? '<span class="badge ok">Enviado</span>' : '<span class="badge waiting">Local</span>') + '</strong></div>' +
+              '<div class="detail-row"><span>Arquivo</span><strong title="' + esc(clip.filePath) + '">' + esc(String(clip.filePath || '').split(/[\\\\/]/).pop()) + '</strong></div>' +
+              (link ? '<div class="detail-row"><span>YouTube</span><strong>' + link + '</strong></div>' : '') +
+            '</div>';
+        }
+
+        const free = status && status.diskFreeGb;
+        $('#systemInfo').innerHTML =
+          '<div class="detail-list">' +
+            '<div class="detail-row"><span>Disco livre</span><strong>' + (free == null ? '—' : esc(free) + ' GB') + '</strong></div>' +
+            '<div class="detail-row"><span>Última atividade</span><strong>' + (status ? esc(relativeTime(status.heartbeatAt)) : '—') + '</strong></div>' +
+            '<div class="detail-row"><span>Versão do painel</span><strong>' + esc(state.payload && state.payload.panel ? state.payload.panel.version : '—') + '</strong></div>' +
+            '<div class="detail-row"><span>Status file</span><strong>' + (status ? 'OK' : 'ausente') + '</strong></div>' +
+          '</div>';
+        const version = state.payload && state.payload.panel ? 'v' + state.payload.panel.version : '';
+        $('#panelVersionInline').textContent = version;
+        $('#panelVersion').textContent = version || 'v1.0';
+      }
+
+      function renderMatchCard(match, compact) {
+        const stream = match.stream
+          ? '<span>Stream <b>' + esc(match.stream.name) + '</b>' + (match.stream.country ? ' · ' + esc(match.stream.country) : '') + (match.stream.viewers != null ? ' · ' + esc(Number(match.stream.viewers).toLocaleString('pt-BR')) + ' viewers' : '') + '</span>'
+          : '<span>Stream <b>—</b></span>';
+        const recorder = match.recorder
+          ? '<span>Buffer <b>' + (match.recorder.separate ? 'separado' : 'off') + (match.recorder.muxed ? ' + muxed' : '') + '</b></span>'
+          : '';
+        const tracker = '<span>Tracker <b>' + (match.tracker ? 'ativo' : 'inativo') + '</b></span>';
+        const link = match.matchPageUrl ? '<a href="' + esc(match.matchPageUrl) + '" target="_blank" rel="noreferrer">HLTV</a>' : '';
+        return '<article class="match-card">' +
+          '<div class="match-top">' +
+            '<div><div class="match-teams">' + esc(match.team1) + ' <span class="muted">vs</span> ' + esc(match.team2) + '</div><div class="match-event">' + esc(match.event || 'Evento não informado') + '</div></div>' +
+            '<span class="badge ' + matchBadgeClass(match.state) + '">' + esc(matchStateLabel(match.state)) + '</span>' +
+          '</div>' +
+          '<div class="match-meta">' +
+            '<span class="stars" title="Estrelas do evento">' + esc(starsLabel(match.stars)) + '</span>' +
+            '<span>Mín. <b>' + esc(match.minKills) + ' kills</b></span>' +
+            stream + tracker + recorder +
+          '</div>' +
+          (compact ? '' : '<div class="match-foot"><span class="tiny">match ' + esc(match.matchId) + '</span>' + link + '</div>') +
+        '</article>';
+      }
+
+      function renderMatches() {
+        const online = Boolean(state.bot && state.bot.online);
+        const matches = online && state.status && Array.isArray(state.status.matches) ? state.status.matches : [];
+        $('#matchesGrid').innerHTML = matches.length
+          ? matches.map((match) => renderMatchCard(match, false)).join('')
+          : '<div class="empty">' + (online ? 'Nenhuma partida no filtro agora.' : 'Bot parado. Inicie para monitorar.') + '</div>';
+      }
+
+      function renderConfigSummary() {
+        renderOverview();
+      }
+
+      function updateDirty() {
+        const keys = Object.keys(state.formValues);
+        const dirty = keys.some((key) => String(state.formValues[key]) !== String(state.initialValues[key]));
+        state.dirty = dirty;
+        const save = $('#btnSave');
+        const saveRestart = $('#btnSaveRestart');
+        if (save) save.disabled = !dirty;
+        if (saveRestart) saveRestart.disabled = !dirty;
+        const note = $('#saveNote');
+        if (note) {
+          const count = keys.filter((key) => String(state.formValues[key]) !== String(state.initialValues[key])).length;
+          note.textContent = dirty ? (count === 1 ? '1 alteração pendente' : count + ' alterações pendentes') : 'Tudo salvo.';
+          note.className = 'save-note' + (dirty ? ' dirty' : '');
+        }
+      }
+
+      function clearErrors() {
+        $$('#settingsFields .input').forEach((element) => element.classList.remove('invalid'));
+        $$('#settingsFields .field-error').forEach((element) => { element.textContent = ''; });
+      }
+
+      function showFieldErrors(errors) {
+        clearErrors();
+        (errors || []).forEach((error) => {
+          const input = document.querySelector('[data-key="' + String(error.key).replace(/"/g, '\\"') + '"]');
+          if (input) input.classList.add('invalid');
+          const target = document.querySelector('[data-error-for="' + String(error.key).replace(/"/g, '\\"') + '"]');
+          if (target) target.textContent = error.message;
+        });
+      }
+
+      function renderField(field) {
+        const value = state.formValues[field.key] ?? '';
+        const id = 'cfg_' + field.key;
+        const help = field.help ? '<div class="field-help">' + esc(field.help) + '</div>' : '';
+        const advanced = field.advanced ? '<span class="advanced-tag">avançado</span>' : '';
+        let control = '';
+        if (field.type === 'boolean') {
+          const checked = value === 'true' ? ' checked' : '';
+          control = '<label class="switch"><input id="' + esc(id) + '" type="checkbox" data-key="' + esc(field.key) + '" data-type="boolean"' + checked + '><span class="switch-track"><span class="switch-thumb"></span></span><span class="switch-label">' + (checked ? 'Ligado' : 'Desligado') + '</span></label>';
+        } else if (field.type === 'select') {
+          const options = (field.options || []).map((option) => '<option value="' + esc(option.value) + '"' + (String(option.value) === String(value) ? ' selected' : '') + '>' + esc(option.label) + '</option>').join('');
+          control = '<select id="' + esc(id) + '" class="input" data-key="' + esc(field.key) + '" data-type="select">' + options + '</select>';
+        } else {
+          const type = field.type === 'number' ? 'number' : 'text';
+          const attrs = type === 'number'
+            ? ' min="' + esc(field.min ?? '') + '" max="' + esc(field.max ?? '') + '" step="' + esc(field.step ?? '1') + '"'
+            : '';
+          control = '<input id="' + esc(id) + '" class="input ' + (type === 'number' ? 'number' : '') + '" type="' + type + '" data-key="' + esc(field.key) + '" data-type="' + type + '" value="' + esc(value) + '"' + attrs + '>' + (field.unit ? '<span class="unit">' + esc(field.unit) + '</span>' : '');
+        }
+        return '<div class="field" data-field="' + esc(field.key) + '">' +
+          '<div class="field-label"><label for="' + esc(id) + '">' + esc(field.label) + advanced + '</label>' + help + '</div>' +
+          '<div class="field-control">' + control + '<div class="field-error" data-error-for="' + esc(field.key) + '"></div></div>' +
+        '</div>';
+      }
+
+      function renderSettings() {
+        if (!state.config) {
+          $('#settingsFields').innerHTML = '<div class="empty">Configuração indisponível.</div>';
+          return;
+        }
+        const groups = state.config.groups || [];
+        $('#groupNav').innerHTML = groups.map((group) => '<button class="group-btn' + (group.id === state.activeGroup ? ' active' : '') + '" data-group="' + esc(group.id) + '" title="' + esc(group.description) + '">' + esc(group.label) + '</button>').join('');
+        const group = groups.find((item) => item.id === state.activeGroup) || groups[0];
+        if (!group) return;
+        const fields = (state.config.fields || []).filter((field) => field.group === group.id && (state.showAdvanced || !field.advanced));
+        $('#settingsFields').innerHTML =
+          '<div class="group-help">' + esc(group.description) + '</div>' +
+          '<div class="card" style="padding-top:8px;padding-bottom:8px">' +
+            (fields.length ? fields.map(renderField).join('') : '<div class="empty">Nenhum campo visível neste grupo.</div>') +
+          '</div>';
+        updateDirty();
+      }
+
+      async function loadConfig(force) {
+        if (state.configLoaded && !force) return;
+        try {
+          const data = await api('/api/config');
+          state.config = data;
+          state.initialValues = Object.assign({}, data.values);
+          state.formValues = Object.assign({}, data.values);
+          state.configLoaded = true;
+          renderSettings();
+          updateDirty();
+          if (state.tab === 'overview') renderOverview();
+        } catch (error) {
+          toast(error.message || 'Falha ao carregar configuração.', 'error');
+          $('#settingsFields').innerHTML = '<div class="empty">Não foi possível carregar a configuração.</div>';
+        }
+      }
+
+      async function saveConfig(restart) {
+        const values = {};
+        for (const key of Object.keys(state.formValues)) {
+          if (String(state.formValues[key]) !== String(state.initialValues[key])) values[key] = state.formValues[key];
+        }
+        if (Object.keys(values).length === 0) {
+          toast('Nenhuma alteração para salvar.', 'warn');
+          return;
+        }
+        const save = $('#btnSave');
+        const saveRestart = $('#btnSaveRestart');
+        save.disabled = true;
+        saveRestart.disabled = true;
+        clearErrors();
+        try {
+          const result = await api('/api/config', { method: 'POST', body: JSON.stringify({ values, restart: Boolean(restart) }) });
+          state.initialValues = Object.assign({}, state.formValues);
+          if (state.config && state.config.values) Object.assign(state.config.values, state.formValues);
+          updateDirty();
+          if (result.restarted) toast('Configuração salva e bot reiniciado.', 'success');
+          else if (result.botWasOnline === false) toast('Configuração salva. O bot está parado; inicie para aplicar.', 'success');
+          else if (restart) toast('Configuração salva. Reinício solicitado, mas não confirmado.', 'warn');
+          else toast('Configuração salva. Reinicie o bot para aplicar.', 'success');
+          if (result.restartError) toast('Falha ao reiniciar: ' + result.restartError, 'error');
+          await loadStatus(true);
+        } catch (error) {
+          if (error.data && error.data.errors) showFieldErrors(error.data.errors);
+          toast(error.message || 'Falha ao salvar configuração.', 'error');
+          updateDirty();
+        }
+      }
+
+      function renderClips() {
+        const clips = state.clips || [];
+        $('#clipsList').innerHTML = clips.length
+          ? clips.map((clip) => '<div class="clip-row"><div><div class="clip-name">' + esc(clip.name) + '</div><div class="clip-meta">' + esc(clip.relativePath) + ' · ' + formatBytes(clip.size) + ' · ' + esc(relativeTime(clip.mtime)) + '</div></div><span class="tiny">' + esc(formatDate(clip.mtime)) + '</span></div>').join('')
+          : '<div class="empty">Nenhum .mp4 encontrado em data/clips.</div>';
+      }
+
+      async function loadClips() {
+        try {
+          const data = await api('/api/clips');
+          state.clips = data.clips || [];
+          if (state.tab === 'clips') renderClips();
+        } catch (error) {
+          if (state.tab === 'clips') $('#clipsList').innerHTML = '<div class="empty">Falha ao listar clipes.</div>';
+        }
+      }
+
+      function logLineClass(line) {
+        if (/\bERROR\b|\bfatal\b|\bfailed\b/i.test(line)) return 'error';
+        if (/\bWARN\b|\bwarn\b|\bbloqueado\b/i.test(line)) return 'warn';
+        return 'info';
+      }
+
+      function renderLogs() {
+        const output = $('#logOutput');
+        if (!state.logs) {
+          output.innerHTML = '<div class="empty">Carregando log...</div>';
+          return;
+        }
+        const filter = state.logFilter.trim().toLowerCase();
+        const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
+        const lines = (state.logs.lines || []).filter((line) => !filter || line.toLowerCase().includes(filter));
+        output.innerHTML = lines.length
+          ? lines.map((line, index) => '<div class="log-line ' + logLineClass(line) + '"><span class="ln">' + (index + 1) + '</span><span>' + esc(line) + '</span></div>').join('')
+          : '<div class="empty">Nenhuma linha para este filtro.</div>';
+        if (atBottom) output.scrollTop = output.scrollHeight;
+      }
+
+      async function loadLogs() {
+        if (state.logsBusy) return;
+        state.logsBusy = true;
+        try {
+          const source = $('#logSource').value || 'bot';
+          const data = await api('/api/logs?source=' + encodeURIComponent(source) + '&lines=300');
+          state.logs = data;
+          if (state.tab === 'logs') renderLogs();
+        } catch (error) {
+          if (state.tab === 'logs') $('#logOutput').innerHTML = '<div class="empty">Falha ao carregar o log.</div>';
+        } finally {
+          state.logsBusy = false;
+        }
+      }
+
+      async function loadStatus(force) {
+        if (state.statusBusy) return;
+        state.statusBusy = true;
+        try {
+          const data = await api('/api/status');
+          state.payload = data;
+          state.bot = data.bot;
+          state.status = data.status;
+          state.connectionError = null;
+          renderGlobal();
+          if (state.tab === 'overview') renderOverview();
+          if (state.tab === 'matches') renderMatches();
+        } catch (error) {
+          state.connectionError = error.message || 'Sem conexão com o painel local.';
+          state.bot = state.bot || { online: false, status: 'panel-error', pid: 0 };
+          renderGlobal();
+        } finally {
+          state.statusBusy = false;
+        }
+      }
+
+      async function doAction(action) {
+        const labels = { start: 'Iniciando...', stop: 'Parando...', restart: 'Reiniciando...' };
+        if (labels[action]) toast(labels[action]);
+        try {
+          const result = await api('/api/action', { method: 'POST', body: JSON.stringify({ action }) });
+          if (labels[action]) toast('Ação concluída.', 'success');
+          if (result.bot) { state.bot = result.bot; renderGlobal(); }
+          await loadStatus(true);
+        } catch (error) {
+          toast(error.message || 'Ação falhou.', 'error');
+          await loadStatus(true);
+        }
+      }
+
+      function switchTab(tab) {
+        if (!TITLES[tab]) tab = 'overview';
+        state.tab = tab;
+        $$('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.tab === tab));
+        $$('.view').forEach((view) => view.classList.toggle('active', view.id === 'view-' + tab));
+        $('#pageTitle').textContent = TITLES[tab][0];
+        $('#pageSubtitle').textContent = TITLES[tab][1];
+        history.replaceState(null, '', '#' + tab);
+        if (tab === 'overview') { renderOverview(); }
+        if (tab === 'matches') { renderMatches(); }
+        if (tab === 'settings' && (!state.configLoaded || !state.dirty)) { void loadConfig(false); }
+        if (tab === 'logs') { void loadLogs(); }
+        if (tab === 'clips') { renderClips(); void loadClips(); }
+      }
+
+      document.addEventListener('click', (event) => {
+        const nav = event.target.closest('[data-tab]');
+        if (nav) { switchTab(nav.dataset.tab); return; }
+        const link = event.target.closest('[data-tab-link]');
+        if (link) { switchTab(link.dataset.tabLink); return; }
+        const group = event.target.closest('[data-group]');
+        if (group) {
+          state.activeGroup = group.dataset.group;
+          renderSettings();
+        }
+      });
+
+      $('#settingsFields').addEventListener('input', (event) => {
+        const input = event.target;
+        const key = input.dataset.key;
+        if (!key) return;
+        const type = input.dataset.type;
+        const value = type === 'boolean' ? (input.checked ? 'true' : 'false') : input.value;
+        state.formValues[key] = value;
+        if (type === 'boolean') {
+          const label = input.closest('.switch')?.querySelector('.switch-label');
+          if (label) label.textContent = input.checked ? 'Ligado' : 'Desligado';
+        }
+        const error = document.querySelector('[data-error-for="' + key.replace(/"/g, '\\"') + '"]');
+        if (error) error.textContent = '';
+        input.classList.remove('invalid');
+        updateDirty();
+      });
+      $('#settingsFields').addEventListener('change', (event) => {
+        if (event.target.dataset.type === 'select' || event.target.dataset.type === 'boolean') {
+          const key = event.target.dataset.key;
+          if (!key) return;
+          state.formValues[key] = event.target.dataset.type === 'boolean' ? (event.target.checked ? 'true' : 'false') : event.target.value;
+          updateDirty();
+        }
+      });
+      $('#showAdvanced').addEventListener('change', (event) => {
+        state.showAdvanced = event.target.checked;
+        renderSettings();
+      });
+      $('#btnSave').addEventListener('click', () => void saveConfig(false));
+      $('#btnSaveRestart').addEventListener('click', () => void saveConfig(true));
+      $('#btnOpenEnv').addEventListener('click', () => void doAction('open-env'));
+      $('#btnStart').addEventListener('click', () => void doAction('start'));
+      $('#btnStop').addEventListener('click', () => void doAction('stop'));
+      $('#btnRestart').addEventListener('click', () => void doAction('restart'));
+      $('#btnRefreshMatches').addEventListener('click', () => void loadStatus(true));
+      $('#btnOpenLogs').addEventListener('click', () => void doAction('open-logs'));
+      $('#btnOpenClips').addEventListener('click', () => void doAction('open-clips'));
+      $('#btnRefreshLogs').addEventListener('click', () => void loadLogs());
+      $('#logSource').addEventListener('change', () => void loadLogs());
+      $('#logFilter').addEventListener('input', (event) => { state.logFilter = event.target.value; renderLogs(); });
+      $('#logOutput').addEventListener('scroll', () => { /* reservado para pausar auto-scroll no futuro */ });
+
+      const initialHash = location.hash.replace('#', '');
+      switchTab(TITLES[initialHash] ? initialHash : 'overview');
+      void loadStatus(true);
+      void loadConfig(false);
+      void loadClips();
+      setInterval(() => { void loadStatus(false); }, 3000);
+      setInterval(() => {
+        if (state.tab === 'logs' && $('#logAuto').checked) void loadLogs();
+      }, 5000);
+      setInterval(() => {
+        if (state.tab === 'clips') void loadClips();
+      }, 30000);
+    })();
+  </script>
+</body>
+</html>
