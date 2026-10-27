@@ -8,7 +8,7 @@ import {
   fetchMatchListing,
   selectNextUpcoming,
 } from '../src/monitor/hltvMonitor.js';
-import { nextPollDelayMs, POLL_START_GRACE_MS } from '../src/monitor/pollSchedule.js';
+import { computePollDecision, POLL_START_GRACE_MS } from '../src/monitor/pollSchedule.js';
 import { getConfig } from '../src/config.js';
 import { loadWatchlistFile } from '../src/watchlist.js';
 import { repoPath } from '../src/paths.js';
@@ -35,24 +35,31 @@ if (!listing) {
       `- [${m.matchId}] ${m.team1} vs ${m.team2} | ${m.event} | stars=${m.stars} topTier=${m.isTopTierGuess} | ${m.matchPageUrl}`,
     );
   }
-  console.log(`ELIGIVEIS-FUTURAS=${listing.upcoming.length}`);
+  console.log(
+    `FUTURAS-VISTAS=${listing.upcomingSeen} FUTURAS-COM-HORARIO=${listing.upcomingTotal} ELIGIVEIS-FUTURAS=${listing.upcoming.length}`,
+  );
+  console.log(
+    `AGENDA-CONFIAVEL=${listing.scheduleReliable}${listing.scheduleReliable ? '' : ' (extração quebrada: poll fica no intervalo base)'}`,
+  );
   const next = selectNextUpcoming(listing.upcoming, Date.now(), POLL_START_GRACE_MS);
+  const now = Date.now();
+  const decision = computePollDecision({
+    now,
+    nextMatchAt: next?.startsAt ?? null,
+    baseIntervalMs: cfg.POLL_INTERVAL_MS,
+    forceReasons: listing.live.length > 0 ? ['live'] : [],
+    scheduleReliable: listing.scheduleReliable,
+    adaptive: cfg.POLL_ADAPTIVE,
+  });
   if (next) {
-    const now = Date.now();
-    const delay = nextPollDelayMs({
-      now,
-      nextMatchAt: next.startsAt,
-      baseIntervalMs: cfg.POLL_INTERVAL_MS,
-      forceBase: listing.live.length > 0,
-    });
     console.log(
       `NEXT=[${next.matchId}] ${next.team1} vs ${next.team2} | ${new Date(next.startsAt).toISOString()} | watchlisted=${Boolean(next.watchlisted)}`,
-    );
-    console.log(
-      `NEXT-POLL=em ${Math.round(delay / 60_000)}min (${new Date(now + delay).toISOString()})`,
     );
   } else {
     console.log('NEXT=nenhuma partida elegível no listing');
   }
+  console.log(
+    `NEXT-POLL=em ${Math.round(decision.delayMs / 60_000)}min (${new Date(now + decision.delayMs).toISOString()}) motivo=${decision.reason}`,
+  );
 }
 await closeBrowser();

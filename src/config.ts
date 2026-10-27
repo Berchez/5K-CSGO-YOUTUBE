@@ -13,6 +13,15 @@ export const ConfigSchema = z.object({
     .default('false')
     .transform((v) => v.toLowerCase() === 'true'),
   POLL_INTERVAL_MS: z.coerce.number().min(5000).default(45000),
+  /**
+   * Poll adaptativo (idle backoff): true = ocioso espera metade do tempo
+   * que falta para a próxima partida (teto 30min); false = sempre no
+   * intervalo base (comportamento antigo, kill switch).
+   */
+  POLL_ADAPTIVE: z
+    .string()
+    .default('true')
+    .transform((v) => v.toLowerCase() === 'true'),
 
   STREAM_PRIORITY: z.string().default('official,en'),
   STREAM_PREFERRED_COUNTRY: z.string().default(''),

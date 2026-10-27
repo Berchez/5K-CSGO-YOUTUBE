@@ -19,7 +19,17 @@ import {
   selectStream,
   type UpcomingMatch,
 } from './monitor/hltvMonitor.js';
-import { nextPollDelayMs, POLL_START_GRACE_MS } from './monitor/pollSchedule.js';
+import {
+  computePollDecision,
+  pollForceReasons,
+  POLL_START_GRACE_MS,
+} from './monitor/pollSchedule.js';
+import {
+  createWatchlistSignal,
+  notifyWatchlistChanged,
+  sleepUntilPoll,
+} from './monitor/pollSleep.js';
+import { detectionEvents } from './monitor/liveTelemetry.js';
 import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
@@ -125,19 +135,20 @@ const deferredBufferCleanup = new Set<string>();
 // daqui a cada round (hot-reload não fica preso ao início da partida).
 let activeWatchlist: WatchlistDoc | null = null;
 
-// Watcher da watchlist: com o poll adaptativo o bot pode dormir horas, mas
-// salvar a watchlist precisa ter efeito imediato (hot-reload). O watcher
-// só stat'a o arquivo (sem page-load) e acorda o sleep quando ele muda.
+// Watcher da watchlist: com o poll adaptativo o bot pode dormir 30min, mas
+// salvar a watchlist precisa ter efeito rápido (hot-reload). O watcher só
+// stat'a o arquivo (sem page-load) e acorda o sleep quando ele muda.
+// O sinal guarda a versão (contador) e a hora da última mudança: o loop
+// consome a versão no topo de cada iteração (nada de "flag sujo" zerada
+// dentro do poll — um poll que lança exceção não vira hot-loop) e o
+// sleep usa a hora para debounce (um salvamento = um poll, não um por
+// toque de arquivo).
 const WATCHLIST_FILE = repoPath('data', 'watchlist.json');
-let watchlistDirty = false;
-let wakeFromSleep: (() => void) | null = null;
+const watchlistSignal = createWatchlistSignal();
 
 function startWatchlistWatcher(): void {
   fs.watchFile(WATCHLIST_FILE, { interval: 2000, persistent: false }, () => {
-    watchlistDirty = true;
-    const wake = wakeFromSleep;
-    wakeFromSleep = null;
-    wake?.();
+    notifyWatchlistChanged(watchlistSignal);
   });
 }
 
@@ -145,27 +156,16 @@ function stopWatchlistWatcher(): void {
   fs.unwatchFile(WATCHLIST_FILE);
 }
 
-/**
- * Dorme até o próximo poll. Acorda antes se a watchlist mudar (o poll
- * seguinte já carrega a versão nova) — sem isso uma edição feita durante
- * uma espera de 4h só valeria 4h depois.
- */
-async function sleepUntilNextPoll(delayMs: number): Promise<void> {
-  if (watchlistDirty) return;
-  await new Promise<void>((resolve) => {
-    let done = false;
-    const finish = (): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      wakeFromSleep = null;
-      resolve();
-    };
-    const timer = setTimeout(finish, delayMs);
-    wakeFromSleep = finish;
-    if (watchlistDirty) finish();
-  });
-}
+// Agenda conhecida (matchId → horário marcado no HLTV): serve para medir
+// a latência de detecção (a live apareceu quanto tempo depois do previsto?).
+const knownUpcoming = new Map<string, number>();
+// Lives elegíveis já detectadas (evita repetir o log a cada poll).
+const detectedLive = new Set<string>();
+// matchId da próxima partida prevista no poll anterior (telemetria).
+let predictedMatchId: string | null = null;
+// Última próxima partida conhecida: mantida no painel quando o listing
+// é bloqueado (o Cloudflare não deve apagar a informação da fila).
+let lastKnownNextMatch: UpcomingMatch | null = null;
 
 function pendingClipCount(): number {
   let total = 0;
@@ -799,20 +799,18 @@ interface PollOutcome {
   liveMatches: number;
   /** Listing bloqueado pelo Cloudflare. */
   blocked: boolean;
+  /** A agenda futura do listing é confiável (extração funcionou)? */
+  scheduleReliable: boolean;
   /** Watchlist ausente mas ainda segurando a última versão boa. */
   watchlistStale: boolean;
   /** A watchlist mudou durante este poll (reprocessa no próximo ciclo). */
   watchlistChanged: boolean;
 }
 
-async function pollOnce(): Promise<PollOutcome> {
+async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
   const cfg = getConfig();
   const log = getLogger();
   getDb(cfg.DB_PATH);
-
-  // Mudanças na watchlist durante o poll marcam o arquivo como sujo: o
-  // próximo ciclo usa o intervalo base para aplicar a versão nova.
-  watchlistDirty = false;
 
   // Watchlist: hot-reload por mtime (barato a cada poll). JSON inválido
   // mantém a última versão boa; arquivo ausente mantém a última versão por
@@ -853,14 +851,43 @@ async function pollOnce(): Promise<PollOutcome> {
     log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
     publishTrayStatus(null, cfg, { lastError: 'listing bloqueado pelo Cloudflare' });
     return {
-      nextMatch: null,
+      // Mantém a última partida conhecida no painel (o bloqueio não
+      // apaga a fila) — o intervalo base já vem do motivo 'blocked'.
+      nextMatch: lastKnownNextMatch,
       liveMatches: 0,
       blocked: true,
+      scheduleReliable: false,
       watchlistStale,
-      watchlistChanged: watchlistDirty,
+      // Mudou durante este poll? (a versão consumida no topo do loop é a
+      // de antes do poll — se o watcher mexeu no arquivo agora, o próximo
+      // ciclo precisa do intervalo base para aplicar a versão nova).
+      watchlistChanged: watchlistSignal.version !== watchlistVersion,
     };
   }
   const matches = listing.live;
+
+  // Telemetria de detecção: quando a live elegível aparece pela 1ª vez,
+  // mede a latência contra o horário previsto (e avisa se ela nem estava
+  // na agenda — sinal de que o backoff dormiu por cima da partida).
+  for (const ev of detectionEvents({
+    liveMatchIds: matches.map((m) => m.matchId),
+    knownUpcoming,
+    predictedMatchId,
+    now: Date.now(),
+    seen: detectedLive,
+  })) {
+    const base = {
+      matchId: ev.matchId,
+      latencyMs: ev.latencyMs,
+      latencyMin: ev.latencyMs === null ? null : Math.round(ev.latencyMs / 60_000),
+      predicted: ev.predicted,
+    };
+    if (ev.latencyMs === null) {
+      log.warn(base, 'live detectada fora da agenda conhecida');
+    } else {
+      log.info(base, 'live detectada');
+    }
+  }
 
   for (const m of matches) {
     if (stopping) break;
@@ -1145,12 +1172,20 @@ async function pollOnce(): Promise<PollOutcome> {
   // A grace mantém no topo a partida já iniciada que ainda não aparece
   // como live (adiamento) — assim o bot não "dorme" no meio do jogo.
   const nextMatch = selectNextUpcoming(listing.upcoming, Date.now(), POLL_START_GRACE_MS);
+  lastKnownNextMatch = nextMatch;
+  predictedMatchId = nextMatch?.matchId ?? null;
+  // Atualiza a agenda conhecida (usada na telemetria do próximo poll).
+  knownUpcoming.clear();
+  for (const m of listing.upcoming) knownUpcoming.set(m.matchId, m.startsAt);
   return {
     nextMatch,
     liveMatches: matches.length,
     blocked: false,
+    scheduleReliable: listing.scheduleReliable,
     watchlistStale,
-    watchlistChanged: watchlistDirty,
+    // Mudou durante este poll (o fetch do listing leva segundos: a versão
+    // é conferida no fim, não no começo).
+    watchlistChanged: watchlistSignal.version !== watchlistVersion,
   };
 }
 
@@ -1254,26 +1289,43 @@ async function main(): Promise<void> {
   // síncrono e best-effort (taskkill por PID dos trackeados).
   process.on('exit', () => killAll());
 
+  // Último motivo registrado do agendamento (log só na mudança: o poll
+  // pode repetir o mesmo motivo a cada ciclo).
+  let lastDecisionReason: string | null = null;
+
   while (!stopping) {
+    const pollStartedAt = Date.now();
+    // Consome a versão da watchlist ANTES do poll: se o arquivo mudar
+    // durante o poll, o fim do poll percebe (watchlistChanged → intervalo
+    // base no próximo ciclo). Se o poll lançar, o sleep abaixo ainda
+    // espera — nada de hot-loop por "flag sujo" não consumida.
+    const watchlistVersion = watchlistSignal.version;
     let delay = cfg.POLL_INTERVAL_MS;
     try {
-      const outcome = await pollOnce();
-      // Live elegível, gravação/tracker ativo ou clipe em andamento: o
-      // poll tem que continuar no intervalo base (buffer/stream/cleanup).
-      const busy =
-        outcome.liveMatches > 0 ||
-        activeRecorders.size > 0 ||
-        activeTrackers.size > 0 ||
-        pendingClips.size > 0;
-      const forceBase =
-        outcome.blocked || busy || outcome.watchlistStale || outcome.watchlistChanged;
+      const outcome = await pollOnce(watchlistVersion);
+      // Live elegível, gravação/tracker ativo, clipe em andamento ou buffer
+      // adiado: o poll tem que continuar no intervalo base (buffer/stream/
+      // cleanup). Cada motivo vira uma linha no log do agendamento.
+      const forceReasons = pollForceReasons({
+        liveMatches: outcome.liveMatches,
+        recorders: activeRecorders.size,
+        trackers: activeTrackers.size,
+        pendingClips: pendingClips.size,
+        deferredCleanup: deferredBufferCleanup.size,
+        blocked: outcome.blocked,
+        watchlistChanged: outcome.watchlistChanged,
+        watchlistStale: outcome.watchlistStale,
+      });
       const now = Date.now();
-      delay = nextPollDelayMs({
+      const decision = computePollDecision({
         now,
         nextMatchAt: outcome.nextMatch?.startsAt ?? null,
         baseIntervalMs: cfg.POLL_INTERVAL_MS,
-        forceBase,
+        forceReasons,
+        scheduleReliable: outcome.scheduleReliable,
+        adaptive: cfg.POLL_ADAPTIVE,
       });
+      delay = decision.delayMs;
       patchTrayStatus({
         nextPollAt: new Date(now + delay).toISOString(),
         nextMatch: outcome.nextMatch
@@ -1286,9 +1338,25 @@ async function main(): Promise<void> {
             }
           : null,
       });
+      if (decision.reason !== lastDecisionReason) {
+        const previous = lastDecisionReason;
+        lastDecisionReason = decision.reason;
+        if (decision.reason === 'schedule-unreliable') {
+          log.warn(
+            { reason: decision.reason, previous },
+            'agenda do listing não confiável — poll no intervalo base',
+          );
+        } else {
+          log.info(
+            { reason: decision.reason, previous, delayMs: delay },
+            'decisão do agendamento do poll',
+          );
+        }
+      }
       if (delay > cfg.POLL_INTERVAL_MS) {
         log.info(
           {
+            reason: decision.reason,
             nextMatch: outcome.nextMatch
               ? `${outcome.nextMatch.team1} vs ${outcome.nextMatch.team2}`
               : null,
@@ -1299,6 +1367,15 @@ async function main(): Promise<void> {
           },
           'poll adiado — próxima partida longe',
         );
+        // Ocioso de verdade (sem live/gravação/tracker/clip pendente — esses
+        // forçam o intervalo base): fecha o browser e libera RAM/CPU
+        // durante a espera. O perfil persistente guarda o clearance do
+        // Cloudflare; o próximo poll relança o browser.
+        try {
+          await closeBrowser();
+        } catch {
+          // best-effort: fechar o browser é conveniência, não parte do poll
+        }
       }
     } catch (e) {
       log.error({ err: String(e) }, 'erro no ciclo de poll');
@@ -1309,7 +1386,16 @@ async function main(): Promise<void> {
         nextMatch: null,
       });
     }
-    await sleepUntilNextPoll(delay);
+    // Dorme até o próximo poll. Uma mudança da watchlist antecipa a
+    // espera (hot-reload), mas nunca antes de um intervalo base após o
+    // poll anterior (debounce) — e nunca zera a espera (hot-loop).
+    await sleepUntilPoll({
+      targetAt: Date.now() + delay,
+      signal: watchlistSignal,
+      lastPollAt: pollStartedAt,
+      baseIntervalMs: cfg.POLL_INTERVAL_MS,
+      shouldStop: () => stopping,
+    });
   }
 }
 

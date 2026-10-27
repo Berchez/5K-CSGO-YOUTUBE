@@ -141,6 +141,17 @@ describe('cardToLiveMatch', () => {
 describe('upcoming matches (poll adaptativo)', () => {
   const NOW = Date.parse('2026-10-27T12:00:00.000Z');
 
+  const mk = (matchId: string, startsAt: number): UpcomingMatch => ({
+    matchId,
+    team1: 'A',
+    team2: 'B',
+    event: 'Test',
+    stars: 2,
+    isTopTierGuess: false,
+    startsAt,
+    matchPageUrl: `https://www.hltv.org/matches/${matchId}/x`,
+  });
+
   it('lê o timestamp do HLTV (ms e s) e rejeita lixo', () => {
     expect(parseHltvUnixMs('1793122200000')).toBe(1793122200000);
     expect(parseHltvUnixMs(1793122200)).toBe(1793122200000);
@@ -151,16 +162,19 @@ describe('upcoming matches (poll adaptativo)', () => {
   });
 
   it('mapeia card futuro com horário e evento', () => {
-    const m = cardToUpcomingMatch({
-      matchId: '2399747',
-      href: '/matches/2399747/vitality-vs-natus-vincere-pgl-masters-bucharest-2026',
-      teamNames: ['Vitality', 'Natus Vincere'],
-      event: 'PGL Masters Bucharest 2026',
-      stage: 'Playoffs',
-      isLive: false,
-      stars: 2,
-      startAt: NOW + 3_600_000,
-    });
+    const m = cardToUpcomingMatch(
+      {
+        matchId: '2399747',
+        href: '/matches/2399747/vitality-vs-natus-vincere-pgl-masters-bucharest-2026',
+        teamNames: ['Vitality', 'Natus Vincere'],
+        event: 'PGL Masters Bucharest 2026',
+        stage: 'Playoffs',
+        isLive: false,
+        stars: 2,
+        startUnix: '1793122200000',
+      },
+      NOW + 3_600_000,
+    );
     expect(m.team1).toBe('Vitality');
     expect(m.team2).toBe('Natus Vincere');
     expect(m.startsAt).toBe(NOW + 3_600_000);
@@ -169,16 +183,6 @@ describe('upcoming matches (poll adaptativo)', () => {
   });
 
   it('escolhe a partida mais próxima', () => {
-    const mk = (matchId: string, startsAt: number): UpcomingMatch => ({
-      matchId,
-      team1: 'A',
-      team2: 'B',
-      event: 'Test',
-      stars: 2,
-      isTopTierGuess: false,
-      startsAt,
-      matchPageUrl: `https://www.hltv.org/matches/${matchId}/x`,
-    });
     const next = selectNextUpcoming(
       [mk('2', NOW + 8 * 3_600_000), mk('1', NOW + 2 * 3_600_000)],
       NOW,
@@ -187,16 +191,6 @@ describe('upcoming matches (poll adaptativo)', () => {
   });
 
   it('mantém no topo a partida atrasada dentro da grace', () => {
-    const mk = (matchId: string, startsAt: number): UpcomingMatch => ({
-      matchId,
-      team1: 'A',
-      team2: 'B',
-      event: 'Test',
-      stars: 2,
-      isTopTierGuess: false,
-      startsAt,
-      matchPageUrl: `https://www.hltv.org/matches/${matchId}/x`,
-    });
     const atrasada = mk('1', NOW - 10 * 60_000);
     expect(selectNextUpcoming([atrasada, mk('2', NOW + 3_600_000)], NOW, 3_600_000)?.matchId).toBe(
       '1',

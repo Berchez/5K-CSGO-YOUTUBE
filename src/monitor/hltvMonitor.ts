@@ -369,8 +369,6 @@ export interface MatchCard {
   stage: string;
   isLive: boolean;
   stars: number;
-  /** Epoch ms do horário marcado (só em cards futuros). */
-  startAt?: number;
 }
 
 /** Mapper puro card → LiveMatch (testável sem rede). */
@@ -388,7 +386,7 @@ export function cardToLiveMatch(card: MatchCard): LiveMatch {
   };
 }
 
-/** Partida futura (ainda não live)extraída do listing, com horário marcado. */
+/** Partida futura (ainda não live) extraída do listing, com horário marcado. */
 export interface UpcomingMatch {
   matchId: string;
   team1: string;
@@ -411,6 +409,18 @@ export interface MatchListing {
   /** Todas as live vistas na página (antes do filtro). */
   liveTotal: number;
   upcoming: UpcomingMatch[];
+  /**
+   * Partidas futuras com horário válido, ANTES do filtro de elegibilidade.
+   * Serve para distinguir "não há partida elegível" de "a extração quebrau".
+   */
+  upcomingTotal: number;
+  /** Cards futuros vistos no DOM (antes do dedupe). */
+  upcomingSeen: number;
+  /**
+   * A agenda do listing é confiável? false = nenhum card futuro com
+   * horário (DOM mudou / extração falhou) → o poll não pode adiar.
+   */
+  scheduleReliable: boolean;
 }
 
 /**
@@ -424,8 +434,8 @@ export function parseHltvUnixMs(value: string | number | null | undefined): numb
   return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
-/** Mapper puro card futuro → UpcomingMatch. */
-export function cardToUpcomingMatch(card: MatchCard & { startAt: number }): UpcomingMatch {
+/** Mapper puro card futuro → UpcomingMatch (horário já parseado). */
+export function cardToUpcomingMatch(card: UpcomingCard, startAt: number): UpcomingMatch {
   return {
     matchId: card.matchId,
     team1: card.teamNames[0] ?? 'TBD',
@@ -433,9 +443,29 @@ export function cardToUpcomingMatch(card: MatchCard & { startAt: number }): Upco
     event: card.event || 'CS2 event',
     stars: card.stars,
     isTopTierGuess: guessTopTier(card.event, card.stars),
-    startsAt: card.startAt,
+    startsAt: startAt,
     matchPageUrl: `https://www.hltv.org${card.href}`,
   };
+}
+
+/**
+ * Dedupe por matchId: o HLTV repete o mesmo card em listas diferentes
+ * ("por evento" e "cronológico"). Vence o horário mais próximo; o evento
+ * só é usado para completar o que faltar. Puro/testável.
+ */
+export function dedupeUpcoming(matches: UpcomingMatch[]): UpcomingMatch[] {
+  const byId = new Map<string, UpcomingMatch>();
+  for (const m of matches) {
+    const prev = byId.get(m.matchId);
+    if (!prev) {
+      byId.set(m.matchId, m);
+    } else if (m.startsAt < prev.startsAt) {
+      byId.set(m.matchId, { ...m, event: m.event || prev.event });
+    } else if (m.startsAt === prev.startsAt && !prev.event && m.event) {
+      byId.set(m.matchId, { ...prev, event: m.event });
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.startsAt - b.startsAt);
 }
 
 /**
@@ -482,17 +512,48 @@ export function effectiveMatchRule(
 }
 
 /** Card futuro cru: mesmo formato do live + o timestamp bruto do listing. */
-export type UpcomingCard = MatchCard & { startUnix: string };
+export interface UpcomingCard extends MatchCard {
+  /** Timestamp bruto do HLTV (data-unix). Vazio = card sem horário. */
+  startUnix: string;
+}
+
+/** Cards crus do listing, antes de qualquer filtro. */
+export interface ListingCards {
+  /** Cards do container live (div.match[data-livescore-match]). */
+  live: MatchCard[];
+  /** Cards futuros (.match-wrapper[data-match-id]). */
+  upcoming: UpcomingCard[];
+  /** Cards futuros vistos no DOM (antes do dedupe). */
+  upcomingSeen: number;
+  /** Erro na extração dos live (o listing inteiro vira "bloqueado"). */
+  liveError: string | null;
+  /** Erro na extração dos futuros (a agenda fica não confiável). */
+  upcomingError: string | null;
+}
 
 /**
- * Cards LIVE da página /matches.
- * Container: div.match[data-livescore-match] (externo — o interno div.match
- * duplica, por isso o seletor mira só no que tem o atributo).
- * Live = .match-meta-live com texto "Live".
+ * Uma passada só no DOM: cards live + cards futuros, com o MESMO critério
+ * de liveness nos dois.
+ *
+ * Layout 2026 do /matches:
+ * - live: `div.match[data-livescore-match]` (o interno div.match duplica,
+ *   por isso o seletor mira só no que tem o atributo);
+ * - futuros: `.match-wrapper[data-match-id]` com `live="false"` e horário
+ *   em `.match-time[data-unix]` (fallback: o wrapper de horário
+ *   `data-zonedgrouping-entry-unix`).
+ *
+ * Liveness (idêntico nos dois lados): texto "Live" em `.match-meta-live`
+ * OU atributo `live="true"`. O card futuro NÃO é descartado por ter
+ * `[data-livescore-match]` dentro: esse atributo já apareceu em card que
+ * não era live e descartar tudo deixaria o bot cego. O que separa live
+ * de futuro é o id (o mesmo matchId aparece nas duas listas) e o
+ * atributo `live`.
+ *
+ * Um card quebrado não derruba a extração inteira (try/catch por card).
  */
-export async function extractLiveCards(page: Page): Promise<MatchCard[]> {
+export async function extractListingCards(page: Page): Promise<ListingCards> {
   return page.evaluate(() => {
-    const out: Array<{
+    type Card = {
       matchId: string;
       href: string;
       teamNames: string[];
@@ -500,122 +561,115 @@ export async function extractLiveCards(page: Page): Promise<MatchCard[]> {
       stage: string;
       isLive: boolean;
       stars: number;
-    }> = [];
-    const seen = new Set<string>();
-    const wrappers = Array.from(document.querySelectorAll('div.match[data-livescore-match]'));
-    for (const w of wrappers) {
-      const matchId = w.getAttribute('data-livescore-match') ?? '';
-      if (!matchId || seen.has(matchId)) continue;
-      const anchor = w.querySelector('a[href*="/matches/"]');
-      const href = anchor?.getAttribute('href') ?? '';
-      if (!/\/matches\/\d+/.test(href)) continue;
-      seen.add(matchId);
+    };
+    const out: {
+      live: Card[];
+      upcoming: Array<Card & { startUnix: string }>;
+      upcomingSeen: number;
+      liveError: string | null;
+      upcomingError: string | null;
+    } = { live: [], upcoming: [], upcomingSeen: 0, liveError: null, upcomingError: null };
 
-      const teamNames = Array.from(w.querySelectorAll('.match-teamname'))
+    // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
+    // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
+    const parseStars = (root: Element): number => {
+      const attr =
+        root.getAttribute('data-stars') ??
+        root.closest('[data-stars]')?.getAttribute('data-stars') ??
+        '';
+      const parsed = Number.parseInt(attr, 10);
+      if (Number.isFinite(parsed)) return Math.max(0, Math.min(5, parsed));
+      let stars = 0;
+      root.querySelectorAll('i.fa-star').forEach((s) => {
+        const cls = s.getAttribute('class') ?? '';
+        if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
+      });
+      return Math.min(5, stars);
+    };
+
+    // Critério ÚNICO de liveness (vale para live e futuro).
+    const isLiveCard = (root: Element): boolean => {
+      const liveText = root.querySelector('.match-meta-live')?.textContent ?? '';
+      if (/live/i.test(liveText)) return true;
+      return root.closest('[live]')?.getAttribute('live') === 'true';
+    };
+
+    const parseCard = (root: Element, matchId: string, href: string, isLive: boolean): Card => {
+      const teamNames = Array.from(root.querySelectorAll('.match-teamname'))
         .map((e) => (e.textContent ?? '').trim())
         .filter(Boolean)
         .slice(0, 2);
-      const eventEl = w.querySelector('.match-event');
+      const eventEl = root.querySelector('.match-event');
       const event =
         eventEl?.getAttribute('data-event-headline')?.trim() ||
-        (eventEl?.textContent ?? '').trim().slice(0, 120);
-      const stage = w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
-      const liveEl = w.querySelector('.match-meta-live');
-      const isLive = /live/i.test(liveEl?.textContent ?? '');
-      // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
-      // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
-      const starsAttr = w.closest('[data-stars]')?.getAttribute('data-stars') ?? '';
-      const starsFromAttr = Number.parseInt(starsAttr, 10);
-      let stars = Number.isFinite(starsFromAttr)
-        ? Math.max(0, Math.min(5, starsFromAttr))
-        : 0;
-      if (!Number.isFinite(starsFromAttr)) {
-        w.querySelectorAll('i.fa-star').forEach((s) => {
-          const cls = s.getAttribute('class') ?? '';
-          if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
-        });
+        (eventEl?.textContent ?? '').trim().slice(0, 120) ||
+        root.closest('[data-event-headline]')?.getAttribute('data-event-headline')?.trim() ||
+        '';
+      const stage = root.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
+      return { matchId, href, teamNames, event, stage, isLive, stars: parseStars(root) };
+    };
+
+    // 1) LIVE
+    const seenLive = new Set<string>();
+    try {
+      for (const w of Array.from(document.querySelectorAll('div.match[data-livescore-match]'))) {
+        try {
+          const matchId = w.getAttribute('data-livescore-match') ?? '';
+          if (!matchId || seenLive.has(matchId)) continue;
+          const anchor = w.querySelector('a[href*="/matches/"]');
+          const href = anchor?.getAttribute('href') ?? '';
+          if (!/\/matches\/\d+/.test(href)) continue;
+          seenLive.add(matchId);
+          out.live.push(parseCard(w, matchId, href, isLiveCard(w)));
+        } catch {
+          // card isolado quebrado: segue (o resto do listing vale)
+        }
       }
-      out.push({
-        matchId,
-        href,
-        teamNames,
-        event,
-        stage,
-        isLive,
-        stars: Math.min(5, stars),
-      });
+    } catch (e) {
+      out.liveError = String(e);
     }
+
+    // 2) FUTUROS
+    const liveIds = new Set(out.live.filter((c) => c.isLive).map((c) => c.matchId));
+    try {
+      for (const w of Array.from(document.querySelectorAll('.match-wrapper[data-match-id]'))) {
+        try {
+          const matchId = w.getAttribute('data-match-id') ?? '';
+          if (!matchId) continue;
+          // Live = id já visto na lista live, atributo live="true" ou
+          // texto "Live". Nenhum sinal ambiguo descarta card futuro.
+          if (liveIds.has(matchId) || isLiveCard(w)) continue;
+          out.upcomingSeen += 1;
+          const anchor = w.querySelector('a[href*="/matches/"]');
+          const href = anchor?.getAttribute('href') ?? '';
+          if (!/\/matches\/\d+/.test(href)) continue;
+          const startUnix =
+            w.querySelector('.match-time[data-unix]')?.getAttribute('data-unix') ??
+            w.closest('[data-zonedgrouping-entry-unix]')?.getAttribute(
+              'data-zonedgrouping-entry-unix',
+            ) ??
+            '';
+          out.upcoming.push({ ...parseCard(w, matchId, href, false), startUnix });
+        } catch {
+          // card isolado quebrado: segue (o resto do listing vale)
+        }
+      }
+    } catch (e) {
+      out.upcomingError = String(e);
+    }
+
     return out;
   });
 }
 
-/**
- * Cards FUTUROS da página /matches (mesmo HTML do live, zero page-load
- * extra). Horário marcado em .match-time[data-unix] — fallback no wrapper
- * de horário data-zonedgrouping-entry-unix. Live é ignorado aqui.
- */
+/** Só os cards live (atalho da extração unificada). */
+export async function extractLiveCards(page: Page): Promise<MatchCard[]> {
+  return (await extractListingCards(page)).live;
+}
+
+/** Só os cards futuros (atalho da extração unificada). */
 export async function extractUpcomingCards(page: Page): Promise<UpcomingCard[]> {
-  return page.evaluate(() => {
-    const out: Array<{
-      matchId: string;
-      href: string;
-      teamNames: string[];
-      event: string;
-      stage: string;
-      isLive: boolean;
-      stars: number;
-      startUnix: string;
-    }> = [];
-    const wrappers = Array.from(document.querySelectorAll('.match-wrapper[data-match-id]'));
-    for (const w of wrappers) {
-      const matchId = w.getAttribute('data-match-id') ?? '';
-      if (!matchId) continue;
-      const isLive =
-        w.getAttribute('live') === 'true' || w.querySelector('[data-livescore-match]') !== null;
-      if (isLive) continue;
-      const anchor = w.querySelector('a[href*="/matches/"]');
-      const href = anchor?.getAttribute('href') ?? '';
-      if (!/\/matches\/\d+/.test(href)) continue;
-      const teamNames = Array.from(w.querySelectorAll('.match-teamname'))
-        .map((e) => (e.textContent ?? '').trim())
-        .filter(Boolean)
-        .slice(0, 2);
-      // Em cards futuros o nome do evento fica no wrapper do evento.
-      const eventEl = w.closest('[data-event-headline]');
-      const event =
-        eventEl?.getAttribute('data-event-headline')?.trim() ||
-        w.querySelector('.match-event')?.getAttribute('data-event-headline')?.trim() ||
-        (w.querySelector('.match-event')?.textContent ?? '').trim().slice(0, 120) ||
-        '';
-      const stage = w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
-      const starsAttr = w.getAttribute('data-stars') ?? '';
-      const starsFromAttr = Number.parseInt(starsAttr, 10);
-      let stars = Number.isFinite(starsFromAttr)
-        ? Math.max(0, Math.min(5, starsFromAttr))
-        : 0;
-      if (!Number.isFinite(starsFromAttr)) {
-        w.querySelectorAll('i.fa-star').forEach((s) => {
-          const cls = s.getAttribute('class') ?? '';
-          if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
-        });
-      }
-      const startUnix =
-        w.querySelector('.match-time[data-unix]')?.getAttribute('data-unix') ??
-        w.closest('[data-zonedgrouping-entry-unix]')?.getAttribute('data-zonedgrouping-entry-unix') ??
-        '';
-      out.push({
-        matchId,
-        href,
-        teamNames,
-        event,
-        stage,
-        isLive: false,
-        stars: Math.min(5, stars),
-        startUnix,
-      });
-    }
-    return out;
-  });
+  return (await extractListingCards(page)).upcoming;
 }
 
 /**
@@ -623,12 +677,14 @@ export async function extractUpcomingCards(page: Page): Promise<UpcomingCard[]> 
  * no filtro + as próximas partidas futuras que também passam no filtro.
  * Container live: div.match[data-livescore-match] (externo — o interno
  * div.match duplica, por isso o seletor mira só no que tem o atributo).
- * Live = .match-meta-live com texto "Live".
+ * Live = .match-meta-live com texto "Live" OU wrapper com live="true".
  * Cards futuros: .match-wrapper[data-match-id] com live="false"; o horário
  * marcado vem de .match-time[data-unix] (fallback: o wrapper de horário
  * data-zonedgrouping-entry-unix) — mesmo HTML, zero page-load extra.
- * Retorna null se o Cloudflare bloquear (para o ciclo pular sem desmontar
- * recorders/trackers — [] significaria "sem lives" e derrubaria tudo).
+ *
+ * Retorna null se o Cloudflare bloquear OU se a extração das live falhar
+ * (para o ciclo pular sem desmontar recorders/trackers — [] significaria
+ * "sem lives" e derrubaria tudo).
  */
 export async function fetchMatchListing(
   matchesUrl: string,
@@ -646,91 +702,112 @@ export async function fetchMatchListing(
     if (!(await waitForClearance(page))) return null;
     await page.waitForTimeout(3000);
 
-    const cards = await extractLiveCards(page);
-    const upcomingCards = await extractUpcomingCards(page);
-
-    const matches: LiveMatch[] = [];
-    for (const card of cards) {
-      if (!card.isLive) continue; // tese do projeto: só lives (velocidade)
-      const m = cardToLiveMatch(card);
-      const rule = effectiveMatchRule(m, filter);
-      m.minKills = rule.minKills;
-      if (rule.watchlisted) {
-        // Watchlist ignora o corte de estrelas/top-tier: grava e usa o
-        // limiar do time (menor entre os que casaram).
-        m.watchlisted = true;
-        m.watchlistedTeams = rule.matchedTeams;
-      } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
-        continue;
-      }
-      matches.push(m);
+    const cards = await extractListingCards(page);
+    if (cards.liveError) {
+      // Falha na extração dos live = listing inutilizável: trata como
+      // bloqueado (mantém recorders/trackers) em vez de "zero lives".
+      log.error({ err: cards.liveError }, 'falha ao extrair as live do listing');
+      return null;
     }
-    // Estrelas primeiro: com MAX_RECORDINGS limitado, elas não podem perder
-    // o slot para um jogo sem estrela. Watchlist desempata mesmas estrelas.
-    matches.sort(
-      (a, b) =>
-        b.stars - a.stars ||
-        Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)),
-    );
-
-    // Próximas partidas: mesmo HTML do live, sem page-load extra. A página
-    // repete o mesmo card em "pinned"/listas — dedupe por matchId.
-    const byId = new Map<string, UpcomingMatch>();
-    for (const card of upcomingCards) {
-      const startAt = parseHltvUnixMs(card.startUnix);
-      if (startAt === null) continue;
-      const m = cardToUpcomingMatch({ ...card, isLive: false, startAt });
-      const prev = byId.get(m.matchId);
-      if (!prev) {
-        byId.set(m.matchId, m);
-      } else if (m.startsAt < prev.startsAt) {
-        byId.set(m.matchId, { ...m, event: m.event || prev.event });
-      } else if (m.startsAt === prev.startsAt && !prev.event && m.event) {
-        byId.set(m.matchId, { ...prev, event: m.event });
-      }
+    if (cards.upcomingError) {
+      // A agenda futura é opcional: o poll continua no intervalo base
+      // (fail-open) em vez de dormir achando que não há partida.
+      log.warn({ err: cards.upcomingError }, 'falha ao extrair as partidas futuras');
     }
 
-    const upcoming: UpcomingMatch[] = [];
-    for (const m of byId.values()) {
-      const rule = effectiveMatchRule(m, filter);
-      if (rule.watchlisted) {
-        m.watchlisted = true;
-        m.watchlistedTeams = rule.matchedTeams;
-      } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
-        continue;
-      }
-      upcoming.push(m);
-    }
-    upcoming.sort((a, b) => a.startsAt - b.startsAt);
-
+    const listing = buildListing(cards, minStars, topTierOnly, filter);
     log.info(
       {
-        live: cards.filter((c) => c.isLive).length,
-        kept: matches.length,
-        watchlisted: matches.filter((m) => m.watchlisted).length,
-        upcoming: upcoming.length,
-        next: upcoming[0]
-          ? { matchId: upcoming[0].matchId, startsAt: new Date(upcoming[0].startsAt).toISOString() }
+        live: listing.liveTotal,
+        kept: listing.live.length,
+        watchlisted: listing.live.filter((m) => m.watchlisted).length,
+        upcoming: listing.upcoming.length,
+        upcomingTotal: listing.upcomingTotal,
+        upcomingSeen: listing.upcomingSeen,
+        scheduleReliable: listing.scheduleReliable,
+        next: listing.upcoming[0]
+          ? {
+              matchId: listing.upcoming[0].matchId,
+              startsAt: new Date(listing.upcoming[0].startsAt).toISOString(),
+            }
           : null,
         minStars,
       },
       'live matches filtradas',
     );
-    return { live: matches, liveTotal: cards.filter((c) => c.isLive).length, upcoming };
+    return listing;
   } finally {
     await page.close().catch(() => undefined);
   }
 }
 
-/** Wrapper compatível: só as partidas live que passaram no filtro. */
-export async function fetchLiveMatches(
-  matchesUrl: string,
+/**
+ * Listing puro: aplica os filtros (estrelas/watchlist) nos cards crus.
+ * Separado do I/O para poder ser testado com fixture de HTML.
+ */
+export function buildListing(
+  cards: ListingCards,
   minStars: number,
   topTierOnly: boolean,
   filter: LiveMatchFilter = {},
-): Promise<LiveMatch[] | null> {
-  const listing = await fetchMatchListing(matchesUrl, minStars, topTierOnly, filter);
-  return listing?.live ?? null;
+): MatchListing {
+  const matches: LiveMatch[] = [];
+  for (const card of cards.live) {
+    if (!card.isLive) continue; // tese do projeto: só lives (velocidade)
+    const m = cardToLiveMatch(card);
+    const rule = effectiveMatchRule(m, filter);
+    m.minKills = rule.minKills;
+    if (rule.watchlisted) {
+      // Watchlist ignora o corte de estrelas/top-tier: grava e usa o
+      // limiar do time (menor entre os que casaram).
+      m.watchlisted = true;
+      m.watchlistedTeams = rule.matchedTeams;
+    } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
+      continue;
+    }
+    matches.push(m);
+  }
+  // Estrelas primeiro: com MAX_RECORDINGS limitado, elas não podem perder
+  // o slot para um jogo sem estrela. Watchlist desempata mesmas estrelas.
+  matches.sort(
+    (a, b) =>
+      b.stars - a.stars || Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)),
+  );
+
+  // Próximas partidas: mesmo HTML do live, sem page-load extra. A página
+  // repete o mesmo card em "pinned"/listas — dedupe por matchId.
+  const scheduled: UpcomingMatch[] = [];
+  for (const card of cards.upcoming) {
+    const startAt = parseHltvUnixMs(card.startUnix);
+    if (startAt === null) continue;
+    scheduled.push(cardToUpcomingMatch(card, startAt));
+  }
+  const deduped = dedupeUpcoming(scheduled);
+
+  const upcoming: UpcomingMatch[] = [];
+  for (const m of deduped) {
+    const rule = effectiveMatchRule(m, filter);
+    if (rule.watchlisted) {
+      m.watchlisted = true;
+      m.watchlistedTeams = rule.matchedTeams;
+    } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
+      continue;
+    }
+    upcoming.push(m);
+  }
+  upcoming.sort((a, b) => a.startsAt - b.startsAt);
+
+  return {
+    live: matches,
+    liveTotal: cards.live.filter((c) => c.isLive).length,
+    upcoming,
+    // Partidas futuras com horário, antes do filtro de elegibilidade.
+    upcomingTotal: deduped.length,
+    upcomingSeen: cards.upcomingSeen,
+    // Agenda confiável = o listing mostrou alguma partida futura com
+    // horário. Sem isso o poll não pode adiar (fail-open: intervalo base).
+    scheduleReliable: !cards.upcomingError && deduped.length > 0,
+  };
 }
 
 /**

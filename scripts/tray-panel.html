@@ -484,6 +484,9 @@
         return;
       }
 
+      // Heartbeat do bot mais velho que isso = "sem resposta".
+      const HEARTBEAT_STALE_MS = 90_000;
+
       const $ = (selector) => document.querySelector(selector);
       const $$ = (selector) => Array.from(document.querySelectorAll(selector));
       const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -612,7 +615,7 @@
         if (!status) return { key: 'warn', label: 'Iniciando...' };
         const heartbeat = Date.parse(status.heartbeatAt || status.startedAt || '');
         const age = Number.isFinite(heartbeat) ? Date.now() - heartbeat : Infinity;
-        if (!Number.isFinite(age) || age > 90_000) return { key: 'warn', label: 'Sem resposta' };
+        if (!Number.isFinite(age) || age > HEARTBEAT_STALE_MS) return { key: 'warn', label: 'Sem resposta' };
         if (status.phase === 'recording' || (status.totals && status.totals.recording > 0)) return { key: 'recording', label: 'Gravando' };
         if (status.lastError) {
           const errorAge = Date.now() - Date.parse(status.lastError.at || '');

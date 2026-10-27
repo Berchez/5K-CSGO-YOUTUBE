@@ -7,7 +7,7 @@ A 100% automated bot up to human review: it monitors **live matches on HLTV** (c
 ## How it works
 
 ```text
-HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
+HLTV /matches (Playwright, 45s base; ocioso espera até 30min conforme a próxima partida) → filtro MIN_STARS (0 = tudo)
   → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → captura feeds separados + melhor formato muxed, ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
   → detector: live scoreboard (K/D column diff) → 4+ kills with a star / 5 kills without a star in the round = multikill (4K!/ACE!)
   → clipper: dois MP4 por evento: captura separada (nome padrão) e fonte muxed (`_muxed`, resolução/FPS nativos), com trim exato
@@ -123,17 +123,39 @@ Dry-run: `npx tsx scripts/watchlist-check.ts "paiN" "FURIA" --stars=0`.
 The HLTV listing already carries the scheduled start time of every upcoming
 match, so the bot knows when the next match it would actually record starts.
 While it is idle it does not hammer the listing every 45s: it waits half of
-the remaining time (8h → 4h → 2h → 1h → 30min, capped at 4h) and then goes
-back to the base `POLL_INTERVAL_MS` inside the last 30 minutes. A match whose
-scheduled time passed keeps the base interval for up to 1 hour (HLTV delays
-are common), and when no eligible match is listed the bot checks again every
-30 minutes.
+the remaining time (40min → 20min, 1h → 30min, capped at **30min**) and then
+goes back to the base `POLL_INTERVAL_MS` inside the last 30 minutes. A match
+whose scheduled time passed keeps the base interval for up to 1 hour (HLTV
+delays are common), and when no eligible match is listed the bot checks again
+every 15 minutes.
 
-The base interval is always used while a qualifying match is live, a recorder
-or tracker is running, a clip is being built, the listing was blocked by
-Cloudflare, or the watchlist was just changed. Saving `data/watchlist.json`
-wakes the bot immediately, so a hot reload never waits for the next poll.
-The panel shows the next poll and the next eligible match.
+The backoff is a *prediction* (times change, new matches appear, the HLTV
+layout breaks), so it fails open instead of closed:
+
+- if the listing shows no upcoming match at all (or the extraction of the
+  upcoming cards fails), the schedule is considered **unreliable** and the bot
+  stays on the base interval — it never sleeps blind;
+- the base interval is always used while a qualifying match is live, a
+  recorder or tracker is running, a clip is being built, a deferred buffer
+  cleanup is pending, the listing was blocked by Cloudflare, or the watchlist
+  changed during the poll;
+- `POLL_ADAPTIVE=false` disables the whole feature (always the base
+  interval) — the kill switch.
+
+Saving `data/watchlist.json` wakes the bot up: the next poll happens a few
+seconds after the save (never sooner than one base interval after the
+previous poll), so repeated file touches (autosave, OneDrive) collapse into a
+single listing check. The panel shows the next poll and the next eligible
+match.
+
+Each live match that is detected for the first time is logged with the
+detection latency (`latencyMs` = detection time − scheduled start) and
+whether it was the predicted next match, so the backoff limits can be tuned
+against real data.
+
+While the bot waits in the backoff it closes the browser (RAM/CPU free); the
+persistent profile keeps the Cloudflare clearance, and the next poll
+relaunches it.
 
 ## Testing with a finished match (without waiting for live)
 
@@ -180,7 +202,10 @@ anchors itself on the 1st detected kill (`CLIP_CONTEXT_SEC` in `.env`).
 ```text
 src/config.ts, logger.ts (arquivo), db.ts (sqlite dedup)
 src/watchlist.ts (times/jogadores com limiar próprio; hot-reload de data/watchlist.json)
-src/monitor/hltvMonitor.ts (stars + preferência official/en)
+src/monitor/hltvMonitor.ts (stars + preferência official/en + extração live/futura do listing)
+src/monitor/pollSchedule.ts (puro: quanto tempo dormir até o próximo poll)
+src/monitor/pollSleep.ts (puro: deadline, wake e debounce da watchlist)
+src/monitor/liveTelemetry.ts (puro: latência de detecção da live)
 src/detector/aceDetector.ts (puro, testado) + matchTracker.ts (poll MR12: 13 pts)
 src/recorder/streamRecorder.ts (buffer circular)
 src/clipper/clipBuilder.ts (concat + sidecar json)
