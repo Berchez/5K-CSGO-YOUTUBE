@@ -85,7 +85,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'POLL_INTERVAL_MS',
     group: 'capture',
     label: 'Intervalo de poll',
-    help: 'Tempo entre verificações do listing. Muito baixo aumenta o risco de Cloudflare.',
+    help: 'Intervalo base entre checagens do listing. Ocioso, o bot espera metade do tempo até a próxima partida (teto de 4h).',
     type: 'number',
     min: 5000,
     max: 600000,

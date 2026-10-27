@@ -158,4 +158,27 @@ describe('trayStatus writer', () => {
     const status = readStatus(file);
     expect(status.phase).toBe('stopping');
   });
+
+  it('guarda o próximo poll e a próxima partida', () => {
+    const file = statusFile();
+    initTrayStatus(cfg, file);
+    let status = readStatus(file);
+    expect(status.nextPollAt).toBeNull();
+    expect(status.nextMatch).toBeNull();
+
+    patchTrayStatus({
+      nextPollAt: '2026-10-27T16:00:00.000Z',
+      nextMatch: {
+        matchId: '2399747',
+        team1: 'Vitality',
+        team2: 'Natus Vincere',
+        startsAt: '2026-10-27T17:30:00.000Z',
+        watchlisted: false,
+      },
+    });
+    status = readStatus(file);
+    expect(status.nextPollAt).toBe('2026-10-27T16:00:00.000Z');
+    expect(status.nextMatch?.team1).toBe('Vitality');
+    expect(status.nextMatch?.startsAt).toBe('2026-10-27T17:30:00.000Z');
+  });
 });

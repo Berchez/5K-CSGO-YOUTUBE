@@ -40,6 +40,15 @@ export interface TrayStatusClip {
   privacy: string;
 }
 
+export interface TrayStatusNextMatch {
+  matchId: string;
+  team1: string;
+  team2: string;
+  /** ISO do horário marcado no HLTV. */
+  startsAt: string;
+  watchlisted: boolean;
+}
+
 export interface TrayStatusConfig {
   minStars: number;
   minKills: number;
@@ -61,6 +70,10 @@ export interface TrayStatus {
   heartbeatAt: string;
   phase: TrayPhase;
   lastPollAt: string | null;
+  /** ISO da próxima checagem do listing (poll adaptativo). */
+  nextPollAt: string | null;
+  /** Próxima partida elegível (horário marcado no HLTV). */
+  nextMatch: TrayStatusNextMatch | null;
   lastError: { at: string; message: string } | null;
   matches: TrayStatusMatch[];
   totals: {
@@ -133,6 +146,8 @@ export function initTrayStatus(cfg: AppConfig, customStatusPath?: string): void 
     heartbeatAt: now,
     phase: 'starting',
     lastPollAt: null,
+    nextPollAt: null,
+    nextMatch: null,
     lastError: null,
     matches: [],
     totals: { live: 0, recording: 0, trackers: 0 },

@@ -90,11 +90,11 @@ teams even when HLTV lists the match with 0–1★. A matched team bypasses the
 star filter and uses its own kill threshold; with two matched teams, the
 lowest threshold wins. A `players` entry overrides the team threshold for that
 round (e.g. a 3k from a specific player), but it does not force a match outside
-the star filter to be recorded. The bot reloads the file every poll (~45s) — no
-restart; changes apply to the next round even in a match already being tracked
-(and to the next matches). If the file disappears during an editor save, the
-last good version is kept for up to 1 minute before falling back to the star
-policy.
+the star filter to be recorded. The bot reloads the file on every poll and
+wakes up as soon as the file is saved — no restart; changes apply to the next
+round even in a match already being tracked (and to the next matches). If the
+file disappears during an editor save, the last good version is kept for up to
+1 minute before falling back to the star policy.
 
 ```json
 {
@@ -117,6 +117,23 @@ Names are case/accent-insensitive; aliases avoid listing mismatches
 shows the validation error); a UTF-8 BOM from Notepad/PowerShell is accepted.
 Full example: `docs/watchlist.example.json`.
 Dry-run: `npx tsx scripts/watchlist-check.ts "paiN" "FURIA" --stars=0`.
+
+## Adaptive polling (idle backoff)
+
+The HLTV listing already carries the scheduled start time of every upcoming
+match, so the bot knows when the next match it would actually record starts.
+While it is idle it does not hammer the listing every 45s: it waits half of
+the remaining time (8h → 4h → 2h → 1h → 30min, capped at 4h) and then goes
+back to the base `POLL_INTERVAL_MS` inside the last 30 minutes. A match whose
+scheduled time passed keeps the base interval for up to 1 hour (HLTV delays
+are common), and when no eligible match is listed the bot checks again every
+30 minutes.
+
+The base interval is always used while a qualifying match is live, a recorder
+or tracker is running, a clip is being built, the listing was blocked by
+Cloudflare, or the watchlist was just changed. Saving `data/watchlist.json`
+wakes the bot immediately, so a hot reload never waits for the next poll.
+The panel shows the next poll and the next eligible match.
 
 ## Testing with a finished match (without waiting for live)
 

@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
   cardToLiveMatch,
+  cardToUpcomingMatch,
   effectiveMatchRule,
   guessTopTier,
   matchPassesFilter,
   minKillsForStars,
+  parseHltvUnixMs,
   parseStarsFromHtml,
   parseStreamCountry,
   parseViewers,
   pickPreferredStream,
+  selectNextUpcoming,
   selectStream,
+  type UpcomingMatch,
 } from '../src/monitor/hltvMonitor.js';
 import { type WatchlistDoc, validateWatchlistDoc } from '../src/watchlist.js';
 
@@ -131,6 +135,77 @@ describe('cardToLiveMatch', () => {
     expect(m.event).toBe('FRAG University 2026');
     expect(m.matchPageUrl).toContain('2399406');
     expect(m.isTopTierGuess).toBe(false);
+  });
+});
+
+describe('upcoming matches (poll adaptativo)', () => {
+  const NOW = Date.parse('2026-10-27T12:00:00.000Z');
+
+  it('lê o timestamp do HLTV (ms e s) e rejeita lixo', () => {
+    expect(parseHltvUnixMs('1793122200000')).toBe(1793122200000);
+    expect(parseHltvUnixMs(1793122200)).toBe(1793122200000);
+    expect(parseHltvUnixMs('')).toBeNull();
+    expect(parseHltvUnixMs('abc')).toBeNull();
+    expect(parseHltvUnixMs(null)).toBeNull();
+    expect(parseHltvUnixMs('0')).toBeNull();
+  });
+
+  it('mapeia card futuro com horário e evento', () => {
+    const m = cardToUpcomingMatch({
+      matchId: '2399747',
+      href: '/matches/2399747/vitality-vs-natus-vincere-pgl-masters-bucharest-2026',
+      teamNames: ['Vitality', 'Natus Vincere'],
+      event: 'PGL Masters Bucharest 2026',
+      stage: 'Playoffs',
+      isLive: false,
+      stars: 2,
+      startAt: NOW + 3_600_000,
+    });
+    expect(m.team1).toBe('Vitality');
+    expect(m.team2).toBe('Natus Vincere');
+    expect(m.startsAt).toBe(NOW + 3_600_000);
+    expect(m.matchPageUrl).toContain('2399747');
+    expect(m.isTopTierGuess).toBe(true);
+  });
+
+  it('escolhe a partida mais próxima', () => {
+    const mk = (matchId: string, startsAt: number): UpcomingMatch => ({
+      matchId,
+      team1: 'A',
+      team2: 'B',
+      event: 'Test',
+      stars: 2,
+      isTopTierGuess: false,
+      startsAt,
+      matchPageUrl: `https://www.hltv.org/matches/${matchId}/x`,
+    });
+    const next = selectNextUpcoming(
+      [mk('2', NOW + 8 * 3_600_000), mk('1', NOW + 2 * 3_600_000)],
+      NOW,
+    );
+    expect(next?.matchId).toBe('1');
+  });
+
+  it('mantém no topo a partida atrasada dentro da grace', () => {
+    const mk = (matchId: string, startsAt: number): UpcomingMatch => ({
+      matchId,
+      team1: 'A',
+      team2: 'B',
+      event: 'Test',
+      stars: 2,
+      isTopTierGuess: false,
+      startsAt,
+      matchPageUrl: `https://www.hltv.org/matches/${matchId}/x`,
+    });
+    const atrasada = mk('1', NOW - 10 * 60_000);
+    expect(selectNextUpcoming([atrasada, mk('2', NOW + 3_600_000)], NOW, 3_600_000)?.matchId).toBe(
+      '1',
+    );
+    expect(selectNextUpcoming([atrasada, mk('2', NOW + 3_600_000)], NOW, 60_000)?.matchId).toBe('2');
+  });
+
+  it('sem partidas futuras volta null', () => {
+    expect(selectNextUpcoming([], NOW)).toBeNull();
   });
 });
 

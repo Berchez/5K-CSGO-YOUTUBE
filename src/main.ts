@@ -12,11 +12,14 @@ import { discardAce, getDb, hasAce, insertAce, insertClip, recordDiscardedEvent 
 import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
-  fetchLiveMatches,
+  fetchMatchListing,
   fetchMatchStreams,
   minKillsForStars,
+  selectNextUpcoming,
   selectStream,
+  type UpcomingMatch,
 } from './monitor/hltvMonitor.js';
+import { nextPollDelayMs, POLL_START_GRACE_MS } from './monitor/pollSchedule.js';
 import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
@@ -121,6 +124,48 @@ const deferredBufferCleanup = new Set<string>();
 // Última versão boa da watchlist vista no poll. Trackers em andamento leem
 // daqui a cada round (hot-reload não fica preso ao início da partida).
 let activeWatchlist: WatchlistDoc | null = null;
+
+// Watcher da watchlist: com o poll adaptativo o bot pode dormir horas, mas
+// salvar a watchlist precisa ter efeito imediato (hot-reload). O watcher
+// só stat'a o arquivo (sem page-load) e acorda o sleep quando ele muda.
+const WATCHLIST_FILE = repoPath('data', 'watchlist.json');
+let watchlistDirty = false;
+let wakeFromSleep: (() => void) | null = null;
+
+function startWatchlistWatcher(): void {
+  fs.watchFile(WATCHLIST_FILE, { interval: 2000, persistent: false }, () => {
+    watchlistDirty = true;
+    const wake = wakeFromSleep;
+    wakeFromSleep = null;
+    wake?.();
+  });
+}
+
+function stopWatchlistWatcher(): void {
+  fs.unwatchFile(WATCHLIST_FILE);
+}
+
+/**
+ * Dorme até o próximo poll. Acorda antes se a watchlist mudar (o poll
+ * seguinte já carrega a versão nova) — sem isso uma edição feita durante
+ * uma espera de 4h só valeria 4h depois.
+ */
+async function sleepUntilNextPoll(delayMs: number): Promise<void> {
+  if (watchlistDirty) return;
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      wakeFromSleep = null;
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    wakeFromSleep = finish;
+    if (watchlistDirty) finish();
+  });
+}
 
 function pendingClipCount(): number {
   let total = 0;
@@ -746,16 +791,35 @@ async function handleAce(
   }
 }
 
-async function pollOnce(): Promise<void> {
+/** Resultado de um poll: o que define o próximo intervalo de checagem. */
+interface PollOutcome {
+  /** Próxima partida elegível (horário marcado), se houver. */
+  nextMatch: UpcomingMatch | null;
+  /** Partidas live que passaram no filtro. */
+  liveMatches: number;
+  /** Listing bloqueado pelo Cloudflare. */
+  blocked: boolean;
+  /** Watchlist ausente mas ainda segurando a última versão boa. */
+  watchlistStale: boolean;
+  /** A watchlist mudou durante este poll (reprocessa no próximo ciclo). */
+  watchlistChanged: boolean;
+}
+
+async function pollOnce(): Promise<PollOutcome> {
   const cfg = getConfig();
   const log = getLogger();
   getDb(cfg.DB_PATH);
 
+  // Mudanças na watchlist durante o poll marcam o arquivo como sujo: o
+  // próximo ciclo usa o intervalo base para aplicar a versão nova.
+  watchlistDirty = false;
+
   // Watchlist: hot-reload por mtime (barato a cada poll). JSON inválido
   // mantém a última versão boa; arquivo ausente mantém a última versão por
   // até 1 min (save/rename do editor) e depois cai na política por estrelas.
-  const watchlist = loadWatchlistFile(repoPath('data', 'watchlist.json'));
+  const watchlist = loadWatchlistFile(WATCHLIST_FILE);
   activeWatchlist = watchlist.doc;
+  const watchlistStale = watchlist.missing && watchlist.stale;
   if (watchlist.changed) {
     if (watchlist.error) {
       log.warn({ err: watchlist.error }, 'watchlist inválida - mantendo última versão boa');
@@ -775,7 +839,7 @@ async function pollOnce(): Promise<void> {
     }
   }
 
-  const matches = await fetchLiveMatches(
+  const listing = await fetchMatchListing(
     cfg.HLTV_MATCHES_URL,
     cfg.MIN_STARS,
     cfg.TOP_TIER_ONLY,
@@ -785,11 +849,18 @@ async function pollOnce(): Promise<void> {
       unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
     },
   );
-  if (!matches) {
+  if (!listing) {
     log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
     publishTrayStatus(null, cfg, { lastError: 'listing bloqueado pelo Cloudflare' });
-    return;
+    return {
+      nextMatch: null,
+      liveMatches: 0,
+      blocked: true,
+      watchlistStale,
+      watchlistChanged: watchlistDirty,
+    };
   }
+  const matches = listing.live;
 
   for (const m of matches) {
     if (stopping) break;
@@ -1069,6 +1140,18 @@ async function pollOnce(): Promise<void> {
   } catch {
     // segue
   }
+
+  // Próxima partida elegível (horário marcado): define o backoff do poll.
+  // A grace mantém no topo a partida já iniciada que ainda não aparece
+  // como live (adiamento) — assim o bot não "dorme" no meio do jogo.
+  const nextMatch = selectNextUpcoming(listing.upcoming, Date.now(), POLL_START_GRACE_MS);
+  return {
+    nextMatch,
+    liveMatches: matches.length,
+    blocked: false,
+    watchlistStale,
+    watchlistChanged: watchlistDirty,
+  };
 }
 
 async function main(): Promise<void> {
@@ -1088,6 +1171,7 @@ async function main(): Promise<void> {
   await ensureDirs(cfg);
   initTrayStatus(cfg);
   startTrayStatusHeartbeat();
+  startWatchlistWatcher();
   setTrayStatusPhase('monitoring');
   const log = getLogger();
   // Faxina de snapshots órfãos: renders só existem com o bot vivo — qualquer
@@ -1149,6 +1233,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     stopping = true;
+    stopWatchlistWatcher();
     shutdownTrayStatus();
     for (const recorders of activeRecorders.values()) {
       await Promise.all([
@@ -1170,13 +1255,61 @@ async function main(): Promise<void> {
   process.on('exit', () => killAll());
 
   while (!stopping) {
+    let delay = cfg.POLL_INTERVAL_MS;
     try {
-      await pollOnce();
+      const outcome = await pollOnce();
+      // Live elegível, gravação/tracker ativo ou clipe em andamento: o
+      // poll tem que continuar no intervalo base (buffer/stream/cleanup).
+      const busy =
+        outcome.liveMatches > 0 ||
+        activeRecorders.size > 0 ||
+        activeTrackers.size > 0 ||
+        pendingClips.size > 0;
+      const forceBase =
+        outcome.blocked || busy || outcome.watchlistStale || outcome.watchlistChanged;
+      const now = Date.now();
+      delay = nextPollDelayMs({
+        now,
+        nextMatchAt: outcome.nextMatch?.startsAt ?? null,
+        baseIntervalMs: cfg.POLL_INTERVAL_MS,
+        forceBase,
+      });
+      patchTrayStatus({
+        nextPollAt: new Date(now + delay).toISOString(),
+        nextMatch: outcome.nextMatch
+          ? {
+              matchId: outcome.nextMatch.matchId,
+              team1: outcome.nextMatch.team1,
+              team2: outcome.nextMatch.team2,
+              startsAt: new Date(outcome.nextMatch.startsAt).toISOString(),
+              watchlisted: Boolean(outcome.nextMatch.watchlisted),
+            }
+          : null,
+      });
+      if (delay > cfg.POLL_INTERVAL_MS) {
+        log.info(
+          {
+            nextMatch: outcome.nextMatch
+              ? `${outcome.nextMatch.team1} vs ${outcome.nextMatch.team2}`
+              : null,
+            startsAt: outcome.nextMatch
+              ? new Date(outcome.nextMatch.startsAt).toISOString()
+              : null,
+            delayMs: delay,
+          },
+          'poll adiado — próxima partida longe',
+        );
+      }
     } catch (e) {
       log.error({ err: String(e) }, 'erro no ciclo de poll');
       setTrayStatusError(String(e));
+      delay = cfg.POLL_INTERVAL_MS;
+      patchTrayStatus({
+        nextPollAt: new Date(Date.now() + delay).toISOString(),
+        nextMatch: null,
+      });
     }
-    await new Promise((r) => setTimeout(r, cfg.POLL_INTERVAL_MS));
+    await sleepUntilNextPoll(delay);
   }
 }
 

@@ -398,7 +398,7 @@
 
       <section class="view" id="view-watchlist">
         <div class="settings-toolbar">
-          <div><h3>Watchlist de times e jogadores</h3><p>Times na lista são gravados mesmo com 0–1★ e usam o limiar escolhido. Jogadores na lista (editáveis no arquivo) sobrescrevem o limiar do time no round, mas não forçam a gravação de uma partida fora do filtro. A mudança vale a partir do próximo round/partida (hot-reload a cada ~45s), sem reiniciar o bot.</p></div>
+          <div><h3>Watchlist de times e jogadores</h3><p>Times na lista são gravados mesmo com 0–1★ e usam o limiar escolhido. Jogadores na lista (editáveis no arquivo) sobrescrevem o limiar do time no round, mas não forçam a gravação de uma partida fora do filtro. A mudança vale a partir do próximo round/partida (hot-reload imediato ao salvar, sem reiniciar o bot).</p></div>
           <div class="settings-tools">
             <label class="check"><input type="checkbox" id="watchlistEnabled"> Watchlist ativa</label>
             <button class="btn ghost small" id="btnOpenWatchlist">Abrir arquivo</button>
@@ -592,6 +592,17 @@
         return Number.isFinite(time) ? new Date(time).toLocaleString('pt-BR') : '—';
       }
 
+      function relativeFuture(iso) {
+        const time = Date.parse(iso);
+        if (!Number.isFinite(time)) return '—';
+        const diff = time - Date.now();
+        if (diff <= 0) return 'agora';
+        if (diff < 60_000) return 'em ' + Math.max(1, Math.floor(diff / 1000)) + 's';
+        if (diff < 3_600_000) return 'em ' + Math.floor(diff / 60_000) + 'min';
+        if (diff < 86_400_000) return 'em ' + Math.floor(diff / 3_600_000) + 'h';
+        return 'em ' + Math.floor(diff / 86_400_000) + 'd';
+      }
+
       function statusVisual() {
         const bot = state.bot;
         const status = state.status;
@@ -668,7 +679,15 @@
         const online = Boolean(state.bot && state.bot.online);
         const totals = online && status && status.totals ? status.totals : { live: 0, recording: 0, trackers: 0 };
         $('#mLive').textContent = String(totals.live || 0);
-        $('#mLiveHint').textContent = !online ? 'Bot parado' : (status && status.lastPollAt ? 'Ultimo poll ' + relativeTime(status.lastPollAt) : 'Aguardando o primeiro poll');
+        const nextPollAt = status && status.nextPollAt ? status.nextPollAt : null;
+        const nextMatch = status && status.nextMatch ? status.nextMatch : null;
+        $('#mLiveHint').textContent = !online
+          ? 'Bot parado'
+          : totals.live > 0
+            ? (status && status.lastPollAt ? 'Último poll ' + relativeTime(status.lastPollAt) : 'Aguardando o primeiro poll')
+            : nextPollAt
+              ? 'Ocioso — próximo poll ' + relativeFuture(nextPollAt)
+              : (status && status.lastPollAt ? 'Último poll ' + relativeTime(status.lastPollAt) : 'Aguardando o primeiro poll');
         $('#mRecording').textContent = String(totals.recording || 0);
         const pendingClips = Number((status && status.pendingClips) || 0);
         $('#mRecordingHint').textContent = totals.recording > 0
@@ -689,6 +708,8 @@
           ['Processo', online && state.bot.pid ? 'pid ' + state.bot.pid : '—'],
           ['Uptime', online && state.bot.uptimeMs != null ? formatUptime(state.bot.uptimeMs) : '—'],
           ['Último poll', status && status.lastPollAt ? formatDate(status.lastPollAt) : '—'],
+          ['Próximo poll', nextPollAt ? formatDate(nextPollAt) + ' (' + relativeFuture(nextPollAt) + ')' : '—'],
+          ['Próxima partida', nextMatch ? esc(nextMatch.team1 + ' vs ' + nextMatch.team2) + ' — ' + formatDate(nextMatch.startsAt) + ' (' + relativeFuture(nextMatch.startsAt) + ')' : '—'],
           ['Reinícios (PM2)', state.bot ? String(state.bot.restarts ?? 0) : '—'],
           ['Memória', online && state.bot.memoryBytes ? formatBytes(state.bot.memoryBytes) : '—'],
         ];

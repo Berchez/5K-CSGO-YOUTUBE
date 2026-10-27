@@ -369,6 +369,8 @@ export interface MatchCard {
   stage: string;
   isLive: boolean;
   stars: number;
+  /** Epoch ms do horário marcado (só em cards futuros). */
+  startAt?: number;
 }
 
 /** Mapper puro card → LiveMatch (testável sem rede). */
@@ -384,6 +386,74 @@ export function cardToLiveMatch(card: MatchCard): LiveMatch {
     matchPageUrl: `https://www.hltv.org${card.href}`,
     streams: [],
   };
+}
+
+/** Partida futura (ainda não live)extraída do listing, com horário marcado. */
+export interface UpcomingMatch {
+  matchId: string;
+  team1: string;
+  team2: string;
+  event: string;
+  stars: number;
+  isTopTierGuess: boolean;
+  /** Epoch ms do horário marcado no HLTV. */
+  startsAt: number;
+  matchPageUrl: string;
+  /** true quando entrou pelo override da watchlist. */
+  watchlisted?: boolean;
+  watchlistedTeams?: string[];
+}
+
+/** Listing completo de uma consulta: o que está live e o que vem a seguir. */
+export interface MatchListing {
+  /** Live que passou no filtro (vira recorder/tracker). */
+  live: LiveMatch[];
+  /** Todas as live vistas na página (antes do filtro). */
+  liveTotal: number;
+  upcoming: UpcomingMatch[];
+}
+
+/**
+ * Timestamp do HLTV (`data-unix` / `data-zonedgrouping-entry-unix`).
+ * A página usa epoch em ms; layouts antigos podem usar segundos.
+ */
+export function parseHltvUnixMs(value: string | number | null | undefined): number | null {
+  const raw = typeof value === 'number' ? value : Number(String(value ?? '').trim());
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  const ms = raw < 1e12 ? raw * 1000 : raw;
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+/** Mapper puro card futuro → UpcomingMatch. */
+export function cardToUpcomingMatch(card: MatchCard & { startAt: number }): UpcomingMatch {
+  return {
+    matchId: card.matchId,
+    team1: card.teamNames[0] ?? 'TBD',
+    team2: card.teamNames[1] ?? 'TBD',
+    event: card.event || 'CS2 event',
+    stars: card.stars,
+    isTopTierGuess: guessTopTier(card.event, card.stars),
+    startsAt: card.startAt,
+    matchPageUrl: `https://www.hltv.org${card.href}`,
+  };
+}
+
+/**
+ * Próxima partida futura por ordem de horário.
+ * `graceMs` mantém no topo a partida cujo horário já passou (adiamento):
+ * enquanto ela não aparece como live, o bot continua no intervalo base.
+ */
+export function selectNextUpcoming(
+  matches: UpcomingMatch[],
+  now: number,
+  graceMs = 0,
+): UpcomingMatch | null {
+  let best: UpcomingMatch | null = null;
+  for (const match of matches) {
+    if (match.startsAt < now - graceMs) continue;
+    if (!best || match.startsAt < best.startsAt) best = match;
+  }
+  return best;
 }
 
 export interface LiveMatchFilter {
@@ -411,20 +481,161 @@ export function effectiveMatchRule(
   return resolveMatchRule(filter.watchlist ?? null, [match.team1, match.team2], fallback);
 }
 
+/** Card futuro cru: mesmo formato do live + o timestamp bruto do listing. */
+export type UpcomingCard = MatchCard & { startUnix: string };
+
 /**
- * Busca partidas LIVE na página /matches (layout HLTV 2026).
+ * Cards LIVE da página /matches.
  * Container: div.match[data-livescore-match] (externo — o interno div.match
  * duplica, por isso o seletor mira só no que tem o atributo).
  * Live = .match-meta-live com texto "Live".
+ */
+export async function extractLiveCards(page: Page): Promise<MatchCard[]> {
+  return page.evaluate(() => {
+    const out: Array<{
+      matchId: string;
+      href: string;
+      teamNames: string[];
+      event: string;
+      stage: string;
+      isLive: boolean;
+      stars: number;
+    }> = [];
+    const seen = new Set<string>();
+    const wrappers = Array.from(document.querySelectorAll('div.match[data-livescore-match]'));
+    for (const w of wrappers) {
+      const matchId = w.getAttribute('data-livescore-match') ?? '';
+      if (!matchId || seen.has(matchId)) continue;
+      const anchor = w.querySelector('a[href*="/matches/"]');
+      const href = anchor?.getAttribute('href') ?? '';
+      if (!/\/matches\/\d+/.test(href)) continue;
+      seen.add(matchId);
+
+      const teamNames = Array.from(w.querySelectorAll('.match-teamname'))
+        .map((e) => (e.textContent ?? '').trim())
+        .filter(Boolean)
+        .slice(0, 2);
+      const eventEl = w.querySelector('.match-event');
+      const event =
+        eventEl?.getAttribute('data-event-headline')?.trim() ||
+        (eventEl?.textContent ?? '').trim().slice(0, 120);
+      const stage = w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
+      const liveEl = w.querySelector('.match-meta-live');
+      const isLive = /live/i.test(liveEl?.textContent ?? '');
+      // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
+      // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
+      const starsAttr = w.closest('[data-stars]')?.getAttribute('data-stars') ?? '';
+      const starsFromAttr = Number.parseInt(starsAttr, 10);
+      let stars = Number.isFinite(starsFromAttr)
+        ? Math.max(0, Math.min(5, starsFromAttr))
+        : 0;
+      if (!Number.isFinite(starsFromAttr)) {
+        w.querySelectorAll('i.fa-star').forEach((s) => {
+          const cls = s.getAttribute('class') ?? '';
+          if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
+        });
+      }
+      out.push({
+        matchId,
+        href,
+        teamNames,
+        event,
+        stage,
+        isLive,
+        stars: Math.min(5, stars),
+      });
+    }
+    return out;
+  });
+}
+
+/**
+ * Cards FUTUROS da página /matches (mesmo HTML do live, zero page-load
+ * extra). Horário marcado em .match-time[data-unix] — fallback no wrapper
+ * de horário data-zonedgrouping-entry-unix. Live é ignorado aqui.
+ */
+export async function extractUpcomingCards(page: Page): Promise<UpcomingCard[]> {
+  return page.evaluate(() => {
+    const out: Array<{
+      matchId: string;
+      href: string;
+      teamNames: string[];
+      event: string;
+      stage: string;
+      isLive: boolean;
+      stars: number;
+      startUnix: string;
+    }> = [];
+    const wrappers = Array.from(document.querySelectorAll('.match-wrapper[data-match-id]'));
+    for (const w of wrappers) {
+      const matchId = w.getAttribute('data-match-id') ?? '';
+      if (!matchId) continue;
+      const isLive =
+        w.getAttribute('live') === 'true' || w.querySelector('[data-livescore-match]') !== null;
+      if (isLive) continue;
+      const anchor = w.querySelector('a[href*="/matches/"]');
+      const href = anchor?.getAttribute('href') ?? '';
+      if (!/\/matches\/\d+/.test(href)) continue;
+      const teamNames = Array.from(w.querySelectorAll('.match-teamname'))
+        .map((e) => (e.textContent ?? '').trim())
+        .filter(Boolean)
+        .slice(0, 2);
+      // Em cards futuros o nome do evento fica no wrapper do evento.
+      const eventEl = w.closest('[data-event-headline]');
+      const event =
+        eventEl?.getAttribute('data-event-headline')?.trim() ||
+        w.querySelector('.match-event')?.getAttribute('data-event-headline')?.trim() ||
+        (w.querySelector('.match-event')?.textContent ?? '').trim().slice(0, 120) ||
+        '';
+      const stage = w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
+      const starsAttr = w.getAttribute('data-stars') ?? '';
+      const starsFromAttr = Number.parseInt(starsAttr, 10);
+      let stars = Number.isFinite(starsFromAttr)
+        ? Math.max(0, Math.min(5, starsFromAttr))
+        : 0;
+      if (!Number.isFinite(starsFromAttr)) {
+        w.querySelectorAll('i.fa-star').forEach((s) => {
+          const cls = s.getAttribute('class') ?? '';
+          if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
+        });
+      }
+      const startUnix =
+        w.querySelector('.match-time[data-unix]')?.getAttribute('data-unix') ??
+        w.closest('[data-zonedgrouping-entry-unix]')?.getAttribute('data-zonedgrouping-entry-unix') ??
+        '';
+      out.push({
+        matchId,
+        href,
+        teamNames,
+        event,
+        stage,
+        isLive: false,
+        stars: Math.min(5, stars),
+        startUnix,
+      });
+    }
+    return out;
+  });
+}
+
+/**
+ * Busca o listing de /matches (layout HLTV 2026): partidas LIVE que passam
+ * no filtro + as próximas partidas futuras que também passam no filtro.
+ * Container live: div.match[data-livescore-match] (externo — o interno
+ * div.match duplica, por isso o seletor mira só no que tem o atributo).
+ * Live = .match-meta-live com texto "Live".
+ * Cards futuros: .match-wrapper[data-match-id] com live="false"; o horário
+ * marcado vem de .match-time[data-unix] (fallback: o wrapper de horário
+ * data-zonedgrouping-entry-unix) — mesmo HTML, zero page-load extra.
  * Retorna null se o Cloudflare bloquear (para o ciclo pular sem desmontar
  * recorders/trackers — [] significaria "sem lives" e derrubaria tudo).
  */
-export async function fetchLiveMatches(
+export async function fetchMatchListing(
   matchesUrl: string,
   minStars: number,
   topTierOnly: boolean,
   filter: LiveMatchFilter = {},
-): Promise<LiveMatch[] | null> {
+): Promise<MatchListing | null> {
   const log = getLogger();
   const b = await getBrowser();
   // Sem userAgent fixo de propósito: o contexto stealth envia UA autêntico
@@ -435,65 +646,8 @@ export async function fetchLiveMatches(
     if (!(await waitForClearance(page))) return null;
     await page.waitForTimeout(3000);
 
-    const cards = await page.evaluate(() => {
-      const out: Array<{
-        matchId: string;
-        href: string;
-        teamNames: string[];
-        event: string;
-        stage: string;
-        isLive: boolean;
-        stars: number;
-      }> = [];
-      const seen = new Set<string>();
-      const wrappers = Array.from(
-        document.querySelectorAll('div.match[data-livescore-match]'),
-      );
-      for (const w of wrappers) {
-        const matchId = w.getAttribute('data-livescore-match') ?? '';
-        if (!matchId || seen.has(matchId)) continue;
-        const anchor = w.querySelector('a[href*="/matches/"]');
-        const href = anchor?.getAttribute('href') ?? '';
-        if (!/\/matches\/\d+/.test(href)) continue;
-        seen.add(matchId);
-
-        const teamNames = Array.from(w.querySelectorAll('.match-teamname'))
-          .map((e) => (e.textContent ?? '').trim())
-          .filter(Boolean)
-          .slice(0, 2);
-        const eventEl = w.querySelector('.match-event');
-        const event =
-          eventEl?.getAttribute('data-event-headline')?.trim() ||
-          (eventEl?.textContent ?? '').trim().slice(0, 120);
-        const stage =
-          w.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
-        const liveEl = w.querySelector('.match-meta-live');
-        const isLive = /live/i.test(liveEl?.textContent ?? '');
-        // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
-        // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
-        const starsAttr = w.closest('[data-stars]')?.getAttribute('data-stars') ?? '';
-        const starsFromAttr = Number.parseInt(starsAttr, 10);
-        let stars = Number.isFinite(starsFromAttr)
-          ? Math.max(0, Math.min(5, starsFromAttr))
-          : 0;
-        if (!Number.isFinite(starsFromAttr)) {
-          w.querySelectorAll('i.fa-star').forEach((s) => {
-            const cls = s.getAttribute('class') ?? '';
-            if (!/\bfa-star-o\b|\bfaded\b|\bunselected\b/.test(cls)) stars += 1;
-          });
-        }
-        out.push({
-          matchId,
-          href,
-          teamNames,
-          event,
-          stage,
-          isLive,
-          stars: Math.min(5, stars),
-        });
-      }
-      return out;
-    });
+    const cards = await extractLiveCards(page);
+    const upcomingCards = await extractUpcomingCards(page);
 
     const matches: LiveMatch[] = [];
     for (const card of cards) {
@@ -518,19 +672,65 @@ export async function fetchLiveMatches(
         b.stars - a.stars ||
         Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)),
     );
+
+    // Próximas partidas: mesmo HTML do live, sem page-load extra. A página
+    // repete o mesmo card em "pinned"/listas — dedupe por matchId.
+    const byId = new Map<string, UpcomingMatch>();
+    for (const card of upcomingCards) {
+      const startAt = parseHltvUnixMs(card.startUnix);
+      if (startAt === null) continue;
+      const m = cardToUpcomingMatch({ ...card, isLive: false, startAt });
+      const prev = byId.get(m.matchId);
+      if (!prev) {
+        byId.set(m.matchId, m);
+      } else if (m.startsAt < prev.startsAt) {
+        byId.set(m.matchId, { ...m, event: m.event || prev.event });
+      } else if (m.startsAt === prev.startsAt && !prev.event && m.event) {
+        byId.set(m.matchId, { ...prev, event: m.event });
+      }
+    }
+
+    const upcoming: UpcomingMatch[] = [];
+    for (const m of byId.values()) {
+      const rule = effectiveMatchRule(m, filter);
+      if (rule.watchlisted) {
+        m.watchlisted = true;
+        m.watchlistedTeams = rule.matchedTeams;
+      } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
+        continue;
+      }
+      upcoming.push(m);
+    }
+    upcoming.sort((a, b) => a.startsAt - b.startsAt);
+
     log.info(
       {
         live: cards.filter((c) => c.isLive).length,
         kept: matches.length,
         watchlisted: matches.filter((m) => m.watchlisted).length,
+        upcoming: upcoming.length,
+        next: upcoming[0]
+          ? { matchId: upcoming[0].matchId, startsAt: new Date(upcoming[0].startsAt).toISOString() }
+          : null,
         minStars,
       },
       'live matches filtradas',
     );
-    return matches;
+    return { live: matches, liveTotal: cards.filter((c) => c.isLive).length, upcoming };
   } finally {
     await page.close().catch(() => undefined);
   }
+}
+
+/** Wrapper compatível: só as partidas live que passaram no filtro. */
+export async function fetchLiveMatches(
+  matchesUrl: string,
+  minStars: number,
+  topTierOnly: boolean,
+  filter: LiveMatchFilter = {},
+): Promise<LiveMatch[] | null> {
+  const listing = await fetchMatchListing(matchesUrl, minStars, topTierOnly, filter);
+  return listing?.live ?? null;
 }
 
 /**
