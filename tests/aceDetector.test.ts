@@ -156,14 +156,114 @@ describe('RoundTracker', () => {
     expect(kills[0].at).toBeLessThanOrEqual(kills[2].at!);
   });
 
-  it('syncBaseline: queda na coluna K reancora sem sintetizar kills', () => {
+  it('syncBaseline: queda isolada reancora o jogador sem zerar o round', () => {
     const t = new RoundTracker('nuke', 1);
     t.syncBaseline([{ name: 'x', kills: 10 }]);
-    expect(t.syncBaseline([{ name: 'x', kills: 0 }])).toBe(true);
+    expect(t.syncBaseline([{ name: 'x', kills: 0 }])).toBe(false);
     expect(t.pending).toBe(0);
     // novo epoch: +2 a partir do zero conta normal
     expect(t.syncBaseline([{ name: 'x', kills: 2 }])).toBe(false);
     expect(t.pending).toBe(2);
+  });
+
+  it('syncBaseline: queda isolada NÃO descarta as kills pendentes do round', () => {
+    const t = new RoundTracker('nuke', 1);
+    t.syncBaseline([
+      { name: 'x', kills: 10, deaths: 4 },
+      { name: 'y', kills: 8, deaths: 3 },
+    ]);
+    t.syncBaseline([
+      { name: 'x', kills: 10, deaths: 4 },
+      { name: 'y', kills: 11, deaths: 3 },
+    ]);
+    expect(t.pending).toBe(3);
+    // x zera sozinho (célula quebrada): o round NÃO é descartado
+    expect(
+      t.syncBaseline([
+        { name: 'x', kills: 0, deaths: 0 },
+        { name: 'y', kills: 11, deaths: 3 },
+      ]),
+    ).toBe(false);
+    expect(t.pending).toBe(3);
+  });
+
+  it('syncBaseline: glitch de 1 ponto em quem TEM kills pendentes não descarta', () => {
+    const t = new RoundTracker('nuke', 1);
+    t.syncBaseline([{ name: 'x', kills: 10, deaths: 4 }]);
+    t.syncBaseline([{ name: 'x', kills: 13, deaths: 4 }]);
+    expect(t.pending).toBe(3);
+    // célula lê 1 a menos por um poll: glitch, não época nova
+    expect(t.syncBaseline([{ name: 'x', kills: 12, deaths: 4 }])).toBe(false);
+    expect(t.pending).toBe(3);
+    // célula volta ao valor real: NÃO sintetiza kill duplicado
+    expect(t.syncBaseline([{ name: 'x', kills: 13, deaths: 4 }])).toBe(false);
+    expect(t.pending).toBe(3);
+  });
+
+  it('syncBaseline: queda grande em quem tem kills pendentes descarta (época nova)', () => {
+    const t = new RoundTracker('nuke', 1);
+    t.syncBaseline([{ name: 'x', kills: 10, deaths: 2 }]);
+    t.syncBaseline([{ name: 'x', kills: 13, deaths: 2 }]);
+    expect(t.pending).toBe(3);
+    expect(t.syncBaseline([{ name: 'x', kills: 8, deaths: 2 }])).toBe(true);
+  });
+
+  it('syncBaseline: reset amplo (metade dos jogadores) reancora tudo', () => {
+    const t = new RoundTracker('nuke', 1);
+    t.syncBaseline([
+      { name: 'a', kills: 10, deaths: 4 },
+      { name: 'b', kills: 9, deaths: 3 },
+      { name: 'c', kills: 8, deaths: 2 },
+      { name: 'd', kills: 7, deaths: 1 },
+    ]);
+    expect(
+      t.syncBaseline([
+        { name: 'a', kills: 0, deaths: 0 },
+        { name: 'b', kills: 0, deaths: 0 },
+        { name: 'c', kills: 8, deaths: 2 },
+        { name: 'd', kills: 7, deaths: 1 },
+      ]),
+    ).toBe(true);
+    expect(
+      t.syncBaseline([
+        { name: 'a', kills: 2, deaths: 0 },
+        { name: 'b', kills: 0, deaths: 0 },
+        { name: 'c', kills: 8, deaths: 2 },
+        { name: 'd', kills: 7, deaths: 1 },
+      ]),
+    ).toBe(false);
+    expect(t.pending).toBe(2);
+  });
+
+  it('syncBaseline: coluna D ausente não vira queda nem vítima fantasma', () => {
+    const t = new RoundTracker('inferno', 7);
+    t.syncBaseline([
+      { name: 'rain', kills: 10, deaths: 2 },
+      { name: 'vA', kills: 3, deaths: 5 },
+    ]);
+    expect(
+      t.syncBaseline([
+        { name: 'rain', kills: 13, deaths: undefined },
+        { name: 'vA', kills: 3, deaths: undefined },
+      ]),
+    ).toBe(false);
+    const { kills } = t.closeRound();
+    expect(kills).toHaveLength(3);
+    expect(kills.every((k) => k.victim === '')).toBe(true);
+  });
+
+  it('syncBaseline: queda só na coluna D de um jogador não zera o round', () => {
+    const t = new RoundTracker('inferno', 7);
+    t.syncBaseline([
+      { name: 'rain', kills: 10, deaths: 4 },
+      { name: 'vA', kills: 3, deaths: 5 },
+    ]);
+    expect(
+      t.syncBaseline([
+        { name: 'rain', kills: 10, deaths: 0 },
+        { name: 'vA', kills: 3, deaths: 5 },
+      ]),
+    ).toBe(false);
   });
 
   it('syncBaseline: nome novo ancora sem spike falso', () => {

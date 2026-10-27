@@ -1,12 +1,14 @@
+import './env.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import { repoPath } from './paths.js';
 import { getConfig, parseStreamOffsets, resolveStaticOffset } from './config.js';
 import { loadCalibrations, resolveSessionOffset } from './recorder/avCalibration.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
 import { ensureTray } from './tray.js';
 import { getLogger } from './logger.js';
-import { deleteAce, getDb, hasAce, insertAce, insertClip } from './db.js';
+import { discardAce, getDb, hasAce, insertAce, insertClip, recordDiscardedEvent } from './db.js';
 import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
@@ -17,6 +19,7 @@ import {
 } from './monitor/hltvMonitor.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
+import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
@@ -74,6 +77,26 @@ function clearStreamFailed(matchId: string, url: string): void {
   if (!entries) return;
   entries.delete(url);
   if (entries.size === 0) failedStreams.delete(matchId);
+}
+
+/**
+ * Instância única: outra cópia viva (pm2 + npm start, por exemplo) duplicaria
+ * buffers, ffmpeg e uploads. O heartbeat fresco + pid vivo do próprio status
+ * file são a prova; status velho (crash/reboot) não bloqueia o start.
+ */
+function otherInstanceAlive(): number | null {
+  try {
+    const raw = fs.readFileSync(repoPath('data', 'tray-status.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { pid?: number; heartbeatAt?: string };
+    const pid = Number(parsed.pid ?? 0);
+    if (!pid || pid === process.pid) return null;
+    const heartbeat = Date.parse(parsed.heartbeatAt ?? '');
+    if (!Number.isFinite(heartbeat) || Date.now() - heartbeat > 90_000) return null;
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
 }
 
 // Referências por partida (foto/logos/mapa): busca 1x, reusa nos aces
@@ -134,7 +157,7 @@ interface MatchRecorders {
 }
 
 const activeRecorders = new Map<string, MatchRecorders>();
-const activeTrackers = new Set<string>();
+const activeTrackers = new Map<string, symbol>();
 const selectedStreams = new Map<string, StreamInfo>();
 let stopping = false;
 
@@ -201,6 +224,7 @@ function publishTrayStatus(
     lastPollAt: now,
     lastError: opts?.lastError ?? null,
     diskFreeGb: free == null ? null : Math.round((free / 1024 ** 3) * 10) / 10,
+    pendingClips: pendingClips.size,
   });
 }
 
@@ -323,22 +347,38 @@ async function handleAce(
     recorder?.listSegments() ?? [],
     cfg.SEGMENT_TIME_SEC,
   );
-  if (aceStartMs != null && initialStartMs != null && aceStartMs < initialStartMs) {
+  const initialCoverage = evaluateAceCoverage({
+    kills: ace.kills,
+    anchorMs: aceStartMs,
+    oldestSegmentStartMs: initialStartMs,
+  });
+  if (initialCoverage.discard) {
     log.warn(
       {
         matchId,
         player: ace.player,
         map: ace.map,
         round: ace.round,
-        aceStart: new Date(aceStartMs).toISOString(),
-        oldestStart: new Date(initialStartMs).toISOString(),
+        kills: initialCoverage.totalKills,
+        oldestStart: initialStartMs != null ? new Date(initialStartMs).toISOString() : null,
       },
-      'primeira kill fora do buffer — evento fantasma descartado (não gravado)',
+      'nenhuma kill do ace está no buffer — evento descartado (sem footage)',
     );
+    recordDiscardedEvent(cfg.DB_PATH, {
+      matchId: ace.matchId,
+      map: ace.map,
+      round: ace.round,
+      player: ace.player,
+      reason: 'sem footage no buffer',
+      detectedAt: ace.detectedAt,
+    });
     return;
   }
   const aceId = insertAce(cfg.DB_PATH, ace);
   pendingClips.add(matchId);
+  // Guarda de restart (tray/painel) lê o status: publica já, sem esperar
+  // o fim do poll — a janela logo após a detecção é a mais crítica.
+  patchTrayStatus({ pendingClips: pendingClips.size });
   const snapDirs: string[] = [];
   try {
     let segments = recorder?.listSegments() ?? [];
@@ -477,7 +517,8 @@ async function handleAce(
     // recorder e apaga o buffer) enquanto refs/render/thumb ainda rodam —
     // minutos. Copia preservando mtime (seleção/trim são mtime-driven) e
     // constrói o clipe a partir da cópia imune ao churn do buffer.
-    let staleDiscard = false;
+    let coverageDiscards = 0;
+    let attemptedVariants = 0;
     const buildVariant = async (
       mode: 'separate' | 'muxed',
       sourceSegments: string[],
@@ -487,6 +528,7 @@ async function handleAce(
         log.warn({ matchId, mode }, 'sem segmentos para esta variante de captura');
         return null;
       }
+      attemptedVariants++;
       const variantAce: AceEvent = {
         ...ace,
         endedAt: sourceEndMs != null ? new Date(sourceEndMs).toISOString() : undefined,
@@ -501,18 +543,29 @@ async function handleAce(
       // sidecar promete (foi o caso do 5K do jcobbb: round fechou minutos
       // depois e o corte pegou só o intervalo seguinte). Melhor não gerar.
       const oldestStartMs = oldestSegmentStartMs(sourceSegments, cfg.SEGMENT_TIME_SEC);
-      if (aceStartMs != null && oldestStartMs != null && aceStartMs < oldestStartMs) {
+      const variantCoverage = evaluateAceCoverage({
+        kills: ace.kills,
+        anchorMs: aceStartMs,
+        oldestSegmentStartMs: oldestStartMs,
+      });
+      if (variantCoverage.discard) {
+        log.warn(
+          { matchId, mode, kills: variantCoverage.totalKills },
+          'nenhuma kill do ace está no buffer — clipe descartado (não conteria o ace)',
+        );
+        coverageDiscards++;
+        return null;
+      }
+      if (variantCoverage.truncatedStart) {
         log.warn(
           {
             matchId,
             mode,
-            aceStart: new Date(aceStartMs).toISOString(),
-            oldestStart: new Date(oldestStartMs).toISOString(),
+            aceStart: aceStartMs != null ? new Date(aceStartMs).toISOString() : null,
+            oldestStart: oldestStartMs != null ? new Date(oldestStartMs).toISOString() : null,
           },
-          'primeira kill fora do buffer — clipe descartado (não conteria o ace)',
+          'âncora fora do buffer — clipe com abertura incompleta (truncatedStart)',
         );
-        staleDiscard = true;
-        return null;
       }
       const variantPicked = pickSegments(sourceSegments, {
         segmentTimeSec: cfg.SEGMENT_TIME_SEC,
@@ -590,13 +643,26 @@ async function handleAce(
         ? buildVariant('muxed', muxedSegments, muxedAceEndMs)
         : Promise.resolve(null),
     ]);
-    // Nenhuma variante sobreviveu por âncora fora do buffer: o evento era
-    // fantasma — remove a linha para não bloquear um ace legítimo futuro.
-    if (!separateClip && !muxedClip && staleDiscard) {
-      deleteAce(cfg.DB_PATH, aceId);
+    // Nenhuma variante sobreviveu: só é fantasma se TODAS as variantes
+    // tentadas caíram por falta de footage. Falha de ffmpeg/disco mantém o
+    // evento no banco (o clipe pode ser refeito manualmente).
+    if (
+      !separateClip &&
+      !muxedClip &&
+      attemptedVariants > 0 &&
+      coverageDiscards === attemptedVariants
+    ) {
+      discardAce(cfg.DB_PATH, aceId, {
+        matchId: ace.matchId,
+        map: ace.map,
+        round: ace.round,
+        player: ace.player,
+        reason: 'nenhuma kill do ace no buffer',
+        detectedAt: ace.detectedAt,
+      });
       log.warn(
         { matchId, player: ace.player, map: ace.map, round: ace.round },
-        'ace fantasma removido do banco (1ª kill fora do buffer)',
+        'ace fantasma removido do banco (sem footage no buffer)',
       );
     }
     const uploadClipResult = muxedClip ?? separateClip;
@@ -648,6 +714,7 @@ async function handleAce(
   } finally {
     for (const dir of snapDirs) fs.rmSync(dir, { recursive: true, force: true });
     pendingClips.delete(matchId);
+    patchTrayStatus({ pendingClips: pendingClips.size });
   }
 }
 
@@ -718,13 +785,23 @@ async function pollOnce(): Promise<void> {
         m.streams = streams;
         const failedUrls = failedStreamUrls(m.matchId);
         const available = streams.filter((s) => !failedUrls.has(s.url));
+        if (streams.length > 0 && available.length === 0) {
+          // Todas as candidatas do cache falharam: a lista pode estar velha
+          // (URL expirada). Só agora vale pagar um novo page-load.
+          streamsCache.delete(m.matchId);
+        }
         const choice = selectStream(available, cfg.STREAM_PRIORITY, {
           country: cfg.STREAM_PREFERRED_COUNTRY,
           minViewers: cfg.STREAM_PREFERRED_MIN_VIEWERS,
         });
         if (!choice) {
           log.info(
-            { matchId: m.matchId, streams: streams.length, failed: failedUrls.size },
+            {
+              matchId: m.matchId,
+              streams: streams.length,
+              withCountry: streams.filter((s) => s.country).length,
+              failed: failedUrls.size,
+            },
             'sem stream disponível, pulando gravação',
           );
         } else {
@@ -781,6 +858,7 @@ async function pollOnce(): Promise<void> {
               country: chosen.country,
               viewers: chosen.viewers,
               reason: choice.reason,
+              candidates: available.length,
               muxed: muxedRecorder != null,
             },
             'gravando buffers separados e muxed',
@@ -789,7 +867,8 @@ async function pollOnce(): Promise<void> {
       } catch (e) {
         if (attemptedStream) markStreamFailed(m.matchId, attemptedStream.url);
         selectedStreams.delete(m.matchId);
-        streamsCache.delete(m.matchId);
+        // Mantém o cache: a próxima tentativa usa outra candidata sem abrir
+        // aba nova (page-load por poll = exposição ao Cloudflare).
         log.warn(
           {
             err: String(e),
@@ -808,10 +887,11 @@ async function pollOnce(): Promise<void> {
       }
     } else if (!activeTrackers.has(m.matchId)) {
       const minKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
-      activeTrackers.add(m.matchId);
+      const token = Symbol(m.matchId);
+      activeTrackers.set(m.matchId, token);
       log.info({ matchId: m.matchId, stars: m.stars, minKills }, 'iniciando tracker de multikill');
       trackMatch(m.matchPageUrl, m.matchId, {
-        shouldStop: () => stopping || !activeTrackers.has(m.matchId),
+        shouldStop: () => stopping || activeTrackers.get(m.matchId) !== token,
         onAce: (a) => {
           // Time do autor desconhecido no live: resumo com confronto completo.
           const summary = buildRoundSummary(
@@ -849,7 +929,7 @@ async function pollOnce(): Promise<void> {
       }, minKills)
         .catch((e) => log.warn({ err: String(e) }, 'tracker encerrou com erro'))
         .finally(() => {
-          activeTrackers.delete(m.matchId);
+          if (activeTrackers.get(m.matchId) === token) activeTrackers.delete(m.matchId);
           log.info({ matchId: m.matchId }, 'tracking encerrado');
         });
     }
@@ -906,6 +986,14 @@ async function pollOnce(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const other = otherInstanceAlive();
+  if (other) {
+    getLogger().error(
+      { pid: other },
+      'outra instância do bot já está rodando (status fresco) — encerrando para não duplicar buffers/uploads',
+    );
+    process.exit(1);
+  }
   ensureTray();
   const cfg = getConfig();
   // Bins vendored (.tools/ffmpeg do repo) no PATH — o clipper chama

@@ -229,11 +229,18 @@ export function normalizeCountry(value: string | undefined): string {
   return COUNTRY_ALIASES[raw] ?? raw;
 }
 
+function isCountryCode(value: string): boolean {
+  return /^[A-Z]{2,3}$/.test(value) || value === 'WORLD';
+}
+
 export function parseStreamCountry(flagSrc: string, flagTitle = ''): string | undefined {
   const fromSrc = flagSrc.match(/\/flags\/[^/]+\/([A-Za-z]{2,5})\.(?:gif|png|svg)/i)?.[1];
-  if (fromSrc) return normalizeCountry(fromSrc);
+  if (fromSrc) {
+    const normalized = normalizeCountry(fromSrc);
+    return isCountryCode(normalized) ? normalized : undefined;
+  }
   const fromTitle = normalizeCountry(flagTitle);
-  return fromTitle.length > 0 && fromTitle.length <= 5 ? fromTitle : undefined;
+  return isCountryCode(fromTitle) ? fromTitle : undefined;
 }
 
 export interface StreamPreference {
@@ -249,10 +256,14 @@ export interface StreamChoice {
 }
 
 function byViewersDesc(a: StreamInfo, b: StreamInfo): number {
-  return (b.viewers ?? 0) - (a.viewers ?? 0) || a.name.localeCompare(b.name);
+  return (b.viewers ?? 0) - (a.viewers ?? 0);
 }
 
-function scoreMainStream(streams: StreamInfo[], priority: string): StreamInfo | null {
+function scoreMainStream(
+  streams: StreamInfo[],
+  priority: string,
+  penalty?: (stream: StreamInfo) => number,
+): StreamInfo | null {
   if (streams.length === 0) return null;
   const prefs = priority
     .split(',')
@@ -288,9 +299,10 @@ function scoreMainStream(streams: StreamInfo[], priority: string): StreamInfo | 
     // Evita restreams BR quando o usuário pediu EN oficial
     // (mas não quando o BR — Gaules pedido ou fallback — é o alvo).
     if (wantsEn && !gaulesActive && /gaules|nak|liminha|bt0|br/i.test(name)) score -= 500_000;
+    score -= penalty?.(s) ?? 0;
     return { s, score };
   });
-  scored.sort((a, b) => b.score - a.score || a.s.name.localeCompare(b.s.name));
+  scored.sort((a, b) => b.score - a.score);
   return scored[0]?.s ?? null;
 }
 
@@ -301,6 +313,8 @@ function isPreferredBelowMin(
 ): boolean {
   return normalizeCountry(stream.country) === country && (stream.viewers ?? 0) < minViewers;
 }
+
+const BELOW_MIN_PENALTY = 500_000;
 
 export function selectStream(
   streams: StreamInfo[],
@@ -318,11 +332,18 @@ export function selectStream(
     if (preferred) return { stream: preferred, reason: 'preferred' };
   }
 
-  const mainCandidates = country
-    ? streams.filter((s) => !isPreferredBelowMin(s, country, minViewers))
-    : streams;
-  const main = scoreMainStream(mainCandidates, priority);
-  if (main) return { stream: main, reason: 'main' };
+  // Stream do país abaixo do mínimo fica de penalty (não é removido): a
+  // prioridade explícita (ex.: gaules) continua valendo, mas a stream do
+  // país não ganha de uma oficial/en só por existir.
+  const penalty = (stream: StreamInfo): number =>
+    country && minViewers > 0 && isPreferredBelowMin(stream, country, minViewers)
+      ? BELOW_MIN_PENALTY
+      : 0;
+
+  const main = scoreMainStream(streams, priority, penalty);
+  if (main) {
+    return { stream: main, reason: penalty(main) > 0 ? 'fallback' : 'main' };
+  }
 
   const fallback = [...streams].sort(byViewersDesc)[0];
   return fallback ? { stream: fallback, reason: 'fallback' } : null;

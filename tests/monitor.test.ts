@@ -167,6 +167,11 @@ describe('parseStreamCountry', () => {
     expect(parseStreamCountry('', 'Brazil')).toBe('BR');
     expect(parseStreamCountry('', 'Brasil')).toBe('BR');
   });
+
+  it('ignora texto de título que não é código de país', () => {
+    expect(parseStreamCountry('', 'Chile')).toBeUndefined();
+    expect(parseStreamCountry('', 'English')).toBeUndefined();
+  });
 });
 
 describe('selectStream', () => {
@@ -219,5 +224,29 @@ describe('selectStream', () => {
 
   it('retorna null sem streams', () => {
     expect(selectStream([], 'official,en', { country: 'BR', minViewers: 2000 })).toBeNull();
+  });
+
+  it('prioridade explícita (gaules) vence o mínimo de audiência do país', () => {
+    const choice = selectStream(
+      [
+        { name: 'Gaules', url: 'https://twitch.tv/gaules', country: 'FR', viewers: 500 },
+        { name: 'ESL_CS', url: 'https://twitch.tv/esl_cs', viewers: 5000 },
+      ],
+      'gaules',
+      { country: 'FR', minViewers: 2000 },
+    );
+    expect(choice?.stream.name).toBe('Gaules');
+  });
+
+  it('desempate mantém a ordem do HLTV (não alfabética)', () => {
+    const choice = selectStream(
+      [
+        { name: 'zzz_channel', url: 'https://twitch.tv/zzz', viewers: 1000 },
+        { name: 'aaa_channel', url: 'https://twitch.tv/aaa', viewers: 1000 },
+      ],
+      'none',
+      {},
+    );
+    expect(choice?.stream.name).toBe('zzz_channel');
   });
 });

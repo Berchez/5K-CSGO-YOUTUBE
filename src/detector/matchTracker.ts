@@ -47,7 +47,7 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
       const ct = Number.parseInt(((ctEl && ctEl.textContent) || '0').trim(), 10) || 0;
       const t = Number.parseInt(((tEl && tEl.textContent) || '0').trim(), 10) || 0;
 
-      const players: Array<{ name: string; kills: number; deaths: number }> = [];
+      const players: Array<{ name: string; kills: number; deaths?: number }> = [];
       for (const tbl of Array.from(document.querySelectorAll('table.team'))) {
         for (const tr of Array.from(tbl.querySelectorAll('tr'))) {
           if (tr.closest('thead')) continue;
@@ -61,7 +61,7 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
           players.push({
             name: name.slice(0, 40),
             kills: Number.parseInt(kText, 10),
-            deaths: /^\d+$/.test(dText) ? Number.parseInt(dText, 10) : 0,
+            deaths: /^\d+$/.test(dText) ? Number.parseInt(dText, 10) : undefined,
           });
         }
       }
@@ -179,7 +179,12 @@ export function processPoll(
     // que está fechando, não ao novo (freeze de 15s = sem kills no início
     // do round novo). Sincronizar DEPOIS do closeRound atribuía os kills
     // do round passado ao novo (falsos "3k" misturando rounds).
-    tracker.syncBaseline(snap.players);
+    // Stats repovoadas já neste poll (break): os pendentes são de outra
+    // época e não podem virar evento — descarta antes de fechar.
+    if (tracker.syncBaseline(snap.players)) {
+      tracker.discardPending();
+      dropped = 'stats reiniciaram no fechamento do round: kills pendentes descartadas';
+    }
     const flags = tracker.anchorFlags();
     // Fecha o round: no máximo UM evento por round/jogador, sempre na
     // contagem máxima (3k→4k→5k não duplica). kills = SÓ os do autor.

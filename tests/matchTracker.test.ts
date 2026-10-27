@@ -110,6 +110,22 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.event).toBeNull();
   });
 
+  it('descarta pendentes quando o reset só aparece no poll de fechamento', () => {
+    const tr = new RoundTracker('Nuke', 1);
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'x', kills: 0 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    // repovoamento +5 durante o break (0-0)
+    r = processPoll(tr, snap(0, 0, [{ name: 'x', kills: 5 }], 'Nuke'), last, 3);
+    last = r.lastTotal;
+    expect(tr.pending).toBe(5);
+    // placar vira 1-0 E a coluna K zera no MESMO poll
+    r = processPoll(tr, snap(1, 0, [{ name: 'x', kills: 0 }], 'Nuke'), last, 3);
+    expect(r.event).toBeNull();
+    expect(r.dropped).toContain('reiniciaram');
+    expect(tr.pending).toBe(0);
+  });
+
   it('descarta multikill com 1ª kill fora da janela do round (stats de outra época)', () => {
     const tr = new RoundTracker('Nuke', 1);
     let last = -1;

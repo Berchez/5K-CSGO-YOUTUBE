@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   CONFIG_GROUPS,
@@ -38,6 +38,7 @@ const LOGS_DIR = path.join(ROOT, 'logs');
 const ENV_FILE = path.join(ROOT, '.env');
 const BOT_STATUS_FILE = path.join(DATA_DIR, 'tray-status.json');
 const PANEL_INFO_FILE = path.join(DATA_DIR, 'tray-panel.json');
+const INTENT_FILE = path.join(DATA_DIR, 'tray-intent.json');
 const PANEL_LOG_FILE = path.join(LOGS_DIR, 'tray-panel.log');
 const PANEL_HTML = path.join(ROOT, 'scripts', 'tray-panel.html');
 
@@ -57,11 +58,19 @@ interface BotState {
   uptimeMs: number | null;
   memoryBytes: number | null;
   error?: string;
+  source?: 'pm2' | 'status-file';
+}
+
+interface TrayIntent {
+  action: string;
+  at: string;
+  suppressUntil: string;
 }
 
 let panelInfo: PanelInfo | null = null;
 let lastActivity = Date.now();
 let botCache: { at: number; value: BotState } | null = null;
+let botStatePending: Promise<BotState> | null = null;
 
 function log(message: string): void {
   try {
@@ -74,21 +83,32 @@ function log(message: string): void {
 
 function readJson<T>(filePath: string): T | null {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    return JSON.parse(text) as T;
   } catch {
     return null;
   }
 }
 
 function writeJsonAtomic(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
   try {
-    fs.renameSync(tmp, filePath);
-  } catch {
-    fs.copyFileSync(tmp, filePath);
-    fs.rmSync(tmp, { force: true });
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmp, filePath);
+    } catch {
+      fs.copyFileSync(tmp, filePath);
+      fs.rmSync(tmp, { force: true });
+    }
+  } catch (e) {
+    log(`falha ao gravar ${path.basename(filePath)}: ${e instanceof Error ? e.message : String(e)}`);
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // best-effort
+    }
   }
 }
 
@@ -110,25 +130,91 @@ function quotedCmdArg(value: string): string {
   return /[\s"]/g.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
 }
 
-function runPm2(args: string[], timeout = 15_000): { ok: boolean; output: string; error?: string } {
+function runPm2Async(
+  args: string[],
+  timeout = 10_000,
+): Promise<{ ok: boolean; output: string; error?: string }> {
   const command = ['pm2', ...args].map(quotedCmdArg).join(' ');
-  const result = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout,
+  return new Promise((resolve) => {
+    execFile(
+      process.env.ComSpec ?? 'cmd.exe',
+      ['/d', '/s', '/c', command],
+      {
+        cwd: ROOT,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout,
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        const output = `${stdout ?? ''}${stderr ?? ''}`.trim();
+        if (error) {
+          resolve({ ok: false, output, error: error.message });
+          return;
+        }
+        resolve({ ok: true, output });
+      },
+    );
   });
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
-  if (result.error) return { ok: false, output, error: result.error.message };
-  if (result.status !== 0) return { ok: false, output, error: `pm2 saiu com código ${result.status}` };
-  return { ok: true, output };
 }
 
-function getBotState(force = false): BotState {
-  if (!force && botCache && Date.now() - botCache.at < 1500) return botCache.value;
-  const result = runPm2(['jlist'], 10_000);
+interface Pm2App {
+  name?: string;
+  pid?: number;
+  pm2_env?: { status?: string; restart_time?: number; pm_uptime?: number };
+  monit?: { memory?: number };
+}
+
+function parsePm2List(output: string): Pm2App[] | null {
+  const lines = output.split(/\r?\n/);
+  const candidates: string[] = [];
+  const trimmed = output.trim();
+  if (trimmed) candidates.push(trimmed);
+  const start = lines.findIndex((line) => line.trimStart().startsWith('['));
+  if (start >= 0) candidates.push(lines.slice(start).join('\n'));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed as Pm2App[];
+    } catch {
+      // tenta o próximo candidato
+    }
+  }
+  return null;
+}
+
+function botStateFromStatusFile(): BotState | null {
+  const status = readJson<{ pid?: number; heartbeatAt?: string; startedAt?: string }>(
+    BOT_STATUS_FILE,
+  );
+  if (!status) return null;
+  const pid = Number(status.pid ?? 0);
+  if (!pid) return null;
+  const stamp = Date.parse(status.heartbeatAt ?? status.startedAt ?? '');
+  if (!Number.isFinite(stamp) || Date.now() - stamp > 30_000) return null;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return null;
+  }
+  return {
+    online: true,
+    status: 'online',
+    pid,
+    restarts: 0,
+    uptimeMs: Number.isFinite(Date.parse(status.startedAt ?? ''))
+      ? Math.max(0, Date.now() - Date.parse(status.startedAt as string))
+      : null,
+    memoryBytes: null,
+    source: 'status-file',
+  };
+}
+
+async function loadBotState(): Promise<BotState> {
+  const result = await runPm2Async(['jlist'], 10_000);
   if (!result.ok) {
-    const value: BotState = {
+    const fallback = botStateFromStatusFile();
+    const value: BotState = fallback ?? {
       online: false,
       status: 'pm2-error',
       pid: 0,
@@ -140,70 +226,125 @@ function getBotState(force = false): BotState {
     botCache = { at: Date.now(), value };
     return value;
   }
-  try {
-    const first = result.output.indexOf('[');
-    const last = result.output.lastIndexOf(']');
-    const list = JSON.parse(result.output.slice(first, last + 1)) as Array<{
-      name?: string;
-      pid?: number;
-      pm2_env?: { status?: string; restart_time?: number; pm_uptime?: number };
-      monit?: { memory?: number };
-    }>;
-    const app = list.find((item) => item.name === '5k-bot');
-    if (!app) {
-      const value: BotState = {
-        online: false,
-        status: 'not-found',
-        pid: 0,
-        restarts: 0,
-        uptimeMs: null,
-        memoryBytes: null,
-      };
-      botCache = { at: Date.now(), value };
-      return value;
-    }
-    const status = app.pm2_env?.status ?? 'unknown';
-    const uptime = app.pm2_env?.pm_uptime;
-    const online = status === 'online';
-    const value: BotState = {
-      online,
-      status,
-      pid: app.pid ?? 0,
-      restarts: app.pm2_env?.restart_time ?? 0,
-      uptimeMs: online && uptime ? Date.now() - uptime : null,
-      memoryBytes: online ? (app.monit?.memory ?? null) : null,
-    };
-    botCache = { at: Date.now(), value };
-    return value;
-  } catch (e) {
-    const value: BotState = {
+  const list = parsePm2List(result.output);
+  if (!list) {
+    const fallback = botStateFromStatusFile();
+    const value: BotState = fallback ?? {
       online: false,
       status: 'pm2-parse-error',
       pid: 0,
       restarts: 0,
       uptimeMs: null,
       memoryBytes: null,
-      error: String(e),
+      error: result.output.slice(0, 400),
     };
     botCache = { at: Date.now(), value };
     return value;
   }
+  const app = list.find((item) => item.name === '5k-bot');
+  if (!app) {
+    // PM2 não conhece o app: o bot pode estar rodando fora do PM2
+    // (npm start). Heartbeat fresco + pid vivo valem como "online".
+    const fallback = botStateFromStatusFile();
+    if (fallback) {
+      botCache = { at: Date.now(), value: fallback };
+      return fallback;
+    }
+    const value: BotState = {
+      online: false,
+      status: 'not-found',
+      pid: 0,
+      restarts: 0,
+      uptimeMs: null,
+      memoryBytes: null,
+    };
+    botCache = { at: Date.now(), value };
+    return value;
+  }
+  const status = app.pm2_env?.status ?? 'unknown';
+  const uptime = app.pm2_env?.pm_uptime;
+  const online = status === 'online';
+  if (!online) {
+    const fallback = botStateFromStatusFile();
+    if (fallback) {
+      botCache = { at: Date.now(), value: fallback };
+      return fallback;
+    }
+  }
+  const value: BotState = {
+    online,
+    status,
+    pid: app.pid ?? 0,
+    restarts: app.pm2_env?.restart_time ?? 0,
+    uptimeMs: online && uptime ? Date.now() - uptime : null,
+    memoryBytes: online ? (app.monit?.memory ?? null) : null,
+    source: 'pm2',
+  };
+  botCache = { at: Date.now(), value };
+  return value;
 }
 
-function pm2Action(action: 'start' | 'stop' | 'restart'): { ok: boolean; output: string; error?: string } {
+async function getBotState(force = false): Promise<BotState> {
+  if (!force && botCache && Date.now() - botCache.at < 10_000) return botCache.value;
+  if (!force && botStatePending) return botStatePending;
+  const pending = loadBotState();
+  botStatePending = pending;
+  try {
+    return await pending;
+  } finally {
+    if (botStatePending === pending) botStatePending = null;
+  }
+}
+
+function botBusy(): { busy: boolean; recording: number; pendingClips: number } {
+  const status = readJson<{ totals?: { recording?: number }; pendingClips?: number }>(
+    BOT_STATUS_FILE,
+  );
+  const recording = Number(status?.totals?.recording ?? 0);
+  const pendingClips = Number(status?.pendingClips ?? 0);
+  return { busy: recording > 0 || pendingClips > 0, recording, pendingClips };
+}
+
+function busyMessage(busy: { recording: number; pendingClips: number }): string {
+  const parts: string[] = [];
+  if (busy.recording > 0) parts.push(`${busy.recording} gravação(ões) em andamento`);
+  if (busy.pendingClips > 0) parts.push(`${busy.pendingClips} clipe(s) em andamento`);
+  return `O bot está com ${parts.join(' e ')}. Reiniciar agora perde esse trabalho — confirme para forçar.`;
+}
+
+function writeIntent(action: string): void {
+  const now = Date.now();
+  const intent: TrayIntent = {
+    action,
+    at: new Date(now).toISOString(),
+    suppressUntil: new Date(now + 45_000).toISOString(),
+  };
+  writeJsonAtomic(INTENT_FILE, intent);
+}
+
+async function pm2Action(
+  action: 'start' | 'stop' | 'restart',
+): Promise<{ ok: boolean; output: string; error?: string }> {
   const args =
     action === 'restart'
       ? ['restart', '5k-bot', '--update-env']
       : action === 'start'
         ? ['start', '5k-bot']
         : ['stop', '5k-bot'];
-  const result = runPm2(args);
+  if (action === 'stop' || action === 'restart') writeIntent(action);
+  const result = await runPm2Async(args, 25_000);
   botCache = null;
   if (result.ok) {
-    const save = runPm2(['save'], 10_000);
+    const save = await runPm2Async(['save'], 10_000);
     if (!save.ok) log(`pm2 save falhou após ${action}: ${save.error ?? save.output}`);
   }
   return result;
+}
+
+function botLogFile(): string {
+  const configured = (readEnvFile(ENV_FILE).values.LOG_FILE ?? '').trim();
+  if (!configured) return path.join(LOGS_DIR, 'bot.log');
+  return path.isAbsolute(configured) ? configured : path.join(ROOT, configured);
 }
 
 function tailFile(filePath: string, maxBytes: number, maxLines: number): { lines: string[]; truncated: boolean } {
@@ -220,6 +361,7 @@ function tailFile(filePath: string, maxBytes: number, maxLines: number): { lines
       fs.closeSync(fd);
     }
     const all = buffer.toString('utf8').split(/\r?\n/);
+    if (start > 0 && all.length > 0) all.shift();
     if (all.length > 0 && all[all.length - 1] === '') all.pop();
     return { lines: all.slice(-maxLines), truncated: start > 0 || all.length > maxLines };
   } catch {
@@ -331,7 +473,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   if (pathname === '/api/status') {
-    const bot = getBotState();
+    const bot = await getBotState();
     const status = readJson<unknown>(BOT_STATUS_FILE);
     sendJson(res, 200, {
       ok: true,
@@ -364,7 +506,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sendJson(res, 405, { ok: false, error: 'Método não permitido.' });
       return;
     }
-    let body: { values?: Record<string, unknown>; restart?: boolean };
+    let body: { values?: Record<string, unknown>; restart?: boolean; force?: boolean; confirmPublic?: boolean };
     try {
       body = (await readJsonBody(req)) as typeof body;
     } catch (e) {
@@ -380,12 +522,34 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sendJson(res, 400, { ok: false, error: 'Configuração inválida.', errors: validation.errors });
       return;
     }
-    const botBefore = getBotState(true);
+    // Política do projeto: private + revisão. O confirm do HTML é UX; a
+    // guarda real é aqui (cliente não é fonte de verdade).
+    if (validation.values.YT_PRIVACY === 'public' && body.confirmPublic !== true) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'YT_PRIVACY=public exige confirmação explícita (confirmPublic: true).',
+      });
+      return;
+    }
+    if (body.restart === true && body.force !== true) {
+      const busy = botBusy();
+      if (busy.busy) {
+        sendJson(res, 409, {
+          ok: false,
+          error: busyMessage(busy),
+          busy: true,
+          recording: busy.recording,
+          pendingClips: busy.pendingClips,
+        });
+        return;
+      }
+    }
+    const botBefore = await getBotState(true);
     const update = updateEnvFile(ENV_FILE, validation.values);
     let restarted = false;
     let restartError: string | undefined;
     if (body.restart === true && botBefore.online) {
-      const result = pm2Action('restart');
+      const result = await pm2Action('restart');
       restarted = result.ok;
       if (!result.ok) restartError = result.error ?? result.output;
     }
@@ -407,7 +571,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sendJson(res, 405, { ok: false, error: 'Método não permitido.' });
       return;
     }
-    let body: { action?: string };
+    let body: { action?: string; force?: boolean };
     try {
       body = (await readJsonBody(req)) as typeof body;
     } catch (e) {
@@ -420,13 +584,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return;
     }
     if (action === 'start' || action === 'stop' || action === 'restart') {
-      const result = pm2Action(action);
+      if (action === 'restart' && body?.force !== true) {
+        const busy = botBusy();
+        if (busy.busy) {
+          sendJson(res, 409, {
+            ok: false,
+            error: busyMessage(busy),
+            busy: true,
+            recording: busy.recording,
+            pendingClips: busy.pendingClips,
+          });
+          return;
+        }
+      }
+      const result = await pm2Action(action);
       log(`ação ${action}: ${result.ok ? 'ok' : `falhou (${result.error ?? result.output})`}`);
       if (!result.ok) {
         sendJson(res, 500, { ok: false, error: result.error ?? result.output });
         return;
       }
-      sendJson(res, 200, { ok: true, action, bot: getBotState(true) });
+      sendJson(res, 200, { ok: true, action, bot: await getBotState(true) });
       return;
     }
     if (action === 'open-clips') {
@@ -461,7 +638,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     const source = url.searchParams.get('source') === 'tray' ? 'tray' : 'bot';
     const requested = Number(url.searchParams.get('lines') ?? 240);
     const lines = Number.isFinite(requested) ? Math.min(1000, Math.max(20, Math.floor(requested))) : 240;
-    const file = source === 'tray' ? path.join(LOGS_DIR, 'bot-tray.log') : path.join(LOGS_DIR, 'bot.log');
+    const file = source === 'tray' ? path.join(LOGS_DIR, 'bot-tray.log') : botLogFile();
     const result = tailFile(file, 256 * 1024, lines);
     sendJson(res, 200, { ok: true, source, file: path.basename(file), ...result });
     return;

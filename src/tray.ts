@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import path from 'node:path';
+import { repoPath } from './paths.js';
 
 /**
  * Garante o ícone do bot na bandeja do Windows mesmo quando o bot é iniciado
@@ -11,7 +11,7 @@ import path from 'node:path';
 export function ensureTray(): void {
   if (process.platform !== 'win32') return;
   try {
-    const script = path.resolve('scripts', 'bot-tray.ps1');
+    const script = repoPath('scripts', 'bot-tray.ps1');
     if (!fs.existsSync(script)) return;
     // `start` (ShellExecute) desprende o processo do job do bot: um spawn
     // detached puro morre junto quando o shell/PM2 limpa a árvore.

@@ -99,10 +99,12 @@ describe('trayStatus writer', () => {
       lastPollAt: '2026-10-25T12:00:00.000Z',
       diskFreeGb: 42.5,
       lastError: 'falha temporária',
+      pendingClips: 2,
     });
     let status = readStatus(file);
     expect(status.phase).toBe('recording');
     expect(status.totals).toEqual({ live: 2, recording: 1, trackers: 1 });
+    expect(status.pendingClips).toBe(2);
     expect(status.lastPollAt).toBe('2026-10-25T12:00:00.000Z');
     expect(status.lastError?.message).toBe('falha temporária');
     expect(status.diskFreeGb).toBe(42.5);
@@ -145,6 +147,15 @@ describe('trayStatus writer', () => {
 
     shutdownTrayStatus();
     status = readStatus(file);
+    expect(status.phase).toBe('stopping');
+  });
+
+  it('publish depois do shutdown não volta a fase para monitoring', () => {
+    const file = statusFile();
+    initTrayStatus(cfg, file);
+    shutdownTrayStatus();
+    publishTraySnapshot({ matches: [makeMatch()] });
+    const status = readStatus(file);
     expect(status.phase).toBe('stopping');
   });
 });

@@ -284,7 +284,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'YT_PRIVACY',
     group: 'youtube',
     label: 'Privacidade do vídeo',
-    help: 'O fluxo do bot usa unlisted por padrão.',
+    help: 'O fluxo do bot usa private por padrão (revisão manual antes de publicar).',
     type: 'select',
     options: [
       { value: 'private', label: 'Privado' },
@@ -378,7 +378,8 @@ function unquoteEnvValue(raw: string): string {
 
 export function parseEnvFile(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const line of raw.split(/\r?\n/)) {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
@@ -426,13 +427,11 @@ export function updateEnvFile(
       if (!lineRe.test(lines[i])) continue;
       lines[i] = `${key}=${formatEnvValue(value)}`;
       replaced = true;
-      changedKeys.push(key);
-      break;
     }
     if (!replaced) {
       lines.push(`${key}=${formatEnvValue(value)}`);
-      changedKeys.push(key);
     }
+    changedKeys.push(key);
   }
   const next = `${lines.join(eol)}${eol}`;
   let backupPath: string | null = null;

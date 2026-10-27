@@ -33,6 +33,16 @@ export function getDb(dbFile: string): Database.Database {
       privacy TEXT NOT NULL DEFAULT 'private',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS discarded_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      match_id TEXT NOT NULL,
+      map TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      player TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      detected_at TEXT NOT NULL,
+      discarded_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
   return db;
 }
@@ -80,15 +90,47 @@ export function insertAce(dbFile: string, ace: AceEvent): number {
   return row.id;
 }
 
+export interface DiscardedEvent {
+  matchId: string;
+  map: string;
+  round: number;
+  player: string;
+  reason: string;
+  detectedAt?: string;
+}
+
 /**
- * Remove um ace (e clipes associados). Usado quando o evento se revela
- * fantasma (1ª kill fora do buffer) e não deve bloquear detecções futuras
- * da mesma chave via hasAce.
+ * Remove um ace (e clipes associados) e registra o descarte. Usado quando o
+ * evento se revela fantasma (sem footage no buffer) e não deve bloquear
+ * detecções futuras da mesma chave via hasAce.
  */
-export function deleteAce(dbFile: string, aceId: number): void {
+export function discardAce(dbFile: string, aceId: number, event: DiscardedEvent): void {
   const d = getDb(dbFile);
-  d.prepare('DELETE FROM clips WHERE ace_id=?').run(aceId);
-  d.prepare('DELETE FROM ace_events WHERE id=?').run(aceId);
+  const tx = d.transaction(() => {
+    d.prepare('DELETE FROM clips WHERE ace_id=?').run(aceId);
+    d.prepare('DELETE FROM ace_events WHERE id=?').run(aceId);
+    insertDiscarded(d, event);
+  });
+  tx();
+}
+
+/** Registra um descarte que nem chegou a ser gravado em ace_events. */
+export function recordDiscardedEvent(dbFile: string, event: DiscardedEvent): void {
+  insertDiscarded(getDb(dbFile), event);
+}
+
+function insertDiscarded(d: Database.Database, event: DiscardedEvent): void {
+  d.prepare(
+    `INSERT INTO discarded_events (match_id, map, round, player, reason, detected_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    event.matchId,
+    event.map,
+    event.round,
+    event.player,
+    event.reason,
+    event.detectedAt ?? new Date().toISOString(),
+  );
 }
 
 export function insertClip(

@@ -17,6 +17,7 @@ $LogFile = Join-Path $RepoRoot 'logs\bot-tray.log'
 $RepoLog = Join-Path $RepoRoot 'logs\bot.log'
 $StatusFile = Join-Path $RepoRoot 'data\tray-status.json'
 $PanelInfoFile = Join-Path $RepoRoot 'data\tray-panel.json'
+$IntentFile = Join-Path $RepoRoot 'data\tray-intent.json'
 $PanelJs = Join-Path $RepoRoot 'dist\scripts\tray-panel.js'
 $EnvFile = Join-Path $RepoRoot '.env'
 
@@ -51,16 +52,31 @@ function Invoke-Pm2([string[]]$pm2Args) {
 # ---------------------------------------------------------------------------
 $script:botState = $null
 $script:lastPm2Probe = [datetime]::MinValue
+$script:lastBotStatus = $null
+$script:lastBotStatusAt = [datetime]::MinValue
+$script:lastQuickConfigKey = ''
+$script:lastQuickConfigAt = [datetime]::MinValue
 
-function Get-BotPidFromPm2 {
+function Get-BotPm2Probe {
   try {
     $out = Invoke-Pm2 @('pid', $BotName)
     $nums = @($out | Where-Object { "$_" -match '^\s*(\d+)\s*$' } | ForEach-Object { [int]$Matches[1] })
-    if ($nums.Count -eq 1) { return $nums[0] }
-    return $null
+    if ($nums.Count -eq 1) { return @{ ok = $true; pid = $nums[0] } }
+    return @{ ok = $true; pid = $null }
   } catch {
-    return $null
+    return @{ ok = $false; pid = $null }
   }
+}
+
+# Bot iniciado FORA do PM2 (npm start): heartbeat fresco + processo vivo.
+function Get-StatusFileLivePid {
+  $status = Read-BotStatus
+  if ($status -eq $null -or $status.pid -eq $null) { return $null }
+  $botPid = [int]$status.pid
+  if ($botPid -le 0) { return $null }
+  if ((Get-AgeSeconds ([string]$status.heartbeatAt)) -ge 30) { return $null }
+  if (-not (Get-Process -Id $botPid -ErrorAction SilentlyContinue)) { return $null }
+  return $botPid
 }
 
 function Get-BotState {
@@ -75,11 +91,24 @@ function Get-BotState {
   if ($script:botState -ne $null -and ($now - $script:lastPm2Probe).TotalSeconds -lt 10) {
     return $script:botState
   }
-  $p = Get-BotPidFromPm2
+  $probe = Get-BotPm2Probe
   $script:lastPm2Probe = $now
-  if ($p -eq $null) { return $null }
-  $script:botState = @{ online = ($p -gt 0); pid = [int]$p }
-  return $script:botState
+  if ($probe.pid -ne $null -and [int]$probe.pid -gt 0) {
+    $script:botState = @{ online = $true; pid = [int]$probe.pid }
+    return $script:botState
+  }
+  # PM2 sem pid: bot pode estar rodando fora do PM2 — evita dupla instância.
+  $livePid = Get-StatusFileLivePid
+  if ($livePid -ne $null) {
+    $script:botState = @{ online = $true; pid = [int]$livePid; source = 'status' }
+    return $script:botState
+  }
+  if ($probe.ok) {
+    # PM2 respondeu e não há processo: parado de verdade (não "sem resposta").
+    $script:botState = @{ online = $false; pid = 0; source = 'pm2' }
+    return $script:botState
+  }
+  return $null
 }
 
 function Save-Pm2State {
@@ -118,12 +147,18 @@ function Get-EnvMap {
       if ($line -match '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
         $key = $Matches[1]
         $value = $Matches[2].Trim()
+        $quoted = $false
         if ($value.Length -ge 2) {
           $first = $value.Substring(0, 1)
           $last = $value.Substring($value.Length - 1, 1)
           if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
             $value = $value.Substring(1, $value.Length - 2)
+            $quoted = $true
           }
+        }
+        if (-not $quoted) {
+          $hash = $value.IndexOf(' #')
+          if ($hash -ge 0) { $value = $value.Substring(0, $hash).Trim() }
         }
         $map[$key] = $value
       }
@@ -133,9 +168,15 @@ function Get-EnvMap {
 }
 
 function Get-EnvValue([hashtable]$map, [string]$key, [string]$default) {
-  if ($map.ContainsKey($key) -and $map[$key] -ne '') { return [string]$map[$key] }
   if ($map.ContainsKey($key)) { return [string]$map[$key] }
   return $default
+}
+
+function Format-EnvValue([string]$value) {
+  if ($value -eq '') { return '' }
+  if (($value -match '^[A-Za-z0-9_.,:/+\-@%*= ]+$') -and ($value -notmatch '#')) { return $value }
+  $escaped = $value.Replace('\', '\\').Replace('"', '\"').Replace("`r`n", '\n').Replace("`n", '\n')
+  return '"' + $escaped + '"'
 }
 
 function Set-EnvValue([string]$key, [string]$value) {
@@ -150,12 +191,11 @@ function Set-EnvValue([string]$key, [string]$value) {
   $found = $false
   for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match "^\s*(?:export\s+)?$escaped\s*=") {
-      $lines[$i] = "$key=$value"
+      $lines[$i] = "$key=$(Format-EnvValue $value)"
       $found = $true
-      break
     }
   }
-  if (-not $found) { $lines.Add("$key=$value") }
+  if (-not $found) { $lines.Add("$key=$(Format-EnvValue $value)") }
   $dir = Split-Path -Parent $EnvFile
   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   $tmp = "$EnvFile.$PID.tmp"
@@ -164,18 +204,61 @@ function Set-EnvValue([string]$key, [string]$value) {
   Move-Item -LiteralPath $tmp -Destination $EnvFile -Force
 }
 
+function Test-BotBusy {
+  $status = Read-BotStatus
+  if ($status -eq $null) { return $null }
+  $recording = 0
+  $pending = 0
+  if ($status.totals -ne $null) { $recording = [int]$status.totals.recording }
+  if ($status.pendingClips -ne $null) { $pending = [int]$status.pendingClips }
+  if ($recording -le 0 -and $pending -le 0) { return $null }
+  $parts = @()
+  if ($recording -gt 0) { $parts += "$recording gravação(ões) em andamento" }
+  if ($pending -gt 0) { $parts += "$pending clipe(s) em andamento" }
+  return ($parts -join ' e ')
+}
+
+function Confirm-BusyRestart([string]$what) {
+  $busy = Test-BotBusy
+  if ($busy -eq $null) { return $true }
+  $answer = [System.Windows.Forms.MessageBox]::Show(
+    "$what`n`nO bot está com $busy. Reiniciar agora pode perder esse trabalho.`n`nContinuar?",
+    '5K Bot',
+    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+    [System.Windows.Forms.MessageBoxIcon]::Warning
+  )
+  return ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
 function Set-QuickConfig([string]$key, [string]$value, [string]$label) {
   try {
-    Set-EnvValue $key $value
+    $stamp = "$key=$value"
+    if ($script:lastQuickConfigKey -eq $stamp -and ((Get-Date) - $script:lastQuickConfigAt).TotalSeconds -lt 10) {
+      Write-TrayLog "ajuste rápido ignorado (repetido em menos de 10s): $stamp"
+      return
+    }
+    if ($key -eq 'YT_PRIVACY' -and $value -eq 'public') {
+      $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Salvar como PÚBLICO deixa o vídeo visível para qualquer pessoa no YouTube. A política do bot é private + revisão manual.`n`nContinuar?",
+        '5K Bot',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+      )
+      if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    }
     $state = Get-BotState
     $online = ($state -ne $null -and $state.online)
+    if ($online -and -not (Confirm-BusyRestart "Aplicar $label agora reinicia o bot.")) { return }
+    Set-EnvValue $key $value
+    $script:lastQuickConfigKey = $stamp
+    $script:lastQuickConfigAt = Get-Date
     if ($online) {
       Suppress-Toast
       Restart-Bot
-      Write-TrayLog "ajuste rápido: $key=$value (bot reiniciado)"
+      Write-TrayLog "ajuste rápido: $stamp (bot reiniciado)"
       Show-TrayBalloon '5K Bot' "$label salvo. Reiniciando para aplicar."
     } else {
-      Write-TrayLog "ajuste rápido: $key=$value (bot parado)"
+      Write-TrayLog "ajuste rápido: $stamp (bot parado)"
       Show-TrayBalloon '5K Bot' "$label salvo. Inicie o bot para aplicar."
     }
   } catch {
@@ -579,10 +662,36 @@ function Read-BotStatus {
   try {
     $raw = [System.IO.File]::ReadAllText($StatusFile, [System.Text.Encoding]::UTF8)
     if (-not $raw) { return $null }
+    $parsed = $raw | ConvertFrom-Json
+    $script:lastBotStatus = $parsed
+    $script:lastBotStatusAt = Get-Date
+    return $parsed
+  } catch {
+    if ($script:lastBotStatus -ne $null -and ((Get-Date) - $script:lastBotStatusAt).TotalSeconds -lt 10) {
+      return $script:lastBotStatus
+    }
+    return $null
+  }
+}
+
+function Read-Intent {
+  if (-not (Test-Path -LiteralPath $IntentFile)) { return $null }
+  try {
+    $raw = [System.IO.File]::ReadAllText($IntentFile, [System.Text.Encoding]::UTF8)
+    if (-not $raw) { return $null }
     return $raw | ConvertFrom-Json
   } catch {
     return $null
   }
+}
+
+function Apply-IntentSuppression {
+  $intent = Read-Intent
+  if ($intent -eq $null -or -not $intent.suppressUntil) { return }
+  try {
+    $until = [datetimeoffset]::Parse([string]$intent.suppressUntil, [System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime
+    if ($until -gt (Get-Date)) { $script:suppressToastUntil = $until }
+  } catch { }
 }
 
 function Get-AgeSeconds([string]$iso) {
@@ -598,9 +707,9 @@ function Get-AgeSeconds([string]$iso) {
 function Update-QuickChecks {
   $map = Get-EnvMap
   $upload = Get-EnvValue $map 'YT_UPLOAD' 'true'
-  $miQuickUpload.Checked = ($upload -ne 'false')
+  $miQuickUpload.Checked = ($upload.ToLower() -eq 'true')
 
-  $privacy = Get-EnvValue $map 'YT_PRIVACY' 'unlisted'
+  $privacy = Get-EnvValue $map 'YT_PRIVACY' 'private'
   $privacyPrivate.Checked = ($privacy -eq 'private')
   $privacyUnlisted.Checked = ($privacy -eq 'unlisted')
   $privacyPublic.Checked = ($privacy -eq 'public')
@@ -637,9 +746,13 @@ function Update-State {
   $onlineKnown = ($state -ne $null)
   $stale = $true
   $heartbeatAge = [double]::PositiveInfinity
+  $pidMismatch = $false
   if ($running -and $status -ne $null) {
     $heartbeatAge = Get-AgeSeconds ([string]$status.heartbeatAt)
     $stale = ($heartbeatAge -gt 90)
+    if ($status.pid -ne $null -and $state.pid -gt 0 -and [int]$status.pid -ne [int]$state.pid) {
+      $pidMismatch = $true
+    }
   }
   $errorRecent = $false
   if ($status -ne $null -and $status.lastError -ne $null) {
@@ -655,7 +768,7 @@ function Update-State {
   } elseif ($running) {
     if ($status -eq $null -or $stale) {
       $visual = 'warn'
-      if ($status -eq $null) { $label = 'Iniciando...' } else { $label = 'Sem resposta' }
+      if ($status -eq $null -or $pidMismatch) { $label = 'Iniciando...' } else { $label = 'Sem resposta' }
     } elseif ($errorRecent) {
       $visual = 'warn'
       $label = 'Atenção'
@@ -694,14 +807,14 @@ function Update-State {
   }
   $miSummary.Text = $summary
 
-  $matches = @()
+  $liveMatches = @()
   if ($running -and $status -ne $null -and $status.matches -ne $null) {
-    $matches = @($status.matches | Select-Object -First 2)
+    $liveMatches = @($status.matches | Select-Object -First 2)
   }
   $matchItems = @($miMatch1, $miMatch2)
   for ($i = 0; $i -lt $matchItems.Count; $i++) {
-    if ($i -lt $matches.Count) {
-      $m = $matches[$i]
+    if ($i -lt $liveMatches.Count) {
+      $m = $liveMatches[$i]
       $stateText = @{ recording = 'REC'; tracking = 'tracker'; waiting = 'aguardando'; 'no-stream' = 'sem stream' }[[string]$m.state]
       if (-not $stateText) { $stateText = [string]$m.state }
       $streamText = ''
@@ -757,6 +870,7 @@ function Update-State {
   }
 
   $intentionalStop = ($status -ne $null -and $status.phase -eq 'stopping')
+  Apply-IntentSuppression
   if ($script:lastOnline -ne $null -and $script:lastOnline -and -not $running -and $onlineKnown -and -not $intentionalStop -and (Get-Date) -gt $script:suppressToastUntil) {
     Show-TrayBalloon '5K Bot' 'O bot parou inesperadamente. Clique com o botão direito para Iniciar.'
     Write-TrayLog 'bot parou inesperadamente (toast exibido)'
@@ -790,6 +904,7 @@ function On-StartClicked {
 
 function On-RestartClicked {
   try {
+    if (-not (Confirm-BusyRestart 'Reiniciar o bot agora?')) { return }
     Suppress-Toast
     Restart-Bot
     Write-TrayLog 'Reiniciar bot: ok'

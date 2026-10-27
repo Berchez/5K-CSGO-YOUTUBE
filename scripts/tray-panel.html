@@ -619,7 +619,10 @@
         $('#mLive').textContent = String(totals.live || 0);
         $('#mLiveHint').textContent = !online ? 'Bot parado' : (status && status.lastPollAt ? 'Ultimo poll ' + relativeTime(status.lastPollAt) : 'Aguardando o primeiro poll');
         $('#mRecording').textContent = String(totals.recording || 0);
-        $('#mRecordingHint').textContent = totals.recording > 0 ? 'Buffer sendo gravado' : 'Nenhum buffer ativo';
+        const pendingClips = Number((status && status.pendingClips) || 0);
+        $('#mRecordingHint').textContent = totals.recording > 0
+          ? (pendingClips > 0 ? 'Buffer em gravação · ' + pendingClips + ' clipe(s) em andamento' : 'Buffer sendo gravado')
+          : (pendingClips > 0 ? pendingClips + ' clipe(s) em andamento' : 'Nenhum buffer ativo');
         $('#mTrackers').textContent = String(totals.trackers || 0);
         $('#mTrackersHint').textContent = totals.trackers > 0 ? 'Detectando multikills' : 'Nenhum tracker ativo';
         const disk = online && status ? status.diskFreeGb : null;
@@ -834,6 +837,17 @@
         }
       }
 
+      function botBusyState() {
+        const status = state.status;
+        if (!status) return null;
+        const recording = Number((status.totals && status.totals.recording) || 0);
+        const pending = Number(status.pendingClips || 0);
+        const parts = [];
+        if (recording > 0) parts.push(recording + ' gravação(ões) em andamento');
+        if (pending > 0) parts.push(pending + ' clipe(s) em andamento');
+        return parts.length ? 'O bot está com ' + parts.join(' e ') + '.' : null;
+      }
+
       async function saveConfig(restart) {
         const values = {};
         for (const key of Object.keys(state.formValues)) {
@@ -843,13 +857,28 @@
           toast('Nenhuma alteração para salvar.', 'warn');
           return;
         }
+        let force = false;
+        if (restart) {
+          const busy = botBusyState();
+          if (busy) {
+            const ok = window.confirm(busy + '\n\nReiniciar agora pode perder esse trabalho. Continuar mesmo assim?');
+            if (!ok) return;
+            force = true;
+          }
+        }
+        let confirmPublic = false;
+        if (values.YT_PRIVACY === 'public') {
+          const ok = window.confirm('Salvar como PÚBLICO deixa o vídeo visível para qualquer pessoa no YouTube. A política do bot é private + revisão manual.\n\nContinuar?');
+          if (!ok) return;
+          confirmPublic = true;
+        }
         const save = $('#btnSave');
         const saveRestart = $('#btnSaveRestart');
         save.disabled = true;
         saveRestart.disabled = true;
         clearErrors();
         try {
-          const result = await api('/api/config', { method: 'POST', body: JSON.stringify({ values, restart: Boolean(restart) }) });
+          const result = await api('/api/config', { method: 'POST', body: JSON.stringify({ values, restart: Boolean(restart), force, confirmPublic }) });
           state.initialValues = Object.assign({}, state.formValues);
           if (state.config && state.config.values) Object.assign(state.config.values, state.formValues);
           updateDirty();
@@ -942,9 +971,18 @@
 
       async function doAction(action) {
         const labels = { start: 'Iniciando...', stop: 'Parando...', restart: 'Reiniciando...' };
+        let force = false;
+        if (action === 'restart') {
+          const busy = botBusyState();
+          if (busy) {
+            const ok = window.confirm(busy + '\n\nReiniciar agora pode perder esse trabalho. Continuar mesmo assim?');
+            if (!ok) return;
+            force = true;
+          }
+        }
         if (labels[action]) toast(labels[action]);
         try {
-          const result = await api('/api/action', { method: 'POST', body: JSON.stringify({ action }) });
+          const result = await api('/api/action', { method: 'POST', body: JSON.stringify({ action, force }) });
           if (labels[action]) toast('Ação concluída.', 'success');
           if (result.bot) { state.bot = result.bot; renderGlobal(); }
           await loadStatus(true);
@@ -955,7 +993,7 @@
       }
 
       function switchTab(tab) {
-        if (!TITLES[tab]) tab = 'overview';
+        if (!Object.hasOwn(TITLES, tab)) tab = 'overview';
         state.tab = tab;
         $$('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.tab === tab));
         $$('.view').forEach((view) => view.classList.toggle('active', view.id === 'view-' + tab));
@@ -964,7 +1002,7 @@
         history.replaceState(null, '', '#' + tab);
         if (tab === 'overview') { renderOverview(); }
         if (tab === 'matches') { renderMatches(); }
-        if (tab === 'settings' && (!state.configLoaded || !state.dirty)) { void loadConfig(false); }
+        if (tab === 'settings' && (!state.configLoaded || !state.dirty)) { void loadConfig(true); }
         if (tab === 'logs') { void loadLogs(); }
         if (tab === 'clips') { renderClips(); void loadClips(); }
       }
@@ -1024,11 +1062,12 @@
       $('#logOutput').addEventListener('scroll', () => { /* reservado para pausar auto-scroll no futuro */ });
 
       const initialHash = location.hash.replace('#', '');
-      switchTab(TITLES[initialHash] ? initialHash : 'overview');
+      switchTab(Object.hasOwn(TITLES, initialHash) ? initialHash : 'overview');
       void loadStatus(true);
       void loadConfig(false);
       void loadClips();
-      setInterval(() => { void loadStatus(false); }, 3000);
+      setInterval(() => { if (!document.hidden) void loadStatus(false); }, 3000);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) void loadStatus(true); });
       setInterval(() => {
         if (state.tab === 'logs' && $('#logAuto').checked) void loadLogs();
       }, 5000);

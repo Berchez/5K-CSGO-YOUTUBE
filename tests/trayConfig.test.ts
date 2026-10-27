@@ -40,6 +40,12 @@ describe('parseEnvFile', () => {
     expect(values.STREAM_PRIORITY).toBe('official,en');
     expect(values.AV_STATIC_MATCHES).toBe('2399000,2399001');
   });
+
+  it('lê arquivo com BOM (a 1ª chave não some)', () => {
+    const values = parseEnvFile('\uFEFFMIN_STARS=2\nYT_UPLOAD=true\n');
+    expect(values.MIN_STARS).toBe('2');
+    expect(values.YT_UPLOAD).toBe('true');
+  });
 });
 
 describe('updateEnvFile', () => {
@@ -85,6 +91,16 @@ describe('updateEnvFile', () => {
     const file = path.join(dir, '.env');
     fs.writeFileSync(file, 'MIN_STARS=2\n', 'utf8');
     expect(() => updateEnvFile(file, { GC_TOKEN: 'x' })).toThrow(/não editável/i);
+  });
+
+  it('substitui todas as ocorrências da chave (dotenv usa a última)', () => {
+    const dir = tempDir();
+    const file = path.join(dir, '.env');
+    fs.writeFileSync(file, ['MIN_STARS=1', 'YT_UPLOAD=true', 'MIN_STARS=1', ''].join('\n'), 'utf8');
+    updateEnvFile(file, { MIN_STARS: '3' });
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw.match(/^MIN_STARS=3$/gm)).toHaveLength(2);
+    expect(parseEnvFile(raw).MIN_STARS).toBe('3');
   });
 });
 

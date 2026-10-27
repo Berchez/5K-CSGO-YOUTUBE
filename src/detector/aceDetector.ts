@@ -209,22 +209,56 @@ export class RoundTracker {
    * Nome novo ou contagem menor só reancora (sem spike falso). É a guarda
    * exata contra re-observação — dispensa dedup para sintetizados.
    *
-   * Retorna true quando alguma contagem DIMINUIU (o HLTV zerou/reiniciou as
-   * stats: troca de mapa ou repopulação durante o break). Nesse caso não
-   * sintetiza diffs e deixa o chamador decidir se as kills pendentes ainda
-   * valem (virada de round) ou são de outra época (mudança só de stats).
+   * Retorna true quando as stats foram ZERADAS de verdade (troca de mapa ou
+   * repopulação durante o break). Queda GRANDE (2+ pontos ou valor zerado)
+   * de quem tem kills pendentes, ou queda grande em metade dos jogadores,
+   * marca o round como suspecto e ele é descartado. Queda de 1 ponto em quem
+   * tem kills pendentes é tratada como glitch de célula: a base é mantida
+   * (reancorar para baixo criaria kill fantasma na volta) e o round segue.
+   * Queda isolada de jogador SEM kills pendentes só reancora ele; queda da
+   * coluna D ilegível não conta (D ausente = desconhecido, não 0).
    */
   syncBaseline(players: Array<{ name: string; kills: number; deaths?: number }>): boolean {
-    let statsReset = false;
+    const pendingByPlayer = new Map<string, number>();
+    for (const kill of this.kills) {
+      const key = kill.killer.trim().toLowerCase();
+      if (!key) continue;
+      pendingByPlayer.set(key, (pendingByPlayer.get(key) ?? 0) + 1);
+    }
+    const smallKDrops = new Set<string>();
+    const smallDDrops = new Set<string>();
+    let compared = 0;
+    let bigDropped = 0;
+    let suspect = false;
     for (const p of players) {
       const rawName = p.name.trim();
       if (!rawName || isRoundMarker(rawName)) continue;
       const key = rawName.toLowerCase();
       const prevK = this.lastCounts.get(key);
-      if (prevK !== undefined && p.kills < prevK) statsReset = true;
       const prevD = this.lastDeaths.get(key);
-      if (prevD !== undefined && (p.deaths ?? 0) < prevD) statsReset = true;
+      if (prevK === undefined && prevD === undefined) continue;
+      compared++;
+      const deathsKnown = typeof p.deaths === 'number' && Number.isFinite(p.deaths);
+      const kDrop = prevK !== undefined && p.kills < prevK;
+      const dDrop = prevD !== undefined && deathsKnown && (p.deaths as number) < prevD;
+      if (!kDrop && !dDrop) continue;
+      const kBig =
+        kDrop && ((prevK as number) - p.kills >= 2 || (p.kills === 0 && (prevK as number) > 0));
+      const dBig =
+        dDrop &&
+        ((prevD as number) - (p.deaths as number) >= 2 ||
+          ((p.deaths as number) === 0 && (prevD as number) > 0));
+      const pending = (pendingByPlayer.get(key) ?? 0) > 0;
+      if (kBig || dBig) {
+        bigDropped++;
+        if (pending) suspect = true;
+      } else if (pending) {
+        if (kDrop) smallKDrops.add(key);
+        if (dDrop) smallDDrops.add(key);
+      }
     }
+    const broadReset = compared > 0 && bigDropped >= 2 && bigDropped * 2 >= compared;
+    const statsReset = suspect || broadReset;
     if (statsReset) {
       // Época nova de stats: reancora sem gerar kills. As pendentes ficam
       // com o chamador (round fechando ainda pode emitir o que já viu).
@@ -235,7 +269,9 @@ export class RoundTracker {
         if (!rawName || isRoundMarker(rawName)) continue;
         const key = rawName.toLowerCase();
         this.lastCounts.set(key, p.kills);
-        this.lastDeaths.set(key, p.deaths ?? 0);
+        if (typeof p.deaths === 'number' && Number.isFinite(p.deaths)) {
+          this.lastDeaths.set(key, p.deaths);
+        }
       }
       return true;
     }
@@ -245,20 +281,26 @@ export class RoundTracker {
       const rawName = p.name.trim();
       if (!rawName || isRoundMarker(rawName)) continue;
       const key = rawName.toLowerCase();
+      if (smallKDrops.has(key) && smallDDrops.has(key)) continue;
       const prevK = this.lastCounts.get(key);
-      if (prevK === undefined || p.kills !== prevK) {
+      if (!smallKDrops.has(key) && (prevK === undefined || p.kills !== prevK)) {
         if (prevK !== undefined && p.kills > prevK) {
           newKills.push({ name: rawName, n: p.kills - prevK });
         }
         this.lastCounts.set(key, p.kills);
       }
-      const d = p.deaths ?? 0;
+      // D ilegível/ausente: mantém a última contagem conhecida (virar 0
+      // aqui criaria vítimas fantasma no próximo poll).
+      const deathsKnown = typeof p.deaths === 'number' && Number.isFinite(p.deaths);
       const prevD = this.lastDeaths.get(key);
-      if (prevD === undefined || d !== prevD) {
-        if (prevD !== undefined && d > prevD) {
-          for (let i = 0; i < d - prevD; i++) victimPool.push(rawName);
+      if (deathsKnown && !smallDDrops.has(key)) {
+        const d = p.deaths as number;
+        if (prevD === undefined || d !== prevD) {
+          if (prevD !== undefined && d > prevD) {
+            for (let i = 0; i < d - prevD; i++) victimPool.push(rawName);
+          }
+          this.lastDeaths.set(key, d);
         }
-        this.lastDeaths.set(key, d);
       }
     }
     // Excesso de mortes = bomba/queda (não vira vítima de ninguém);

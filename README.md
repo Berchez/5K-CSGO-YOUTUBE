@@ -252,4 +252,7 @@ Missing fields come as `undefined` and the text degrades on its own.
 - HLTV has Cloudflare: selectors are by class/`data-*` with fallback, but the layout can break — see `logs/bot.log`.
 - Max `MAX_RECORDINGS=2` by default so as not to overload the PC.
 - No buffer = no clip (the event is saved in sqlite, you can cut it later via VOD — outside the MVP).
+- The tracker only runs while a recorder is up: a match without a stream produces no event row at all. If the last recorder drops, the tracker keeps running for one more poll (to close the round) and then stops.
+- Matches listed as 0★ (no rating in the listing) only yield a clip at `MIN_KILLS_NO_STARS` (default 5 = ACE); a 4★ match yields a clip from `MIN_KILLS` (default 4).
+- An event whose kills have no footage in the buffer is discarded and recorded in `discarded_events` (sqlite) instead of being deleted silently.
 - Rights: even an official stream can trigger Content ID. Starting private + reviewing the title/description is intentional.

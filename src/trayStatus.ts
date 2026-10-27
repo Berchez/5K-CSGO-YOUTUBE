@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { AppConfig } from './config.js';
+import { repoPath } from './paths.js';
 
 export type TrayPhase = 'starting' | 'monitoring' | 'recording' | 'stopping' | 'error';
 
@@ -69,6 +70,7 @@ export interface TrayStatus {
   };
   lastClip: TrayStatusClip | null;
   diskFreeGb: number | null;
+  pendingClips: number;
   config: TrayStatusConfig;
 }
 
@@ -78,9 +80,10 @@ export interface TrayStatusSnapshot {
   lastPollAt?: string;
   lastError?: string | null;
   diskFreeGb?: number | null;
+  pendingClips?: number;
 }
 
-const STATUS_PATH = path.resolve('data', 'tray-status.json');
+const STATUS_PATH = repoPath('data', 'tray-status.json');
 const HEARTBEAT_MS = 5_000;
 
 let status: TrayStatus | null = null;
@@ -135,6 +138,7 @@ export function initTrayStatus(cfg: AppConfig, customStatusPath?: string): void 
     totals: { live: 0, recording: 0, trackers: 0 },
     lastClip: null,
     diskFreeGb: null,
+    pendingClips: 0,
     config: {
       minStars: cfg.MIN_STARS,
       minKills: cfg.MIN_KILLS,
@@ -199,7 +203,7 @@ export function publishTraySnapshot(snapshot: TrayStatusSnapshot): void {
     ...status,
     matches,
     totals: summarizeTrayMatches(matches),
-    phase: snapshot.phase ?? phaseForMatches(matches),
+    phase: status.phase === 'stopping' ? 'stopping' : snapshot.phase ?? phaseForMatches(matches),
     lastPollAt: snapshot.lastPollAt ?? status.lastPollAt,
     lastError:
       snapshot.lastError === undefined
@@ -208,6 +212,7 @@ export function publishTraySnapshot(snapshot: TrayStatusSnapshot): void {
           ? null
           : { at: nowIso(), message: snapshot.lastError },
     diskFreeGb: snapshot.diskFreeGb === undefined ? status.diskFreeGb : snapshot.diskFreeGb,
+    pendingClips: snapshot.pendingClips ?? status.pendingClips,
     heartbeatAt: nowIso(),
   };
   writeStatusTo(statusPath);
