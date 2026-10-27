@@ -17,6 +17,7 @@ import {
   minKillsForStars,
   selectStream,
 } from './monitor/hltvMonitor.js';
+import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
@@ -38,6 +39,7 @@ import {
 import type { TrayMatchState, TrayStatusMatch } from './trayStatus.js';
 import type { AceEvent, ClipResult, LiveMatch, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
+import type { WatchlistDoc } from './watchlist.js';
 
 // Streams por partida (a página do match raramente muda mid-game —
 // buscar 1x evita N page loads por ciclo e rate-limit do Cloudflare).
@@ -50,6 +52,10 @@ const streamsCache = new Map<string, StreamInfo[]>();
 const streamsMiss = new Map<string, { at: number; blocked: boolean }>();
 const STREAMS_MISS_TTL_MS = 10 * 60_000;
 const STREAMS_BLOCKED_TTL_MS = 60_000;
+// Todas as URLs do cache falharam: evita um page-load novo a cada poll
+// enquanto as mesmas candidatas estão queimadas (TTL de falha = 5 min).
+const streamsAllFailedRetry = new Map<string, number>();
+const STREAMS_ALL_FAILED_RETRY_MS = 2 * 60_000;
 const failedStreams = new Map<string, Map<string, number>>();
 const STREAM_FAILED_TTL_MS = 5 * 60_000;
 
@@ -107,8 +113,30 @@ const refsCache = new Map<string, ReferenceImages>();
 // partida com clipe em andamento — o ace do round final é justamente o que
 // a espera do fim ancorado pode atravessar. O build trabalha sobre um
 // SNAPSHOT dos segmentos; o buffer físico sai no ciclo seguinte.
-const pendingClips = new Set<string>();
+// Contador por partida: dois aces simultâneos não podem liberar o guard
+// quando só um clipe terminou.
+const pendingClips = new Map<string, number>();
 const deferredBufferCleanup = new Set<string>();
+
+// Última versão boa da watchlist vista no poll. Trackers em andamento leem
+// daqui a cada round (hot-reload não fica preso ao início da partida).
+let activeWatchlist: WatchlistDoc | null = null;
+
+function pendingClipCount(): number {
+  let total = 0;
+  for (const count of pendingClips.values()) total += count;
+  return total;
+}
+
+function addPendingClip(matchId: string): void {
+  pendingClips.set(matchId, (pendingClips.get(matchId) ?? 0) + 1);
+}
+
+function removePendingClip(matchId: string): void {
+  const remaining = (pendingClips.get(matchId) ?? 0) - 1;
+  if (remaining > 0) pendingClips.set(matchId, remaining);
+  else pendingClips.delete(matchId);
+}
 
 /** Copia os segmentos escolhidos PRESERVANDO o mtime (pipeline mtime-driven). */
 function snapshotSegments(files: string[], destDir: string): string[] {
@@ -191,7 +219,7 @@ function trayMatchesFrom(
       team2: m.team2,
       event: m.event,
       stars: m.stars,
-      minKills: minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
+      minKills: m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
       matchPageUrl: m.matchPageUrl,
       state,
       stream: stream
@@ -224,7 +252,7 @@ function publishTrayStatus(
     lastPollAt: now,
     lastError: opts?.lastError ?? null,
     diskFreeGb: free == null ? null : Math.round((free / 1024 ** 3) * 10) / 10,
-    pendingClips: pendingClips.size,
+    pendingClips: pendingClipCount(),
   });
 }
 
@@ -375,10 +403,10 @@ async function handleAce(
     return;
   }
   const aceId = insertAce(cfg.DB_PATH, ace);
-  pendingClips.add(matchId);
+  addPendingClip(matchId);
   // Guarda de restart (tray/painel) lê o status: publica já, sem esperar
   // o fim do poll — a janela logo após a detecção é a mais crítica.
-  patchTrayStatus({ pendingClips: pendingClips.size });
+  patchTrayStatus({ pendingClips: pendingClipCount() });
   const snapDirs: string[] = [];
   try {
     let segments = recorder?.listSegments() ?? [];
@@ -713,8 +741,8 @@ async function handleAce(
     log.error({ err: String(e) }, 'falha ao montar clipe');
   } finally {
     for (const dir of snapDirs) fs.rmSync(dir, { recursive: true, force: true });
-    pendingClips.delete(matchId);
-    patchTrayStatus({ pendingClips: pendingClips.size });
+    removePendingClip(matchId);
+    patchTrayStatus({ pendingClips: pendingClipCount() });
   }
 }
 
@@ -723,10 +751,39 @@ async function pollOnce(): Promise<void> {
   const log = getLogger();
   getDb(cfg.DB_PATH);
 
+  // Watchlist: hot-reload por mtime (barato a cada poll). JSON inválido
+  // mantém a última versão boa; arquivo ausente mantém a última versão por
+  // até 1 min (save/rename do editor) e depois cai na política por estrelas.
+  const watchlist = loadWatchlistFile(repoPath('data', 'watchlist.json'));
+  activeWatchlist = watchlist.doc;
+  if (watchlist.changed) {
+    if (watchlist.error) {
+      log.warn({ err: watchlist.error }, 'watchlist inválida - mantendo última versão boa');
+    } else if (watchlist.missing && watchlist.stale) {
+      log.warn('watchlist ausente - mantendo última versão boa por até 1 min');
+    } else if (watchlist.missing) {
+      log.info('watchlist não encontrada - usando política por estrelas');
+    } else {
+      log.info(
+        {
+          enabled: watchlist.doc.enabled,
+          teams: watchlist.doc.teams.length,
+          players: watchlist.doc.players.length,
+        },
+        'watchlist carregada',
+      );
+    }
+  }
+
   const matches = await fetchLiveMatches(
     cfg.HLTV_MATCHES_URL,
     cfg.MIN_STARS,
     cfg.TOP_TIER_ONLY,
+    {
+      watchlist: watchlist.doc,
+      starredMinKills: cfg.MIN_KILLS,
+      unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
+    },
   );
   if (!matches) {
     log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
@@ -749,6 +806,7 @@ async function pollOnce(): Promise<void> {
         selectedStreams.delete(id);
         streamsCache.delete(id);
         streamsMiss.delete(id);
+        streamsAllFailedRetry.delete(id);
         log.info({ matchId: id }, 'recorder morto, vai recriar com streams frescas');
       }
     }
@@ -760,6 +818,9 @@ async function pollOnce(): Promise<void> {
         // Vazia/bloqueada entra com TTL negativo em vez de rebuscar a cada
         // ciclo — cada rebusca é uma aba nova no browser.
         let streams = streamsCache.get(m.matchId);
+        if (!streams && (streamsAllFailedRetry.get(m.matchId) ?? 0) > Date.now()) {
+          streams = [];
+        }
         if (!streams) {
           const miss = streamsMiss.get(m.matchId);
           const missTtl = miss?.blocked ? STREAMS_BLOCKED_TTL_MS : STREAMS_MISS_TTL_MS;
@@ -775,6 +836,7 @@ async function pollOnce(): Promise<void> {
             } else if (fetched.length > 0) {
               streamsCache.set(m.matchId, fetched);
               streamsMiss.delete(m.matchId);
+              streamsAllFailedRetry.delete(m.matchId);
               streams = fetched;
             } else {
               streamsMiss.set(m.matchId, { at: Date.now(), blocked: false });
@@ -787,8 +849,10 @@ async function pollOnce(): Promise<void> {
         const available = streams.filter((s) => !failedUrls.has(s.url));
         if (streams.length > 0 && available.length === 0) {
           // Todas as candidatas do cache falharam: a lista pode estar velha
-          // (URL expirada). Só agora vale pagar um novo page-load.
+          // (URL expirada). Só agora vale pagar um novo page-load — e não a
+          // cada poll enquanto as falhas ainda estão no TTL.
           streamsCache.delete(m.matchId);
+          streamsAllFailedRetry.set(m.matchId, Date.now() + STREAMS_ALL_FAILED_RETRY_MS);
         }
         const choice = selectStream(available, cfg.STREAM_PRIORITY, {
           country: cfg.STREAM_PREFERRED_COUNTRY,
@@ -886,10 +950,31 @@ async function pollOnce(): Promise<void> {
         log.info({ matchId: m.matchId }, 'sem recorder, tracking encerrado');
       }
     } else if (!activeTrackers.has(m.matchId)) {
-      const minKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
+      const baseMinKills =
+        m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
+      // Recalcula a cada round: hot-reload da watchlist vale para partidas já
+      // em andamento. Jogador listado vence o limiar do time/default.
+      const minKillsFor = (player: string): number => {
+        const live = activeWatchlist;
+        const base = resolveMatchRule(
+          live,
+          [m.team1, m.team2],
+          minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
+        ).minKills;
+        return resolvePlayerRule(live, player)?.minKills ?? base;
+      };
       const token = Symbol(m.matchId);
       activeTrackers.set(m.matchId, token);
-      log.info({ matchId: m.matchId, stars: m.stars, minKills }, 'iniciando tracker de multikill');
+      log.info(
+        {
+          matchId: m.matchId,
+          stars: m.stars,
+          minKills: baseMinKills,
+          watchlisted: m.watchlisted ?? false,
+          teams: m.watchlistedTeams?.join(', ') || undefined,
+        },
+        'iniciando tracker de multikill',
+      );
       trackMatch(m.matchPageUrl, m.matchId, {
         shouldStop: () => stopping || activeTrackers.get(m.matchId) !== token,
         onAce: (a) => {
@@ -926,7 +1011,7 @@ async function pollOnce(): Promise<void> {
             cfg,
           ).catch((e) => log.error({ err: String(e) }, 'erro no handleAce'));
         },
-      }, minKills)
+      }, minKillsFor)
         .catch((e) => log.warn({ err: String(e) }, 'tracker encerrou com erro'))
         .finally(() => {
           if (activeTrackers.get(m.matchId) === token) activeTrackers.delete(m.matchId);
@@ -948,6 +1033,7 @@ async function pollOnce(): Promise<void> {
       activeTrackers.delete(id);
       streamsCache.delete(id);
       streamsMiss.delete(id);
+      streamsAllFailedRetry.delete(id);
       failedStreams.delete(id);
       for (const key of refsCache.keys()) {
         if (key === id || key.startsWith(`${id}:`)) refsCache.delete(key);

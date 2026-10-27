@@ -19,6 +19,12 @@ export interface LiveMatch {
   isTopTierGuess: boolean;
   matchPageUrl: string;
   streams: StreamInfo[];
+  /** Limiar efetivo de kills (watchlist vence a política por estrelas). */
+  minKills?: number;
+  /** Times da watchlist que casaram com a partida. */
+  watchlistedTeams?: string[];
+  /** true quando entrou pelo override da watchlist (mesmo com 0-1★). */
+  watchlisted?: boolean;
 }
 
 export interface KillEvent {

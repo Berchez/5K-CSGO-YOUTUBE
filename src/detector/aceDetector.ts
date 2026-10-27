@@ -71,11 +71,14 @@ export function prettyWeapon(w: string): string {
 }
 
 /**
- * Selo do multikill pelo nº de kills: ACE (5+), 3K, 4K — mesma convenção
- * em título, thumb, descrição e prompt IA. Sem dado (<3) cai no legado ACE!.
+ * Selo do multikill pelo nº de kills: ACE (5+), 2K, 3K, 4K — mesma
+ * convenção em título, thumb, descrição e prompt IA. Sem dado (<2) cai no
+ * legado ACE!.
  */
 export function killLabel(killCount: number): string {
-  return killCount >= 5 ? 'ACE' : killCount >= 3 ? `${killCount}K` : 'ACE';
+  if (killCount >= 5) return 'ACE';
+  if (killCount >= 2) return `${killCount}K`;
+  return 'ACE';
 }
 
 export interface MultiKill {
@@ -83,12 +86,26 @@ export interface MultiKill {
   kills: KillEvent[];
 }
 
+/** Limiar fixo ou por jogador (watchlist de jogadores). */
+export type MinKillsRule = number | ((player: string) => number);
+
+export function requiredKills(rule: MinKillsRule, player: string): number {
+  if (typeof rule !== 'function') return rule;
+  const n = rule(player);
+  // Resolver quebrado não pode virar clipe a torto: exige o máximo.
+  return Number.isFinite(n) ? n : 5;
+}
+
 /**
  * Detecta multikill: jogador com mais kills no round, exigindo ao menos
  * minKills (default 3: 3k/4k/5k). Desempate: quem chegou primeiro.
+ * minKills pode ser um número ou uma função por jogador (watchlist).
  * Retorna null se ninguém atingir o mínimo.
  */
-export function detectMultiKill(kills: KillEvent[], minKills = 3): MultiKill | null {
+export function detectMultiKill(
+  kills: KillEvent[],
+  minKills: MinKillsRule = 3,
+): MultiKill | null {
   const byPlayer = new Map<string, KillEvent[]>();
   const order: string[] = [];
   for (const k of kills) {
@@ -103,8 +120,10 @@ export function detectMultiKill(kills: KillEvent[], minKills = 3): MultiKill | n
   }
   let best: string | null = null;
   for (const key of order) {
-    const n = byPlayer.get(key)!.length;
-    if (n >= minKills && (!best || n > byPlayer.get(best)!.length)) best = key;
+    const arr = byPlayer.get(key)!;
+    const n = arr.length;
+    if (n < requiredKills(minKills, arr[0].killer.trim())) continue;
+    if (!best || n > byPlayer.get(best)!.length) best = key;
   }
   if (!best) return null;
   const arr = byPlayer.get(best)!;
@@ -330,7 +349,7 @@ export class RoundTracker {
    * sempre a contagem MÁXIMA do round (um evento por round/jogador, sem
    * duplicar 3k→4k→5k). kills = SÓ os do autor (metadados honestos).
    */
-  closeRound(minKills = 3): { player: string | null; kills: KillEvent[] } {
+  closeRound(minKills: MinKillsRule = 3): { player: string | null; kills: KillEvent[] } {
     const m = detectMultiKill(this.kills, minKills);
     const kills = m ? m.kills : [];
     this.kills = [];

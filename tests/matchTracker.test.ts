@@ -80,6 +80,40 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.lastTotal).toBe(7);
   });
 
+  it('limiar por jogador (watchlist) fecha o round com 2k só do listado', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'KSCERATO', kills: 10 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(3, 3, [{ name: 'KSCERATO', kills: 12 }]), last, 3);
+    last = r.lastTotal;
+    expect(r.event).toBeNull();
+    const minKillsFor = (p: string) => (p.toLowerCase() === 'kscerato' ? 2 : 3);
+    r = processPoll(tr, snap(4, 3, [{ name: 'KSCERATO', kills: 12 }]), last, minKillsFor);
+    expect(r.event?.player).toBe('KSCERATO');
+    expect(r.event?.kills).toHaveLength(2);
+  });
+
+  it('limiar por jogador não afrouxa quem está fora da lista', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'KSCERATO', kills: 10 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(3, 3, [{ name: 'KSCERATO', kills: 12 }]), last, 3);
+    last = r.lastTotal;
+    const minKillsFor = (p: string) => (p.toLowerCase() === 'kscerato' ? 2 : 3);
+    r = processPoll(tr, snap(4, 3, [{ name: 'KSCERATO', kills: 12 }]), last, minKillsFor);
+    expect(r.event?.player).toBe('KSCERATO');
+    // Round novo: 2 kills de quem NÃO está na lista — não dispara.
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'KSCERATO', kills: 12 }, { name: 'outro', kills: 0 }]), last, minKillsFor);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'KSCERATO', kills: 12 }, { name: 'outro', kills: 2 }]), last, minKillsFor);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(5, 3, [{ name: 'KSCERATO', kills: 12 }, { name: 'outro', kills: 2 }]), last, minKillsFor);
+    expect(r.event).toBeNull();
+  });
+
   it('descarta multikill impossível (>5, gap corrompeu a base)', () => {
     expect(MAX_KILLS_PER_ROUND).toBe(5);
     const tr = new RoundTracker('inferno', 1);
@@ -150,6 +184,39 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     r = processPoll(tr, after, r.lastTotal, 3, 10_000, before);
     expect(r.event?.scoreBefore).toBe('5-2');
     expect(r.event?.scoreAfter).toBe('6-2');
+  });
+
+  it('reset no fechamento sem kills pendentes não loga descarte falso', () => {
+    const tr = new RoundTracker('Nuke', 1);
+    let last = -1;
+    const players = [
+      { name: 'a', kills: 5 },
+      { name: 'b', kills: 5 },
+    ];
+    let r = processPoll(tr, snap(0, 0, players, 'Nuke'), last, 3);
+    last = r.lastTotal;
+    expect(tr.pending).toBe(0);
+    // Placar vira e as duas stats zeram: reset amplo sem nada pendente.
+    r = processPoll(
+      tr,
+      snap(1, 0, [{ name: 'a', kills: 0 }, { name: 'b', kills: 0 }], 'Nuke'),
+      last,
+      3,
+    );
+    expect(r.dropped).toBeNull();
+    expect(r.roundClosed).toEqual({ map: 'Nuke', round: 2, score: '1-0' });
+  });
+
+  it('resolver NaN não descarta um 5k válido (usa o máximo)', () => {
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 0 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 5 }]), last, 3);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'x', kills: 5 }]), last, () => Number.NaN);
+    expect(r.event?.player).toBe('x');
+    expect(r.event?.kills).toHaveLength(5);
   });
 });
 

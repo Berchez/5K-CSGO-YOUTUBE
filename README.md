@@ -14,7 +14,7 @@ HLTV /matches (Playwright, 45s) → filtro MIN_STARS (0 = tudo)
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds.
+Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records even at 0–1★ with its own threshold (see below).
 
 ## Prerequisites (Windows)
 
@@ -83,6 +83,41 @@ The bot also spawns the tray on startup (single instance via mutex), so starting
 it manually (`npm start`) keeps the icon too.
 Useful commands: `pm2 list/logs/stop/restart 5k-bot`.
 
+## Watchlist (teams and players)
+
+Edit `data/watchlist.json` (or use the panel's **Watchlist** tab) to record
+teams even when HLTV lists the match with 0–1★. A matched team bypasses the
+star filter and uses its own kill threshold; with two matched teams, the
+lowest threshold wins. A `players` entry overrides the team threshold for that
+round (e.g. a 3k from a specific player), but it does not force a match outside
+the star filter to be recorded. The bot reloads the file every poll (~45s) — no
+restart; changes apply to the next round even in a match already being tracked
+(and to the next matches). If the file disappears during an editor save, the
+last good version is kept for up to 1 minute before falling back to the star
+policy.
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "defaults": { "minKills": 4, "clutch": false },
+  "teams": [
+    { "names": ["FURIA", "FURIA Esports"], "minKills": 3, "enabled": true },
+    { "names": ["Legacy"], "minKills": 4, "enabled": true },
+    { "names": ["Imperial", "Imperial Esports"], "minKills": 5, "enabled": true },
+    { "names": ["paiN", "paiN Gaming"], "minKills": 3, "enabled": true }
+  ],
+  "players": []
+}
+```
+
+Names are case/accent-insensitive; aliases avoid listing mismatches
+(`FURIA` vs `FURIA Esports`). `minKills` is 2–5; omit it to inherit
+`defaults.minKills`. Invalid JSON/values keep the last good version (the panel
+shows the validation error); a UTF-8 BOM from Notepad/PowerShell is accepted.
+Full example: `docs/watchlist.example.json`.
+Dry-run: `npx tsx scripts/watchlist-check.ts "paiN" "FURIA" --stars=0`.
+
 ## Testing with a finished match (without waiting for live)
 
 The real mode is LIVE, but you can validate download → clip → upload with a VOD:
@@ -127,6 +162,7 @@ anchors itself on the 1st detected kill (`CLIP_CONTEXT_SEC` in `.env`).
 
 ```text
 src/config.ts, logger.ts (arquivo), db.ts (sqlite dedup)
+src/watchlist.ts (times/jogadores com limiar próprio; hot-reload de data/watchlist.json)
 src/monitor/hltvMonitor.ts (stars + preferência official/en)
 src/detector/aceDetector.ts (puro, testado) + matchTracker.ts (poll MR12: 13 pts)
 src/recorder/streamRecorder.ts (buffer circular)
@@ -253,6 +289,7 @@ Missing fields come as `undefined` and the text degrades on its own.
 - Max `MAX_RECORDINGS=2` by default so as not to overload the PC.
 - No buffer = no clip (the event is saved in sqlite, you can cut it later via VOD — outside the MVP).
 - The tracker only runs while a recorder is up: a match without a stream produces no event row at all. If the last recorder drops, the tracker keeps running for one more poll (to close the round) and then stops.
-- Matches listed as 0★ (no rating in the listing) only yield a clip at `MIN_KILLS_NO_STARS` (default 5 = ACE); a 4★ match yields a clip from `MIN_KILLS` (default 4).
+- Matches listed as 0★ (no rating in the listing) only yield a clip at `MIN_KILLS_NO_STARS` (default 5 = ACE); a 4★ match yields a clip from `MIN_KILLS` (default 4). The watchlist is the exception: a listed team records even at 0–1★ using its own threshold.
 - An event whose kills have no footage in the buffer is discarded and recorded in `discarded_events` (sqlite) instead of being deleted silently.
+- No clip queue/quota guard: a watchlist threshold of 2 on a busy match can create more clips/private uploads than the daily YouTube API quota allows.
 - Rights: even an official stream can trigger Content ID. Starting private + reviewing the title/description is intentional.

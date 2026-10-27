@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   cardToLiveMatch,
+  effectiveMatchRule,
   guessTopTier,
   matchPassesFilter,
   minKillsForStars,
@@ -10,6 +11,13 @@ import {
   pickPreferredStream,
   selectStream,
 } from '../src/monitor/hltvMonitor.js';
+import { type WatchlistDoc, validateWatchlistDoc } from '../src/watchlist.js';
+
+function watchlist(input: unknown): WatchlistDoc {
+  const result = validateWatchlistDoc(input);
+  if (!result.ok || !result.value) throw new Error(result.errors.join('; '));
+  return result.value;
+}
 
 describe('stars filter', () => {
   it('filtra por MIN_STARS', () => {
@@ -59,6 +67,51 @@ describe('minKillsForStars', () => {
 
   it('sem estrela: só 5k', () => {
     expect(minKillsForStars(0, 4, 5)).toBe(5);
+  });
+});
+
+describe('effectiveMatchRule (watchlist vence estrelas)', () => {
+  const wl = watchlist({
+    defaults: { minKills: 4 },
+    teams: [
+      { names: ['FURIA', 'FURIA Esports'], minKills: 3 },
+      { names: ['Imperial', 'Imperial Esports'], minKills: 5 },
+      { names: ['Legacy'], minKills: 4, enabled: false },
+    ],
+  });
+  const filter = { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 };
+
+  it('time na lista grava com 0★ e usa o limiar do time', () => {
+    const rule = effectiveMatchRule({ stars: 0, team1: 'Fúria', team2: 'MIBR' }, filter);
+    expect(rule).toMatchObject({ watchlisted: true, minKills: 3, matchedTeams: ['FURIA'] });
+  });
+
+  it('dois times casados usam o menor limiar (ordem das regras)', () => {
+    const rule = effectiveMatchRule({ stars: 0, team1: 'Imperial', team2: 'FURIA' }, filter);
+    expect(rule.watchlisted).toBe(true);
+    expect(rule.minKills).toBe(3);
+    expect(rule.matchedTeams).toEqual(['FURIA', 'Imperial']);
+  });
+
+  it('fora da lista (ou time desabilitado) cai na política por estrela', () => {
+    expect(effectiveMatchRule({ stars: 0, team1: 'MIBR', team2: 'NIP' }, filter)).toMatchObject({
+      watchlisted: false,
+      minKills: 5,
+    });
+    expect(effectiveMatchRule({ stars: 4, team1: 'MIBR', team2: 'NIP' }, filter)).toMatchObject({
+      watchlisted: false,
+      minKills: 5,
+    });
+    expect(effectiveMatchRule({ stars: 0, team1: 'Legacy', team2: 'NIP' }, filter).watchlisted).toBe(
+      false,
+    );
+  });
+
+  it('sem watchlist mantém a política por estrela', () => {
+    expect(effectiveMatchRule({ stars: 2, team1: 'FURIA', team2: 'MIBR' }, {})).toMatchObject({
+      watchlisted: false,
+      minKills: 4,
+    });
   });
 });
 

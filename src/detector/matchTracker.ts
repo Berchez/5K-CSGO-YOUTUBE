@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
 import { waitForClearance } from '../monitor/hltvMonitor.js';
-import { RoundTracker } from './aceDetector.js';
+import { requiredKills, RoundTracker, type MinKillsRule } from './aceDetector.js';
 import type { AnchorConfidence, KillEvent } from '../types.js';
 import { getLogger } from '../logger.js';
 import { getConfig } from '../config.js';
@@ -158,7 +158,7 @@ export function processPoll(
   tracker: RoundTracker,
   snap: RoundSnapshot,
   lastTotal: number,
-  minKills: number,
+  minKills: MinKillsRule,
   delayCompMs = 10_000,
   lastSnapshot?: RoundSnapshot | null,
 ): { event: PollEvent | null; dropped: string | null; roundClosed: { map: string; round: number; score: string } | null; lastTotal: number } {
@@ -181,15 +181,21 @@ export function processPoll(
     // do round passado ao novo (falsos "3k" misturando rounds).
     // Stats repovoadas já neste poll (break): os pendentes são de outra
     // época e não podem virar evento — descarta antes de fechar.
-    if (tracker.syncBaseline(snap.players)) {
+    const reset = tracker.syncBaseline(snap.players);
+    const hadPending = tracker.pending > 0;
+    if (reset) {
       tracker.discardPending();
-      dropped = 'stats reiniciaram no fechamento do round: kills pendentes descartadas';
+      if (hadPending) {
+        dropped = 'stats reiniciaram no fechamento do round: kills pendentes descartadas';
+      }
     }
     const flags = tracker.anchorFlags();
     // Fecha o round: no máximo UM evento por round/jogador, sempre na
     // contagem máxima (3k→4k→5k não duplica). kills = SÓ os do autor.
     const { player, kills } = tracker.closeRound(minKills);
-    if (player && kills.length >= minKills) {
+    // Mesma regra usada na detecção: resolver inválido exige 5, não NaN.
+    const required = requiredKills(minKills, player ?? '');
+    if (player && kills.length >= required) {
       const firstAt = kills[0]?.at;
       const closedAtMs = Date.now();
       const spanMs = firstAt != null ? closedAtMs - firstAt : 0;
@@ -246,7 +252,7 @@ export async function trackMatch(
   matchPageUrl: string,
   matchId: string,
   cb: TrackerCallbacks,
-  minKills = 3,
+  minKills: MinKillsRule = 3,
 ): Promise<void> {
   const log = getLogger().child({ matchId });
   const { newTrackedPage } = await import('../monitor/hltvMonitor.js');

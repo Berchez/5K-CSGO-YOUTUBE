@@ -12,8 +12,13 @@ import {
   updateEnvFile,
   validateConfigPatch,
 } from '../src/trayConfig.js';
+import {
+  defaultWatchlistDoc,
+  loadWatchlistFile,
+  validateWatchlistDoc,
+} from '../src/watchlist.js';
 
-const PANEL_VERSION = '1.0.0';
+const PANEL_VERSION = '1.1.0';
 const DEFAULT_PORT = 38475;
 const PORT_TRIES = 12;
 const IDLE_MS = 30 * 60_000;
@@ -39,6 +44,8 @@ const ENV_FILE = path.join(ROOT, '.env');
 const BOT_STATUS_FILE = path.join(DATA_DIR, 'tray-status.json');
 const PANEL_INFO_FILE = path.join(DATA_DIR, 'tray-panel.json');
 const INTENT_FILE = path.join(DATA_DIR, 'tray-intent.json');
+const WATCHLIST_FILE = path.join(DATA_DIR, 'watchlist.json');
+const WATCHLIST_BACKUP = `${WATCHLIST_FILE}.bak`;
 const PANEL_LOG_FILE = path.join(LOGS_DIR, 'tray-panel.log');
 const PANEL_HTML = path.join(ROOT, 'scripts', 'tray-panel.html');
 
@@ -91,7 +98,7 @@ function readJson<T>(filePath: string): T | null {
   }
 }
 
-function writeJsonAtomic(filePath: string, value: unknown): void {
+function writeJsonAtomic(filePath: string, value: unknown): boolean {
   const tmp = `${filePath}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -102,6 +109,7 @@ function writeJsonAtomic(filePath: string, value: unknown): void {
       fs.copyFileSync(tmp, filePath);
       fs.rmSync(tmp, { force: true });
     }
+    return true;
   } catch (e) {
     log(`falha ao gravar ${path.basename(filePath)}: ${e instanceof Error ? e.message : String(e)}`);
     try {
@@ -109,6 +117,7 @@ function writeJsonAtomic(filePath: string, value: unknown): void {
     } catch {
       // best-effort
     }
+    return false;
   }
 }
 
@@ -296,7 +305,10 @@ async function getBotState(force = false): Promise<BotState> {
   }
 }
 
-function botBusy(): { busy: boolean; recording: number; pendingClips: number } {
+async function botBusy(): Promise<{ busy: boolean; recording: number; pendingClips: number }> {
+  // Status file velho (bot parado/crashado) não pode bloquear start/restart.
+  const bot = await getBotState();
+  if (!bot.online) return { busy: false, recording: 0, pendingClips: 0 };
   const status = readJson<{ totals?: { recording?: number }; pendingClips?: number }>(
     BOT_STATUS_FILE,
   );
@@ -532,7 +544,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return;
     }
     if (body.restart === true && body.force !== true) {
-      const busy = botBusy();
+      const busy = await botBusy();
       if (busy.busy) {
         sendJson(res, 409, {
           ok: false,
@@ -566,6 +578,67 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return;
   }
 
+  if (pathname === '/api/watchlist') {
+    if (req.method === 'GET') {
+      const exists = fs.existsSync(WATCHLIST_FILE);
+      // Lê mesmo ausente: o cache guarda a última versão boa durante o grace.
+      const loaded = loadWatchlistFile(WATCHLIST_FILE);
+      sendJson(res, 200, {
+        ok: true,
+        file: 'data/watchlist.json',
+        exists,
+        stale: loaded.stale,
+        doc: loaded.doc,
+        error: loaded.error,
+        backup: fs.existsSync(WATCHLIST_BACKUP) ? 'data/watchlist.json.bak' : null,
+      });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, error: 'Método não permitido.' });
+      return;
+    }
+    let body: { doc?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    const validation = validateWatchlistDoc(body?.doc);
+    if (!validation.ok || !validation.value) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'Watchlist inválida.',
+        errors: validation.errors,
+      });
+      return;
+    }
+    // Backup da versão anterior ANTES de gravar; a gravação atômica garante
+    // que o bot nunca lê um arquivo pela metade.
+    try {
+      if (fs.existsSync(WATCHLIST_FILE)) {
+        fs.copyFileSync(WATCHLIST_FILE, WATCHLIST_BACKUP);
+      }
+    } catch (e) {
+      log(`falha no backup da watchlist: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!writeJsonAtomic(WATCHLIST_FILE, validation.value)) {
+      sendJson(res, 500, { ok: false, error: 'Falha ao gravar data/watchlist.json.' });
+      return;
+    }
+    log(
+      `watchlist salva (${validation.value.teams.length} times, ${validation.value.players.length} jogadores)`,
+    );
+    sendJson(res, 200, {
+      ok: true,
+      doc: validation.value,
+      applied: 'next-parts',
+      backup: fs.existsSync(WATCHLIST_BACKUP) ? 'data/watchlist.json.bak' : null,
+    });
+    return;
+  }
+
   if (pathname === '/api/action') {
     if (req.method !== 'POST') {
       sendJson(res, 405, { ok: false, error: 'Método não permitido.' });
@@ -585,7 +658,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     if (action === 'start' || action === 'stop' || action === 'restart') {
       if (action === 'restart' && body?.force !== true) {
-        const busy = botBusy();
+        const busy = await botBusy();
         if (busy.busy) {
           sendJson(res, 409, {
             ok: false,
@@ -628,6 +701,15 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (!fs.existsSync(ENV_FILE)) fs.writeFileSync(ENV_FILE, '', 'utf8');
       openNotepad(ENV_FILE);
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (action === 'open-watchlist') {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      if (!fs.existsSync(WATCHLIST_FILE)) {
+        writeJsonAtomic(WATCHLIST_FILE, defaultWatchlistDoc());
+      }
+      openNotepad(WATCHLIST_FILE);
+      sendJson(res, 200, { ok: true, file: 'data/watchlist.json' });
       return;
     }
     sendJson(res, 400, { ok: false, error: `Ação desconhecida: ${action}` });

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "enabled": true,
+  "defaults": {
+    "minKills": 4,
+    "clutch": false
+  },
+  "teams": [
+    {
+      "names": ["FURIA", "FURIA Esports"],
+      "minKills": 3,
+      "enabled": true
+    },
+    {
+      "names": ["Legacy"],
+      "minKills": 4,
+      "enabled": true
+    },
+    {
+      "names": ["Imperial", "Imperial Esports"],
+      "minKills": 5,
+      "enabled": true
+    },
+    {
+      "names": ["paiN", "paiN Gaming"],
+      "minKills": 3,
+      "enabled": true
+    }
+  ],
+  "players": [
+    {
+      "names": ["KSCERATO"],
+      "minKills": 3,
+      "enabled": true
+    }
+  ]
+}

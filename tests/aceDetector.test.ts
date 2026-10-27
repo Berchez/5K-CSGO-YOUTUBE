@@ -74,14 +74,31 @@ describe('detectMultiKill', () => {
     expect(detectMultiKill([k('T'), k('a'), k('a')])).toBeNull();
     expect(detectMultiKill([])).toBeNull();
   });
+
+  it('limiar por jogador (watchlist): regra do killer vence o default', () => {
+    const kills = ['a', 'a', 'a', 'b', 'b'].map((p) => k(p));
+    expect(detectMultiKill(kills, 3)?.player).toBe('a');
+    const m = detectMultiKill(kills, (p) => (p.toLowerCase() === 'b' ? 2 : 5));
+    expect(m?.player).toBe('b');
+    expect(m?.kills).toHaveLength(2);
+  });
+
+  it('resolver inválido cai no máximo (5): ace passa, 4k não', () => {
+    const ace = ['a', 'a', 'a', 'a', 'a'].map((p) => k(p));
+    expect(detectMultiKill(ace, () => Number.NaN)?.player).toBe('a');
+    const four = ['a', 'a', 'a', 'a'].map((p) => k(p));
+    expect(detectMultiKill(four, () => Number.NaN)).toBeNull();
+  });
 });
 
 describe('killLabel', () => {
-  it('ACE p/ 5+, 4K/3K abaixo disso', () => {
+  it('ACE p/ 5+, 2K/3K/4K abaixo disso', () => {
     expect(killLabel(5)).toBe('ACE');
     expect(killLabel(9)).toBe('ACE');
     expect(killLabel(4)).toBe('4K');
     expect(killLabel(3)).toBe('3K');
+    expect(killLabel(2)).toBe('2K');
+    expect(killLabel(1)).toBe('ACE');
   });
 });
 
@@ -105,6 +122,16 @@ describe('RoundTracker', () => {
     const { player, kills } = t.closeRound();
     expect(player).toBe('x');
     expect(kills.map((kk) => kk.victim)).toEqual(['a', 'c', 'd']);
+  });
+
+  it('closeRound aceita limiar por jogador (watchlist)', () => {
+    const t = new RoundTracker('mirage', 3);
+    t.addKill('coldzera', 'a');
+    t.addKill('coldzera', 'b');
+    t.addKill('outro', 'c');
+    const { player, kills } = t.closeRound((p) => (p === 'coldzera' ? 2 : 4));
+    expect(player).toBe('coldzera');
+    expect(kills).toHaveLength(2);
   });
 
   it('dedup: polling repetido não infla a contagem', () => {

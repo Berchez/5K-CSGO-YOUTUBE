@@ -256,6 +256,18 @@
     .clip-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(15, 23, 42, .5); }
     .clip-name { font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
     .clip-meta { margin-top: 3px; color: var(--faint); font-size: 11px; }
+    .watchlist-defaults { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid rgba(148, 163, 184, .09); }
+    .watchlist-field { display: grid; gap: 5px; min-width: 0; }
+    .watchlist-field > span { color: var(--muted); font-size: 11px; font-weight: 600; }
+    .watchlist-field .input { max-width: none; }
+    .watchlist-list { display: grid; gap: 10px; }
+    .watchlist-row {
+      display: grid; grid-template-columns: minmax(0, 1fr) 132px auto auto;
+      gap: 10px; align-items: end; padding: 12px;
+      border: 1px solid var(--line); border-radius: 12px; background: rgba(15, 23, 42, .5);
+    }
+    .watchlist-row .check { align-self: center; min-height: 38px; }
+    .watchlist-row .btn { align-self: center; }
     .toast {
       position: fixed; right: 22px; bottom: 22px; z-index: 50;
       max-width: min(420px, calc(100vw - 44px)); padding: 12px 15px;
@@ -298,6 +310,9 @@
       .savebar { align-items: stretch; }
       .save-actions { width: 100%; }
       .save-actions .btn { flex: 1; }
+      .watchlist-row { grid-template-columns: 1fr 1fr; }
+      .watchlist-row .watchlist-names { grid-column: 1 / -1; }
+      .watchlist-defaults { align-items: stretch; }
     }
   </style>
 </head>
@@ -312,11 +327,12 @@
       <nav class="nav" aria-label="Seções">
         <button class="nav-item active" data-tab="overview">Visão geral</button>
         <button class="nav-item" data-tab="matches">Partidas</button>
+        <button class="nav-item" data-tab="watchlist">Watchlist</button>
         <button class="nav-item" data-tab="settings">Configurações</button>
         <button class="nav-item" data-tab="logs">Logs</button>
         <button class="nav-item" data-tab="clips">Clipes</button>
       </nav>
-      <div class="side-foot"><span>Painel local</span><span id="panelVersion">v1.0</span></div>
+      <div class="side-foot"><span>Painel local</span><span id="panelVersion">v1.1</span></div>
     </aside>
 
     <main class="main">
@@ -378,6 +394,35 @@
           <button class="btn ghost small" id="btnRefreshMatches">Atualizar</button>
         </div>
         <div class="matches-grid" id="matchesGrid"><div class="empty">Carregando...</div></div>
+      </section>
+
+      <section class="view" id="view-watchlist">
+        <div class="settings-toolbar">
+          <div><h3>Watchlist de times e jogadores</h3><p>Times na lista são gravados mesmo com 0–1★ e usam o limiar escolhido. Jogadores na lista (editáveis no arquivo) sobrescrevem o limiar do time no round, mas não forçam a gravação de uma partida fora do filtro. A mudança vale a partir do próximo round/partida (hot-reload a cada ~45s), sem reiniciar o bot.</p></div>
+          <div class="settings-tools">
+            <label class="check"><input type="checkbox" id="watchlistEnabled"> Watchlist ativa</label>
+            <button class="btn ghost small" id="btnOpenWatchlist">Abrir arquivo</button>
+          </div>
+        </div>
+        <div class="banner hidden" id="watchlistBanner"></div>
+        <article class="card">
+          <div class="card-head"><h3>Times monitorados</h3><button class="btn ghost small" id="btnAddTeam">Adicionar time</button></div>
+          <div class="watchlist-defaults">
+            <label class="watchlist-field" style="max-width:300px">
+              <span>Limiar padrão (times sem regra própria)</span>
+              <select class="input" id="watchlistDefaultMinKills"></select>
+            </label>
+            <p class="tiny">Também é o mínimo de entradas sem valor próprio. Jogadores fora da watchlist usam o limiar da partida.</p>
+          </div>
+          <div class="watchlist-list" id="watchlistTeams"><div class="empty">Carregando watchlist...</div></div>
+        </article>
+        <div class="savebar">
+          <span class="save-note" id="watchlistNote">Carregando...</span>
+          <div class="save-actions">
+            <button class="btn ghost" id="btnReloadWatchlist">Recarregar</button>
+            <button class="btn" id="btnSaveWatchlist">Salvar watchlist</button>
+          </div>
+        </div>
       </section>
 
       <section class="view" id="view-settings">
@@ -463,11 +508,17 @@
         logsBusy: false,
         configLoaded: false,
         connectionError: null,
+        watchlist: watchlistFromDoc(null),
+        watchlistFile: null,
+        watchlistLoaded: false,
+        watchlistDirty: false,
+        watchlistBusy: false,
       };
 
       const TITLES = {
         overview: ['Visão geral', 'O que o bot está fazendo agora.'],
         matches: ['Partidas', 'Streams escolhidas, buffers ativos e trackers.'],
+        watchlist: ['Watchlist', 'Times que gravam mesmo sem estrelas, com limiar próprio.'],
         settings: ['Configurações', 'Ajuste fino sem editar o .env na mão.'],
         logs: ['Logs', 'Diagnóstico em tempo real.'],
         clips: ['Clipes', 'Últimos arquivos gerados no disco.'],
@@ -708,7 +759,7 @@
           '</div>';
         const version = state.payload && state.payload.panel ? 'v' + state.payload.panel.version : '';
         $('#panelVersionInline').textContent = version;
-        $('#panelVersion').textContent = version || 'v1.0';
+        $('#panelVersion').textContent = version || 'v1.1';
       }
 
       function renderMatchCard(match, compact) {
@@ -740,6 +791,214 @@
         $('#matchesGrid').innerHTML = matches.length
           ? matches.map((match) => renderMatchCard(match, false)).join('')
           : '<div class="empty">' + (online ? 'Nenhuma partida no filtro agora.' : 'Bot parado. Inicie para monitorar.') + '</div>';
+      }
+
+      function normalizeWatchlistName(value) {
+        return String(value || '')
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function watchlistMinKillsOptions(selected, withInherit, defaultKills) {
+        const parts = [];
+        if (withInherit) {
+          parts.push('<option value=""' + (selected === '' ? ' selected' : '') + '>Herdar (' + defaultKills + ')</option>');
+        }
+        for (let n = 2; n <= 5; n++) {
+          parts.push('<option value="' + n + '"' + (String(selected) === String(n) ? ' selected' : '') + '>' + n + ' kills</option>');
+        }
+        return parts.join('');
+      }
+
+      function watchlistFromDoc(doc) {
+        const source = doc && typeof doc === 'object' ? doc : {};
+        const defaults = source.defaults && typeof source.defaults === 'object' ? source.defaults : {};
+        const defaultMinKills = Number.isInteger(defaults.minKills) && defaults.minKills >= 2 && defaults.minKills <= 5
+          ? defaults.minKills
+          : 4;
+        const teams = Array.isArray(source.teams) ? source.teams : [];
+        return {
+          enabled: source.enabled !== false,
+          defaults: { minKills: defaultMinKills },
+          defaultClutch: defaults.clutch === true,
+          teams: teams.map((team) => ({
+            namesText: team && Array.isArray(team.names) ? team.names.join(', ') : '',
+            minKills: team && Number.isInteger(team.minKills) ? String(team.minKills) : '',
+            enabled: !(team && team.enabled === false),
+            clutch: team && typeof team.clutch === 'boolean' ? team.clutch : undefined,
+          })),
+          players: Array.isArray(source.players) ? source.players : [],
+        };
+      }
+
+      function markWatchlistDirty() {
+        state.watchlistDirty = true;
+        const note = $('#watchlistNote');
+        if (note) {
+          note.textContent = 'Alterações pendentes.';
+          note.className = 'save-note dirty';
+        }
+        const save = $('#btnSaveWatchlist');
+        if (save) save.disabled = false;
+      }
+
+      function renderWatchlist() {
+        const wl = state.watchlist || watchlistFromDoc(null);
+        const file = state.watchlistFile || {};
+        const banner = $('#watchlistBanner');
+        if (file.error) {
+          banner.className = 'banner error';
+          banner.innerHTML = '<div><strong>Arquivo inválido:</strong> ' + esc(file.error) + ' O bot está usando a última versão boa; salve para corrigir.</div>';
+        } else if (file && file.exists === false && file.stale) {
+          banner.className = 'banner';
+          banner.innerHTML = '<div><strong>Watchlist ausente no disco.</strong> O bot está usando a última versão boa por até 1 min; salve para recriar data/watchlist.json.</div>';
+        } else if (file && file.exists === false) {
+          banner.className = 'banner';
+          banner.innerHTML = '<div><strong>Sem watchlist no disco.</strong> Adicione um time e salve para criar data/watchlist.json.</div>';
+        } else {
+          banner.className = 'banner hidden';
+        }
+        $('#watchlistEnabled').checked = wl.enabled !== false;
+        $('#watchlistDefaultMinKills').innerHTML = watchlistMinKillsOptions(wl.defaults.minKills, false, wl.defaults.minKills);
+        const rows = wl.teams.map((team, index) => (
+          '<div class="watchlist-row" data-index="' + index + '">' +
+            '<label class="watchlist-field watchlist-names"><span>Nomes (vírgula separa aliases)</span>' +
+              '<input class="input" data-wl="names" value="' + esc(team.namesText) + '" placeholder="FURIA, FURIA Esports">' +
+            '</label>' +
+            '<label class="watchlist-field"><span>Mín. kills</span><select class="input" data-wl="minKills">' +
+              watchlistMinKillsOptions(team.minKills, true, wl.defaults.minKills) +
+            '</select></label>' +
+            '<label class="check"><input type="checkbox" data-wl="enabled"' + (team.enabled ? ' checked' : '') + '> Ativo</label>' +
+            '<button class="btn ghost small" type="button" data-wl-remove>Remover</button>' +
+          '</div>'
+        )).join('');
+        $('#watchlistTeams').innerHTML = rows || '<div class="empty">Nenhum time na watchlist. Todos seguem a política por estrelas.</div>';
+        const note = $('#watchlistNote');
+        note.textContent = state.watchlistDirty ? 'Alterações pendentes.' : (file.error ? 'Arquivo inválido no disco.' : 'Tudo salvo.');
+        note.className = 'save-note' + (state.watchlistDirty ? ' dirty' : '');
+        $('#btnSaveWatchlist').disabled = !state.watchlistDirty;
+      }
+
+      async function loadWatchlist(force) {
+        if (state.watchlistBusy) return;
+        if (state.watchlistLoaded && !force) return;
+        state.watchlistBusy = true;
+        try {
+          const data = await api('/api/watchlist');
+          state.watchlistFile = data;
+          state.watchlist = watchlistFromDoc(data.doc);
+          state.watchlistLoaded = true;
+          state.watchlistDirty = false;
+          if (state.tab === 'watchlist') renderWatchlist();
+        } catch (error) {
+          if (state.tab === 'watchlist') {
+            const banner = $('#watchlistBanner');
+            banner.className = 'banner error';
+            banner.innerHTML = '<div><strong>Falha ao carregar a watchlist:</strong> ' + esc(error.message || 'erro') + '</div>';
+          }
+        } finally {
+          state.watchlistBusy = false;
+        }
+      }
+
+      function buildWatchlistDoc() {
+        const wl = state.watchlist;
+        const errors = [];
+        const teams = [];
+        const seen = new Map();
+        wl.teams.forEach((team, index) => {
+          const label = 'Time ' + (index + 1);
+          const raw = String(team.namesText || '').split(',').map((name) => name.trim()).filter(Boolean);
+          if (raw.length === 0) {
+            errors.push(label + ': informe ao menos um nome.');
+            return;
+          }
+          const names = [];
+          const localSeen = new Set();
+          for (const name of raw) {
+            if (name.length > 60) {
+              errors.push(label + ': "' + name.slice(0, 20) + '…" passa de 60 caracteres.');
+              continue;
+            }
+            const key = normalizeWatchlistName(name);
+            if (localSeen.has(key)) continue;
+            localSeen.add(key);
+            names.push(name);
+          }
+          if (names.length === 0) {
+            errors.push(label + ': nenhum nome válido.');
+            return;
+          }
+          if (names.length > 20) {
+            errors.push(label + ': no máximo 20 aliases.');
+            return;
+          }
+          for (const name of names) {
+            const key = normalizeWatchlistName(name);
+            const first = seen.get(key);
+            if (first !== undefined) {
+              errors.push('"' + name + '" aparece nos times ' + (first + 1) + ' e ' + (index + 1) + '.');
+            } else {
+              seen.set(key, index);
+            }
+          }
+          const rule = { names, enabled: team.enabled !== false };
+          if (team.minKills !== '') rule.minKills = Number(team.minKills);
+          if (team.clutch !== undefined) rule.clutch = team.clutch;
+          teams.push(rule);
+        });
+        if (teams.length > 100) errors.push('Máximo de 100 times.');
+        const doc = {
+          version: 1,
+          enabled: wl.enabled !== false,
+          defaults: {
+            minKills: Number(wl.defaults.minKills) || 4,
+            clutch: wl.defaultClutch === true,
+          },
+          teams,
+          players: wl.players,
+        };
+        return { doc, errors };
+      }
+
+      async function saveWatchlist() {
+        const built = buildWatchlistDoc();
+        const banner = $('#watchlistBanner');
+        if (built.errors.length > 0) {
+          banner.className = 'banner error';
+          banner.innerHTML = '<div><strong>Corrija antes de salvar:</strong> ' + built.errors.map(esc).join(' · ') + '</div>';
+          return;
+        }
+        banner.className = 'banner hidden';
+        const save = $('#btnSaveWatchlist');
+        save.disabled = true;
+        try {
+          const result = await api('/api/watchlist', {
+            method: 'POST',
+            body: JSON.stringify({ doc: built.doc }),
+          });
+          state.watchlistFile = {
+            ok: true,
+            file: 'data/watchlist.json',
+            exists: true,
+            doc: result.doc,
+            error: null,
+            backup: result.backup || null,
+          };
+          state.watchlist = watchlistFromDoc(result.doc);
+          state.watchlistLoaded = true;
+          state.watchlistDirty = false;
+          renderWatchlist();
+          toast('Watchlist salva — aplica nas próximas partidas (sem reiniciar).', 'success');
+        } catch (error) {
+          const details = error.data && Array.isArray(error.data.errors) ? ' ' + error.data.errors.join(' ') : '';
+          banner.className = 'banner error';
+          banner.innerHTML = '<div><strong>Falha ao salvar:</strong> ' + esc((error.message || 'erro') + details) + '</div>';
+          save.disabled = false;
+        }
       }
 
       function renderConfigSummary() {
@@ -1002,6 +1261,7 @@
         history.replaceState(null, '', '#' + tab);
         if (tab === 'overview') { renderOverview(); }
         if (tab === 'matches') { renderMatches(); }
+        if (tab === 'watchlist') { renderWatchlist(); if (!state.watchlistDirty) void loadWatchlist(true); }
         if (tab === 'settings' && (!state.configLoaded || !state.dirty)) { void loadConfig(true); }
         if (tab === 'logs') { void loadLogs(); }
         if (tab === 'clips') { renderClips(); void loadClips(); }
@@ -1047,6 +1307,56 @@
         state.showAdvanced = event.target.checked;
         renderSettings();
       });
+      $('#watchlistTeams').addEventListener('input', (event) => {
+        const row = event.target.closest('[data-index]');
+        if (!row || event.target.dataset.wl !== 'names') return;
+        const index = Number(row.dataset.index);
+        if (!state.watchlist.teams[index]) return;
+        state.watchlist.teams[index].namesText = event.target.value;
+        markWatchlistDirty();
+      });
+      $('#watchlistTeams').addEventListener('change', (event) => {
+        const row = event.target.closest('[data-index]');
+        const field = event.target.dataset.wl;
+        if (!row || !field) return;
+        const index = Number(row.dataset.index);
+        const team = state.watchlist.teams[index];
+        if (!team) return;
+        if (field === 'minKills') team.minKills = event.target.value;
+        if (field === 'enabled') team.enabled = event.target.checked;
+        markWatchlistDirty();
+      });
+      $('#watchlistTeams').addEventListener('click', (event) => {
+        const button = event.target.closest('[data-wl-remove]');
+        if (!button) return;
+        const row = button.closest('[data-index]');
+        const index = Number(row && row.dataset.index);
+        if (!Number.isInteger(index) || index < 0) return;
+        state.watchlist.teams.splice(index, 1);
+        markWatchlistDirty();
+        renderWatchlist();
+      });
+      $('#watchlistEnabled').addEventListener('change', (event) => {
+        state.watchlist.enabled = event.target.checked;
+        markWatchlistDirty();
+      });
+      $('#watchlistDefaultMinKills').addEventListener('change', (event) => {
+        state.watchlist.defaults.minKills = Number(event.target.value) || 4;
+        markWatchlistDirty();
+        renderWatchlist();
+      });
+      $('#btnAddTeam').addEventListener('click', () => {
+        state.watchlist.teams.push({ namesText: '', minKills: '', enabled: true, clutch: undefined });
+        markWatchlistDirty();
+        renderWatchlist();
+      });
+      $('#btnReloadWatchlist').addEventListener('click', () => {
+        if (state.watchlistDirty && !window.confirm('Descartar as alterações não salvas da watchlist?')) return;
+        state.watchlistDirty = false;
+        void loadWatchlist(true);
+      });
+      $('#btnSaveWatchlist').addEventListener('click', () => void saveWatchlist());
+      $('#btnOpenWatchlist').addEventListener('click', () => void doAction('open-watchlist'));
       $('#btnSave').addEventListener('click', () => void saveConfig(false));
       $('#btnSaveRestart').addEventListener('click', () => void saveConfig(true));
       $('#btnOpenEnv').addEventListener('click', () => void doAction('open-env'));

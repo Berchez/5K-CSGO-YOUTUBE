@@ -3,6 +3,11 @@ import type { LiveMatch, StreamInfo } from '../types.js';
 import { getLogger } from '../logger.js';
 import { getConfig } from '../config.js';
 import { trySolveChallenge } from '../clipper/stealthBrowser.js';
+import {
+  resolveMatchRule,
+  type MatchRuleResolution,
+  type WatchlistDoc,
+} from '../watchlist.js';
 
 const OFFICIAL_HINTS = ['esl', 'blast', 'pgl', 'starladder', 'faceit', 'major', 'iem', 'eslcs'];
 
@@ -381,6 +386,31 @@ export function cardToLiveMatch(card: MatchCard): LiveMatch {
   };
 }
 
+export interface LiveMatchFilter {
+  /** Watchlist carregada do disco (ausente = política por estrelas). */
+  watchlist?: WatchlistDoc | null;
+  /** Limiar para partidas com estrela (MIN_KILLS). */
+  starredMinKills?: number;
+  /** Limiar para partidas sem estrela (MIN_KILLS_NO_STARS). */
+  unstarredMinKills?: number;
+}
+
+/**
+ * Regra efetiva da partida: time na watchlist vence a política por estrelas
+ * (grava mesmo com 0★) e usa o menor limiar dos times casados.
+ */
+export function effectiveMatchRule(
+  match: Pick<LiveMatch, 'stars' | 'team1' | 'team2'>,
+  filter: LiveMatchFilter = {},
+): MatchRuleResolution {
+  const fallback = minKillsForStars(
+    match.stars,
+    filter.starredMinKills ?? 4,
+    filter.unstarredMinKills ?? 5,
+  );
+  return resolveMatchRule(filter.watchlist ?? null, [match.team1, match.team2], fallback);
+}
+
 /**
  * Busca partidas LIVE na página /matches (layout HLTV 2026).
  * Container: div.match[data-livescore-match] (externo — o interno div.match
@@ -393,6 +423,7 @@ export async function fetchLiveMatches(
   matchesUrl: string,
   minStars: number,
   topTierOnly: boolean,
+  filter: LiveMatchFilter = {},
 ): Promise<LiveMatch[] | null> {
   const log = getLogger();
   const b = await getBrowser();
@@ -468,15 +499,34 @@ export async function fetchLiveMatches(
     for (const card of cards) {
       if (!card.isLive) continue; // tese do projeto: só lives (velocidade)
       const m = cardToLiveMatch(card);
-      if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
+      const rule = effectiveMatchRule(m, filter);
+      m.minKills = rule.minKills;
+      if (rule.watchlisted) {
+        // Watchlist ignora o corte de estrelas/top-tier: grava e usa o
+        // limiar do time (menor entre os que casaram).
+        m.watchlisted = true;
+        m.watchlistedTeams = rule.matchedTeams;
+      } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
         continue;
       }
       matches.push(m);
     }
-    // Partidas com estrela primeiro: com MAX_RECORDINGS limitado, elas não
-    // podem perder o slot para um jogo sem estrela (que só rende 5k).
-    matches.sort((a, b) => b.stars - a.stars);
-    log.info({ live: cards.filter((c) => c.isLive).length, kept: matches.length, minStars }, 'live matches filtradas');
+    // Estrelas primeiro: com MAX_RECORDINGS limitado, elas não podem perder
+    // o slot para um jogo sem estrela. Watchlist desempata mesmas estrelas.
+    matches.sort(
+      (a, b) =>
+        b.stars - a.stars ||
+        Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)),
+    );
+    log.info(
+      {
+        live: cards.filter((c) => c.isLive).length,
+        kept: matches.length,
+        watchlisted: matches.filter((m) => m.watchlisted).length,
+        minStars,
+      },
+      'live matches filtradas',
+    );
     return matches;
   } finally {
     await page.close().catch(() => undefined);
