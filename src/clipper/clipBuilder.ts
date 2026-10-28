@@ -1440,6 +1440,8 @@ export async function buildClip(
         freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),
+        clipStartMs: Math.round(firstSegStartMs + trimStartSec * 1000),
+        clipDurationSec: outDurSec,
         avMode,
         avOffsetMs: avMeasuredMs,
         avAppliedMs,

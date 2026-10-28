@@ -325,6 +325,76 @@ Phase 2 = download the finished match demo and parse it with a `.dem` parser
 (`demofile`): completes 100% of the list (weapons, assists, HE/flash/smoke/molotov).
 Missing fields come as `undefined` and the text degrades on its own.
 
+## Titles and descriptions (AI + deterministic fallback)
+
+Every upload gets a title and description built from the round data. The
+generation runs **in parallel with the clip render**, so it costs no extra
+latency on the upload.
+
+| `YT_META_MODE` | What happens |
+|---|---|
+| `ai` (default) | Gemini writes 3 title options + the description; every output is checked before use. If the AI fails, times out or says something the round data doesn't support, the deterministic generator takes over. |
+| `template` | Deterministic only: ~20 title formats picked by hash + rotation (never the same format twice in a row), stats, kill-by-kill, hashtags, footer. Offline, instant, no API cost. |
+| `legacy` | The old fixed title/description (kill switch). |
+
+Provider chain (`YT_META_AI_ORDER=gemini,huggingface`): the first one that
+answers wins; a provider that fails twice is disabled for the session.
+
+### The description
+
+The description always has the same readable structure:
+
+```
+donk pegou o round 10 no Mirage — PGL Masters Bucharest 2026
+
+O round 10 no Mirage virou spectacle: donk somou 5 kills.
+
+Round 10 | Mirage | Spirit vs MOUZ | Placar 3-6
+
+0:20 matou Spinx
+0:26 matou PR
+0:29 matou sh1ro (AK-47, HS)
+...
+
+5 kills | 2 headshots | arma principal AK-47 (4/5)
+
+#cs2 #counterstrike #mirage #ace #donk #spirit #mouz #pgl
+
+Corte automático. Vídeo não listado: aparece só para quem tem o link.
+```
+
+The opening (first two blocks) is what the AI writes — a punchy line plus a
+short paragraph in 2nd person. The rest is deterministic, so the facts, the
+kill-by-kill list, the stats, the hashtags and the footer are always there and
+always true. The kill timestamps use the same anchor the cut uses (first kill
+minus the context), so `0:20` is where the elimination really happens in the
+video; the exact clip start is also stored in the sidecar (`clipStartMs`).
+
+### The guard (why the AI can't publish nonsense)
+
+The AI only receives the round's facts (JSON) and every output is validated
+before it reaches YouTube. Rejected: wrong kill/headshot counts, "ace" below
+5 kills, `clutch`/`1vX`, round results ("vitória/GG"), a score that isn't the
+real one, naming the player's rival when the player's side is unknown, URLs,
+hashtags in the title, more than one emoji, titles over 100 chars and
+descriptions over 5000. A rejected title falls back to the deterministic one;
+a rejected description falls back to the deterministic narrative. Either way
+the video is published with something correct.
+
+Titles always carry the player name plus the event (or the team), at most one
+emoji (`🔥💥⚡🎯💀🚨❗`), and no hashtags — those go at the end of the
+description. `YT_BRAND` (e.g. `5K CS`) becomes a hashtag in the description,
+`YT_DESC_CTA` adds a closing line, and the "published as private" footer only
+appears when `YT_PRIVACY=private`.
+
+Preview before publishing anything (reads the sidecars of recent clips):
+
+```bash
+npm run check:meta            # deterministic titles for the last 5 clips
+npm run check:meta -- --ai    # same, through the AI chain
+npm run check:meta -- --ai --n 3 --json
+```
+
 ## Known limits
 
 - HLTV has Cloudflare: selectors are by class/`data-*` with fallback, but the layout can break — see `logs/bot.log`.

@@ -38,6 +38,8 @@ import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
+import { buildVideoMetadata } from './uploader/videoMetadata.js';
+import { createMetadataAi } from './uploader/metadataAi.js';
 import { getFreeBytes } from './diskSpace.js';
 import {
   initTrayStatus,
@@ -476,6 +478,42 @@ async function handleAce(
     );
     ace.streamSync = streamSync;
     if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
+    // Contexto adaptativo (mesma conta do corte): âncora de início incerta =
+    // a kill pode não ser a 1ª real do round → abre mais cedo.
+    const lowAnchor = isAnchorLowConfidence(
+      ace.anchorConfidence,
+      ace.kills[0]?.at,
+      Date.now(),
+    );
+    const contextSec = lowAnchor ? cfg.CLIP_CONTEXT_UNCERTAIN_SEC : cfg.CLIP_CONTEXT_SEC;
+    // Metadados (IA ou template) rodam EM PARALELO ao corte do clipe: só
+    // dependem do round, então não somam latência no upload. Falha aqui cai
+    // no gerador determinístico (ou no título legado, se tudo falhar).
+    const metadataPromise =
+      cfg.YT_META_MODE === 'legacy' || !cfg.YT_UPLOAD
+        ? undefined
+        : buildVideoMetadata(ace, {
+            mode: cfg.YT_META_MODE,
+            ai: createMetadataAi({
+              order: cfg.YT_META_AI_ORDER,
+              timeoutMs: cfg.YT_META_AI_TIMEOUT_MS,
+              geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+              geminiModel: cfg.YT_META_GEMINI_MODEL,
+              hfToken: cfg.HF_TOKEN || undefined,
+              hfModel: cfg.YT_META_HF_MODEL,
+            }),
+            brand: cfg.YT_BRAND,
+            cta: cfg.YT_DESC_CTA,
+            privacy: cfg.YT_PRIVACY,
+            defaultTags: cfg.YT_DEFAULT_TAGS,
+            clipStartMs: aceStartMs != null ? aceStartMs - contextSec * 1000 : undefined,
+          }).catch((e) => {
+            log.warn(
+              { err: String(e).slice(0, 200) },
+              'falha ao gerar metadados — upload segue com o caminho legado',
+            );
+            return undefined;
+          });
     const useScoreboardEnd = streamSync.applied && detectedEndMs != null;
     const useFallback =
       cfg.CLIP_STREAM_SYNC === 'auto' &&
@@ -523,12 +561,7 @@ async function handleAce(
     // do round, resetou a base, ou a 1ª kill veio da janela de assentamento)
     // = a kill pode não ser a 1ª real — começa mais cedo para não perder a
     // abertura. Confiança alta mantém os 10s da especificação.
-    const lowAnchor = isAnchorLowConfidence(
-      ace.anchorConfidence,
-      ace.kills[0]?.at,
-      Date.now(),
-    );
-    const contextSec = lowAnchor ? cfg.CLIP_CONTEXT_UNCERTAIN_SEC : cfg.CLIP_CONTEXT_SEC;
+    // (lowAnchor/contextSec já calculados acima, para os metadados.)
     if (lowAnchor) {
       log.warn({ conf: ace.anchorConfidence }, 'âncora de início incerta — contexto alargado');
     }
@@ -751,6 +784,7 @@ async function handleAce(
         log.info({ clip: uploadClipResult.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
       } else {
         try {
+          const metadata = await metadataPromise;
           videoId = await uploadClip(ace, uploadClipResult.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
             tokenPath: cfg.YT_TOKEN_PATH,
@@ -758,6 +792,7 @@ async function handleAce(
             categoryId: cfg.YT_CATEGORY_ID,
             defaultTags: cfg.YT_DEFAULT_TAGS,
             thumbnailPath: separateClip?.thumbnailPath,
+            metadata,
           });
         } catch (e) {
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');

@@ -3,6 +3,7 @@ import { google } from 'googleapis';
 import type { AceEvent } from '../types.js';
 import { buildDescription, buildTitle } from '../clipper/clipBuilder.js';
 import { getLogger } from '../logger.js';
+import type { VideoMetadata } from './videoMetadata.js';
 
 const SCOPES = ['https://www.googleapis.com/auth/youtube.upload'];
 
@@ -52,6 +53,8 @@ export interface UploadOptions {
   defaultTags: string;
   /** Caminho da thumb 1280x720 (opcional). Sobe via thumbnails.set após o vídeo. */
   thumbnailPath?: string;
+  /** Metadados já gerados (IA ou template). Ausente = caminho legado. */
+  metadata?: VideoMetadata;
 }
 
 /**
@@ -68,11 +71,20 @@ export async function uploadClip(
   const auth = loadOAuthClient(opts.clientSecretsPath, opts.tokenPath);
   const youtube = google.youtube({ version: 'v3', auth });
 
-  const title = buildTitle(ace).slice(0, 100);
-  const description = buildDescription(ace, opts.defaultTags);
-  const tags = [...new Set([...opts.defaultTags.split(',').map((t) => t.trim()).filter(Boolean), ace.player, ace.map, ace.event])].slice(0, 30);
+  const title = opts.metadata
+    ? opts.metadata.title
+    : buildTitle(ace).slice(0, 100);
+  const description = opts.metadata
+    ? opts.metadata.description
+    : buildDescription(ace, opts.defaultTags);
+  const tags = opts.metadata
+    ? opts.metadata.tags
+    : [...new Set([...opts.defaultTags.split(',').map((t) => t.trim()).filter(Boolean), ace.player, ace.map, ace.event])].slice(0, 30);
 
-  log.info({ title, privacy: opts.privacy }, 'enviando para o YouTube');
+  log.info(
+    { title, privacy: opts.privacy, source: opts.metadata?.source ?? 'legacy' },
+    'enviando para o YouTube',
+  );
   const res = await youtube.videos.insert({
     part: ['snippet', 'status'],
     requestBody: {

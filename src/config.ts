@@ -139,6 +139,22 @@ export const ConfigSchema = z.object({
   YT_TOKEN_PATH: z.string().default('./token.json'),
   YT_CATEGORY_ID: z.string().default('20'),
   YT_DEFAULT_TAGS: z.string().default('cs2,ace,5k,counter-strike,highlights'),
+  /**
+   * Metadados do YouTube: 'ai' = IA (com fallback determinístico), 'template'
+   * = gerador determinístico (offline, instantâneo), 'legacy' = título e
+   * descrição fixos de antes (kill switch).
+   */
+  YT_META_MODE: z.enum(['ai', 'template', 'legacy']).default('ai'),
+  /** Ordem dos providers de TEXTO (ia): o 1º preferred, os seguintes são fallback. */
+  YT_META_AI_ORDER: z.string().default('gemini,huggingface'),
+  /** Timeout por provider de texto (ms). */
+  YT_META_AI_TIMEOUT_MS: z.coerce.number().min(5_000).max(600_000).default(45_000),
+  YT_META_GEMINI_MODEL: z.string().default('gemini-3-flash-preview'),
+  YT_META_HF_MODEL: z.string().default('Qwen/Qwen2.5-7B-Instruct'),
+  /** Assinatura do canal: vira hashtag no fim da descrição (vazio = sem assinatura). */
+  YT_BRAND: z.string().default(''),
+  /** Linha extra (CTA) no fim da descrição. */
+  YT_DESC_CTA: z.string().default(''),
 
   // Thumbnails: composed = frame + selo (grátis, instantâneo, default).
   // ai = tenta fundo IA (pollinations grátis e/ou gemini pago) com fallback p/ composed.
