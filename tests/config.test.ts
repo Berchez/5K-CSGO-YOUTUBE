@@ -1,5 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { parseStreamOffsets, resolveStaticOffset } from '../src/config.js';
+import { boolEnv, parseStreamOffsets, resolveStaticOffset } from '../src/config.js';
+
+describe('boolEnv', () => {
+  it('aceita 1/true/yes/on como ligado', () => {
+    expect(boolEnv('1', false)).toBe(true);
+    expect(boolEnv('true', false)).toBe(true);
+    expect(boolEnv('TRUE', false)).toBe(true);
+    expect(boolEnv(' yes ', false)).toBe(true);
+    expect(boolEnv('on', false)).toBe(true);
+  });
+
+  it('aceita 0/false/no/off como desligado', () => {
+    expect(boolEnv('0', true)).toBe(false);
+    expect(boolEnv('false', true)).toBe(false);
+    expect(boolEnv('OFF', true)).toBe(false);
+  });
+
+  it('vazio ou valor desconhecido usa o default', () => {
+    expect(boolEnv(undefined, true)).toBe(true);
+    expect(boolEnv('', true)).toBe(true);
+    expect(boolEnv('   ', false)).toBe(false);
+    expect(boolEnv('talvez', true)).toBe(true);
+  });
+});
 
 describe('resolveStaticOffset (match > stream > global)', () => {
   it('0/desligado: ms sempre 0 (regra indica o escopo que decidiu)', () => {

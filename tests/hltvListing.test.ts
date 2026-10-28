@@ -5,6 +5,7 @@ import {
   dedupeUpcoming,
   extractListingCards,
   type ListingCards,
+  type UpcomingCard,
   type UpcomingMatch,
 } from '../src/monitor/hltvMonitor.js';
 import { computePollDecision } from '../src/monitor/pollSchedule.js';
@@ -119,8 +120,15 @@ let browser: Browser | null = null;
 beforeAll(async () => {
   try {
     browser = await chromium.launch();
-  } catch {
+  } catch (e) {
     browser = null; // sem browser do Playwright: os testes de DOM são pulados
+    // Na CI, teste pulado = pipeline verde sem a cobertura do DOM.
+    // Falha alto: instale o Chromium (npm run playwright:install).
+    if (process.env.CI) {
+      throw new Error(
+        `Chromium do Playwright indisponível na CI (${String(e).slice(0, 200)}) — rode npm run playwright:install`,
+      );
+    }
   }
 });
 
@@ -230,7 +238,9 @@ describe('extração do listing (fixture HTML do HLTV)', () => {
     expect(cards.upcoming).toHaveLength(0);
   });
 
-  it('card sem horário não entra na agenda, mas conta como visto', async (ctx) => {
+  it('card sem horário é extraído (sem hora) e conta como visto', async (ctx) => {
+    // A exclusão do card sem horário acontece no buildListing (que
+    // decide a confiabilidade da agenda), não na extração.
     if (!browser) return ctx.skip();
     const cards = await extract(
       pageHtml(upcomingCard({ matchId: '2399903', unix: null })),
@@ -300,6 +310,87 @@ describe('buildListing (filtros puros sobre os cards)', () => {
     expect(listing.upcoming).toHaveLength(1);
     expect(listing.upcoming[0].startsAt).toBe(now + 2 * 3600_000);
     expect(listing.upcoming[0].team1).toBe('Team A');
+  });
+});
+
+/** ListingCards cru (sem DOM) para testar o buildListing puro. */
+function rawCards(partial: Partial<ListingCards>): ListingCards {
+  return {
+    live: [],
+    upcoming: [],
+    upcomingSeen: 0,
+    liveError: null,
+    upcomingError: null,
+    liveCardErrors: 0,
+    upcomingCardErrors: 0,
+    ...partial,
+  };
+}
+
+function rawUpcoming(matchId: string, startUnix: string): UpcomingCard {
+  return {
+    matchId,
+    href: `/matches/${matchId}/a-vs-b`,
+    teamNames: ['A', 'B'],
+    event: 'Evento',
+    stage: '',
+    isLive: false,
+    stars: 5,
+    startUnix,
+  };
+}
+
+describe('buildListing (confiabilidade da agenda)', () => {
+  const now = Date.parse('2026-10-27T12:00:00.000Z');
+
+  it('maioria dos cards com horário: agenda confiável', () => {
+    const listing = buildListing(
+      rawCards({
+        upcoming: [
+          rawUpcoming('1', String(now + 3600_000)),
+          rawUpcoming('2', String(now + 7200_000)),
+          rawUpcoming('3', ''),
+        ],
+        upcomingSeen: 3,
+      }),
+      0,
+      false,
+    );
+    expect(listing.upcomingTotal).toBe(2);
+    expect(listing.scheduleReliable).toBe(true);
+  });
+
+  it('poucos cards com horário: agenda NÃO confiável (fail-open)', () => {
+    // A partida mais próxima pode ser a que está sem data: adiar o poll
+    // mirando a mais distante seria perder o começo do jogo.
+    const listing = buildListing(
+      rawCards({
+        upcoming: [
+          rawUpcoming('1', String(now + 3600_000)),
+          rawUpcoming('2', ''),
+          rawUpcoming('3', ''),
+          rawUpcoming('4', ''),
+        ],
+        upcomingSeen: 4,
+      }),
+      0,
+      false,
+    );
+    expect(listing.upcomingTotal).toBe(1);
+    expect(listing.scheduleReliable).toBe(false);
+  });
+
+  it('card futuro que quebrou: agenda NÃO confiável', () => {
+    const listing = buildListing(
+      rawCards({
+        upcoming: [rawUpcoming('1', String(now + 3600_000))],
+        upcomingSeen: 1,
+        upcomingCardErrors: 1,
+      }),
+      0,
+      false,
+    );
+    expect(listing.scheduleReliable).toBe(false);
   });
 });
 

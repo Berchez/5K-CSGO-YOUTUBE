@@ -7,14 +7,54 @@ export type MetadataPrivacy = 'private' | 'unlisted' | 'public';
 
 export const TITLE_MAX = 100;
 export const DESCRIPTION_MAX = 5000;
+/**
+ * O YouTube limita a descrição em BYTES (não em caracteres): 5000 chars de
+ * português com acento passam de 5000 bytes e o upload volta com
+ * invalidDescription. O corte é feito por byte.
+ */
+export const DESCRIPTION_MAX_BYTES = 5000;
 export const TAGS_MAX = 30;
+/** Limite do conjunto de tags (o YouTube conta as vírgulas também). */
 export const TAGS_CHARS_MAX = 500;
+/** Limite por tag (o próprio painel do YouTube usa 30). */
+export const TAG_CHARS_MAX = 30;
 
 const ALLOWED_EMOJI = ['🔥', '💥', '⚡', '🎯', '💀', '🚨', '❗'];
 const EMOJI_RE =
   /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{1F1E6}-\u{1F1FF}]/gu;
 const URL_RE = /https?:\/\/\S+|www\.\S+/gi;
 const URL_TEST_RE = /https?:\/\/|www\./i;
+/**
+ * Contagem de kills no texto. As bordas importam: sem elas, "2026 Kyiv",
+ * "Techno4K" e "10k inscritos" viravam "contagem de kills contraditória"
+ * e derrubavam um texto válido.
+ */
+const KILL_COUNT_RE =
+  /(?<![\p{L}\d])(\d+)[ \t]*(?:kills?|k|elimina(?:ç|c)(?:õ|o)es?|abates?|mortes?)(?![\p{L}\d])/giu;
+const HEADSHOT_COUNT_RE =
+  /(?<![\p{L}\d])(\d+)[ \t]*(?:hs|head\s?shots?|cabe[cç]adas?)(?![\p{L}\d])/giu;
+
+const utf8Encoder = new TextEncoder();
+
+/** Tamanho em bytes UTF-8 (o YouTube conta a descrição assim). */
+export function utf8Length(value: string): number {
+  return utf8Encoder.encode(value).length;
+}
+
+/** Corta o texto no limite de BYTES sem quebrar caractere multibyte. */
+export function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  if (utf8Length(value) <= maxBytes) return value;
+  let out = '';
+  let used = 0;
+  for (const ch of value) {
+    const size = utf8Length(ch);
+    if (used + size > maxBytes) break;
+    out += ch;
+    used += size;
+  }
+  return out.replace(/\s+$/, '');
+}
 
 export interface MetadataFeedRow {
   victim: string;
@@ -57,6 +97,13 @@ export interface MetadataContext {
   clipStartMs?: number;
   /** Duração do clipe (s), quando conhecida. */
   clipDurationSec?: number;
+  /**
+   * Atraso do placar (ms): quanto tempo o placar do HLTV demora a
+   * refletir um kill que já aconteceu. O `at` da kill é o MOMENTO DA
+   * OBSERVAÇÃO, não o do kill — sem esta compensação todo timestamp
+   * sai atrasado em SCOREBOARD_DELAY_MS.
+   */
+  killTimeOffsetMs: number;
 }
 
 export interface MetadataValidation {
@@ -84,6 +131,14 @@ export interface MetadataOptions {
   defaultTags?: string;
   /** Início do clipe (epoch ms): âncora dos timestamps das eliminações. */
   clipStartMs?: number;
+  /** Duração real do clipe (s) — vira a linha "duração" da descrição. */
+  clipDurationSec?: number;
+  /**
+   * Atraso do placar (ms): o `at` da kill é o momento em que o placar
+   * MostROU o kill, não o instante em que ele aconteceu. Subtrair esse
+   * atraso deixa o timestamp da descrição alinhado com o vídeo.
+   */
+  killTimeOffsetMs?: number;
 }
 
 export interface VideoMetadata {
@@ -121,13 +176,23 @@ export function slugify(value: string): string {
 export function buildMetadataContext(
   ace: AceEvent,
   clipStartMs?: number,
+  clipDurationSec?: number,
+  killTimeOffsetMs?: number,
 ): MetadataContext {
   const summary = ace.summary;
   const kills = summary?.kills?.length ?? ace.kills.length;
   const rawKills = summary?.kills ?? ace.kills;
+  // O placar do HLTV reflete o kill alguns segundos depois dele ter
+  // acontecido (SCOREBOARD_DELAY_MS). O `at` da kill é o momento da
+  // OBSERVAÇÃO: sem descontar o atraso, todo timestamp da descrição
+  // aponta para depois da eliminação (o vídeo mostra o kill "adiantado"
+  // em relação ao texto).
+  const killOffsetMs = Math.max(0, Math.floor(killTimeOffsetMs ?? 0));
   const feed: MetadataFeedRow[] = rawKills.map((k) => {
     const timeSec =
-      clipStartMs != null && k.at != null ? Math.max(0, (k.at - clipStartMs) / 1000) : undefined;
+      clipStartMs != null && k.at != null
+        ? Math.max(0, (k.at - killOffsetMs - clipStartMs) / 1000)
+        : undefined;
     return {
       victim: k.victim || '?',
       weapon: prettyWeapon(k.weapon ?? ''),
@@ -208,13 +273,9 @@ export function buildMetadataContext(
     scoreAfter: ace.scoreAfter || undefined,
     detectedAt: ace.detectedAt ?? '',
     clipStartMs,
-    clipDurationSec: clipDurationFromSidecar(ace),
+    clipDurationSec: clipDurationSec ?? ace.clipDurationSec,
+    killTimeOffsetMs: killOffsetMs,
   };
-}
-
-function clipDurationFromSidecar(ace: AceEvent): number | undefined {
-  const raw = (ace as unknown as { clipDurationSec?: unknown }).clipDurationSec;
-  return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
 }
 
 export function sanitizeTitle(raw: string): string {
@@ -223,6 +284,11 @@ export function sanitizeTitle(raw: string): string {
   s = s.replace(URL_RE, ' ');
   s = s.replace(/[«»""''`]/g, '');
   s = s.replace(/#\S+/g, ' ');
+  // O YouTube rejeita título/descrição com < ou > (invalidTitle).
+  s = s.replace(/[<>]/g, ' ');
+  // O seletor de emoji não cobre o variation selector (U+FE0F): ele
+  // sobrava na string como lixo invisível depois do replace.
+  s = s.replace(/\uFE0F/g, '');
   let kept = 0;
   s = s.replace(EMOJI_RE, (m) => {
     const base = m.replace(/\uFE0F/g, '');
@@ -247,11 +313,17 @@ export function sanitizeDescription(raw: string): string {
   s = s.replace(/\r\n?/g, '\n');
   s = s.replace(URL_RE, ' ');
   s = s.replace(EMOJI_RE, '');
+  // Resíduo do variation selector (U+FE0F) depois do replace do emoji.
+  s = s.replace(/\uFE0F/g, '');
+  // O YouTube rejeita descrição com < ou > (invalidDescription).
+  s = s.replace(/[<>]/g, ' ');
   s = s.replace(/[ \t]+$/gm, '');
   s = s.replace(/\n{3,}/g, '\n\n');
   s = s.replace(/[ \t]{2,}/g, ' ');
   s = s.trim();
-  if (s.length > DESCRIPTION_MAX) s = s.slice(0, DESCRIPTION_MAX).trim();
+  if (utf8Length(s) > DESCRIPTION_MAX_BYTES) {
+    s = truncateUtf8(s, DESCRIPTION_MAX_BYTES);
+  }
   return s;
 }
 
@@ -271,15 +343,13 @@ function factualClaims(text: string, ctx: MetadataContext): MetadataValidation[]
   if (/\bquintuple\b/i.test(clean) && ctx.kills < 5) {
     out.push({ ok: false, reason: `afirma quintuple com ${ctx.kills} kills` });
   }
-  for (const m of clean.matchAll(
-    /(\d+)[ \t]*(?:k(?:ills?|ill)?|elimina(?:ç|c)(?:õ|o)es?|abates?|mortes?)/gi,
-  )) {
+  for (const m of clean.matchAll(KILL_COUNT_RE)) {
     const n = Number(m[1]);
     if (n !== ctx.kills) {
       out.push({ ok: false, reason: `contagem de kills contraditória (${n} vs ${ctx.kills})` });
     }
   }
-  for (const m of clean.matchAll(/(\d+)[ \t]*(?:hs|head\s?shots?|cabe[cç]adas?)\b/gi)) {
+  for (const m of clean.matchAll(HEADSHOT_COUNT_RE)) {
     const n = Number(m[1]);
     if (n !== ctx.headshots) {
       out.push({ ok: false, reason: `contagem de headshots contraditória (${n} vs ${ctx.headshots})` });
@@ -375,8 +445,8 @@ export function validateDescription(
   ctx: MetadataContext,
 ): MetadataValidation {
   if (!description.trim()) return { ok: false, reason: 'descrição vazia' };
-  if (description.length > DESCRIPTION_MAX) {
-    return { ok: false, reason: 'acima de 5000 caracteres' };
+  if (utf8Length(description) > DESCRIPTION_MAX_BYTES) {
+    return { ok: false, reason: 'acima de 5000 bytes' };
   }
   if (URL_TEST_RE.test(description)) return { ok: false, reason: 'contém URL' };
   const claim = factualClaims(description, ctx).find((c) => !c.ok);
@@ -553,7 +623,7 @@ const PARAGRAPHS: Array<(ctx: MetadataContext) => string> = [
     `No ${c.map}, ${c.player} apareceu para fechar o round ${c.round}: ${c.kills} eliminações` +
     `${c.mainWeapon ? ` com a ${c.mainWeapon}` : ''}${c.headshots > 0 ? ` e ${c.headshots} headshot${c.headshots > 1 ? 's' : ''}` : ''}.`,
   (c) =>
-    `O round ${c.round} no ${c.map} virou spectacle: ${c.player} somou ${c.kills} kills` +
+    `O round ${c.round} no ${c.map} virou espetáculo: ${c.player} somou ${c.kills} kills` +
     `${c.flashAssists.length > 0 ? `, com flash de ${c.flashAssists.join(', ')}` : ''}.`,
 ];
 
@@ -638,9 +708,27 @@ export function composeDescription(
   const stats = buildStatsLine(ctx);
   if (stats) blocks.push(stats);
   blocks.push(buildHashtags(ctx, opts.brand));
+  const body = sanitizeDescription(blocks.filter(Boolean).join('\n\n'));
+  // O rodapé (com o CTA) entra DEPOIS do sanitize: ele é config do dono
+  // e pode ter URL — o sanitize remove URL (e a guarda é do texto da IA,
+  // não do CTA). O YouTube aceita link na descrição.
   const footer = buildFooter(ctx, opts);
-  if (footer) blocks.push(footer);
-  return sanitizeDescription(blocks.filter(Boolean).join('\n\n'));
+  return joinDescription(body, footer);
+}
+
+/**
+ * Corpo + rodapé dentro do limite de bytes do YouTube. O rodapé tem
+ * prioridade: se faltar espaço, o corpo é que cede.
+ */
+function joinDescription(body: string, footer: string): string {
+  if (!footer) return body;
+  const footerBytes = utf8Length(footer);
+  if (footerBytes >= DESCRIPTION_MAX_BYTES) {
+    return truncateUtf8(footer, DESCRIPTION_MAX_BYTES);
+  }
+  const room = DESCRIPTION_MAX_BYTES - footerBytes - 2; // "\n\n"
+  const head = room > 0 ? truncateUtf8(body, room) : '';
+  return head ? `${head}\n\n${footer}` : footer;
 }
 
 export function buildHashtags(ctx: MetadataContext, brand?: string): string {
@@ -685,6 +773,17 @@ export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): s
   return cta ? `${base}\n${cta}` : base;
 }
 
+/**
+ * Corta a tag no limite do YouTube (30 chars), preferindo a última
+ * palavra completa.
+ */
+function trimTag(tag: string): string {
+  if (tag.length <= TAG_CHARS_MAX) return tag;
+  const cut = tag.slice(0, TAG_CHARS_MAX);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > TAG_CHARS_MAX / 2 ? cut.slice(0, lastSpace) : cut).trim();
+}
+
 export function buildTags(ctx: MetadataContext, defaults: string[]): string[] {
   const base = defaults.map((t) => t.trim()).filter(Boolean);
   const extra = [
@@ -706,14 +805,24 @@ export function buildTags(ctx: MetadataContext, defaults: string[]): string[] {
   const limited: string[] = [];
   let total = 0;
   for (const tag of unique) {
-    if (total + tag.length > TAGS_CHARS_MAX) break;
-    total += tag.length;
-    limited.push(tag);
+    const trimmed = trimTag(tag);
+    if (!trimmed) continue;
+    // O YouTube conta no limite de 500: as vírgulas entre as tags e as
+    // aspas implícitas de tag com espaço.
+    const cost =
+      trimmed.length +
+      (trimmed.includes(' ') ? 2 : 0) +
+      (limited.length > 0 ? 1 : 0);
+    if (total + cost > TAGS_CHARS_MAX) break;
+    total += cost;
+    limited.push(trimmed);
   }
   return limited;
 }
 
 const usedTitles = new Set<string>();
+/** Teto do histórico de títulos (evita crescimento sem fim na sessão). */
+const USED_TITLES_MAX = 500;
 
 export function resetUsedTitles(): void {
   usedTitles.clear();
@@ -724,7 +833,15 @@ export function isUsedTitle(title: string): boolean {
 }
 
 export function rememberTitle(title: string): void {
-  usedTitles.add(normalizeText(title));
+  const key = normalizeText(title);
+  usedTitles.delete(key);
+  usedTitles.add(key);
+  // O Set mantém a ordem de inserção: o mais antigo é o primeiro.
+  while (usedTitles.size > USED_TITLES_MAX) {
+    const oldest = usedTitles.values().next().value;
+    if (oldest === undefined) break;
+    usedTitles.delete(oldest);
+  }
 }
 
 export function buildTemplateMetadata(
@@ -747,7 +864,12 @@ export async function buildVideoMetadata(
   ace: AceEvent,
   opts: MetadataOptions = {},
 ): Promise<VideoMetadata> {
-  const ctx = buildMetadataContext(ace, opts.clipStartMs);
+  const ctx = buildMetadataContext(
+    ace,
+    opts.clipStartMs,
+    opts.clipDurationSec,
+    opts.killTimeOffsetMs,
+  );
   const template = buildTemplateMetadata(ctx, opts);
   if (opts.mode !== 'ai' || !opts.ai) return template;
   let draft: MetadataDraft | null = null;
@@ -777,20 +899,28 @@ export async function buildVideoMetadata(
     break;
   }
   let description = '';
+  let descriptionReason = '';
+  // A guarda olha SÓ o texto da IA (título e abertura). O corpo
+  // determinístico vem dos dados do round e o rodapé é config do dono:
+  // validá-los junto derrubaria textos válidos (o CTA com URL, por
+  // exemplo) sem proteger contra alucinação nenhuma.
   const rawOpening = sanitizeDescription(draft.opening ?? draft.description ?? '');
   const openingCheck = validateDescription(rawOpening, ctx);
   if (openingCheck.ok && rawOpening.trim()) {
-    const composed = composeDescription(rawOpening, ctx, opts);
-    if (validateDescription(composed, ctx).ok) description = composed;
+    description = composeDescription(rawOpening, ctx, opts);
   } else if (rawOpening.trim()) {
+    descriptionReason = openingCheck.reason ?? 'inválida';
     log.warn(
       { motivo: openingCheck.reason, abertura: rawOpening.slice(0, 160) },
       'abertura da IA rejeitada',
     );
   }
   if (!title && !description) {
-    return { ...template, reason: titleReason || 'IA rejeitada' };
+    return { ...template, reason: titleReason || descriptionReason || 'IA rejeitada' };
   }
+  const reasons: string[] = [];
+  if (!title && titleReason) reasons.push(`título: ${titleReason}`);
+  if (!description && descriptionReason) reasons.push(`descrição: ${descriptionReason}`);
   if (!title) title = template.title;
   if (!description) description = template.description;
   rememberTitle(title);
@@ -806,6 +936,6 @@ export async function buildVideoMetadata(
     ),
     source: 'ai',
     provider: draft.provider,
-    reason: title ? undefined : titleReason || undefined,
+    reason: reasons.length > 0 ? reasons.join(' | ') : undefined,
   };
 }

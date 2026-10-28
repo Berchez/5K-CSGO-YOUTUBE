@@ -54,9 +54,10 @@ function collectSidecars(clipsDir: string): string[] {
 interface LoadedAce {
   ace: AceEvent;
   clipStartMs?: number;
+  clipDurationSec?: number;
 }
 
-function loadAces(clipsDir: string, player?: string): LoadedAce[] {
+function loadAces(clipsDir: string, player: string | undefined, contextSec: number): LoadedAce[] {
   const files = collectSidecars(clipsDir);
   const withTime = files.map((file) => {
     let mtime = 0;
@@ -71,21 +72,19 @@ function loadAces(clipsDir: string, player?: string): LoadedAce[] {
   const out: LoadedAce[] = [];
   for (const { file } of withTime) {
     try {
-      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as AceEvent & {
-        clipStartMs?: number;
-      };
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as AceEvent;
       if (!raw.player || !raw.kills?.length) continue;
       if (player && raw.player.toLowerCase() !== player.toLowerCase()) continue;
       // Sidecar novo traz o início exato do clipe; o antigo é estimado
-      // (1ª kill menos o contexto padrão de 10s, como o corte faz).
+      // (1ª kill menos o contexto padrão, como o corte faz).
       const startedAtMs = raw.startedAt ? Date.parse(raw.startedAt) : undefined;
       const clipStartMs =
         typeof raw.clipStartMs === 'number'
           ? raw.clipStartMs
           : startedAtMs != null
-            ? startedAtMs - 10_000
+            ? startedAtMs - contextSec * 1000
             : undefined;
-      out.push({ ace: raw, clipStartMs });
+      out.push({ ace: raw, clipStartMs, clipDurationSec: raw.clipDurationSec });
     } catch {
       continue;
     }
@@ -96,7 +95,7 @@ function loadAces(clipsDir: string, player?: string): LoadedAce[] {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const cfg = getConfig();
-  const aces = loadAces(cfg.CLIPS_DIR, args.player).slice(0, args.count);
+  const aces = loadAces(cfg.CLIPS_DIR, args.player, cfg.CLIP_CONTEXT_SEC).slice(0, args.count);
   if (aces.length === 0) {
     console.log('Nenhum sidecar encontrado em ' + cfg.CLIPS_DIR);
     return;
@@ -112,7 +111,7 @@ async function main(): Promise<void> {
       })
     : undefined;
   const results: Array<Record<string, unknown>> = [];
-  for (const { ace, clipStartMs } of aces) {
+  for (const { ace, clipStartMs, clipDurationSec } of aces) {
     const meta = await buildVideoMetadata(ace, {
       mode: args.ai ? 'ai' : 'template',
       ai,
@@ -121,6 +120,8 @@ async function main(): Promise<void> {
       privacy: cfg.YT_PRIVACY,
       defaultTags: cfg.YT_DEFAULT_TAGS,
       clipStartMs,
+      clipDurationSec,
+      killTimeOffsetMs: cfg.SCOREBOARD_DELAY_MS,
     });
     results.push({
       jogador: ace.player,

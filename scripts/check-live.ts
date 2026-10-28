@@ -15,7 +15,7 @@ import { repoPath } from '../src/paths.js';
 
 const cfg = getConfig();
 const watchlist = loadWatchlistFile(repoPath('data', 'watchlist.json'));
-const listing = await fetchMatchListing(
+const result = await fetchMatchListing(
   cfg.HLTV_MATCHES_URL,
   cfg.MIN_STARS,
   cfg.TOP_TIER_ONLY,
@@ -25,9 +25,14 @@ const listing = await fetchMatchListing(
     unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
   },
 );
-if (!listing) {
-  console.log('LIVE-TOTAL=bloqueado pelo Cloudflare (tente de novo em segundos)');
+if (!result.ok) {
+  console.log(
+    result.reason === 'blocked'
+      ? 'LIVE-TOTAL=bloqueado pelo Cloudflare (tente de novo em segundos)'
+      : `LIVE-TOTAL=falha ao extrair o listing (${result.detail ?? 'sem detalhe'})`,
+  );
 } else {
+  const listing = result.listing;
   console.log(`LIVE-TOTAL=${listing.liveTotal}`);
   console.log(`LIVE-KEPT=${listing.live.length}`);
   for (const m of listing.live) {

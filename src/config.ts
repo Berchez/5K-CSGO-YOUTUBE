@@ -1,6 +1,23 @@
 import './env.js';
 import { z } from 'zod';
 
+/** Valores aceitos como "ligado" nas variáveis de ambiente. */
+const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'sim']);
+
+/**
+ * Boolean de env sem pegadinha: "1"/"true"/"yes"/"on" ligam; "0"/
+ * "false"/"no"/"off" desligam; vazio usa o default. (O "só 'true'
+ * liga" desligava o recurso com POLL_ADAPTIVE=1.)
+ */
+export function boolEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value == null) return defaultValue;
+  const v = value.trim().toLowerCase();
+  if (!v) return defaultValue;
+  if (TRUTHY.has(v)) return true;
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off' || v === 'nao') return false;
+  return defaultValue;
+}
+
 export const ConfigSchema = z.object({
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
   /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
@@ -11,7 +28,7 @@ export const ConfigSchema = z.object({
   TOP_TIER_ONLY: z
     .string()
     .default('false')
-    .transform((v) => v.toLowerCase() === 'true'),
+    .transform((v) => boolEnv(v, false)),
   POLL_INTERVAL_MS: z.coerce.number().min(5000).default(45000),
   /**
    * Poll adaptativo (idle backoff): true = ocioso espera metade do tempo
@@ -21,7 +38,22 @@ export const ConfigSchema = z.object({
   POLL_ADAPTIVE: z
     .string()
     .default('true')
-    .transform((v) => v.toLowerCase() === 'true'),
+    .transform((v) => boolEnv(v, true)),
+  /**
+   * Fechar o browser (headed) durante a espera ociosa: libera RAM/CPU,
+   * mas o relançamento no poll seguinte pode piscar na tela (foco em
+   * jogo fullscreen). false = mantém o browser aberto.
+   */
+  HLTV_CLOSE_BROWSER_IDLE: z
+    .string()
+    .default('true')
+    .transform((v) => boolEnv(v, true)),
+  /**
+   * Espera mínima (ms) para fechar o browser ocioso. Espera curta não
+   * compensa fechar/relançar (e o relançamento é o que incomoda).
+   * 0 = fecha em qualquer espera ociosa.
+   */
+  HLTV_CLOSE_BROWSER_MIN_IDLE_MS: z.coerce.number().min(0).default(600_000),
 
   STREAM_PRIORITY: z.string().default('official,en'),
   STREAM_PREFERRED_COUNTRY: z.string().default(''),
@@ -134,7 +166,7 @@ export const ConfigSchema = z.object({
   YT_UPLOAD: z
     .string()
     .default('true')
-    .transform((v) => v.toLowerCase() === 'true'),
+    .transform((v) => boolEnv(v, true)),
   YT_CLIENT_SECRETS: z.string().default('./client_secrets.json'),
   YT_TOKEN_PATH: z.string().default('./token.json'),
   YT_CATEGORY_ID: z.string().default('20'),

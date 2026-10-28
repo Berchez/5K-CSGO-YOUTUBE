@@ -27,6 +27,7 @@ import {
 import {
   createWatchlistSignal,
   notifyWatchlistChanged,
+  pollSleepDeadline,
   sleepUntilPoll,
 } from './monitor/pollSleep.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
@@ -38,8 +39,9 @@ import { StreamRecorder } from './recorder/streamRecorder.js';
 import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
-import { buildVideoMetadata } from './uploader/videoMetadata.js';
+import { buildVideoMetadata, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
+import type { MetadataAiFn } from './uploader/videoMetadata.js';
 import { getFreeBytes } from './diskSpace.js';
 import {
   initTrayStatus,
@@ -168,6 +170,28 @@ let predictedMatchId: string | null = null;
 // Última próxima partida conhecida: mantida no painel quando o listing
 // é bloqueado (o Cloudflare não deve apagar a informação da fila).
 let lastKnownNextMatch: UpcomingMatch | null = null;
+
+/**
+ * Cliente de metadados (IA): UMA instância por sessão. Recriá-lo a cada
+ * ace zerava o circuit breaker — o contador de falhas e o provider
+ * desligado morriam com o objeto, e um provider fora do ar era tentado
+ * de novo em todo ace (2 tentativas × timeout).
+ */
+let metadataAiFn: MetadataAiFn | null = null;
+
+function getMetadataAi(): MetadataAiFn {
+  if (metadataAiFn) return metadataAiFn;
+  const cfg = getConfig();
+  metadataAiFn = createMetadataAi({
+    order: cfg.YT_META_AI_ORDER,
+    timeoutMs: cfg.YT_META_AI_TIMEOUT_MS,
+    geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+    geminiModel: cfg.YT_META_GEMINI_MODEL,
+    hfToken: cfg.HF_TOKEN || undefined,
+    hfModel: cfg.YT_META_HF_MODEL,
+  });
+  return metadataAiFn;
+}
 
 function pendingClipCount(): number {
   let total = 0;
@@ -486,34 +510,26 @@ async function handleAce(
       Date.now(),
     );
     const contextSec = lowAnchor ? cfg.CLIP_CONTEXT_UNCERTAIN_SEC : cfg.CLIP_CONTEXT_SEC;
-    // Metadados (IA ou template) rodam EM PARALELO ao corte do clipe: só
-    // dependem do round, então não somam latência no upload. Falha aqui cai
+    // Metadados: a CHAMADA da IA começa aqui (EM PARALELO ao corte do
+    // clipe — só ela depende da rede, então não soma latência no
+    // upload). A composição final espera o clipe real: o sidecar sabe o
+    // início exato do vídeo, enquanto a estimativa (1ª kill − contexto)
+    // erra quando a abertura foi truncada pelo buffer. Falha aqui cai
     // no gerador determinístico (ou no título legado, se tudo falhar).
-    const metadataPromise =
-      cfg.YT_META_MODE === 'legacy' || !cfg.YT_UPLOAD
-        ? undefined
-        : buildVideoMetadata(ace, {
-            mode: cfg.YT_META_MODE,
-            ai: createMetadataAi({
-              order: cfg.YT_META_AI_ORDER,
-              timeoutMs: cfg.YT_META_AI_TIMEOUT_MS,
-              geminiApiKey: cfg.GEMINI_API_KEY || undefined,
-              geminiModel: cfg.YT_META_GEMINI_MODEL,
-              hfToken: cfg.HF_TOKEN || undefined,
-              hfModel: cfg.YT_META_HF_MODEL,
-            }),
-            brand: cfg.YT_BRAND,
-            cta: cfg.YT_DESC_CTA,
-            privacy: cfg.YT_PRIVACY,
-            defaultTags: cfg.YT_DEFAULT_TAGS,
-            clipStartMs: aceStartMs != null ? aceStartMs - contextSec * 1000 : undefined,
-          }).catch((e) => {
+    const estimatedClipStartMs =
+      aceStartMs != null ? aceStartMs - contextSec * 1000 : undefined;
+    const metadataDraftPromise =
+      cfg.YT_META_MODE === 'ai' && cfg.YT_UPLOAD
+        ? getMetadataAi()(
+            buildMetadataContext(ace, estimatedClipStartMs, undefined, cfg.SCOREBOARD_DELAY_MS),
+          ).catch((e) => {
             log.warn(
               { err: String(e).slice(0, 200) },
               'falha ao gerar metadados — upload segue com o caminho legado',
             );
-            return undefined;
-          });
+            return null;
+          })
+        : undefined;
     const useScoreboardEnd = streamSync.applied && detectedEndMs != null;
     const useFallback =
       cfg.CLIP_STREAM_SYNC === 'auto' &&
@@ -784,7 +800,25 @@ async function handleAce(
         log.info({ clip: uploadClipResult.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
       } else {
         try {
-          const metadata = await metadataPromise;
+          // Composição final: usa o clipe REAL (início e duração do
+          // sidecar) para os timestamps e a linha de duração.
+          const metadata =
+            cfg.YT_META_MODE === 'legacy' || !cfg.YT_UPLOAD
+              ? undefined
+              : await buildVideoMetadata(ace, {
+                  mode: cfg.YT_META_MODE,
+                  ai: metadataDraftPromise ? async () => metadataDraftPromise : undefined,
+                  brand: cfg.YT_BRAND,
+                  cta: cfg.YT_DESC_CTA,
+                  privacy: cfg.YT_PRIVACY,
+                  defaultTags: cfg.YT_DEFAULT_TAGS,
+                  clipStartMs: uploadClipResult.clipStartMs ?? estimatedClipStartMs,
+                  clipDurationSec: uploadClipResult.clipDurationSec,
+                  // O `at` da kill é o momento em que o placar a mostrou:
+                  // sem descontar o atraso do placar, todo timestamp da
+                  // descrição aponta para depois da eliminação.
+                  killTimeOffsetMs: cfg.SCOREBOARD_DELAY_MS,
+                });
           videoId = await uploadClip(ace, uploadClipResult.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
             tokenPath: cfg.YT_TOKEN_PATH,
@@ -872,7 +906,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
     }
   }
 
-  const listing = await fetchMatchListing(
+  const result = await fetchMatchListing(
     cfg.HLTV_MATCHES_URL,
     cfg.MIN_STARS,
     cfg.TOP_TIER_ONLY,
@@ -882,15 +916,25 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
     },
   );
-  if (!listing) {
-    log.warn('listing bloqueado pelo Cloudflare — mantendo recorders/trackers');
-    publishTrayStatus(null, cfg, { lastError: 'listing bloqueado pelo Cloudflare' });
+  if (!result.ok) {
+    // Bloqueio do Cloudflare e erro de extração são coisas diferentes:
+    // a mensagem precisa dizer qual foi (diagnóstico), mas o efeito é o
+    // mesmo — manter recorders/trackers e pollar no intervalo base.
+    const lastError =
+      result.reason === 'blocked'
+        ? 'listing bloqueado pelo Cloudflare'
+        : 'falha ao extrair o listing';
+    log.warn(
+      { reason: result.reason, detail: result.detail },
+      `${lastError} — mantendo recorders/trackers`,
+    );
+    publishTrayStatus(null, cfg, { lastError });
     return {
       // Mantém a última partida conhecida no painel (o bloqueio não
       // apaga a fila) — o intervalo base já vem do motivo 'blocked'.
       nextMatch: lastKnownNextMatch,
       liveMatches: 0,
-      blocked: true,
+      blocked: result.reason === 'blocked',
       scheduleReliable: false,
       watchlistStale,
       // Mudou durante este poll? (a versão consumida no topo do loop é a
@@ -899,6 +943,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       watchlistChanged: watchlistSignal.version !== watchlistVersion,
     };
   }
+  const listing = result.listing;
   const matches = listing.live;
 
   // Telemetria de detecção: quando a live elegível aparece pela 1ª vez,
@@ -918,7 +963,13 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       predicted: ev.predicted,
     };
     if (ev.latencyMs === null) {
-      log.warn(base, 'live detectada fora da agenda conhecida');
+      // Agenda vazia = o bot ainda não viu um listing válido (startup):
+      // "fora da agenda" é o estado normal, não um sintoma do backoff.
+      if (knownUpcoming.size > 0) {
+        log.warn(base, 'live detectada fora da agenda conhecida');
+      } else {
+        log.info(base, 'live detectada (agenda ainda desconhecida)');
+      }
     } else {
       log.info(base, 'live detectada');
     }
@@ -1406,10 +1457,16 @@ async function main(): Promise<void> {
         // forçam o intervalo base): fecha o browser e libera RAM/CPU
         // durante a espera. O perfil persistente guarda o clearance do
         // Cloudflare; o próximo poll relança o browser.
-        try {
-          await closeBrowser();
-        } catch {
-          // best-effort: fechar o browser é conveniência, não parte do poll
+        //
+        // Só fecha quando a espera é LONGA: relançar o Chrome a cada
+        // espera curta pisca na tela e pode roubar o foco de um jogo em
+        // fullscreen (o Chrome real às vezes ignora a flag de minimizar).
+        if (cfg.HLTV_CLOSE_BROWSER_IDLE && delay >= cfg.HLTV_CLOSE_BROWSER_MIN_IDLE_MS) {
+          try {
+            await closeBrowser();
+          } catch {
+            // best-effort: fechar o browser é conveniência, não parte do poll
+          }
         }
       }
     } catch (e) {
@@ -1424,13 +1481,35 @@ async function main(): Promise<void> {
     // Dorme até o próximo poll. Uma mudança da watchlist antecipa a
     // espera (hot-reload), mas nunca antes de um intervalo base após o
     // poll anterior (debounce) — e nunca zera a espera (hot-loop).
-    await sleepUntilPoll({
-      targetAt: Date.now() + delay,
-      signal: watchlistSignal,
-      lastPollAt: pollStartedAt,
-      baseIntervalMs: cfg.POLL_INTERVAL_MS,
-      shouldStop: () => stopping,
-    });
+    // seenVersion = a versão que ESTE poll já consumiu: uma mudança
+    // antiga (o contador nunca volta a 0) não pode continuar
+    // antecipando o deadline e matar o backoff.
+    await sleepUntilPoll(
+      {
+        targetAt: Date.now() + delay,
+        signal: watchlistSignal,
+        seenVersion: watchlistVersion,
+        lastPollAt: pollStartedAt,
+        baseIntervalMs: cfg.POLL_INTERVAL_MS,
+        shouldStop: () => stopping,
+      },
+      {
+        // A mudança da watchlist antecipa o poll: o horário publicado no
+        // painel (nextPollAt) ficava no deadline antigo, mentindo sobre
+        // quando o próximo poll acontece.
+        onWake: () => {
+          const deadline = pollSleepDeadline({
+            now: Date.now(),
+            targetAt: Date.now() + delay,
+            signal: watchlistSignal,
+            seenVersion: watchlistVersion,
+            lastPollAt: pollStartedAt,
+            baseIntervalMs: cfg.POLL_INTERVAL_MS,
+          });
+          patchTrayStatus({ nextPollAt: new Date(deadline).toISOString() });
+        },
+      },
+    );
   }
 }
 

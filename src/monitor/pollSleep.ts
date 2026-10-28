@@ -12,6 +12,12 @@
  *   UM poll (o último toque redefine a hora);
  * - nenhum "flag sujo" consegue zerar a espera: o poll que lançou
  *   exceção não vira hot-loop (o sleep sempre espera até o deadline).
+ *
+ * A versão da watchlist é um contador monotônico: ela NUNCA volta a 0.
+ * Por isso o sleep compara com a versão JÁ CONSUMIDA por um poll
+ * (seenVersion): uma mudança antiga que o poll anterior já aplicou não
+ * pode continuar antecipando o deadline (senão o backoff de 30min
+ * vira poll a cada 45s para sempre).
  */
 
 /** Sinal da watchlist compartilhado entre o watcher e o loop de poll. */
@@ -49,6 +55,11 @@ export interface PollSleepDeadlineInput {
   /** Deadline normal (fim do poll + intervalo decidido). */
   targetAt: number;
   signal: WatchlistSignal;
+  /**
+   * Versão da watchlist já consumida por um poll. Mudanças com versão
+   * MAIOR que esta ainda não foram aplicadas → antecipam o poll.
+   */
+  seenVersion: number;
   /** Início do último poll (base do piso entre polls). */
   lastPollAt: number;
   baseIntervalMs: number;
@@ -57,16 +68,21 @@ export interface PollSleepDeadlineInput {
 /**
  * Deadline absoluto do próximo poll (epoch ms).
  *
- * Sem mudança: o deadline normal (fim do poll + delay).
- * Com mudança: antecipa para "mudança + quiet period", mas nunca antes do
- * piso "último poll + 1 intervalo base" (debounce) — assim uma salva não
- * gera um poll por segundo e o poll que acabou de rodar não é seguido de
- * outro imediato. O deadline nunca passa do normal (targetAt).
+ * Sem mudança nova (version <= seenVersion): o deadline normal (fim do
+ * poll + delay). O piso "último poll + 1 intervalo base" NÃO entra aqui:
+ * ele existe para debounce do wake da watchlist, e aplicá-lo no deadline
+ * normal atropelava o "near-match" (o poll acabava depois do início da
+ * partida, que é justamente o que o near-match promete evitar).
+ *
+ * Com mudança nova: antecipa para "mudança + quiet period", mas nunca
+ * antes do piso "último poll + 1 intervalo base" (debounce) — assim uma
+ * salva não gera um poll por segundo. O deadline nunca passa do normal
+ * (targetAt).
  */
 export function pollSleepDeadline(input: PollSleepDeadlineInput): number {
   const base = Math.max(1000, Math.floor(input.baseIntervalMs));
   const minGapAt = input.lastPollAt + base;
-  if (input.signal.version === 0) return Math.max(input.targetAt, minGapAt);
+  if (input.signal.version <= input.seenVersion) return input.targetAt;
   const wakeAt = Math.min(
     input.targetAt,
     input.signal.changedAt + POLL_WATCHLIST_DEBOUNCE_MS,
@@ -78,6 +94,8 @@ export interface PollSleepInput {
   /** Deadline normal (fim do poll + intervalo decidido). */
   targetAt: number;
   signal: WatchlistSignal;
+  /** Versão da watchlist já consumida pelo poll que acabou de rodar. */
+  seenVersion: number;
   /** Início do último poll (base do piso entre polls). */
   lastPollAt: number;
   baseIntervalMs: number;
@@ -116,6 +134,7 @@ export async function sleepUntilPoll(
       now: now(),
       targetAt: input.targetAt,
       signal: input.signal,
+      seenVersion: input.seenVersion,
       lastPollAt: input.lastPollAt,
       baseIntervalMs: input.baseIntervalMs,
     });

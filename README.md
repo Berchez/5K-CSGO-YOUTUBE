@@ -145,8 +145,9 @@ layout breaks), so it fails open instead of closed:
 Saving `data/watchlist.json` wakes the bot up: the next poll happens a few
 seconds after the save (never sooner than one base interval after the
 previous poll), so repeated file touches (autosave, OneDrive) collapse into a
-single listing check. The panel shows the next poll and the next eligible
-match.
+single listing check. A save that the poll in flight already applied doesn't
+wake anything (the backoff keeps its schedule). The panel shows the next poll
+and the next eligible match.
 
 Each live match that is detected for the first time is logged with the
 detection latency (`latencyMs` = detection time − scheduled start) and
@@ -155,7 +156,11 @@ against real data.
 
 While the bot waits in the backoff it closes the browser (RAM/CPU free); the
 persistent profile keeps the Cloudflare clearance, and the next poll
-relaunches it.
+relaunches it. The relaunch can blink on screen (the real Chrome sometimes
+ignores the "minimized" flag), so the browser is only closed when the wait is
+**long** (`HLTV_CLOSE_BROWSER_MIN_IDLE_MS`, default 10min) — a short wait
+isn't worth a restart. `HLTV_CLOSE_BROWSER_IDLE=false` keeps the browser open
+the whole time.
 
 ## Testing with a finished match (without waiting for live)
 
@@ -338,7 +343,11 @@ latency on the upload.
 | `legacy` | The old fixed title/description (kill switch). |
 
 Provider chain (`YT_META_AI_ORDER=gemini,huggingface`): the first one that
-answers wins; a provider that fails twice is disabled for the session.
+answers wins; a provider that fails twice is disabled for the session (the
+breaker lives in the client, which is created once per bot session — not once
+per clip). The calls are queued (one at a time), so two simultaneous aces
+don't blow the provider's rate limit, and the timeout is a budget shared by
+the retries (a bad key fails fast, without burning the whole budget twice).
 
 ### The description
 
@@ -347,16 +356,16 @@ The description always has the same readable structure:
 ```
 donk pegou o round 10 no Mirage — PGL Masters Bucharest 2026
 
-O round 10 no Mirage virou spectacle: donk somou 5 kills.
+O round 10 no Mirage virou espetáculo: donk somou 5 kills.
 
 Round 10 | Mirage | Spirit vs MOUZ | Placar 3-6
 
-0:20 matou Spinx
-0:26 matou PR
-0:29 matou sh1ro (AK-47, HS)
+0:10 matou Spinx
+0:16 matou PR
+0:19 matou sh1ro (AK-47, HS)
 ...
 
-5 kills | 2 headshots | arma principal AK-47 (4/5)
+5 kills | 2 headshots | arma principal AK-47 (4/5) | duração 1:12
 
 #cs2 #counterstrike #mirage #ace #donk #spirit #mouz #pgl
 
@@ -366,9 +375,16 @@ Corte automático. Vídeo não listado: aparece só para quem tem o link.
 The opening (first two blocks) is what the AI writes — a punchy line plus a
 short paragraph in 2nd person. The rest is deterministic, so the facts, the
 kill-by-kill list, the stats, the hashtags and the footer are always there and
-always true. The kill timestamps use the same anchor the cut uses (first kill
-minus the context), so `0:20` is where the elimination really happens in the
-video; the exact clip start is also stored in the sidecar (`clipStartMs`).
+always true.
+
+The kill timestamps point at where the elimination happens in the video: they
+are measured from the **real** clip start (stored in the sidecar as
+`clipStartMs`; the estimate — first kill minus the context — is only the
+fallback for a clip whose opening was truncated by the buffer) and they
+discount the scoreboard delay (`SCOREBOARD_DELAY_MS`), because the timestamp
+of a kill is the moment the HLTV scoreboard *showed* it, not the moment it
+happened. With the default context (10s) the first elimination lands at
+`0:10`.
 
 ### The guard (why the AI can't publish nonsense)
 
@@ -377,9 +393,13 @@ before it reaches YouTube. Rejected: wrong kill/headshot counts, "ace" below
 5 kills, `clutch`/`1vX`, round results ("vitória/GG"), a score that isn't the
 real one, naming the player's rival when the player's side is unknown, URLs,
 hashtags in the title, more than one emoji, titles over 100 chars and
-descriptions over 5000. A rejected title falls back to the deterministic one;
+descriptions over 5000 bytes. A rejected title falls back to the deterministic one;
 a rejected description falls back to the deterministic narrative. Either way
 the video is published with something correct.
+
+The guard only looks at what the AI wrote (title and opening). The footer and
+the `YT_DESC_CTA` line are yours — a CTA with a link stays in the description
+(YouTube accepts links there), and the round data itself is never "wrong".
 
 Titles always carry the player name plus the event (or the team), at most one
 emoji (`🔥💥⚡🎯💀🚨❗`), and no hashtags — those go at the end of the

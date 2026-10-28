@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildMetadataPrompt, metadataAiProviders, parseAiDraft } from '../src/uploader/metadataAi.js';
+import {
+  buildMetadataPrompt,
+  isRetriableError,
+  metadataAiProviders,
+  parseAiDraft,
+  thinkingConfigFor,
+} from '../src/uploader/metadataAi.js';
 import { buildMetadataContext } from '../src/uploader/videoMetadata.js';
 import type { AceEvent } from '../src/types.js';
 
@@ -51,15 +57,17 @@ describe('parse da resposta da IA', () => {
     expect(draft?.opening).toBe('d');
   });
 
-  it('conserta JSON truncado no meio da lista', () => {
+  it('conserta JSON truncado no meio da lista e descarta o título cortado', () => {
+    // O último item de uma resposta truncada fica pela metade e passa na
+    // validação: ele viraria título cortado no vídeo.
     const draft = parseAiDraft('{"titles": ["titulo bom", "titulo cortad');
     expect(draft?.titles?.[0]).toBe('titulo bom');
-    expect(draft?.titles).toHaveLength(2);
+    expect(draft?.titles).toHaveLength(1);
   });
 
-  it('conserta JSON truncado dentro de uma string', () => {
+  it('descarta a resposta truncada que só tinha o título cortado', () => {
     const draft = parseAiDraft('{"titles": ["titulo cortad');
-    expect(draft?.titles).toEqual(['titulo cortad']);
+    expect(draft).toBeNull();
   });
 
   it('descarta resposta sem JSON utilizável', () => {
@@ -78,5 +86,24 @@ describe('prompt dos metadados', () => {
     expect(prompt).toContain('5');
     expect(prompt).toContain('clutch');
     expect(prompt).toContain('100 caracteres');
+  });
+});
+
+describe('resiliência do provider', () => {
+  it('não repete erro de credencial/permissão', () => {
+    expect(isRetriableError(new Error('API key not valid: 400'))).toBe(false);
+    expect(isRetriableError(new Error('got status 401 Unauthorized'))).toBe(false);
+    expect(isRetriableError(new Error('got status 403 Forbidden'))).toBe(false);
+  });
+
+  it('repete erro de rede/rate limit', () => {
+    expect(isRetriableError(new Error('fetch failed'))).toBe(true);
+    expect(isRetriableError(new Error('got status 429 Too Many Requests'))).toBe(true);
+    expect(isRetriableError(new Error('timeout gemini-texto após 45000ms'))).toBe(true);
+  });
+
+  it('não manda thinkingBudget para o Gemini 3 (o modelo rejeita o campo)', () => {
+    expect(thinkingConfigFor('gemini-3-flash-preview')).toBeUndefined();
+    expect(thinkingConfigFor('gemini-2.5-flash')).toEqual({ thinkingBudget: 0 });
   });
 });

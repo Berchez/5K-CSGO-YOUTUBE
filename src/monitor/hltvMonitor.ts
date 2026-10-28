@@ -529,6 +529,15 @@ export interface ListingCards {
   liveError: string | null;
   /** Erro na extração dos futuros (a agenda fica não confiável). */
   upcomingError: string | null;
+  /**
+   * Cards live que quebraram na extração. Um card live perdido = a
+   * partida some do listing = o recorder dela é parado e o buffer
+   * APAGADO. Por isso o erro é contabilizado: o listing inteiro é
+   * tratado como inutilizável (mantém recorder/buffer).
+   */
+  liveCardErrors: number;
+  /** Cards futuros que quebraram (a agenda fica não confiável). */
+  upcomingCardErrors: number;
 }
 
 /**
@@ -568,7 +577,17 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
       upcomingSeen: number;
       liveError: string | null;
       upcomingError: string | null;
-    } = { live: [], upcoming: [], upcomingSeen: 0, liveError: null, upcomingError: null };
+      liveCardErrors: number;
+      upcomingCardErrors: number;
+    } = {
+      live: [],
+      upcoming: [],
+      upcomingSeen: 0,
+      liveError: null,
+      upcomingError: null,
+      liveCardErrors: 0,
+      upcomingCardErrors: 0,
+    };
 
     // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
     // rating incluem estrelas "faded"; contar só os <i> dava 5 em jogo 1★.
@@ -600,10 +619,13 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
         .filter(Boolean)
         .slice(0, 2);
       const eventEl = root.querySelector('.match-event');
+      // Ordem: atributo do próprio card → atributo do wrapper do evento
+      // → texto do card. O texto do .match-event concatena o stage
+      // ("evento + fase"), então ele é o ÚLTIMO recurso.
       const event =
         eventEl?.getAttribute('data-event-headline')?.trim() ||
-        (eventEl?.textContent ?? '').trim().slice(0, 120) ||
         root.closest('[data-event-headline]')?.getAttribute('data-event-headline')?.trim() ||
+        (eventEl?.textContent ?? '').trim().slice(0, 120) ||
         '';
       const stage = root.querySelector('.match-stage')?.textContent?.trim().slice(0, 40) ?? '';
       return { matchId, href, teamNames, event, stage, isLive, stars: parseStars(root) };
@@ -622,7 +644,9 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
           seenLive.add(matchId);
           out.live.push(parseCard(w, matchId, href, isLiveCard(w)));
         } catch {
-          // card isolado quebrado: segue (o resto do listing vale)
+          // Card isolado quebrado: conta o erro (o listing pode ficar
+          // inutilizável — ver liveCardErrors) e segue com o resto.
+          out.liveCardErrors += 1;
         }
       }
     } catch (e) {
@@ -651,7 +675,9 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
             '';
           out.upcoming.push({ ...parseCard(w, matchId, href, false), startUnix });
         } catch {
-          // card isolado quebrado: segue (o resto do listing vale)
+          // Card isolado quebrado: conta o erro (a agenda fica não
+          // confiável) e segue com o resto.
+          out.upcomingCardErrors += 1;
         }
       }
     } catch (e) {
@@ -662,15 +688,16 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
   });
 }
 
-/** Só os cards live (atalho da extração unificada). */
-export async function extractLiveCards(page: Page): Promise<MatchCard[]> {
-  return (await extractListingCards(page)).live;
-}
+/** Motivo pelo qual o listing não pôde ser usado neste poll. */
+export type ListingFailureReason =
+  /** Cloudflare não liberou a página (challenge). */
+  | 'blocked'
+  /** A página abriu, mas a extração dos cards quebrou. */
+  | 'extraction-error';
 
-/** Só os cards futuros (atalho da extração unificada). */
-export async function extractUpcomingCards(page: Page): Promise<UpcomingCard[]> {
-  return (await extractListingCards(page)).upcoming;
-}
+export type ListingResult =
+  | { ok: true; listing: MatchListing }
+  | { ok: false; reason: ListingFailureReason; detail?: string };
 
 /**
  * Busca o listing de /matches (layout HLTV 2026): partidas LIVE que passam
@@ -682,16 +709,17 @@ export async function extractUpcomingCards(page: Page): Promise<UpcomingCard[]> 
  * marcado vem de .match-time[data-unix] (fallback: o wrapper de horário
  * data-zonedgrouping-entry-unix) — mesmo HTML, zero page-load extra.
  *
- * Retorna null se o Cloudflare bloquear OU se a extração das live falhar
- * (para o ciclo pular sem desmontar recorders/trackers — [] significaria
- * "sem lives" e derrubaria tudo).
+ * Falha vem com o MOTIVO (blocked x extraction-error): o ciclo precisa
+ * manter recorders/trackers nos dois casos (listing vazio significaria
+ * "sem lives" e derrubaria tudo), mas a mensagem/log tem que ser honesto
+ * — "bloqueado pelo Cloudflare" num erro de parsing é diagnóstico errado.
  */
 export async function fetchMatchListing(
   matchesUrl: string,
   minStars: number,
   topTierOnly: boolean,
   filter: LiveMatchFilter = {},
-): Promise<MatchListing | null> {
+): Promise<ListingResult> {
   const log = getLogger();
   const b = await getBrowser();
   // Sem userAgent fixo de propósito: o contexto stealth envia UA autêntico
@@ -699,20 +727,34 @@ export async function fetchMatchListing(
   const page: Page = await newTrackedPage();
   try {
     await page.goto(matchesUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    if (!(await waitForClearance(page))) return null;
+    if (!(await waitForClearance(page))) {
+      return { ok: false, reason: 'blocked' };
+    }
     await page.waitForTimeout(3000);
 
     const cards = await extractListingCards(page);
-    if (cards.liveError) {
-      // Falha na extração dos live = listing inutilizável: trata como
-      // bloqueado (mantém recorders/trackers) em vez de "zero lives".
-      log.error({ err: cards.liveError }, 'falha ao extrair as live do listing');
-      return null;
+    if (cards.liveError || cards.liveCardErrors > 0) {
+      // Falha na extração dos live = listing inutilizável: o poll pula
+      // sem desmontar recorders/trackers. Um card live perdido também
+      // conta: a partida sumiria do listing e o recorder dela seria
+      // parado (e o buffer apagado) sem motivo.
+      log.error(
+        { err: cards.liveError, cardErrors: cards.liveCardErrors },
+        'falha ao extrair as live do listing',
+      );
+      return {
+        ok: false,
+        reason: 'extraction-error',
+        detail: cards.liveError ?? `${cards.liveCardErrors} card(s) live quebrado(s)`,
+      };
     }
-    if (cards.upcomingError) {
+    if (cards.upcomingError || cards.upcomingCardErrors > 0) {
       // A agenda futura é opcional: o poll continua no intervalo base
       // (fail-open) em vez de dormir achando que não há partida.
-      log.warn({ err: cards.upcomingError }, 'falha ao extrair as partidas futuras');
+      log.warn(
+        { err: cards.upcomingError, cardErrors: cards.upcomingCardErrors },
+        'falha ao extrair as partidas futuras',
+      );
     }
 
     const listing = buildListing(cards, minStars, topTierOnly, filter);
@@ -735,11 +777,18 @@ export async function fetchMatchListing(
       },
       'live matches filtradas',
     );
-    return listing;
+    return { ok: true, listing };
   } finally {
     await page.close().catch(() => undefined);
   }
 }
+
+/**
+ * Fração mínima de cards futuros COM horário para a agenda ser
+ * confiável. Abaixo disso, parte do listing não tem data (countdown,
+ * "TBD") e o backoff miraria uma partida mais distante que a real.
+ */
+export const SCHEDULE_MIN_TIME_RATIO = 0.5;
 
 /**
  * Listing puro: aplica os filtros (estrelas/watchlist) nos cards crus.
@@ -797,6 +846,14 @@ export function buildListing(
   }
   upcoming.sort((a, b) => a.startsAt - b.startsAt);
 
+  // Confiabilidade da agenda: além de existir card com horário, a MAIOR
+  // parte deles precisa ter horário. Se só uma minoria tem data, o
+  // backoff miraria uma partida mais distante que a real (a mais
+  // próxima pode ser a que está sem data) → fail-open: intervalo base.
+  const uniqueSeen = new Set(cards.upcoming.map((c) => c.matchId)).size;
+  const uniqueWithTime = new Set(scheduled.map((m) => m.matchId)).size;
+  const timeRatio = uniqueSeen > 0 ? uniqueWithTime / uniqueSeen : 0;
+
   return {
     live: matches,
     liveTotal: cards.live.filter((c) => c.isLive).length,
@@ -805,8 +862,13 @@ export function buildListing(
     upcomingTotal: deduped.length,
     upcomingSeen: cards.upcomingSeen,
     // Agenda confiável = o listing mostrou alguma partida futura com
-    // horário. Sem isso o poll não pode adiar (fail-open: intervalo base).
-    scheduleReliable: !cards.upcomingError && deduped.length > 0,
+    // horário (e a maioria dos cards tem horário). Sem isso o poll não
+    // pode adiar (fail-open: intervalo base).
+    scheduleReliable:
+      !cards.upcomingError &&
+      cards.upcomingCardErrors === 0 &&
+      deduped.length > 0 &&
+      timeRatio >= SCHEDULE_MIN_TIME_RATIO,
   };
 }
 

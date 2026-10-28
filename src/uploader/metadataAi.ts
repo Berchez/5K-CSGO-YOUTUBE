@@ -1,5 +1,6 @@
 import { getLogger } from '../logger.js';
 import type { MetadataAiFn, MetadataContext, MetadataDraft } from './videoMetadata.js';
+import type { ThinkingConfig } from '@google/genai';
 
 export type MetadataAiProvider = 'gemini' | 'huggingface';
 
@@ -86,12 +87,18 @@ export function parseAiDraft(raw: string): MetadataDraft | null {
   const start = unfenced.indexOf('{');
   const end = unfenced.lastIndexOf('}');
   const candidate = start >= 0 && end > start ? unfenced.slice(start, end + 1) : unfenced;
-  const parsed = tryParseJson(candidate) ?? tryParseJson(repairJson(candidate));
+  const direct = tryParseJson(candidate);
+  const repaired = direct ? null : tryParseJson(repairJson(candidate));
+  const parsed = direct ?? repaired;
   if (!parsed || typeof parsed !== 'object') return null;
   const obj = parsed as { titles?: unknown; opening?: unknown; description?: unknown };
   const titles = Array.isArray(obj.titles)
     ? obj.titles.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
     : [];
+  // A resposta truncada (fim de contexto/token) deixa o ÚLTIMO item pela
+  // metade: ele passa na validação e vira título cortado no vídeo.
+  // Quando o JSON teve que ser consertado, o último título é descartado.
+  if (repaired && titles.length > 0) titles.pop();
   const opening =
     typeof obj.opening === 'string'
       ? obj.opening
@@ -155,13 +162,50 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
   }
 }
 
+/**
+ * Erro que NÃO adianta repetir: credencial inválida/permissão negada.
+ * Repetir só gasta o orçamento de tempo (e o provider acabaria
+ * desligado do mesmo jeito).
+ */
+export function isRetriableError(error: unknown): boolean {
+  const message = String((error as { message?: unknown } | undefined)?.message ?? error);
+  return !(
+    /\b(401|403)\b/.test(message) ||
+    /api[\s_-]?key/i.test(message) ||
+    /unauthori[sz]ed|forbidden|permission/i.test(message)
+  );
+}
+
+/**
+ * Configuração de "thinking" por modelo.
+ *
+ * Os modelos Gemini 3 não aceitam `thinkingBudget` (o parâmetro foi
+ * trocado por `thinkingLevel`, que o SDK nem envia no Developer API):
+ * mandar o campo errado derruba a chamada com INVALID_ARGUMENT e o
+ * provider era desligado depois de 2 falhas. Para o Gemini 3 a resposta
+ * é NÃO mandar config nenhuma (o modelo raciocina sempre; o orçamento
+ * de 8192 tokens já cobre pensamento + títulos + texto).
+ *
+ * Modelos anteriores (2.x) aceitam `thinkingBudget: 0` (sem raciocínio
+ * → mais rápido e barato).
+ */
+export function thinkingConfigFor(model: string): ThinkingConfig | undefined {
+  if (/gemini-?3/i.test(model)) return undefined;
+  return { thinkingBudget: 0 };
+}
+
+function mentionsThinking(error: unknown): boolean {
+  const message = String((error as { message?: unknown } | undefined)?.message ?? error);
+  return /thinking/i.test(message);
+}
+
 export async function geminiText(
   prompt: string,
   opts: { apiKey: string; model: string; timeoutMs: number },
 ): Promise<string> {
   const { GoogleGenAI, Type } = await import('@google/genai');
   const ai = new GoogleGenAI({ apiKey: opts.apiKey });
-  const run = (async () => {
+  const call = async (thinking?: ThinkingConfig) => {
     const res = await ai.models.generateContent({
       model: opts.model,
       contents: prompt,
@@ -180,30 +224,54 @@ export async function geminiText(
         // da resposta: sem limite, o texto truncava no meio do 2º título (e a
         // descrição nunca chegava). 8192 cabe pensamento + 3 títulos + texto.
         maxOutputTokens: 8192,
-        // Escrever metadados não precisa de raciocínio longo: sem pensamento
-        // a chamada fica mais rápida, barata e previsível.
-        thinkingConfig: { thinkingBudget: 0 },
+        // Para os modelos 2.x, escrever metadados não precisa de raciocínio
+        // longo (thinkingBudget: 0 → mais rápido, barato e previsível).
+        // No Gemini 3 nenhum config de thinking é enviado (o modelo
+        // raciocina sempre e rejeita thinkingBudget).
+        ...(thinking ? { thinkingConfig: thinking } : {}),
       },
     });
     return res.text ?? '';
+  };
+  const run = (async () => {
+    const thinking = thinkingConfigFor(opts.model);
+    try {
+      return await call(thinking);
+    } catch (e) {
+      // Se o modelo recusar o parâmetro de thinking, tenta sem ele
+      // (melhor um título com raciocínio do que nenhum título).
+      if (thinking && mentionsThinking(e)) {
+        return await call(undefined);
+      }
+      throw e;
+    }
   })();
   return withTimeout(run, opts.timeoutMs, 'gemini-texto');
 }
 
+/**
+ * Retry com orçamento TOTAL de tempo: as tentativas compartilham o mesmo
+ * prazo (o timeout não é multiplicado pelo número de tentativas) e erros
+ * não retentáveis (401/403) quebram na hora.
+ */
 async function withRetry<T>(
-  fn: () => Promise<T>,
+  fn: (budgetMs: number) => Promise<T>,
   attempts: number,
   label: string,
+  budgetMs: number,
 ): Promise<T> {
+  const deadline = Date.now() + budgetMs;
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     try {
-      return await fn();
+      return await fn(remaining);
     } catch (e) {
       lastError = e;
-      if (attempt < attempts) {
-        await new Promise((r) => setTimeout(r, 1200 * attempt));
-      }
+      if (!isRetriableError(e) || attempt >= attempts) break;
+      const wait = Math.min(1200 * attempt, Math.max(0, deadline - Date.now()));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   }
   throw new Error(`${label}: ${String(lastError).slice(0, 200)}`);
@@ -242,7 +310,19 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
   const log = getLogger().child({ feature: 'metadata-ai' });
   const failures = new Map<MetadataAiProvider, number>();
   const disabled = new Set<MetadataAiProvider>();
-  return async (ctx: MetadataContext): Promise<MetadataDraft | null> => {
+  // Fila de chamadas: com MAX_RECORDINGS > 1, dois aces simultâneos
+  // estouravam o RPM do provider (e o rate limit derruba a sessão
+  // inteira). Uma chamada por vez, na ordem em que chegaram.
+  let queue: Promise<unknown> = Promise.resolve();
+  const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = queue.then(fn, fn);
+    queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+  const runProvider = async (ctx: MetadataContext): Promise<MetadataDraft | null> => {
     const prompt = buildMetadataPrompt(ctx);
     for (const provider of providers) {
       if (disabled.has(provider)) continue;
@@ -254,14 +334,15 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
             continue;
           }
           raw = await withRetry(
-            () =>
+            (budgetMs) =>
               geminiText(prompt, {
                 apiKey: opts.geminiApiKey as string,
                 model: geminiModel,
-                timeoutMs,
+                timeoutMs: budgetMs,
               }),
             2,
             'gemini-texto',
+            timeoutMs,
           );
         } else {
           if (!opts.hfToken) {
@@ -269,14 +350,15 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
             continue;
           }
           raw = await withRetry(
-            () =>
+            (budgetMs) =>
               huggingfaceText(prompt, {
                 token: opts.hfToken as string,
                 model: hfModel,
-                timeoutMs,
+                timeoutMs: budgetMs,
               }),
             1,
             'huggingface-texto',
+            timeoutMs,
           );
         }
         const draft = parseAiDraft(raw);
@@ -302,4 +384,5 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
     }
     return null;
   };
+  return (ctx: MetadataContext): Promise<MetadataDraft | null> => enqueue(() => runProvider(ctx));
 }

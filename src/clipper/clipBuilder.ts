@@ -1429,6 +1429,11 @@ export async function buildClip(
     }
   }
 
+  // Início real do clipe (timeline do concat + trim): o sidecar é a
+  // fonte da verdade para os timestamps da descrição (a estimativa
+  // "1ª kill − contexto" erra quando a abertura foi truncada).
+  const clipStartMs = Math.round(firstSegStartMs + trimStartSec * 1000);
+
   fs.writeFileSync(
     sidecarPath,
     JSON.stringify(
@@ -1440,7 +1445,7 @@ export async function buildClip(
         freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),
-        clipStartMs: Math.round(firstSegStartMs + trimStartSec * 1000),
+        clipStartMs,
         clipDurationSec: outDurSec,
         avMode,
         avOffsetMs: avMeasuredMs,
@@ -1465,6 +1470,8 @@ export async function buildClip(
     sidecarPath,
     thumbnailPath: fs.existsSync(thumbPath) ? thumbPath : undefined,
     durationSec,
+    clipStartMs,
+    clipDurationSec: outDurSec,
   };
 }
 

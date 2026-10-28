@@ -11,6 +11,7 @@ import {
   resetUsedTitles,
   sanitizeDescription,
   sanitizeTitle,
+  utf8Length,
   validateDescription,
   validateTitle,
 } from '../src/uploader/videoMetadata.js';
@@ -170,6 +171,30 @@ describe('descrição determinística', () => {
     expect(desc).toContain('1:05 matou b');
   });
 
+  it('desconta o atraso do placar (o `at` é a observação, não o kill)', () => {
+    // O placar do HLTV reflete o kill SCOREBOARD_DELAY_MS depois: o `at`
+    // da kill é o momento da OBSERVAÇÃO. Sem descontar o atraso, todo
+    // timestamp aponta para depois da eliminação no vídeo.
+    const ace = makeAce({
+      kills: [
+        { killer: 'donk', victim: 'a', round: 12, map: 'Mirage', at: 1_010_000 },
+        { killer: 'donk', victim: 'b', round: 12, map: 'Mirage', at: 1_075_000 },
+      ],
+    });
+    const ctx = buildMetadataContext(ace, 1_000_000, undefined, 10_000);
+    const desc = buildTemplateDescription(ctx);
+    expect(desc).toContain('0:00 matou a');
+    expect(desc).toContain('1:05 matou b');
+  });
+
+  it('timestamp nunca fica negativo (kill antes do início do clipe)', () => {
+    const ace = makeAce({
+      kills: [{ killer: 'donk', victim: 'a', round: 12, map: 'Mirage', at: 900_000 }],
+    });
+    const ctx = buildMetadataContext(ace, 1_000_000, undefined, 10_000);
+    expect(ctx.feed[0].timeSec).toBe(0);
+  });
+
   it('sem âncora não inventa timestamp', () => {
     const ctx = buildMetadataContext(makeAce());
     const desc = buildTemplateDescription(ctx);
@@ -194,6 +219,16 @@ describe('guarda anti-alucinação', () => {
       false,
     );
     expect(validateDescription('donk marcou 5 abates no Mirage.', ctx).ok).toBe(true);
+  });
+
+  it('não confunde número/nick com contagem de kills', () => {
+    // Regressão: o regex sem bordas casava "2026 Kyiv" (2026 + K) e
+    // "Techno4K" (4 + K) como contagem de kills e derrubava o texto.
+    expect(
+      validateTitle('donk 5 kills no Mirage | PGL Masters Bucharest 2026 Kyiv', ctx).ok,
+    ).toBe(true);
+    expect(validateTitle('donk 5 kills no Mirage | Techno4K Spirit', ctx).ok).toBe(true);
+    expect(validateDescription('donk fez 5 kills em 2026 Kyiv com o Spirit.', ctx).ok).toBe(true);
   });
 
   it('rejeita ace com menos de 5 kills', () => {
@@ -288,6 +323,23 @@ describe('sanitização', () => {
 
   it('remove emoji da descrição', () => {
     expect(sanitizeDescription('donk fez 5 kills 🔥 no Mirage')).not.toContain('🔥');
+  });
+
+  it('não deixa o variation selector (U+FE0F) no texto', () => {
+    // O seletor de emoji não cobre o VS16: ele sobrevivia ao replace.
+    expect(sanitizeTitle('donk 🔥 5 kills')).not.toContain('\uFE0F');
+    expect(sanitizeDescription('donk fez 5 kills ❗️ no Mirage')).not.toContain('\uFE0F');
+  });
+
+  it('remove < e > (o YouTube rejeita título/descrição com eles)', () => {
+    expect(sanitizeTitle('donk <Mirage> 5 kills')).not.toMatch(/[<>]/);
+    expect(sanitizeDescription('donk <Mirage> 5 kills')).not.toMatch(/[<>]/);
+  });
+
+  it('corta a descrição no limite de BYTES do YouTube (acentos valem 2)', () => {
+    const desc = sanitizeDescription('á'.repeat(3000));
+    expect(utf8Length(desc)).toBeLessThanOrEqual(5000);
+    expect(desc.length).toBeLessThan(3000);
   });
 });
 
@@ -409,6 +461,32 @@ describe('buildVideoMetadata', () => {
     expect(called).toBe(false);
     expect(meta.source).toBe('template');
   });
+
+  it('mantém a URL do CTA (o sanitize não pode comê-la)', async () => {
+    const meta = await buildVideoMetadata(makeAce(), {
+      mode: 'template',
+      cta: 'Inscreva-se: https://youtube.com/@canal',
+    });
+    expect(meta.description).toContain('https://youtube.com/@canal');
+  });
+
+  it('CTA com URL e número não derruba a descrição da IA', async () => {
+    // O CTA é config do dono (pode ter link e número): a guarda anti-
+    // alucinação olha o texto da IA, não o rodapé.
+    const meta = await buildVideoMetadata(makeAce(), {
+      mode: 'ai',
+      cta: 'Inscreva-se: https://youtube.com/@canal (10k inscritos)',
+      ai: async () => ({
+        titles: ['donk 5 KILLS no Mirage — PGL Masters 🔥'],
+        opening: 'donk dominou o round 12 no Mirage com 5 kills.',
+        provider: 'gemini',
+      }),
+    });
+    expect(meta.source).toBe('ai');
+    expect(meta.description).toContain('donk dominou o round');
+    expect(meta.description).toContain('https://youtube.com/@canal');
+    expect(meta.description).toContain('10k inscritos');
+  });
 });
 
 describe('tags', () => {
@@ -420,5 +498,14 @@ describe('tags', () => {
     expect(tags).toContain('PGL Masters Bucharest');
     expect(tags.length).toBeLessThanOrEqual(30);
     expect(tags.join('').length).toBeLessThanOrEqual(500);
+  });
+
+  it('corta tag longa e respeita o total de 500 (com as vírgulas)', () => {
+    const ctx = buildMetadataContext(
+      makeAce({ event: 'ESL Pro League Season 21 - Group Stage' }),
+    );
+    const tags = buildTags(ctx, []);
+    for (const tag of tags) expect(tag.length).toBeLessThanOrEqual(30);
+    expect(tags.join(',').length).toBeLessThanOrEqual(500);
   });
 });

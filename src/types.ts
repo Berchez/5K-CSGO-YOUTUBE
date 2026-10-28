@@ -134,9 +134,17 @@ export interface AceEvent {
   offsetUnverified?: boolean;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
-  /** Placar antes/depois do fechamento do round, ex "5-2" / "6-2". */
+  /** Placar antes/depois do fechamento do round, ex "5-2" / "6-2". Opcional. */
   scoreBefore?: string;
   scoreAfter?: string;
+  /**
+   * Início REAL do clipe (epoch ms) — gravado no sidecar pelo clipBuilder.
+   * Difiere da estimativa (1ª kill − contexto) quando a abertura foi
+   * truncada pelo buffer.
+   */
+  clipStartMs?: number;
+  /** Duração real do clipe (s) — gravada no sidecar pelo clipBuilder. */
+  clipDurationSec?: number;
   /** Resumo rico (armas, vítimas, assists, granadas). Ausente em modos sem detalhe (ex: VOD). */
   summary?: RoundSummary;
 }
@@ -146,4 +154,8 @@ export interface ClipResult {
   sidecarPath: string;
   thumbnailPath?: string;
   durationSec: number;
+  /** Início real do clipe (epoch ms) — âncora dos timestamps da descrição. */
+  clipStartMs?: number;
+  /** Duração real do clipe (s), medida no arquivo final. */
+  clipDurationSec?: number;
 }

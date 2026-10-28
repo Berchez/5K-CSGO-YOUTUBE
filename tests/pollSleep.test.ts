@@ -54,6 +54,7 @@ describe('pollSleepDeadline', () => {
         now: 0,
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       }),
@@ -70,6 +71,7 @@ describe('pollSleepDeadline', () => {
         now: 10_000,
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       }),
@@ -84,6 +86,7 @@ describe('pollSleepDeadline', () => {
         now: 5 * 60_000,
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       }),
@@ -98,10 +101,46 @@ describe('pollSleepDeadline', () => {
         now: 20 * 60_000,
         targetAt: 21 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       }),
     ).toBe(20 * 60_000 + POLL_WATCHLIST_DEBOUNCE_MS);
+  });
+
+  it('mudança já consumida por um poll anterior NÃO antecipa (backoff vale)', () => {
+    // Regressão: a versão é um contador e nunca volta a 0. Sem comparar
+    // com a versão já vista, o deadline caía no piso (45s) para sempre
+    // depois da 1ª edição da watchlist — o backoff de 30min morria.
+    const signal = createWatchlistSignal();
+    notifyWatchlistChanged(signal, 10_000);
+    expect(
+      pollSleepDeadline({
+        now: 60_000,
+        targetAt: 30 * 60_000,
+        signal,
+        seenVersion: signal.version,
+        lastPollAt: 60_000,
+        baseIntervalMs: BASE,
+      }),
+    ).toBe(30 * 60_000);
+  });
+
+  it('o deadline normal não é atropelado pelo piso (near-match)', () => {
+    // O piso entre polls (lastPollAt + base) não pode empurrar o poll
+    // para DEPOIS do horário da partida (o "near-match" promete não
+    // passar do início).
+    const signal = createWatchlistSignal();
+    expect(
+      pollSleepDeadline({
+        now: 0,
+        targetAt: 20_000,
+        signal,
+        seenVersion: 0,
+        lastPollAt: 0,
+        baseIntervalMs: BASE,
+      }),
+    ).toBe(20_000);
   });
 });
 
@@ -114,6 +153,7 @@ describe('sleepUntilPoll', () => {
       {
         targetAt: 10 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       },
@@ -137,6 +177,7 @@ describe('sleepUntilPoll', () => {
       {
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       },
@@ -161,6 +202,7 @@ describe('sleepUntilPoll', () => {
       {
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       },
@@ -192,6 +234,7 @@ describe('sleepUntilPoll', () => {
       {
         targetAt: BASE,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
       },
@@ -207,6 +250,34 @@ describe('sleepUntilPoll', () => {
     expect(finishedAt).toBe(BASE);
   });
 
+  it('mudança já consumida por um poll anterior não antecipa o sleep', async () => {
+    // Regressão do P0: a versão é monotônica. Se o sleep comparasse só
+    // com "versão > 0", a 1ª edição da watchlist deixaria o bot pollando
+    // a cada 45s para sempre (o backoff de 30min morria).
+    const clock = new FakeClock();
+    const signal = createWatchlistSignal();
+    notifyWatchlistChanged(signal, 0);
+    let finishedAt: number | null = null;
+    const sleeping = sleepUntilPoll(
+      {
+        targetAt: 30 * 60_000,
+        signal,
+        seenVersion: signal.version,
+        lastPollAt: 0,
+        baseIntervalMs: BASE,
+      },
+      { now: () => clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer },
+    ).then(() => {
+      finishedAt = clock.now;
+    });
+
+    await clock.advance(BASE);
+    expect(finishedAt).toBe(null);
+    await clock.advance(30 * 60_000);
+    await sleeping;
+    expect(finishedAt).toBe(30 * 60_000);
+  });
+
   it('para quando o bot está encerrando', async () => {
     const clock = new FakeClock();
     const signal: WatchlistSignal = createWatchlistSignal();
@@ -215,6 +286,7 @@ describe('sleepUntilPoll', () => {
       {
         targetAt: 30 * 60_000,
         signal,
+        seenVersion: 0,
         lastPollAt: 0,
         baseIntervalMs: BASE,
         shouldStop: () => stopping,
