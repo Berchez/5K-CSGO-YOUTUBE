@@ -35,6 +35,11 @@ if (!result.ok) {
   const listing = result.listing;
   console.log(`LIVE-TOTAL=${listing.liveTotal}`);
   console.log(`LIVE-KEPT=${listing.live.length}`);
+  if (result.degraded) {
+    console.log(
+      `LIVE-DEGRADADO=${result.detail ?? 'sim'} (cards quebrados: ${result.brokenLiveIds.join(', ') || '?'} — os recorders dessas partidas são preservados)`,
+    );
+  }
   for (const m of listing.live) {
     console.log(
       `- [${m.matchId}] ${m.team1} vs ${m.team2} | ${m.event} | stars=${m.stars} topTier=${m.isTopTierGuess} | ${m.matchPageUrl}`,

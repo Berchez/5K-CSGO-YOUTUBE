@@ -31,14 +31,14 @@ describe('parseEnvFile', () => {
         'MIN_STARS=2',
         'YT_DEFAULT_TAGS="cs2, ace, highlight"',
         "STREAM_PRIORITY='official,en'",
-        'AV_STATIC_MATCHES=2399000,2399001 # escopo',
+        'CLIP_CONTEXT_SEC=25 # contexto',
         '',
       ].join('\n'),
     );
     expect(values.MIN_STARS).toBe('2');
     expect(values.YT_DEFAULT_TAGS).toBe('cs2, ace, highlight');
     expect(values.STREAM_PRIORITY).toBe('official,en');
-    expect(values.AV_STATIC_MATCHES).toBe('2399000,2399001');
+    expect(values.CLIP_CONTEXT_SEC).toBe('25');
   });
 
   it('lê arquivo com BOM (a 1ª chave não some)', () => {
@@ -174,5 +174,22 @@ describe('panelConfigValues', () => {
     const values = panelConfigValues({ MIN_STARS: '2', YT_UPLOAD: 'false' });
     expect(values.MIN_STARS).toBe('2');
     expect(values.YT_UPLOAD).toBe('false');
+  });
+
+  it('normaliza booleanos escritos como 1/yes/on (o painel e o bot)', () => {
+    // Com "1" no .env o bot tratava como LIGADO e o painel mostrava
+    // "desligado" — num toggle que controla upload isso é enganoso.
+    const values = panelConfigValues({ YT_UPLOAD: '1', POLL_ADAPTIVE: 'on', TOP_TIER_ONLY: 'no' });
+    expect(values.YT_UPLOAD).toBe('true');
+    expect(values.POLL_ADAPTIVE).toBe('true');
+    expect(values.TOP_TIER_ONLY).toBe('false');
+  });
+
+  it('aceita as mesmas formas de ligado/desligado no patch', () => {
+    const result = validateConfigPatch({ YT_UPLOAD: 'yes', POLL_ADAPTIVE: 'off' });
+    expect(result).toEqual({
+      ok: true,
+      values: { YT_UPLOAD: 'true', POLL_ADAPTIVE: 'false' },
+    });
   });
 });

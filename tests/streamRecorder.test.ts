@@ -2,15 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { capturePlan, isDiscontinuityLine } from '../src/recorder/streamRecorder.js';
 
 describe('capturePlan', () => {
-  it('mantém os feeds de áudio/vídeo separados na captura de referência', () => {
-    expect(capturePlan('separate')).toEqual({
-      formats: ['bv*', 'ba/b'],
-      maps: ['0:v', '1:a'],
+  it('usa só a fonte combinada (muxed) da stream', () => {
+    expect(capturePlan()).toEqual({
+      formats: ['best'],
+      maps: ['0:v', '0:a'],
     });
   });
 
-  it('seleciona o melhor formato muxed sem limitar resolução ou FPS', () => {
-    expect(capturePlan('muxed')).toEqual({
+  it('aceita o seletor de formato da config (kill-switch da captura)', () => {
+    expect(capturePlan('best[height<=1080]')).toEqual({
+      formats: ['best[height<=1080]'],
+      maps: ['0:v', '0:a'],
+    });
+  });
+
+  it('formato vazio volta para o combinado padrão (um input c/ áudio e vídeo)', () => {
+    expect(capturePlan('   ')).toEqual({
       formats: ['best'],
       maps: ['0:v', '0:a'],
     });

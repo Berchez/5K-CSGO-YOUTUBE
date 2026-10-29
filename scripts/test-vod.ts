@@ -99,6 +99,9 @@ async function main(): Promise<void> {
   const post = Number(arg('post', '15'));
   const resWanted = Number(arg('res', '1080'));
   const res = [720, 1080].includes(resWanted) ? resWanted : 1080;
+  // O upscale aqui é OPT-IN do harness de VOD (--upscale 0 desliga). O
+  // pipeline live NÃO faz upscale por padrão (resolução nativa da fonte);
+  // lá o equivalente é CLIP_UPSCALE_HEIGHT (0 = desligado).
   const upscaleWanted = Number(arg('upscale', '1440'));
   const upscale = [0, 1440, 2160].includes(upscaleWanted) ? upscaleWanted : 1440;
   const player = arg('player') ?? pos[2] ?? 'TEST_PLAYER';
@@ -255,11 +258,11 @@ async function main(): Promise<void> {
         geminiModel: cfg.GEMINI_IMAGE_MODEL,
         geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
         geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
-        geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS !== '0',
+        geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS,
         chatgptProfileDir: cfg.CHATGPT_PROFILE,
-        chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
+        chatgptMinimized: cfg.CHATGPT_MINIMIZED,
         grokProfileDir: cfg.GROK_PROFILE,
-        grokMinimized: cfg.GROK_MINIMIZED === '1',
+        grokMinimized: cfg.GROK_MINIMIZED,
         references,
       },
     });

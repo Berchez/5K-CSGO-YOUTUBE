@@ -8,9 +8,9 @@ A 100% automated bot up to human review: it monitors **live matches on HLTV** (c
 
 ```text
 HLTV /matches (Playwright, 45s base; ocioso espera até 30min conforme a próxima partida) → filtro MIN_STARS (0 = tudo)
-  → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → captura feeds separados + melhor formato muxed, ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
+  → recorder: yt-dlp (official EN ou Gaules, via STREAM_PRIORITY) → melhor formato combinado (muxed) da fonte, ffmpeg segmentos 10s (MPEG-TS, resiliente a quedas), últimos ~240s
   → detector: live scoreboard (K/D column diff) → 4+ kills with a star / 5 kills without a star in the round = multikill (4K!/ACE!)
-  → clipper: dois MP4 por evento: captura separada (nome padrão) e fonte muxed (`_muxed`, resolução/FPS nativos), com trim exato
+  → clipper: um MP4 por evento (fonte muxed, resolução nativa), com trim exato
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
@@ -32,23 +32,22 @@ record the Gaules broadcast in PT-BR — with automatic cross-fallback:
 if the chosen one is unavailable, the other is used), the rest keeps the
 defaults.
 
-During each match the recorder tries to keep both buffers continuously.
-The separate buffer uses the best available video track with no resolution
-limit, alongside the separate audio feed; the muxed one uses the best
-format with audio and video that the source exposes, with no resolution/FPS
-limit. The separate output keeps the source resolution and only upscales
-when the source drops below `CLIP_UPSCALE_HEIGHT`; it never downscales a
-higher-resolution source. If the
-source does not offer a combined format, the separate capture continues and
-the reason is written to the log. Clips are saved as `<match>_<map>_r<round>_<player>.mp4`
-and `<...>_muxed.mp4`. When the muxed one is available, that variant is
-preferred for upload; the separate one is used as a fallback. The separate
-one uses content-based auto-sync with confidence gates (dubious offsets are not
-applied). The sidecar records frozen-frame intervals detected before
-encoding. They are not removed/interpolated automatically: if the
+During each match the recorder keeps a single continuous buffer, taken from
+the best **combined (muxed)** format the source exposes — audio and video in
+the same variant, at the source's own resolution/FPS (no artificial cap).
+That means there is never a skew between separate audio/video feeds to
+correct, and the clip keeps the source resolution (upscale is opt-in, see
+`CLIP_UPSCALE_HEIGHT`). If the source does not offer a combined format, the
+match is skipped: nothing is recorded, no clip is produced and no video is
+uploaded (the reason is written to the log and the stream is marked as
+failed so the next poll tries another candidate). The format selector is
+configurable (`CAPTURE_FORMAT`, default `best`) — that is the kill-switch of
+the capture layer; it must always point to a **combined** variant
+(`bv*` would bring the A/V skew back).
+Clips are saved as `<match>_<map>_r<round>_<player>.mp4` — that same file is
+what goes to YouTube. The sidecar records frozen-frame intervals detected
+before encoding. They are not removed/interpolated automatically: if the
 source already froze, inventing motion could make the game evidence worse.
-Capturing both increases network and disk usage by roughly one extra
-stream per match.
 
 ## YouTube (once)
 
@@ -184,7 +183,9 @@ quality even when watching at 1080p (the ~8 Mbps Twitch source remains the
 ceiling). The upscale includes light restoration (denoise before the scale
 so blocks are not amplified + adaptive sharpen afterwards) and the download is a stream copy
 (without the CRF 23 re-encode that `--force-keyframes-at-cuts` imposed).
-Live mode applies the same treatment (`CLIP_UPSCALE_HEIGHT` in `.env`).
+Live mode keeps the source resolution by default; `CLIP_UPSCALE_HEIGHT`
+(0 = off, 1440/2160) applies the same upscale to the live clip, in the same
+encode pass.
 `.json` + sqlite entry. Everything comes out tagged `[TESTE]` — never confuse it with a real clip.
 On Windows prefer `npx tsx` directly (the `npm run ... --` sometimes swallows the flags).
 
@@ -200,7 +201,32 @@ npx tsx scripts/test-vod.ts --url "<VOD>" --at 11:07:10 --player donk `
 ```
 The clip starts `--ctx` (default 10s) **before the 1st kill** (`--firstat`; without it,
 it uses `pre` before the 5th kill and may start right on the action). In live mode the bot
-anchors itself on the 1st detected kill (`CLIP_CONTEXT_SEC` in `.env`).
+anchors itself on the 1st detected kill (`CLIP_CONTEXT_SEC` in `.env`) and then shifts that
+anchor by `CLIP_STREAM_LATENCY_MS`: the recorded HLS feed reaches the buffer ~25s after
+the game happened, while the segment mtime marks when the file was *written*. Without the
+shift the cut points at footage that has not been recorded yet and the clip opens in the
+previous round. The round end uses `CLIP_SCORE_DELAY_MS` (the scoreboard publishes the
+round score later than it publishes each kill).
+
+That latency is not the same for every source, so it can be set per channel with
+`CLIP_STREAM_LATENCY_BY_STREAM` (`{"Gaules": 22000, "ESL TV": 30000}`) — the global
+`CLIP_STREAM_LATENCY_MS` stays as the fallback. When the scoreboard OCR finds the round
+transition inside the video, the bot logs the **observed** latency of that channel
+(`latência observada da stream`) next to the configured value, which is how you calibrate
+it. When the round end is only *estimated* (the OCR did not find it), the cut gets an
+extra tail (`CLIP_END_TAIL_SEC`): a latency that was underestimated would otherwise close
+the clip before the round and drop the last kill — a short clip is worse than a long one.
+
+The start of the clip pays the opposite error: if the real latency is *smaller* than the
+configured one, the clip would begin **after** the first kill and lose it. The cut
+therefore opens `CLIP_CONTEXT_SEC + CLIP_START_MARGIN_SEC` before the first kill
+(`CLIP_START_MARGIN_SEC`, default 5s) — the cheap side of the error (a few extra seconds
+of the previous round) instead of the expensive one (a missing first kill).
+
+The live clip is rendered at the source resolution by default. `CLIP_UPSCALE_HEIGHT`
+(0 = off, 1440/2160) re-scales it in the same encode pass (denoise + scale + sharpen):
+it forces YouTube's VP9/AV1 pipeline (YouTube serves 1080p as AV1/H.264) but costs CPU,
+so it is opt-in.
 
 ## Structure
 
@@ -343,11 +369,13 @@ latency on the upload.
 | `legacy` | The old fixed title/description (kill switch). |
 
 Provider chain (`YT_META_AI_ORDER=gemini,huggingface`): the first one that
-answers wins; a provider that fails twice is disabled for the session (the
-breaker lives in the client, which is created once per bot session — not once
-per clip). The calls are queued (one at a time), so two simultaneous aces
-don't blow the provider's rate limit, and the timeout is a budget shared by
-the retries (a bad key fails fast, without burning the whole budget twice).
+answers wins. A provider that fails twice goes on **cooldown** (10 min; 60 min
+for a credential error like 401/403) and is tried again after it expires — the
+breaker lives in the client, which is created once per bot session (not once
+per clip), so a network blip doesn't kill the AI for the rest of the event.
+The calls are queued (one at a time), so two simultaneous aces don't blow the
+provider's rate limit, and the timeout is a budget shared by the retries (a bad
+key fails fast, without burning the whole budget twice).
 
 ### The description
 
@@ -380,11 +408,13 @@ always true.
 The kill timestamps point at where the elimination happens in the video: they
 are measured from the **real** clip start (stored in the sidecar as
 `clipStartMs`; the estimate — first kill minus the context — is only the
-fallback for a clip whose opening was truncated by the buffer) and they
-discount the scoreboard delay (`SCOREBOARD_DELAY_MS`), because the timestamp
-of a kill is the moment the HLTV scoreboard *showed* it, not the moment it
-happened. With the default context (10s) the first elimination lands at
-`0:10`.
+fallback for a clip whose opening was truncated by the buffer) and they apply
+the scoreboard→video offset (`CLIP_STREAM_LATENCY_MS` − `SCOREBOARD_DELAY_MS`),
+because the timestamp of a kill is the moment the HLTV scoreboard *showed* it,
+while the recorded video only receives that material
+`CLIP_STREAM_LATENCY_MS` later (the HLS feed the recorder consumes runs that
+much behind the game). With the default context (10s) the first elimination
+lands at `0:10`.
 
 ### The guard (why the AI can't publish nonsense)
 

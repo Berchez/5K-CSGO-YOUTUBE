@@ -43,7 +43,7 @@ function makeMatch(overrides: Partial<TrayStatusMatch> = {}): TrayStatusMatch {
     state: 'recording',
     tracker: true,
     stream: { name: 'ESL', country: 'BR', viewers: 12_000 },
-    recorder: { separate: true, muxed: true },
+    recorder: { recording: true },
     ...overrides,
   };
 }

@@ -8,8 +8,8 @@ import {
   probeSegmentPackets,
   resolveFfprobeBin,
   slopePerStep,
+  startDeltaSec,
 } from '../clipper/segmentProbe.js';
-import { noteRestart } from './avCalibration.js';
 import { DEFAULT_DISK_MIN_FREE_BYTES, gb, getFreeBytes, isFreeSpaceOk } from '../diskSpace.js';
 
 export interface RecorderOptions {
@@ -17,9 +17,12 @@ export interface RecorderOptions {
   bufferDir: string;
   segmentTimeSec: number;
   segmentWrap: number;
-  /** Separate HLS feeds or the best combined source format. */
-  captureMode?: 'separate' | 'muxed';
-  /** Nome da stream (log "gravando buffer") — chave da calibragem por canal. */
+  /**
+   * Seletor de formato do yt-dlp para a fonte COMBINADA. Default 'best'
+   * (a melhor variante combinada da fonte). Ver CAPTURE_FORMAT.
+   */
+  captureFormat?: string;
+  /** Nome da stream (contexto nos logs do recorder e do clipe). */
   streamName?: string;
   /** Livre mínimo (bytes) — abaixo disto, error a cada ciclo (não para). */
   diskMinFreeBytes?: number;
@@ -29,10 +32,10 @@ export interface RecorderOptions {
 const FFMPEG_SYNC_WARN_RE =
   /non-monotonous dts|cur_dts is stale|timestamps are unset|discontinuity|failed to open segment|error when loading|invalid timestamp/i;
 
-/** Subconjunto: restart do transcode na fonte (o offset A/V pode mudar). */
+/** Subconjunto: restart do transcode na fonte (diagnóstico de descontinuidade). */
 const DISCONTINUITY_RE = /timestamp discontinuity|discontinuity/i;
 
-/** Linha de restart do transcode? Puro/testável (ancora recalibragem). */
+/** Linha de restart do transcode? Puro/testável. */
 export function isDiscontinuityLine(line: string): boolean {
   return DISCONTINUITY_RE.test(line);
 }
@@ -45,19 +48,44 @@ interface PlaylistHead {
   ended: boolean;
 }
 
-export function capturePlan(mode: 'separate' | 'muxed' = 'separate'): {
-  formats: string[];
-  maps: string[];
-} {
-  return mode === 'muxed'
-    ? { formats: ['best'], maps: ['0:v', '0:a'] }
-    : { formats: ['bv*', 'ba/b'], maps: ['0:v', '1:a'] };
+/**
+ * A fonte não expõe formato COMBINADO (áudio + vídeo no mesmo formato).
+ *
+ * Não é falha operacional (rede/ffmpeg/disco): é limitação da fonte. A
+ * partida é ignorada e a stream é marcada como falhada (o próximo poll
+ * tenta outra candidata). O erro é próprio para o log não dizer "falhou
+ * a gravação" quando o problema é a fonte não ter o formato.
+ */
+export class MuxedFormatUnavailableError extends Error {
+  constructor(message = 'a fonte não expõe formato combinado (muxed)') {
+    super(message);
+    this.name = 'MuxedFormatUnavailableError';
+  }
+}
+
+/** Erro do yt-dlp que indica "não tem formato combinado". */
+const NO_MUXED_FORMAT_RE =
+  /no video formats|requested format is not available|no formats found|requested format not available/i;
+
+/**
+ * Plano de captura: a ÚNICA fonte aceita é a variante combinada (muxed)
+ * da stream — áudio e vídeo no mesmo formato. Sem fonte combinada não há
+ * gravação (a alternativa seria o par separado de feeds, que exige
+ * correções de skew A/V).
+ *
+ * O seletor de formato vem da config (CAPTURE_FORMAT, default 'best'):
+ * é o kill-switch da camada de captura — trocar a variante combinada
+ * sem mexer no código. Ele NUNCA pode apontar para vídeo separado
+ * ('bv*'): a captura é UM input com áudio e vídeo.
+ */
+export function capturePlan(format = 'best'): { formats: string[]; maps: string[] } {
+  const selector = format.trim() || 'best';
+  return { formats: [selector], maps: ['0:v', '0:a'] };
 }
 
 /**
- * Borda atual da playlist HLS (best-effort): a diferença de mediaSeq entre
- * vídeo e áudio na abertura revela o desalinhamento inicial dos dois
- * inputs (ex: áudio ~2s adiantado). Sem isso o offset vira "mistério".
+ * Borda atual da playlist HLS (best-effort): número de segmentos,
+ * duração-alvo e descontinuidades da fonte no momento da abertura.
  */
 async function fetchPlaylistHead(url: string): Promise<PlaylistHead | null> {
   try {
@@ -90,13 +118,14 @@ export class StreamRecorder {
   private watchTimer: NodeJS.Timeout | null = null;
   private watchBusy = false;
   private probedSegs = new Set<string>();
-  private deltaSeries: number[] = [];
   private sinceSummary = 0;
   private avIssues = 0;
-  /** Walls de restart do transcode (discontinuity): offset pode ter mudado. */
-  private discontinuitiesAt: number[] = [];
-  /** Wall do start desta sessão de gravação (era da calibragem). 0 = nunca iniciou. */
-  private sessionStartMs = 0;
+  /**
+   * Série do offset de abertura (vídeo − áudio) por segmento. A captura
+   * é única (muxed), então o skew vem da FONTE — a série (mediana +
+   * drift) é a evidência de que áudio e vídeo chegam alinhados.
+   */
+  private avDeltas: number[] = [];
   /** Último estado do disco (null = desconhecido): avisa só em transição. */
   private diskOk: boolean | null = null;
 
@@ -106,24 +135,9 @@ export class StreamRecorder {
     return this.running;
   }
 
-  /** Restarts do transcode desde o start (cópia, teto 50). */
-  get discontinuities(): number[] {
-    return [...this.discontinuitiesAt];
-  }
-
-  /** Nome da stream (chave da calibragem por canal). */
+  /** Nome da stream (contexto nos logs). */
   get streamName(): string | undefined {
     return this.opts.streamName;
-  }
-
-  /** Wall do start desta sessão (0 = nunca iniciou). */
-  get sessionStart(): number {
-    return this.sessionStartMs;
-  }
-
-  /** Marca o início da sessão (era da calibragem). Idempotente. */
-  markSessionStart(nowMs: number = Date.now()): void {
-    if (this.sessionStartMs <= 0) this.sessionStartMs = nowMs;
   }
 
   get segmentDir(): string {
@@ -185,32 +199,37 @@ export class StreamRecorder {
       log.warn({ stale }, 'ffmpegs fantasmas do buffer mortos');
     }
 
-    const plan = capturePlan(this.opts.captureMode);
+    const plan = capturePlan(this.opts.captureFormat);
     // `best` selects the highest-quality combined format exposed by the source.
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const execFileAsync = promisify(execFile);
     const grabUrl = async (format: string): Promise<string> => {
-      const { stdout } = await execFileAsync(
-        ytdlpBin,
-        ['--no-playlist', '--no-warnings', '-g', '-f', format, this.opts.streamUrl],
-        // windowsHide: yt-dlp abre console próprio no Windows (rouba foco do jogo)
-        { timeout: 60_000, windowsHide: true },
-      );
-      const url = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? '';
-      if (!url) throw new Error(`yt-dlp não resolveu o formato ${format}`);
-      return url;
+      try {
+        const { stdout } = await execFileAsync(
+          ytdlpBin,
+          ['--no-playlist', '--no-warnings', '-g', '-f', format, this.opts.streamUrl],
+          // windowsHide: yt-dlp abre console próprio no Windows (rouba foco do jogo)
+          { timeout: 60_000, windowsHide: true },
+        );
+        const url = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? '';
+        if (!url) throw new Error(`yt-dlp não resolveu o formato ${format}`);
+        return url;
+      } catch (e) {
+        const raw = String((e as { stderr?: unknown })?.stderr ?? e);
+        if (NO_MUXED_FORMAT_RE.test(raw)) {
+          throw new MuxedFormatUnavailableError(
+            `a fonte não expõe formato combinado (muxed): ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
+          );
+        }
+        throw e;
+      }
     };
     const urls = await Promise.all(plan.formats.map(grabUrl));
-    // Borda das playlists na abertura (diagnóstico do offset inicial).
+    // Borda da playlist na abertura (diagnóstico da fonte).
     try {
       const heads = await Promise.all(urls.map(fetchPlaylistHead));
-      log.info(
-        this.opts.captureMode === 'muxed'
-          ? { muxed: heads[0] }
-          : { video: heads[0], audio: heads[1] },
-        'playlists HLS na abertura',
-      );
+      log.info({ source: heads[0] }, 'playlist HLS na abertura');
     } catch {
       // best-effort: a gravação não depende disto
     }
@@ -243,21 +262,18 @@ export class StreamRecorder {
       'mpegts',
       // SEM -reset_timestamps e SEM -use_wallclock_as_timestamps:
       // 1) reset por segmento zerava cada trilha na sua própria abertura
-      //    e CONGELAVA o offset de abertura dos inputs HLS (áudio ~2s
-      //    adiantado no arquivo inteiro);
+      //    e CONGELAVA o offset de abertura do input HLS;
       // 2) wallclock marca frames pelo horário de CHEGADA da rede — rajadas
       //    viram VFR caótico (clipe "powerpoint").
-      // Mantendo os PTS ORIGINAIS do broadcast: CFR 60 limpo E as duas
-      // trilhas na MESMA linha do tempo (o sync vem de graça; o custo é
-      // ≤2s de silêncio no início, cortável pelo trim do render).
+      // Mantendo os PTS ORIGINAIS do broadcast: CFR 60 limpo E áudio/vídeo
+      // na MESMA linha do tempo (o sync vem de graça; o custo é ≤2s de
+      // silêncio no início, cortável pelo trim do render).
       segPattern,
     );
     // windowsHide: o recorder vive horas — sem isso o Windows abre um
     // console próprio p/ o ffmpeg (rouba foco do jogo em fullscreen).
     this.ffmpeg = spawn(ffmpegBin, ffmpegArgs, { windowsHide: true });
     this.running = true;
-    // Sessão HLS aberta aqui: era da calibragem de offset por canal.
-    this.markSessionStart();
     const recProc = this.ffmpeg;
     track(recProc);
     // stderr com buffer de linha: avisos de sync (DTS fora de ordem, input
@@ -272,20 +288,9 @@ export class StreamRecorder {
         const t = line.trim().slice(0, 300);
         if (!t) continue;
         if (FFMPEG_SYNC_WARN_RE.test(t)) {
-          // Restart do transcode na fonte: o offset A/V pode mudar a partir
-          // daqui — carimba o wall para o handleAce sinalizar clipes cuja
-          // janela cruza o restart (offsetUnverified).
+          // Restart do transcode na fonte: a partir daqui a linha do tempo
+          // pode mudar — sinaliza no log para o clipe ser conferido.
           const restart = isDiscontinuityLine(t);
-          if (restart) {
-            const at = Date.now();
-            this.discontinuitiesAt.push(at);
-            if (this.discontinuitiesAt.length > 50) {
-              this.discontinuitiesAt.splice(0, this.discontinuitiesAt.length - 50);
-            }
-            // Compartilha a era com outros recorders do canal (a calibragem
-            // deles invalida junto — offset re-rola por restart).
-            if (this.opts.streamName) noteRestart(this.opts.streamName, at);
-          }
           log.warn({ src: 'ffmpeg', line: t, restart }, 'ffmpeg sinalizou falha de input/dessincronia');
         } else {
           log.debug({ src: 'ffmpeg' }, t);
@@ -299,23 +304,21 @@ export class StreamRecorder {
     };
     this.ffmpeg.on('exit', onExit('ffmpeg'));
 
-    log.info({ dir: this.opts.bufferDir }, 'recorder iniciado');
+    log.info({ dir: this.opts.bufferDir, formato: plan.formats[0] }, 'recorder iniciado');
     // Dá 10s para os primeiros segmentos aparecerem
     await new Promise((r) => setTimeout(r, 10_000));
     if (!this.running) {
-      throw new Error(`ffmpeg encerrou durante a inicialização (${this.opts.captureMode ?? 'separate'})`);
+      throw new Error('ffmpeg encerrou durante a inicialização');
     }
-    this.startAvWatch();
+    this.startBufferWatch();
   }
 
   /**
-   * Vigia A/V do buffer: a cada ciclo probeia os segmentos novos (menos o
-   * mais recente, em gravação) e mantém a série temporal do startDelta.
-   * Segmento com problema → warn imediato; a cada 6 segmentos, resumo com
-   * mediano + drift (constante = offset de abertura; crescente = relógios
-   * divergindo; saltos = descontinuidade da fonte). Best-effort puro.
+   * Vigia do buffer: a cada ciclo probeia os segmentos novos (menos o
+   * mais recente, em gravação) e reporta divergências/stalls/saltos de PTS.
+   * Best-effort puro.
    */
-  private startAvWatch(): void {
+  private startBufferWatch(): void {
     const log = getLogger();
     const slot = this.opts.segmentTimeSec;
     const ffprobe = resolveFfprobeBin();
@@ -347,30 +350,43 @@ export class StreamRecorder {
           const done = segs.length > 1 ? segs.slice(0, -1) : [];
           for (const f of done) {
             const base = path.basename(f);
-            if (this.probedSegs.has(base)) continue;
-            this.probedSegs.add(base);
+            // O buffer é CIRCULAR (segment_wrap): os mesmos nomes são
+            // reescritos a cada volta. Chavear só pelo nome deixava a
+            // vigia cega depois da primeira volta (4min de partida).
+            // A chave inclui o mtime: o mesmo nome com mtime novo = novo
+            // conteúdo = reanalisar.
+            let key = base;
+            try {
+              key = `${base}:${Math.round(fs.statSync(f).mtimeMs)}`;
+            } catch {
+              continue; // arquivo sumiu no meio (buffer rotacionando)
+            }
+            if (this.probedSegs.has(key)) continue;
+            this.probedSegs.add(key);
+            // Set limitado (a ordem de inserção é a ordem de análise):
+            // sem limite ele cresce a cada volta do buffer.
+            const maxKeys = Math.max(32, this.opts.segmentWrap * 4);
+            while (this.probedSegs.size > maxKeys) {
+              const oldest = this.probedSegs.values().next();
+              if (oldest.done) break;
+              this.probedSegs.delete(oldest.value);
+            }
             const pkts = await probeSegmentPackets(f, ffprobe);
             if (!pkts) continue;
+            const delta = startDeltaSec(pkts.video, pkts.audio);
+            if (Number.isFinite(delta)) {
+              this.avDeltas.push(delta);
+              while (this.avDeltas.length > 12) this.avDeltas.shift();
+            }
             const verdict = classifySegmentAv(pkts.video, pkts.audio, slot);
             if (verdict) {
               this.avIssues++;
               this.sinceSummary++;
-              if (Number.isFinite(verdict.startDeltaSec)) {
-                this.deltaSeries.push(verdict.startDeltaSec);
-              }
               log.warn({ seg: base, ...verdict }, 'segmento do buffer com divergência A/V');
             } else {
-              const v0 = Math.min(...pkts.video);
-              const a0 = Math.min(...pkts.audio);
-              if (Number.isFinite(v0) && Number.isFinite(a0)) {
-                this.deltaSeries.push(v0 - a0);
-              }
               this.sinceSummary++;
               log.debug({ seg: base }, 'segmento do buffer A/V ok');
             }
-          }
-          if (this.deltaSeries.length > 600) {
-            this.deltaSeries.splice(0, this.deltaSeries.length - 600);
           }
           if (this.sinceSummary >= 6) {
             this.sinceSummary = 0;
@@ -378,10 +394,10 @@ export class StreamRecorder {
               {
                 probed: this.probedSegs.size,
                 issues: this.avIssues,
-                medianDeltaSec: Math.round(median(this.deltaSeries) * 100) / 100,
-                driftPerSegSec: Math.round(slopePerStep(this.deltaSeries) * 1000) / 1000,
+                startDeltaMediano: median(this.avDeltas),
+                driftPorSegmento: slopePerStep(this.avDeltas),
               },
-              'série A/V do buffer (mediano + drift)',
+              'resumo da vigia do buffer',
             );
           }
         } catch {
@@ -424,11 +440,20 @@ export class StreamRecorder {
   /** Lista segmentos ordenados por mtime (mais antigo -> mais novo). */
   listSegments(): string[] {
     if (!fs.existsSync(this.opts.bufferDir)) return [];
-    return fs
-      .readdirSync(this.opts.bufferDir)
-      .filter((f) => /^seg_\d+\.ts$/.test(f))
-      .map((f) => path.join(this.opts.bufferDir, f))
-      .filter((f) => fs.statSync(f).size > 50_000)
-      .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs);
+    const out: Array<{ file: string; mtimeMs: number; size: number }> = [];
+    for (const f of fs.readdirSync(this.opts.bufferDir)) {
+      if (!/^seg_\d+\.ts$/.test(f)) continue;
+      const file = path.join(this.opts.bufferDir, f);
+      try {
+        // O buffer rotaciona DEPOIS da listagem: o arquivo pode sumir
+        // entre o readdir e o stat (erro ENOENT derrubaria a vigia).
+        const st = fs.statSync(file);
+        if (st.size <= 50_000) continue;
+        out.push({ file, mtimeMs: st.mtimeMs, size: st.size });
+      } catch {
+        continue;
+      }
+    }
+    return out.sort((a, b) => a.mtimeMs - b.mtimeMs).map((s) => s.file);
   }
 }

@@ -2,8 +2,7 @@ import './env.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { repoPath } from './paths.js';
-import { getConfig, parseStreamOffsets, resolveStaticOffset } from './config.js';
-import { loadCalibrations, resolveSessionOffset } from './recorder/avCalibration.js';
+import { deprecatedEnvVars, divergentLatencyEnvs, getConfig, invalidBoolEnvs } from './config.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
 import { ensureTray } from './tray.js';
@@ -17,6 +16,7 @@ import {
   minKillsForStars,
   selectNextUpcoming,
   selectStream,
+  shouldStopRecorder,
   type UpcomingMatch,
 } from './monitor/hltvMonitor.js';
 import {
@@ -30,16 +30,23 @@ import {
   pollSleepDeadline,
   sleepUntilPoll,
 } from './monitor/pollSleep.js';
+import {
+  latencyMapProblem,
+  observedLatencyMs,
+  resolveStreamLatencyMs,
+  StreamLatencyTracker,
+} from './monitor/streamLatency.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
 import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
-import { StreamRecorder } from './recorder/streamRecorder.js';
-import { buildClip, computeAceEndMs, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
+import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
+import { buildClip, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
+import { computeClipAnchors } from './clipper/clipAnchors.js';
 import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
-import { buildVideoMetadata, buildMetadataContext } from './uploader/videoMetadata.js';
+import { buildVideoMetadataSafe, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
 import type { MetadataAiFn } from './uploader/videoMetadata.js';
 import { getFreeBytes } from './diskSpace.js';
@@ -172,12 +179,43 @@ let predictedMatchId: string | null = null;
 let lastKnownNextMatch: UpcomingMatch | null = null;
 
 /**
+ * Falhas CONSECUTIVAS de extração do listing. O aviso no log se repete
+ * a cada ciclo (45s) e some no ruído — depois de N falhas seguidas um
+ * toast avisa o dono (o HLTV mudou o markup e o bot pode estar cego
+ * para novas partidas).
+ */
+let listingFailures = 0;
+let listingFailureNotified = false;
+const LISTING_FAILURE_NOTIFY_AFTER = 3;
+
+function notifyListingFailure(reason: string, detail?: string): void {
+  listingFailures++;
+  if (listingFailures < LISTING_FAILURE_NOTIFY_AFTER || listingFailureNotified) return;
+  listingFailureNotified = true;
+  notifyWindows(
+    '5K Bot: listing do HLTV quebrado',
+    `${reason} há ${listingFailures} ciclos seguidos${detail ? ` (${detail})` : ''}. O bot continua rodando, mas pode estar cego para novas partidas.`,
+  );
+}
+
+/**
  * Cliente de metadados (IA): UMA instância por sessão. Recriá-lo a cada
  * ace zerava o circuit breaker — o contador de falhas e o provider
  * desligado morriam com o objeto, e um provider fora do ar era tentado
  * de novo em todo ace (2 tentativas × timeout).
  */
 let metadataAiFn: MetadataAiFn | null = null;
+
+/**
+ * Latência OBSERVADA por canal: quando o OCR acha a virada do placar
+ * no vídeo, o instante medido é a latência real da stream (o instante
+ * do round no vídeo menos o instante estimado no relógio do jogo).
+ * Só mede — não ajusta as âncoras sozinho (uma calibração errada
+ * quebraria todos os clipes do canal). Serve para o log dizer quanto a
+ * stream está atrasando e o dono calibrar CLIP_STREAM_LATENCY_MS (ou o
+ * mapa por canal).
+ */
+const latencyTracker = new StreamLatencyTracker();
 
 function getMetadataAi(): MetadataAiFn {
   if (metadataAiFn) return metadataAiFn;
@@ -250,12 +288,7 @@ async function getRefs(
   return refs;
 }
 
-interface MatchRecorders {
-  separate: StreamRecorder;
-  muxed: StreamRecorder | null;
-}
-
-const activeRecorders = new Map<string, MatchRecorders>();
+const activeRecorders = new Map<string, StreamRecorder>();
 const activeTrackers = new Map<string, symbol>();
 const selectedStreams = new Map<string, StreamInfo>();
 let stopping = false;
@@ -268,8 +301,8 @@ async function ensureDirs(cfg: ReturnType<typeof getConfig>): Promise<void> {
 }
 
 function trayMatchState(m: LiveMatch): TrayMatchState {
-  const recorders = activeRecorders.get(m.matchId);
-  if (recorders?.separate.isRunning) return 'recording';
+  const recorder = activeRecorders.get(m.matchId);
+  if (recorder?.isRunning) return 'recording';
   if (activeTrackers.has(m.matchId)) return 'tracking';
   const miss = streamsMiss.get(m.matchId);
   if (m.streams.length === 0 && miss && !miss.blocked) return 'no-stream';
@@ -298,8 +331,7 @@ function trayMatchesFrom(
         : undefined,
       recorder: recorders
         ? {
-            separate: recorders.separate.isRunning,
-            muxed: recorders.muxed?.isRunning ?? false,
+            recording: recorders.isRunning,
           }
         : undefined,
       tracker: activeTrackers.has(m.matchId),
@@ -435,10 +467,30 @@ async function handleAce(
     log.info('ace duplicado, ignorando');
     return;
   }
-  const recorders = activeRecorders.get(matchId);
-  const recorder = recorders?.separate;
-  const muxedRecorder = recorders?.muxed;
+  const recorder = activeRecorders.get(matchId);
   const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
+  /**
+   * Latência EFETIVA da stream: o valor do canal quando existe
+   * (CLIP_STREAM_LATENCY_BY_STREAM), senão o global. A latência não é
+   * igual em toda fonte — uma oficial e um mirror BR entregam o HLS com
+   * defasagens diferentes, e usar a média delas erra o corte.
+   */
+  const streamLatencyMs = resolveStreamLatencyMs(
+    cfg.CLIP_STREAM_LATENCY_MS,
+    cfg.CLIP_STREAM_LATENCY_BY_STREAM,
+    recorder?.streamName,
+  );
+  /**
+   * Âncora na TIMELINE DO VÍDEO (a mesma dos mtimes dos segmentos).
+   *
+   * A âncora do tracker vem do placar do HLTV (relógio do jogo), mas o
+   * conteúdo gravado chega atrasado: o HLS do recorder entrega o que
+   * aconteceu há ~CLIP_STREAM_LATENCY_MS. Sem empurrar a âncora para a
+   * frente, o corte aponta para um instante que ainda não foi gravado e o
+   * clipe abre no round ANTERIOR (medido: 30s antes da 1ª kill real).
+   */
+  const videoStartMs =
+    aceStartMs != null ? aceStartMs + streamLatencyMs : undefined;
   // Valida ANTES de gravar: stats velhas (repovoamento no break) podem
   // produzir um ace cuja 1ª kill já saiu do buffer — sem isso a linha
   // ficaria no banco e o hasAce bloquearia uma detecção legítima futura.
@@ -448,8 +500,10 @@ async function handleAce(
   );
   const initialCoverage = evaluateAceCoverage({
     kills: ace.kills,
-    anchorMs: aceStartMs,
+    anchorMs: videoStartMs,
     oldestSegmentStartMs: initialStartMs,
+    streamLatencyMs,
+    scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
   });
   if (initialCoverage.discard) {
     log.warn(
@@ -481,7 +535,6 @@ async function handleAce(
   const snapDirs: string[] = [];
   try {
     let segments = recorder?.listSegments() ?? [];
-    let muxedSegments = muxedRecorder?.listSegments() ?? [];
     if (segments.length === 0) {
       log.warn('sem buffer para cortar (stream caiu ou iniciou agora), evento salvo sem clipe');
       return;
@@ -492,11 +545,10 @@ async function handleAce(
       () => ({}) as ReferenceImages,
     );
     const aceDetectedAtMs = Date.now();
-    const syncRecorder = muxedRecorder ?? recorder;
     const { detectedEndMs, sync: streamSync } = await measureRoundEnd(
       ace,
       cfg,
-      syncRecorder,
+      recorder,
       () => stopping,
       aceDetectedAtMs - 30_000,
     );
@@ -510,18 +562,45 @@ async function handleAce(
       Date.now(),
     );
     const contextSec = lowAnchor ? cfg.CLIP_CONTEXT_UNCERTAIN_SEC : cfg.CLIP_CONTEXT_SEC;
+    /**
+     * Margem do início: o erro de latência é assimétrico (latência real
+     * menor que a configurada = 1ª kill FORA do clipe). A margem abre o
+     * corte antes, pagando o erro pelo lado barato.
+     */
+    const startMarginSec = cfg.CLIP_START_MARGIN_SEC;
+    /**
+     * Âncoras do clipe (do relógio do placar para a timeline do vídeo).
+     * Puro/testável em clipAnchors.ts.
+     */
+    const anchors = computeClipAnchors({
+      aceStartedAtMs: aceStartMs,
+      streamLatencyMs,
+      scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+      scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
+      endAfterCloseSec: cfg.CLIP_END_AFTER_CLOSE_SEC,
+      endTailSec: cfg.CLIP_END_TAIL_SEC,
+      contextSec,
+      startMarginSec,
+      aceDetectedAtMs,
+      scoreboardEndMs: detectedEndMs,
+      syncApplied: streamSync.applied,
+      syncScanned:
+        cfg.CLIP_STREAM_SYNC === 'auto' &&
+        streamSync.reason !== 'disabled' &&
+        streamSync.reason !== 'recorder-unavailable',
+    });
+    const { endMs, killVideoOffsetMs } = anchors;
     // Metadados: a CHAMADA da IA começa aqui (EM PARALELO ao corte do
     // clipe — só ela depende da rede, então não soma latência no
     // upload). A composição final espera o clipe real: o sidecar sabe o
     // início exato do vídeo, enquanto a estimativa (1ª kill − contexto)
     // erra quando a abertura foi truncada pelo buffer. Falha aqui cai
     // no gerador determinístico (ou no título legado, se tudo falhar).
-    const estimatedClipStartMs =
-      aceStartMs != null ? aceStartMs - contextSec * 1000 : undefined;
+    const estimatedClipStartMs = anchors.estimatedClipStartMs;
     const metadataDraftPromise =
       cfg.YT_META_MODE === 'ai' && cfg.YT_UPLOAD
         ? getMetadataAi()(
-            buildMetadataContext(ace, estimatedClipStartMs, undefined, cfg.SCOREBOARD_DELAY_MS),
+            buildMetadataContext(ace, estimatedClipStartMs, undefined, killVideoOffsetMs),
           ).catch((e) => {
             log.warn(
               { err: String(e).slice(0, 200) },
@@ -530,33 +609,77 @@ async function handleAce(
             return null;
           })
         : undefined;
-    const useScoreboardEnd = streamSync.applied && detectedEndMs != null;
-    const useFallback =
-      cfg.CLIP_STREAM_SYNC === 'auto' &&
-      !streamSync.applied &&
-      streamSync.reason !== 'disabled' &&
-      streamSync.reason !== 'recorder-unavailable';
-    const endMs = useScoreboardEnd
-      ? detectedEndMs + cfg.CLIP_END_AFTER_CLOSE_SEC * 1000
-      : computeAceEndMs(aceDetectedAtMs, cfg.SCOREBOARD_DELAY_MS, cfg.CLIP_END_AFTER_CLOSE_SEC) +
-        (useFallback ? cfg.CLIP_STREAM_SYNC_FALLBACK_SEC * 1000 : 0);
+    /**
+     * Alvo de espera: o mesmo fim com folga. A folga NÃO entra no corte —
+     * ela só dá tempo do round fechar (e do material chegar) antes de
+     * medir. Sem essa separação, o fallback empurrava o fim do clipe
+     * 35s e o vídeo guardava o bloco de anúncios do fim da transmissão.
+     */
+    const waitTargetMs =
+      endMs + (anchors.usedFallback ? cfg.CLIP_STREAM_SYNC_FALLBACK_SEC * 1000 : 0);
+    /**
+     * Telemetria da latência: quando o OCR achou a virada do placar no
+     * vídeo, o instante medido é a latência REAL da stream (o round no
+     * vídeo menos o round no relógio do jogo). Compara com o valor
+     * configurado — a diferença é o ajuste que o dono precisa fazer.
+     */
+    if (anchors.usedScoreboardEnd && detectedEndMs != null) {
+      const observed = observedLatencyMs(
+        detectedEndMs,
+        aceDetectedAtMs,
+        cfg.CLIP_SCORE_DELAY_MS,
+      );
+      latencyTracker.record(recorder?.streamName, observed);
+      const median = latencyTracker.median(recorder?.streamName);
+      log.info(
+        {
+          matchId,
+          stream: recorder?.streamName,
+          latenciaObservadaMs: observed,
+          latenciaMedianaMs: median,
+          latenciaConfiguradaMs: streamLatencyMs,
+          deltaMs: observed - streamLatencyMs,
+          // A latência observada é a virada no vídeo menos o fechamento
+          // ESTIMADO do round: ela carrega o erro do atraso do placar
+          // final. Sem logar esse valor, a medição parece exata.
+          scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
+          amostras: latencyTracker.samplesCount(recorder?.streamName),
+        },
+        'latência observada da stream (virada do placar no vídeo)',
+      );
+    }
+    // Trilha de calibração: com o clipe pronto, estes instantes mostram
+    // se a latência configurada bate com o material gravado.
+    log.info(
+      {
+        matchId,
+        player: ace.player,
+        round: ace.round,
+        stream: recorder?.streamName,
+        aceStart: aceStartMs != null ? new Date(aceStartMs).toISOString() : null,
+        videoStart: videoStartMs != null ? new Date(videoStartMs).toISOString() : null,
+        end: new Date(endMs).toISOString(),
+        streamLatencyMs,
+        scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+        scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
+        endAnchored: anchors.usedScoreboardEnd,
+        contextSec,
+      },
+      'âncoras do clipe (placar → vídeo)',
+    );
     let endCovered = false;
-    let muxedEndCovered = false;
     const waitUntil =
       Date.now() +
-      Math.max(150_000, endMs - Date.now() + cfg.SEGMENT_TIME_SEC * 1000 + 20_000);
+      Math.max(
+        150_000,
+        waitTargetMs - Date.now() + cfg.SEGMENT_TIME_SEC * 1000 + 20_000,
+      );
     while (!stopping && Date.now() < waitUntil) {
       segments = recorder?.listSegments() ?? [];
-      muxedSegments = muxedRecorder?.listSegments() ?? [];
       if (segments.length === 0) break;
       endCovered =
         newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
-      muxedEndCovered =
-        muxedRecorder != null &&
-        newestSegmentEndMs(muxedSegments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
-      const muxedReady =
-        muxedRecorder == null || !muxedRecorder.isRunning || muxedEndCovered;
-      if (endCovered && muxedReady) {
+      if (endCovered) {
         break;
       }
       await new Promise((r) => setTimeout(r, 2000));
@@ -566,7 +689,6 @@ async function handleAce(
       return;
     }
     const aceEndMs = endCovered ? endMs : undefined;
-    const muxedAceEndMs = muxedEndCovered ? endMs : undefined;
     if (endCovered) {
       ace.endedAt = new Date(endMs).toISOString();
     } else {
@@ -586,52 +708,11 @@ async function handleAce(
     ace.truncatedStart = detectTruncatedStart(segments, {
       segmentTimeSec: cfg.SEGMENT_TIME_SEC,
       contextSec,
-      aceStartMs,
+      startMarginSec,
+      aceStartMs: videoStartMs,
     });
     if (ace.truncatedStart) {
       log.warn('âncora precede o buffer (truncatedStart): abertura incompleta');
-    }
-    // Correção A/V do clipe, decidida por sessão (log por clipe):
-    // override manual > calibragem do canal válida > nada.
-    // A calibragem vale para a sessão corrente sem restart desde então
-    // (offset re-rola a cada restart do transcode — r4 sync vs r12 +2s).
-    // Sem calibragem aplicável: 0 + flag (spot-check, não revisão total).
-    // (recorder vem do início do handleAce.)
-    const streamOffsets = parseStreamOffsets(cfg.AV_STREAM_OFFSETS);
-    const { ms: staticMs, rule: staticRule } = resolveStaticOffset(
-      cfg.AV_STATIC_OFFSET_MS,
-      cfg.AV_STATIC_MATCHES,
-      matchId,
-      streamOffsets,
-      recorder?.streamName,
-    );
-    const calibrations = loadCalibrations();
-    const calibration = recorder?.streamName ? calibrations[recorder.streamName] : undefined;
-    // Era compartilhada: restart visto por OUTRO recorder do canal também
-    // invalida (mesma fonte). Junta ao array local antes de decidir.
-    const restarts: number[] = [...(recorder?.discontinuities ?? [])];
-    if (calibration?.lastRestartAt) restarts.push(calibration.lastRestartAt);
-    const sess = resolveSessionOffset({
-      staticMs,
-      staticRule,
-      calibration,
-      streamName: recorder?.streamName,
-      sessionStartMs: recorder?.sessionStart,
-      discontinuities: restarts,
-      winStartMs: aceStartMs,
-      winEndMs: aceEndMs,
-    });
-    ace.offsetUnverified = sess.unverified;
-    if (sess.ms > 0) {
-      log.info(
-        { matchId, staticMs: sess.ms, source: sess.source, rule: staticRule, stream: recorder?.streamName },
-        'offset A/V ativo p/ este clipe',
-      );
-    } else if (sess.unverified) {
-      log.warn(
-        { matchId, reason: sess.reason, stream: recorder?.streamName },
-        'sem correção A/V — conferir sync (spot-check)',
-      );
     }
 
     // SNAPSHOT dos segmentos escolhidos: o buffer é CIRCULAR (SEGMENT_WRAP
@@ -639,141 +720,123 @@ async function handleAce(
     // recorder e apaga o buffer) enquanto refs/render/thumb ainda rodam —
     // minutos. Copia preservando mtime (seleção/trim são mtime-driven) e
     // constrói o clipe a partir da cópia imune ao churn do buffer.
-    let coverageDiscards = 0;
-    let attemptedVariants = 0;
-    const buildVariant = async (
-      mode: 'separate' | 'muxed',
-      sourceSegments: string[],
-      sourceEndMs: number | undefined,
-    ): Promise<ClipResult | null> => {
+    let coverageDiscarded = false;
+    const buildClipFromBuffer = async (): Promise<ClipResult | null> => {
+      const sourceSegments = segments;
+      const sourceEndMs = aceEndMs;
       if (sourceSegments.length === 0) {
-        log.warn({ matchId, mode }, 'sem segmentos para esta variante de captura');
+        log.warn({ matchId }, 'sem segmentos para montar o clipe');
         return null;
       }
-      attemptedVariants++;
-      const variantAce: AceEvent = {
+      const clipAce: AceEvent = {
         ...ace,
         endedAt: sourceEndMs != null ? new Date(sourceEndMs).toISOString() : undefined,
         truncatedStart: detectTruncatedStart(sourceSegments, {
           segmentTimeSec: cfg.SEGMENT_TIME_SEC,
           contextSec,
-          aceStartMs,
+          startMarginSec,
+          aceStartMs: videoStartMs,
         }),
-        offsetUnverified: mode === 'separate' ? ace.offsetUnverified : undefined,
       };
       // A 1ª kill já saiu do buffer? Sem ela o clipe não é o ace que o
       // sidecar promete (foi o caso do 5K do jcobbb: round fechou minutos
       // depois e o corte pegou só o intervalo seguinte). Melhor não gerar.
       const oldestStartMs = oldestSegmentStartMs(sourceSegments, cfg.SEGMENT_TIME_SEC);
-      const variantCoverage = evaluateAceCoverage({
+      const coverage = evaluateAceCoverage({
         kills: ace.kills,
-        anchorMs: aceStartMs,
+        anchorMs: videoStartMs,
         oldestSegmentStartMs: oldestStartMs,
+        streamLatencyMs,
+        scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
       });
-      if (variantCoverage.discard) {
+      if (coverage.discard) {
         log.warn(
-          { matchId, mode, kills: variantCoverage.totalKills },
+          { matchId, kills: coverage.totalKills },
           'nenhuma kill do ace está no buffer — clipe descartado (não conteria o ace)',
         );
-        coverageDiscards++;
+        coverageDiscarded = true;
         return null;
       }
-      if (variantCoverage.truncatedStart) {
+      if (coverage.truncatedStart) {
         log.warn(
           {
             matchId,
-            mode,
             aceStart: aceStartMs != null ? new Date(aceStartMs).toISOString() : null,
             oldestStart: oldestStartMs != null ? new Date(oldestStartMs).toISOString() : null,
           },
           'âncora fora do buffer — clipe com abertura incompleta (truncatedStart)',
         );
       }
-      const variantPicked = pickSegments(sourceSegments, {
+      const picked = pickSegments(sourceSegments, {
         segmentTimeSec: cfg.SEGMENT_TIME_SEC,
         preRollSec: cfg.CLIP_PRE_ROLL_SEC,
         postRollSec: cfg.CLIP_POST_ROLL_SEC,
-        contextSec,
-        aceStartMs,
+        contextSec: contextSec + startMarginSec,
+        aceStartMs: videoStartMs,
         aceEndMs: sourceEndMs,
       });
-      const variantSnapDir = path.join(
+      const snapDir = path.join(
         cfg.CLIPS_DIR,
         '.build',
-        `${matchId}-r${ace.round}-${Date.now()}-${mode}`,
+        `${matchId}-r${ace.round}-${Date.now()}`,
       );
-      snapDirs.push(variantSnapDir);
-      const snapshot = snapshotSegments(variantPicked, variantSnapDir);
+      snapDirs.push(snapDir);
+      const snapshot = snapshotSegments(picked, snapDir);
       log.info(
-        { picked: variantPicked.length, snap: path.basename(variantSnapDir), mode },
+        { picked: picked.length, snap: path.basename(snapDir) },
         'segmentos congelados (snapshot)',
       );
       try {
-        const references = mode === 'separate' ? await refsPromise : undefined;
-        return await buildClip(variantAce, snapshot, {
-          bufferDir: variantSnapDir,
+        const references = await refsPromise;
+        return await buildClip(clipAce, snapshot, {
+          bufferDir: snapDir,
           clipsDir: cfg.CLIPS_DIR,
           preRollSec: cfg.CLIP_PRE_ROLL_SEC,
           postRollSec: cfg.CLIP_POST_ROLL_SEC,
           segmentTimeSec: cfg.SEGMENT_TIME_SEC,
           contextSec,
-          aceStartMs,
+          startMarginSec,
+          aceStartMs: videoStartMs,
           aceEndMs: sourceEndMs,
           replayAware: cfg.REPLAY_AWARE,
-          avSync: mode === 'separate' ? cfg.CLIP_AV_SYNC : 'off',
-          staticAvOffsetMs: mode === 'separate' ? sess.ms : 0,
           diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
-          // The muxed capture is already the source's best format; preserve
-          // its native resolution instead of forcing the separate-feed cap.
-          upscaleHeight: mode === 'separate' ? cfg.CLIP_UPSCALE_HEIGHT || undefined : undefined,
-          outputSuffix: mode === 'muxed' ? '_muxed' : undefined,
-          generateThumbnail: mode === 'separate',
-          captureMode: mode,
-          thumb: mode === 'separate'
-            ? {
-                mode: cfg.THUMB_MODE,
-                ai: {
-                  order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
-                  timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
-                  hfToken: cfg.HF_TOKEN || undefined,
-                  hfModel: cfg.HF_IMAGE_MODEL,
-                  geminiApiKey: cfg.GEMINI_API_KEY || undefined,
-                  geminiModel: cfg.GEMINI_IMAGE_MODEL,
-                  geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
-                  geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
-                  geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS !== '0',
-                  chatgptProfileDir: cfg.CHATGPT_PROFILE,
-                  chatgptMinimized: cfg.CHATGPT_MINIMIZED === '1',
-                  grokProfileDir: cfg.GROK_PROFILE,
-                  grokMinimized: cfg.GROK_MINIMIZED === '1',
-                  references: references ?? {},
-                },
-              }
-            : undefined,
+          upscaleHeight: cfg.CLIP_UPSCALE_HEIGHT,
+          streamName: recorder?.streamName,
+          streamLatencyMs,
+          killVideoOffsetMs,
+          thumb: {
+            mode: cfg.THUMB_MODE,
+            ai: {
+              order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
+              timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
+              hfToken: cfg.HF_TOKEN || undefined,
+              hfModel: cfg.HF_IMAGE_MODEL,
+              geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+              geminiModel: cfg.GEMINI_IMAGE_MODEL,
+              geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+              geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
+              geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS,
+              chatgptProfileDir: cfg.CHATGPT_PROFILE,
+              chatgptMinimized: cfg.CHATGPT_MINIMIZED,
+              grokProfileDir: cfg.GROK_PROFILE,
+              grokMinimized: cfg.GROK_MINIMIZED,
+              references: references ?? {},
+            },
+          },
         });
       } catch (e) {
-        log.error({ err: String(e), matchId, mode }, 'falha ao montar variante do clipe');
+        log.error({ err: String(e), matchId }, 'falha ao montar o clipe');
         return null;
       } finally {
-        fs.rmSync(variantSnapDir, { recursive: true, force: true });
+        fs.rmSync(snapDir, { recursive: true, force: true });
       }
     };
 
-    const [separateClip, muxedClip] = await Promise.all([
-      buildVariant('separate', segments, aceEndMs),
-      muxedRecorder
-        ? buildVariant('muxed', muxedSegments, muxedAceEndMs)
-        : Promise.resolve(null),
-    ]);
-    // Nenhuma variante sobreviveu: só é fantasma se TODAS as variantes
-    // tentadas caíram por falta de footage. Falha de ffmpeg/disco mantém o
-    // evento no banco (o clipe pode ser refeito manualmente).
-    if (
-      !separateClip &&
-      !muxedClip &&
-      attemptedVariants > 0 &&
-      coverageDiscards === attemptedVariants
-    ) {
+    const clip = await buildClipFromBuffer();
+    // Nenhum clipe sobreviveu: só é fantasma se caiu por falta de footage.
+    // Falha de ffmpeg/disco mantém o evento no banco (o clipe pode ser
+    // refeito manualmente).
+    if (!clip && coverageDiscarded) {
       discardAce(cfg.DB_PATH, aceId, {
         matchId: ace.matchId,
         map: ace.map,
@@ -787,69 +850,61 @@ async function handleAce(
         'ace fantasma removido do banco (sem footage no buffer)',
       );
     }
-    const uploadClipResult = muxedClip ?? separateClip;
-    if (muxedClip) {
-      log.info(
-        { clip: muxedClip.filePath, fallback: separateClip?.filePath },
-        'preferindo a fonte muxed para upload (A/V da mesma variante de origem)',
-      );
-    }
-    if (uploadClipResult) {
+    if (clip) {
       let videoId: string | undefined;
       if (!cfg.YT_UPLOAD) {
-        log.info({ clip: uploadClipResult.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
+        log.info({ clip: clip.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
       } else {
         try {
           // Composição final: usa o clipe REAL (início e duração do
           // sidecar) para os timestamps e a linha de duração.
+          // A composição tem fallback PRÓPRIO (buildVideoMetadataSafe):
+          // uma exceção aqui (sidecar nulo, regex, dado inesperado) NÃO
+          // pode derrubar o upload — sem metadados o upload segue pelo
+          // caminho legado.
           const metadata =
             cfg.YT_META_MODE === 'legacy' || !cfg.YT_UPLOAD
               ? undefined
-              : await buildVideoMetadata(ace, {
+              : await buildVideoMetadataSafe(ace, {
                   mode: cfg.YT_META_MODE,
                   ai: metadataDraftPromise ? async () => metadataDraftPromise : undefined,
                   brand: cfg.YT_BRAND,
                   cta: cfg.YT_DESC_CTA,
                   privacy: cfg.YT_PRIVACY,
                   defaultTags: cfg.YT_DEFAULT_TAGS,
-                  clipStartMs: uploadClipResult.clipStartMs ?? estimatedClipStartMs,
-                  clipDurationSec: uploadClipResult.clipDurationSec,
+                  clipStartMs: clip.clipStartMs ?? estimatedClipStartMs,
+                  clipDurationSec: clip.clipDurationSec,
                   // O `at` da kill é o momento em que o placar a mostrou:
-                  // sem descontar o atraso do placar, todo timestamp da
-                  // descrição aponta para depois da eliminação.
-                  killTimeOffsetMs: cfg.SCOREBOARD_DELAY_MS,
+                  // no vídeo o kill aparece (latência da stream − atraso
+                  // do placar) depois. É esse offset que alinha os
+                  // timestamps da descrição com a tela.
+                  killTimeOffsetMs: killVideoOffsetMs,
                 });
-          videoId = await uploadClip(ace, uploadClipResult.filePath, {
+          videoId = await uploadClip(ace, clip.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
             tokenPath: cfg.YT_TOKEN_PATH,
             privacy: cfg.YT_PRIVACY,
             categoryId: cfg.YT_CATEGORY_ID,
             defaultTags: cfg.YT_DEFAULT_TAGS,
-            thumbnailPath: separateClip?.thumbnailPath,
+            thumbnailPath: clip.thumbnailPath,
             metadata,
           });
         } catch (e) {
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');
         }
       }
-      insertClip(cfg.DB_PATH, aceId, uploadClipResult.filePath, cfg.YT_PRIVACY, videoId);
+      insertClip(cfg.DB_PATH, aceId, clip.filePath, cfg.YT_PRIVACY, videoId);
       setTrayStatusClip({
         at: new Date().toISOString(),
         matchId: ace.matchId,
         player: ace.player,
         map: ace.map,
         round: ace.round,
-        filePath: uploadClipResult.filePath,
+        filePath: clip.filePath,
         videoId,
         uploaded: Boolean(videoId),
         privacy: cfg.YT_PRIVACY,
       });
-    }
-    if (separateClip && separateClip.filePath !== uploadClipResult?.filePath) {
-      insertClip(cfg.DB_PATH, aceId, separateClip.filePath, cfg.YT_PRIVACY);
-    }
-    if (muxedClip && muxedClip.filePath !== uploadClipResult?.filePath) {
-      insertClip(cfg.DB_PATH, aceId, muxedClip.filePath, cfg.YT_PRIVACY);
     }
   } catch (e) {
     log.error({ err: String(e) }, 'falha ao montar clipe');
@@ -868,6 +923,12 @@ interface PollOutcome {
   liveMatches: number;
   /** Listing bloqueado pelo Cloudflare. */
   blocked: boolean;
+  /**
+   * Listing DEGRADADO (algum card live quebrou): os cards bons valem,
+   * mas a lista pode estar incompleta → não para recorders que sumiram
+   * e repete o poll no intervalo base.
+   */
+  degraded: boolean;
   /** A agenda futura do listing é confiável (extração funcionou)? */
   scheduleReliable: boolean;
   /** Watchlist ausente mas ainda segurando a última versão boa. */
@@ -928,6 +989,9 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       { reason: result.reason, detail: result.detail },
       `${lastError} — mantendo recorders/trackers`,
     );
+    if (result.reason === 'extraction-error') {
+      notifyListingFailure(lastError, result.detail);
+    }
     publishTrayStatus(null, cfg, { lastError });
     return {
       // Mantém a última partida conhecida no painel (o bloqueio não
@@ -935,6 +999,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       nextMatch: lastKnownNextMatch,
       liveMatches: 0,
       blocked: result.reason === 'blocked',
+      degraded: false,
       scheduleReliable: false,
       watchlistStale,
       // Mudou durante este poll? (a versão consumida no topo do loop é a
@@ -945,6 +1010,17 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
   }
   const listing = result.listing;
   const matches = listing.live;
+  // Listing degradado: um card live quebrou. Os cards bons valem (o
+  // poll continua), mas a lista pode estar incompleta: NENHUM recorder
+  // pode ser parado por "sumir do listing" e o poll volta no intervalo
+  // base (o markup pode estar consertado no próximo ciclo).
+  const degraded = result.degraded;
+  if (degraded) {
+    notifyListingFailure('listing degradado', result.detail);
+  } else {
+    listingFailures = 0;
+    listingFailureNotified = false;
+  }
 
   // Telemetria de detecção: quando a live elegível aparece pela 1ª vez,
   // mede a latência contra o horário previsto (e avisa se ela nem estava
@@ -980,12 +1056,9 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
 
     // 1) Recorder (máx MAX_RECORDINGS, stream por STREAM_PRIORITY)
     // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
-    for (const [id, recorders] of activeRecorders) {
-      if (!recorders.separate.isRunning) {
-        await Promise.all([
-          recorders.separate.stop().catch(() => undefined),
-          recorders.muxed?.stop().catch(() => undefined),
-        ]);
+    for (const [id, recorder] of activeRecorders) {
+      if (!recorder.isRunning) {
+        await recorder.stop().catch(() => undefined);
         activeRecorders.delete(id);
         selectedStreams.delete(id);
         streamsCache.delete(id);
@@ -1056,47 +1129,27 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
           const chosen = choice.stream;
           attemptedStream = chosen;
           const streamUrl = twitchUrlFrom(chosen.url);
-          const separate = new StreamRecorder({
-            streamUrl,
-            bufferDir: `${cfg.BUFFER_DIR}/${m.matchId}/separate`,
-            segmentTimeSec: cfg.SEGMENT_TIME_SEC,
-            segmentWrap: cfg.SEGMENT_WRAP,
-            captureMode: 'separate',
-            streamName: chosen.name,
-            diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
-          });
-          const muxed = new StreamRecorder({
+          const recorder = new StreamRecorder({
             streamUrl,
             bufferDir: `${cfg.BUFFER_DIR}/${m.matchId}/muxed`,
             segmentTimeSec: cfg.SEGMENT_TIME_SEC,
             segmentWrap: cfg.SEGMENT_WRAP,
-            captureMode: 'muxed',
+            captureFormat: cfg.CAPTURE_FORMAT,
             streamName: chosen.name,
             diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
           });
-          const [separateStart, muxedStart] = await Promise.allSettled([
-            separate.start(),
-            muxed.start(),
-          ]);
-          if (separateStart.status === 'rejected') {
-            await Promise.all([
-              separate.stop().catch(() => undefined),
-              muxed.stop().catch(() => undefined),
-            ]);
-            throw separateStart.reason;
+          try {
+            await recorder.start();
+          } catch (e) {
+            await recorder.stop().catch(() => undefined);
+            fs.rmSync(recorder.segmentDir, { recursive: true, force: true });
+            // Sem gravação não há o que cortar: a partida é ignorada
+            // (sem recorder → sem tracker → sem clipe). A stream é
+            // marcada como falhada p/ o próximo poll tentar outra
+            // candidata.
+            throw e;
           }
-          let muxedRecorder: StreamRecorder | null = null;
-          if (muxedStart.status === 'fulfilled') {
-            muxedRecorder = muxed;
-          } else {
-            await muxed.stop().catch(() => undefined);
-            fs.rmSync(muxed.segmentDir, { recursive: true, force: true });
-            log.warn(
-              { err: String(muxedStart.reason), matchId: m.matchId, stream: chosen.name },
-              'fonte sem variante muxed acessível; mantendo captura separada',
-            );
-          }
-          activeRecorders.set(m.matchId, { separate, muxed: muxedRecorder });
+          activeRecorders.set(m.matchId, recorder);
           selectedStreams.set(m.matchId, chosen);
           clearStreamFailed(m.matchId, chosen.url);
           log.info(
@@ -1107,9 +1160,8 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
               viewers: chosen.viewers,
               reason: choice.reason,
               candidates: available.length,
-              muxed: muxedRecorder != null,
             },
-            'gravando buffers separados e muxed',
+            'gravando buffer muxed',
           );
         }
       } catch (e) {
@@ -1117,13 +1169,21 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
         selectedStreams.delete(m.matchId);
         // Mantém o cache: a próxima tentativa usa outra candidata sem abrir
         // aba nova (page-load por poll = exposição ao Cloudflare).
+        // "Sem formato muxed" (limitação da fonte) e "falha na gravação"
+        // (rede/ffmpeg/disco) são coisas diferentes: o primeiro não é
+        // culpa da máquina e a partida fica sem footage mesmo com a
+        // stream no ar.
+        const semMuxed = e instanceof MuxedFormatUnavailableError;
         log.warn(
           {
-            err: String(e),
+            err: String(e).slice(0, 300),
             matchId: m.matchId,
             stream: attemptedStream?.name,
+            causa: semMuxed ? 'fonte-sem-formato-muxed' : 'falha-operacional',
           },
-          'não foi possível iniciar gravação',
+          semMuxed
+            ? 'fonte sem formato combinado (muxed) — partida ignorada (sem gravação e sem clipe)'
+            : 'falha ao iniciar a gravação — partida ignorada (sem gravação e sem clipe)',
         );
       }
     }
@@ -1204,14 +1264,23 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
     }
   }
 
-  // 3) Limpa recorders de partidas que saíram do filtro
+  // 3) Limpa recorders de partidas que saíram do filtro.
+  // Listing DEGRADADO = algum card live quebrou. A partida desse card
+  // pode ter "sumido" do listing: parar o recorder dela mataria a
+  // gravação (e apagaria o buffer) sem motivo. A proteção é POR ID (os
+  // cards quebrados), não para toda a limpeza — suspender tudo deixava
+  // recorders de partidas encerradas ocupando os slots de MAX_RECORDINGS
+  // para sempre (partidas novas deixavam de ser gravadas).
   const liveIds = new Set(matches.map((m) => m.matchId));
-  for (const [id, recorders] of activeRecorders) {
-    if (!liveIds.has(id)) {
-      await Promise.all([
-        recorders.separate.stop().catch(() => undefined),
-        recorders.muxed?.stop().catch(() => undefined),
-      ]);
+  if (degraded) {
+    log.warn(
+      { recorders: activeRecorders.size, cardsQuebrados: result.brokenLiveIds },
+      'listing degradado — recorders dos cards quebrados preservados',
+    );
+  }
+  for (const [id, recorder] of activeRecorders) {
+    if (shouldStopRecorder(id, liveIds, result.brokenLiveIds)) {
+      await recorder.stop().catch(() => undefined);
       activeRecorders.delete(id);
       selectedStreams.delete(id);
       activeTrackers.delete(id);
@@ -1267,6 +1336,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
     nextMatch,
     liveMatches: matches.length,
     blocked: false,
+    degraded,
     scheduleReliable: listing.scheduleReliable,
     watchlistStale,
     // Mudou durante este poll (o fetch do listing leva segundos: a versão
@@ -1303,6 +1373,31 @@ async function main(): Promise<void> {
   } catch {
     // best-effort
   }
+  // Buffers órfãos do modo de captura DUPLA (removido): as pastas
+  // `separate` não são lidas por nada desde a captura única muxed e só
+  // ocupam disco.
+  try {
+    for (const entry of fs.readdirSync(cfg.BUFFER_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const separate = path.join(cfg.BUFFER_DIR, entry.name, 'separate');
+      if (!fs.existsSync(separate)) continue;
+      fs.rmSync(separate, { recursive: true, force: true });
+      log.info({ matchId: entry.name }, 'buffer do modo separado (obsoleto) removido');
+    }
+  } catch {
+    // best-effort
+  }
+  // Arquivo órfão do subsistema de calibração A/V (removido): nada o lê
+  // mais — sai no startup para não parecer configuração viva.
+  try {
+    const staleCalibration = repoPath('data', 'av-calibration.json');
+    if (fs.existsSync(staleCalibration)) {
+      fs.rmSync(staleCalibration, { force: true });
+      log.info('calibração A/V obsoleta removida (subsistema desativado)');
+    }
+  } catch {
+    // best-effort
+  }
   const loggedOut = loadLoggedOut();
   log.info(
     {
@@ -1313,11 +1408,7 @@ async function main(): Promise<void> {
       streamPreferredCountry: cfg.STREAM_PREFERRED_COUNTRY || '(off)',
       streamPreferredMinViewers: cfg.STREAM_PREFERRED_MIN_VIEWERS,
       privacy: cfg.YT_PRIVACY,
-      avSync: cfg.CLIP_AV_SYNC,
       replayAware: cfg.REPLAY_AWARE,
-      avStaticMs: cfg.AV_STATIC_OFFSET_MS,
-      avStaticMatches: cfg.AV_STATIC_MATCHES || '(nenhum)',
-      avStreamOffsets: [...parseStreamOffsets(cfg.AV_STREAM_OFFSETS).entries()].map(([k, v]) => `${k}=${v}`).join(',') || '(nenhum)',
       diskMinFreeGb: cfg.DISK_MIN_FREE_GB,
       thumbLogin: Object.keys(loggedOut).length > 0
         ? Object.keys(loggedOut).map((p) => `${p}=LOGOUT!`).join(',')
@@ -1327,6 +1418,47 @@ async function main(): Promise<void> {
     },
     `bot iniciado (multikills ${cfg.MIN_KILLS}k+ com estrela / ${cfg.MIN_KILLS_NO_STARS}k sem estrela live, 16:9, log em arquivo)`,
   );
+  // Envs que o bot IGNORA: o zod aceita qualquer coisa e o dono acaba
+  // achando que a configuração velha ainda vale (a depreciação silenciosa
+  // já custou um .env inteiro de ajustes de A/V).
+  const deprecated = deprecatedEnvVars();
+  if (deprecated.length > 0) {
+    log.warn(
+      { vars: deprecated },
+      'envs depreciadas no .env — ignoradas pelo bot (remova do arquivo)',
+    );
+  }
+  const invalidBools = invalidBoolEnvs();
+  if (invalidBools.length > 0) {
+    log.warn(
+      { vars: invalidBools },
+      'valor de env não reconhecido (ligado/desligado) — usando o default',
+    );
+  }
+  // Mapa de latência por canal: JSON inválido era aceitado em silêncio
+  // (o bot caía na latência global sem avisar).
+  const latencyMapIssue = latencyMapProblem(process.env.CLIP_STREAM_LATENCY_BY_STREAM);
+  if (latencyMapIssue) {
+    log.warn(
+      { env: 'CLIP_STREAM_LATENCY_BY_STREAM', problema: latencyMapIssue },
+      'mapa de latência por canal inválido — usando CLIP_STREAM_LATENCY_MS',
+    );
+  }
+  // Latência/atraso do placar com valor DIFERENTE do default no .env:
+  // só a DIFERENÇA (CLIP_STREAM_LATENCY_MS − SCOREBOARD_DELAY_MS) move o
+  // início do clipe, a cobertura e os timestamps — os dois valores não
+  // são identificáveis separadamente. Um .env antigo (SCOREBOARD_DELAY_MS
+  // =10000) desloca o corte em segundos sem nenhuma pista no log.
+  const latencyEnvs = divergentLatencyEnvs();
+  if (latencyEnvs.length > 0) {
+    log.warn(
+      {
+        vars: latencyEnvs,
+        offsetPlacarVideoMs: cfg.CLIP_STREAM_LATENCY_MS - cfg.SCOREBOARD_DELAY_MS,
+      },
+      'latência/atraso do placar com valor diferente do default no .env — o corte usa só a diferença (CLIP_STREAM_LATENCY_MS - SCOREBOARD_DELAY_MS)',
+    );
+  }
   if (Object.keys(loggedOut).length > 0) {
     const providers = Object.keys(loggedOut);
     log.error(
@@ -1338,13 +1470,6 @@ async function main(): Promise<void> {
       `Providers sem login: ${providers.join(', ')}. Rode os scripts de relogin (ex: ${loginScriptFor(providers[0]) ?? 'npx tsx scripts/chatgpt-login.ts'}).`,
     );
   }
-  if (cfg.AV_STATIC_OFFSET_MS > 0 && !cfg.AV_STATIC_MATCHES.trim()) {
-    log.warn(
-      { avStaticMs: cfg.AV_STATIC_OFFSET_MS },
-      'offset estático GLOBAL: aplica em todas as partidas, inclusive sem skew — escopete com AV_STATIC_MATCHES',
-    );
-  }
-
   const bins = StreamRecorder.checkBinaries();
   if (!bins.ffmpeg || !bins.ytdlp) {
     log.warn(
@@ -1356,11 +1481,8 @@ async function main(): Promise<void> {
     stopping = true;
     stopWatchlistWatcher();
     shutdownTrayStatus();
-    for (const recorders of activeRecorders.values()) {
-      await Promise.all([
-        recorders.separate.stop().catch(() => undefined),
-        recorders.muxed?.stop().catch(() => undefined),
-      ]);
+    for (const recorder of activeRecorders.values()) {
+      await recorder.stop().catch(() => undefined);
     }
     await closeBrowser();
     // Mata qualquer ffmpeg restante (render em andamento etc.) — o Windows
@@ -1378,6 +1500,13 @@ async function main(): Promise<void> {
   // Último motivo registrado do agendamento (log só na mudança: o poll
   // pode repetir o mesmo motivo a cada ciclo).
   let lastDecisionReason: string | null = null;
+  /**
+   * Ciclos seguidos com a agenda do listing não confiável (card futuro
+   * quebrado / sem horário): o poll fica no intervalo base (fail-open).
+   * Um único card quebrado mantém o bot checando o listing o dia
+   * inteiro — o contador deixa isso visível no log em vez de silencioso.
+   */
+  let unreliableScheduleCycles = 0;
 
   while (!stopping) {
     const pollStartedAt = Date.now();
@@ -1389,6 +1518,17 @@ async function main(): Promise<void> {
     let delay = cfg.POLL_INTERVAL_MS;
     try {
       const outcome = await pollOnce(watchlistVersion);
+      if (outcome.blocked || outcome.scheduleReliable) {
+        unreliableScheduleCycles = 0;
+      } else {
+        unreliableScheduleCycles++;
+        if (unreliableScheduleCycles === 1 || unreliableScheduleCycles % 20 === 0) {
+          log.warn(
+            { ciclos: unreliableScheduleCycles },
+            'agenda do listing não confiável — poll no intervalo base',
+          );
+        }
+      }
       // Live elegível, gravação/tracker ativo, clipe em andamento ou buffer
       // adiado: o poll tem que continuar no intervalo base (buffer/stream/
       // cleanup). Cada motivo vira uma linha no log do agendamento.
@@ -1399,6 +1539,7 @@ async function main(): Promise<void> {
         pendingClips: pendingClips.size,
         deferredCleanup: deferredBufferCleanup.size,
         blocked: outcome.blocked,
+        listingDegraded: outcome.degraded,
         watchlistChanged: outcome.watchlistChanged,
         watchlistStale: outcome.watchlistStale,
       });
@@ -1484,9 +1625,13 @@ async function main(): Promise<void> {
     // seenVersion = a versão que ESTE poll já consumiu: uma mudança
     // antiga (o contador nunca volta a 0) não pode continuar
     // antecipando o deadline e matar o backoff.
+    // O deadline é calculado UMA vez: o sleep usa este valor e o wake
+    // publica o MESMO (recalcular com um "agora" novo mostrava um
+    // horário diferente do poll real).
+    const sleepTargetAt = Date.now() + delay;
     await sleepUntilPoll(
       {
-        targetAt: Date.now() + delay,
+        targetAt: sleepTargetAt,
         signal: watchlistSignal,
         seenVersion: watchlistVersion,
         lastPollAt: pollStartedAt,
@@ -1500,7 +1645,7 @@ async function main(): Promise<void> {
         onWake: () => {
           const deadline = pollSleepDeadline({
             now: Date.now(),
-            targetAt: Date.now() + delay,
+            targetAt: sleepTargetAt,
             signal: watchlistSignal,
             seenVersion: watchlistVersion,
             lastPollAt: pollStartedAt,

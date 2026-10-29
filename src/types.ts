@@ -127,11 +127,6 @@ export interface AceEvent {
    * sabidamente incompleta, nunca silenciosa.
    */
   truncatedStart?: boolean;
-  /**
-   * Restart do transcode dentro da janela do clipe: a calibragem de offset
-   * pode ter mudado no meio — conferir sync (spot-check, não revisão total).
-   */
-  offsetUnverified?: boolean;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
   /** Placar antes/depois do fechamento do round, ex "5-2" / "6-2". Opcional. */
@@ -139,7 +134,7 @@ export interface AceEvent {
   scoreAfter?: string;
   /**
    * Início REAL do clipe (epoch ms) — gravado no sidecar pelo clipBuilder.
-   * Difiere da estimativa (1ª kill − contexto) quando a abertura foi
+   * Difere da estimativa (1ª kill − contexto) quando a abertura foi
    * truncada pelo buffer.
    */
   clipStartMs?: number;

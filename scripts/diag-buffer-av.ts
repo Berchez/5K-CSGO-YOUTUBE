@@ -17,7 +17,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifySegmentAv, median, probeConcatSpan, probeSegmentPackets, resolveFfprobeBin, slopePerStep, type SegmentAvIssue } from '../src/clipper/segmentProbe.js';
+import { classifySegmentAv, probeConcatSpan, probeSegmentPackets, resolveFfprobeBin, type SegmentAvIssue } from '../src/clipper/segmentProbe.js';
 
 function arg(name: string, def?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -92,8 +92,8 @@ async function main(): Promise<void> {
     if (segs.length === 0) continue;
     console.log(`\n== ${dir} (${segs.length} segmentos, slot=${slot}s) ==`);
     console.log('seg          kind       vSpan   aSpan   vGap    aGap    vPkts aPkts startΔ');
-    const results: Array<{ seg: string; issue: SegmentAvIssue | null; delta: number }> =
-      new Array(segs.length).fill(null).map(() => ({ seg: '', issue: null as SegmentAvIssue | null, delta: NaN }));
+    const results: Array<{ seg: string; issue: SegmentAvIssue | null }> =
+      new Array(segs.length).fill(null).map(() => ({ seg: '', issue: null as SegmentAvIssue | null }));
     let next = 0;
     async function worker(): Promise<void> {
       while (next < segs.length) {
@@ -102,29 +102,23 @@ async function main(): Promise<void> {
         try {
           const pkts = await probeSegmentPackets(segs[i], ffprobe);
           if (!pkts) {
-            results[i] = { seg, issue: null, delta: NaN };
+            results[i] = { seg, issue: null };
             continue;
           }
           const verdict = classifySegmentAv(pkts.video, pkts.audio, slot);
-          const v0 = Math.min(...pkts.video);
-          const a0 = Math.min(...pkts.audio);
-          const delta = Number.isFinite(v0) && Number.isFinite(a0) ? v0 - a0 : NaN;
           results[i] = {
             seg,
             issue: verdict ? { file: seg, ...verdict } : null,
-            delta,
           };
         } catch {
-          results[i] = { seg, issue: null, delta: NaN };
+          results[i] = { seg, issue: null };
         }
       }
     }
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, segs.length) }, () => worker()));
 
-    const deltas: number[] = [];
     const kinds: Record<string, number> = {};
-    for (const { seg, issue, delta } of results) {
-      if (Number.isFinite(delta)) deltas.push(delta);
+    for (const { seg, issue } of results) {
       const k = issue?.kind ?? 'ok';
       kinds[k] = (kinds[k] ?? 0) + 1;
       if (issue) {
@@ -146,7 +140,7 @@ async function main(): Promise<void> {
     } catch {
       // segue sem span
     }
-    console.log(`-- resumo: ${counted} | ${spanTxt} | startΔ mediano=${Number.isNaN(median(deltas)) ? 'n/a' : median(deltas).toFixed(2) + 's'} | drift=${slopePerStep(deltas).toFixed(3)}s/seg`);
+    console.log(`-- resumo: ${counted} | ${spanTxt}`);
   }
   console.log(bad === 0 ? '\nOK: nenhum segmento com problema.' : `\n${bad} segmento(s) com problema (detalhe acima).`);
 }

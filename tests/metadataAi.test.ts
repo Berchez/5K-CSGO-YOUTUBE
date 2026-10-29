@@ -5,6 +5,7 @@ import {
   metadataAiProviders,
   parseAiDraft,
   thinkingConfigFor,
+  titlesArrayTruncated,
 } from '../src/uploader/metadataAi.js';
 import { buildMetadataContext } from '../src/uploader/videoMetadata.js';
 import type { AceEvent } from '../src/types.js';
@@ -74,6 +75,48 @@ describe('parse da resposta da IA', () => {
     expect(parseAiDraft('sem json nenhum')).toBeNull();
     expect(parseAiDraft('')).toBeNull();
     expect(parseAiDraft('{"titles": [], "description": ""}')).toBeNull();
+  });
+
+  it('mantém os títulos inteiros quando o corte foi na abertura', () => {
+    // O corte no meio da ABERTURA não deixa nenhum título pela metade:
+    // descartar o último título tiraria uma opção boa de graça.
+    const draft = parseAiDraft('{"titles": ["titulo 1", "titulo 2"], "opening": "linha de impacto\\n\\nparagrafo cortad');
+    expect(draft?.titles).toEqual(['titulo 1', 'titulo 2']);
+    expect(draft?.truncated).toBe(true);
+  });
+
+  it('marca a resposta truncada mesmo quando os títulos estão inteiros', () => {
+    const draft = parseAiDraft('{"titles": ["titulo 1"], "opening": "abertura cortad');
+    expect(draft?.truncated).toBe(true);
+  });
+
+  it('JSON completo não é marcado como truncado', () => {
+    const draft = parseAiDraft('{"titles": ["a"], "opening": "d"}');
+    expect(draft?.truncated).toBe(false);
+  });
+});
+
+describe('detecção de corte na lista de títulos', () => {
+  it('reconhece o array fechado', () => {
+    expect(titlesArrayTruncated('{"titles": ["a", "b"], "opening": "d"}')).toBe(false);
+  });
+
+  it('reconhece o array interrompido', () => {
+    expect(titlesArrayTruncated('{"titles": ["a", "b"')).toBe(true);
+  });
+
+  it('array fechado não é truncagem de lista (mesmo com o JSON cortado depois)', () => {
+    // O JSON pode ter sido cortado DEPOIS do array: os títulos estão
+    // inteiros e nenhum deve ser descartado.
+    expect(titlesArrayTruncated('{"titles": ["a", "b"]')).toBe(false);
+  });
+
+  it('não confunde ] dentro de string com fim do array', () => {
+    expect(titlesArrayTruncated('{"titles": ["a ] b", "c"], "opening": "d"}')).toBe(false);
+  });
+
+  it('sem lista de títulos não é truncagem de lista', () => {
+    expect(titlesArrayTruncated('{"opening": "d"}')).toBe(false);
   });
 });
 

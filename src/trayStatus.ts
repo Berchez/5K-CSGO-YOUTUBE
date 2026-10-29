@@ -22,8 +22,7 @@ export interface TrayStatusMatch {
     viewers?: number;
   };
   recorder?: {
-    separate: boolean;
-    muxed: boolean;
+    recording: boolean;
   };
   tracker: boolean;
 }

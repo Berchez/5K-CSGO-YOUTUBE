@@ -4,6 +4,7 @@ import {
   buildListing,
   dedupeUpcoming,
   extractListingCards,
+  shouldStopRecorder,
   type ListingCards,
   type UpcomingCard,
   type UpcomingMatch,
@@ -248,6 +249,50 @@ describe('extração do listing (fixture HTML do HLTV)', () => {
     expect(cards.upcomingSeen).toBe(1);
     expect(cards.upcoming).toHaveLength(1);
     expect(cards.upcoming[0].startUnix).toBe('');
+  });
+
+  it('card live quebrado degrada o listing mas não descarta os cards bons', async (ctx) => {
+    // Card live SEM link de partida (markup atípico): a partida pode ter
+    // sumido do listing → o listing é degradado (o chamador não pode
+    // parar os recorders que sumiram) e os cards bons seguem valendo.
+    if (!browser) return ctx.skip();
+    const html = pageHtml(
+      liveCard({ matchId: '2399406', team1: 'DENDELE', team2: 'Imperial' }) +
+        `<div class="match" data-livescore-match="2399407">
+           <div class="match-meta-live">Live</div>
+           <div class="match-teamname">Time Quebrado</div>
+         </div>`,
+    );
+    const cards = await extract(html);
+    expect(cards.liveError).toBeNull();
+    expect(cards.liveCardErrors).toBe(1);
+    expect(cards.brokenLiveIds).toEqual(['2399407']);
+    expect(cards.live).toHaveLength(1);
+    expect(cards.live[0].matchId).toBe('2399406');
+  });
+});
+
+describe('shouldStopRecorder (limpeza com listing degradado)', () => {
+  const liveIds = new Set(['2399406']);
+
+  it('partida no listing: o recorder continua', () => {
+    expect(shouldStopRecorder('2399406', liveIds, [])).toBe(false);
+  });
+
+  it('partida que sumiu de verdade: o recorder é parado', () => {
+    expect(shouldStopRecorder('2399999', liveIds, [])).toBe(true);
+  });
+
+  it('partida cujo card quebrou: o recorder é PRESERVADO', () => {
+    // O card quebrado pode ser o dela: parar mataria a gravação (e
+    // apagaria o buffer) sem motivo.
+    expect(shouldStopRecorder('2399999', liveIds, ['2399999'])).toBe(false);
+  });
+
+  it('a proteção é POR ID (as outras partidas encerradas são limpas)', () => {
+    // Suspender a limpeza inteira deixava recorders mortos ocupando os
+    // slots de MAX_RECORDINGS (partidas novas deixavam de ser gravadas).
+    expect(shouldStopRecorder('2399998', liveIds, ['2399999'])).toBe(true);
   });
 });
 

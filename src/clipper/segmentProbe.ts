@@ -133,8 +133,8 @@ export function median(xs: number[]): number {
 
 /**
  * Inclinação da série por passo (regressão linear): em startDelta por
- * segmento, >0 indica drift crescente (áudio se adiantando cada vez mais),
- * ~0 indica offset constante (desalinhamento fixo na abertura).
+ * segmento, >0 indica drift crescente (áudio se adiantando cada vez
+ * mais), ~0 indica offset constante (desalinhamento fixo na abertura).
  */
 export function slopePerStep(xs: number[]): number {
   const n = xs.length;
@@ -144,10 +144,28 @@ export function slopePerStep(xs: number[]): number {
   let num = 0;
   let den = 0;
   for (let i = 0; i < n; i++) {
+    // num = Σ(x−mx)(y−my); den = Σ(x−mx)² (variância de x).
+    // den NÃO pode ser o numerador: com os dois iguais a inclinação
+    // sairia 1 em qualquer série (bug que fazia o drift sempre ≈ 1).
     num += (i - mx) * (xs[i] - my);
     den += (i - mx) * (i - mx);
   }
   return den === 0 ? 0 : num / den;
+}
+
+/**
+ * Offset de abertura entre as trilhas (s): início do vídeo menos
+ * início do áudio. É a métrica que mostra skew: num buffer de captura
+ * ÚNICA (muxed) o offset vem da fonte, não de feeds separados — a
+ * série temporal (mediana + drift) é a evidência de que a fonte
+ * entrega áudio e vídeo alinhados.
+ */
+export function startDeltaSec(videoPts: number[], audioPts: number[]): number {
+  if (videoPts.length === 0 || audioPts.length === 0) return NaN;
+  const v0 = Math.min(...videoPts);
+  const a0 = Math.min(...audioPts);
+  if (!Number.isFinite(v0) || !Number.isFinite(a0)) return NaN;
+  return Math.round((v0 - a0) * 1000) / 1000;
 }
 
 /**

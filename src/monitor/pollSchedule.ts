@@ -29,6 +29,13 @@ export const POLL_START_GRACE_MS = 60 * 60_000;
  * (A agenda é confiável — o filtro é que não deixou ninguém elegível.)
  */
 export const POLL_NO_NEXT_MATCH_MS = 15 * 60_000;
+/**
+ * Piso do near-match: o "near-match" acorda o bot perto do horário da
+ * partida, mas nunca pode virar hot-loop (cada poll abre a página do
+ * HLTV e o Cloudflare barra quem martela). O intervalo base tem piso
+ * próprio no config (POLL_INTERVAL_MS >= 5s).
+ */
+export const POLL_MIN_DELAY_MS = 10_000;
 
 /** Motivos que obrigam o intervalo base (o poll não pode adiar). */
 export type PollForceReason =
@@ -38,6 +45,7 @@ export type PollForceReason =
   | 'pending-clip'
   | 'deferred-cleanup'
   | 'blocked'
+  | 'listing-degraded'
   | 'watchlist'
   | 'watchlist-stale';
 
@@ -98,9 +106,14 @@ export interface PollRuntimeState {
   deferredCleanup: number;
   /** Listing bloqueado pelo Cloudflare. */
   blocked: boolean;
+  /**
+   * Listing degradado (algum card live quebrou): a lista pode estar
+   * incompleta → o poll precisa repetir logo (intervalo base).
+   */
+  listingDegraded?: boolean;
   /** A watchlist mudou durante o poll. */
   watchlistChanged: boolean;
-  /** Watchlist ausente, segurando a última versão boa. */
+  /** A watchlist ausente, segurando a última versão boa. */
   watchlistStale: boolean;
 }
 
@@ -117,6 +130,7 @@ export function pollForceReasons(state: PollRuntimeState): PollForceReason[] {
   if (state.pendingClips > 0) reasons.push('pending-clip');
   if (state.deferredCleanup > 0) reasons.push('deferred-cleanup');
   if (state.blocked) reasons.push('blocked');
+  if (state.listingDegraded) reasons.push('listing-degraded');
   if (state.watchlistChanged) reasons.push('watchlist');
   if (state.watchlistStale) reasons.push('watchlist-stale');
   return reasons;
@@ -155,8 +169,12 @@ export function computePollDecision(input: PollDecisionInput): PollDecision {
     return { delayMs: Math.max(base, POLL_NO_NEXT_MATCH_MS), reason: 'no-next-match' };
   }
   if (remaining <= POLL_NEAR_MATCH_MS) {
-    // Perto do horário: não passa do início (nem do intervalo base).
-    return { delayMs: Math.max(1000, Math.min(base, remaining)), reason: 'near-match' };
+    // Perto do horário: não passa do início (nem do intervalo base),
+    // mas nunca abaixo do piso absoluto (hot-loop contra o Cloudflare).
+    return {
+      delayMs: Math.max(POLL_MIN_DELAY_MS, Math.min(base, remaining)),
+      reason: 'near-match',
+    };
   }
   const half = Math.floor(remaining / 2);
   return {

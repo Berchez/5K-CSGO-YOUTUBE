@@ -791,7 +791,7 @@
           ? '<span>Stream <b>' + esc(match.stream.name) + '</b>' + (match.stream.country ? ' · ' + esc(match.stream.country) : '') + (match.stream.viewers != null ? ' · ' + esc(Number(match.stream.viewers).toLocaleString('pt-BR')) + ' viewers' : '') + '</span>'
           : '<span>Stream <b>—</b></span>';
         const recorder = match.recorder
-          ? '<span>Buffer <b>' + (match.recorder.separate ? 'separado' : 'off') + (match.recorder.muxed ? ' + muxed' : '') + '</b></span>'
+          ? '<span>Buffer <b>' + (match.recorder.recording ? 'muxed' : 'off') + '</b></span>'
           : '';
         const tracker = '<span>Tracker <b>' + (match.tracker ? 'ativo' : 'inativo') + '</b></span>';
         const link = match.matchPageUrl ? '<a href="' + esc(match.matchPageUrl) + '" target="_blank" rel="noreferrer">HLTV</a>' : '';

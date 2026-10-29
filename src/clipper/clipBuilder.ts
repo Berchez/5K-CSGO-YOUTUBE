@@ -124,6 +124,13 @@ export interface ClipOptions {
   replayAware?: ReplayAwareMode;
   /** Contexto antes do 1º kill (default 10s). */
   contextSec?: number;
+  /**
+   * Margem extra antes do 1º kill (default 0). O erro de latência é
+   * assimétrico: latência real MENOR que a configurada faz o clipe
+   * começar depois da 1ª kill (ela fica fora do clipe). A margem abre o
+   * corte antes, pagando o erro pelo lado barato (material extra).
+   */
+  startMarginSec?: number;
   /** Epoch ms do 1º kill — ancora o início do clipe. Sem ele, usa últimos N. */
   aceStartMs?: number;
   /** Epoch ms do fim do clipe (win panel parcial). Sem ele, usa cauda pós-detect. */
@@ -135,31 +142,25 @@ export interface ClipOptions {
   /** Optional fallback wall-clock span when PTS measurements are unreliable. */
   concatWallSec?: number | null;
   /**
-   * Correção A/V estática (ms de atraso no áudio). Tem precedência sobre a
-   * medição automática: calibração manual p/ skew sistemático conhecido
-   * quando a correlação por conteúdo não decide (gameplay denso).
-   */
-  staticAvOffsetMs?: number;
-  /**
    * Espaço livre mínimo (bytes) p/ renderizar. Sem ele o encode morre no
    * meio e entrega mp4 sem moov (corrompido) — aborta com erro claro.
    * Default 3GB.
    */
   diskMinFreeBytes?: number;
-  /** Upscale p/ 1440 (default no config): força o pipeline VP9/AV1 do YouTube. */
-  upscaleHeight?: number;
-  /** Suffix appended to the base filename for alternate source captures. */
-  outputSuffix?: string;
-  /** Avoid duplicate thumbnail generation for alternate source captures. */
-  generateThumbnail?: boolean;
-  /** Source variant captured into this clip. */
-  captureMode?: 'separate' | 'muxed';
   /**
-   * Auto-sync A/V por conteúdo. 'auto' mede E aplica a compensação;
-   * 'log' (default) mede e registra no log/sidecar SEM aplicar — modo
-   * diagnóstico; 'off' pula a medição.
+   * Altura alvo do upscale no render (0 = desligado, resolução nativa).
+   * Só upscale quando a fonte é MENOR que o alvo (fonte maior não é
+   * reduzida). Ver CLIP_UPSCALE_HEIGHT.
    */
-  avSync?: 'auto' | 'off' | 'log';
+  upscaleHeight?: number;
+  /**
+   * Rastro da latência no sidecar: de qual stream veio o material, qual
+   * latência foi usada e qual offset (latência − atraso do placar) alinha
+   * os timestamps. Sem isso o sidecar não reproduz o que foi publicado.
+   */
+  streamName?: string;
+  streamLatencyMs?: number;
+  killVideoOffsetMs?: number;
   /** Thumb: default composed; ai tenta fundo IA com fallback. */
   thumb?: SmartThumbOptions;
 }
@@ -249,241 +250,6 @@ export async function verifySegmentAv(
   );
   for (const s of slots) if (s) issues.push(s);
   return issues;
-}
-
-/**
- * Correlação cruzada normalizada entre envelopes (onsets) de áudio e vídeo.
- * Convenção de sinal: lag POSITIVO = áudio ADIANTADO (é preciso atrasar o
- * áudio desse tanto p/ alinhar). Retorna o lag do pico + proeminência
- * (pico / 2º melhor fora de ±0.5s — sem pico dominante, não há medida).
- * Puro/testável.
- */
-export function correlateOffset(
-  audioEnv: number[],
-  videoEnv: number[],
-  sampleHz: number,
-  maxLagSec: number,
-): { lagSec: number; prominence: number } {
-  const n = Math.min(audioEnv.length, videoEnv.length);
-  const lags = Math.round(maxLagSec * sampleHz);
-  const mean = (arr: number[]): number => arr.reduce((s, v) => s + v, 0) / Math.max(1, arr.length);
-  const ma = mean(audioEnv.slice(0, n));
-  const mv = mean(videoEnv.slice(0, n));
-  const scored: Array<{ lag: number; corr: number }> = [];
-  for (let lag = -lags; lag <= lags; lag++) {
-    let sxy = 0;
-    let sxx = 0;
-    let syy = 0;
-    let m = 0;
-    for (let i = 0; i < n; i++) {
-      const j = i - lag;
-      if (j < 0 || j >= n) continue;
-      const x = audioEnv[j] - ma;
-      const y = videoEnv[i] - mv;
-      sxy += x * y;
-      sxx += x * x;
-      syy += y * y;
-      m++;
-    }
-    // Exige sobreposição majoritária: janelinhas de puro fundo correlacionam
-    // 1.0 entre si e elegeriam lag absurdo (ex: −9.1s p/ impulso real em +2s).
-    scored.push({ lag, corr: m > Math.max(16, n / 2) && sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : -2 });
-  }
-  scored.sort((a, b) => b.corr - a.corr);
-  const best = scored[0];
-  const runner = scored.find((s) => Math.abs(s.lag - best.lag) / sampleHz > 0.5);
-  return {
-    lagSec: best.lag / sampleHz,
-    prominence: runner && runner.corr > 0 ? best.corr / runner.corr : best.corr > 0 ? 99 : 0,
-  };
-}
-
-export interface AvOffsetResult {
-  /** Segundos (áudio adiantado > 0). Só válido com measured=true. */
-  offsetSec: number;
-  prominence: number;
-  measured: boolean;
-  reason: string;
-  /** Fim REAL do material de áudio na timeline do concat (loud span). */
-  audioLenSec?: number;
-  /** Fim REAL do material de vídeo na timeline do concat (frames/5). */
-  videoLenSec?: number;
-}
-
-/**
- * Mede o desalinhamento A/V por CONTEÚDO (não por container — PTS alinhado
- * com conteúdo deslocado é invisível em start_time/duration; caso real com
- * áudio 5s na frente e arquivo "perfeito").
- *
- * Método: envelopes via FILTER_COMPLEX concat — a MESMA semântica de
- * emenda do render. O concat DEMUXER (.ts -c copy) não serve aqui: ele
- * re-timestampa as trilhas com bases diferentes (mp4→ts: vídeo start
- * 1.423s vs áudio 1.400s, áudio truncado) e a medição sai errada —
- * validado no e2e sintético (lag 4.9s medido vs 1.9s real).
- * Áudio: ebur128 (loudness M a ~10Hz) → envelope de onsets.
- * Vídeo: frames 160px a 5fps → diff médio → envelope de onsets.
- * Correlação ±10s. Gate: |δ|≥0.5s, proeminência ≥1.5, |δ|≤10s.
- * Best-effort: qualquer falha retorna measured=false (pipeline segue igual).
- */
-export async function measureAvOffset(
-  files: string[],
-  ffmpegBin: string,
-  opts: { sampleHz?: number; maxLagSec?: number } = {},
-): Promise<AvOffsetResult> {
-  const no = (reason: string): AvOffsetResult => ({ offsetSec: 0, prominence: 0, measured: false, reason });
-  const sampleHz = opts.sampleHz ?? 10;
-  const maxLagSec = opts.maxLagSec ?? 10;
-  if (files.length === 0) return no('sem segmentos');
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'avoff-'));
-  try {
-    const inputs: string[] = [];
-    for (const f of files) inputs.push('-i', f);
-    const nIn = files.length;
-    // Pass 1 — envelope de áudio na timeline do render (concat filter).
-    const aPads = files.map((_, i) => `[${i}:a]`).join('');
-    const aGraph = `${aPads}concat=n=${nIn}:v=0:a=1,ebur128=peak=true:framelog=info[a]`;
-    const audioLog = await execFileAsync(
-      ffmpegBin,
-      ['-hide_banner', ...inputs, '-filter_complex', aGraph, '-map', '[a]', '-f', 'null', '-'],
-      // ebur128 framelog emite ~10 linhas/s: clipes longos passam do
-      // maxBuffer default de 1MB e a medição falha em silêncio.
-      { timeout: 180_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
-    )
-      .then((r) => String(r.stderr ?? ''))
-      .catch((e) => String((e as { stderr?: unknown }).stderr ?? e));
-    const loud: Array<{ t: number; m: number }> = [];
-    for (const line of audioLog.split('\n')) {
-      // Silêncio digital vira M: nan / -inf (91 de 141 linhas num clipe de
-      // teste!): sem tratar, o envelope carrega a última loudness pela
-      // frente e o span termina cedo — correlação degradada.
-      const m = line.match(/t:\s*([\d.]+).*?M:\s*(-?[\d.]+|-inf|nan)/);
-      if (!m) continue;
-      const mv = m[2] === '-inf' || m[2] === 'nan' ? -70 : Number.parseFloat(m[2]);
-      loud.push({ t: Number.parseFloat(m[1]), m: mv });
-    }
-    if (loud.length < 30) return no(`envelope de áudio curto (${loud.length} amostras)`);
-    // Pass 2 — envelope de vídeo (frames 160px a 5fps) na MESMA timeline.
-    const framesDir = path.join(tmpRoot, 'vf');
-    fs.mkdirSync(framesDir, { recursive: true });
-    const vPads = files.map((_, i) => `[${i}:v]`).join('');
-    const vGraph = `${vPads}concat=n=${nIn}:v=1:a=0,fps=5,scale=160:-1[v]`;
-    await execFileAsync(
-      ffmpegBin,
-      ['-hide_banner', '-loglevel', 'error', '-y', ...inputs, '-filter_complex', vGraph, '-map', '[v]', path.join(framesDir, 'fr_%04d.png')],
-      { timeout: 180_000, windowsHide: true },
-    );
-    const frames = fs.readdirSync(framesDir).filter((f) => f.endsWith('.png')).sort();
-    if (frames.length < 15) return no(`frames insuficientes (${frames.length})`);
-    const sharp = (await import('sharp')).default;
-    const means: number[] = [];
-    for (const f of frames) {
-      const { data, info } = await sharp(path.join(framesDir, f)).raw().toBuffer({ resolveWithObject: true });
-      let sum = 0;
-      const ch = info.channels;
-      for (let i = 0; i < data.length; i += ch) sum += data[i];
-      means.push(sum / (data.length / ch));
-    }
-    // Reamostra vídeo (5fps) p/ 10Hz + envelopes de ONSET (transientes).
-    const step = 1 / sampleHz;
-    const tEnd = Math.min(loud[loud.length - 1].t, frames.length / 5);
-    const n = Math.floor(tEnd / step);
-    if (n < 30) return no('janela curta demais');
-    const aEnv: number[] = [];
-    const vEnv: number[] = [];
-    let li = 0;
-    for (let i = 0; i < n; i++) {
-      const t = i * step;
-      while (li < loud.length - 1 && loud[li + 1].t <= t) li++;
-      const a = loud[li]?.m ?? -70;
-      const v = means[Math.min(frames.length - 1, Math.floor(t * 5))] ?? 0;
-      aEnv.push(Math.max(-60, a));
-      vEnv.push(v);
-    }
-    const onset = (arr: number[]): number[] => arr.map((v, i) => (i === 0 ? 0 : Math.max(0, v - arr[i - 1])));
-    // Tamanhos REAIS do material (concatLen teórico mente com segmento curto
-    // ou arquivo único > segmentTimeSec): alimentam o clamp da compensação.
-    const audioLenSec = Math.round(loud[loud.length - 1].t * 100) / 100;
-    const videoLenSec = Math.round((frames.length / 5) * 100) / 100;
-    const aOn = onset(aEnv);
-    const vOn = onset(vEnv);
-    const { lagSec, prominence } = correlateOffset(aOn, vOn, sampleHz, maxLagSec);
-    const done = (offsetSec: number, prom: number, measured: boolean, reason: string): AvOffsetResult =>
-      measured
-        ? { offsetSec, prominence: prom, measured, reason, audioLenSec, videoLenSec }
-        : { offsetSec: 0, prominence: prom, measured, reason, audioLenSec, videoLenSec };
-    if (Math.abs(lagSec) < 0.5) return done(0, prominence, false, `alinhado (δ=${lagSec.toFixed(2)}s)`);
-    if (prominence < 1.5) return done(0, prominence, false, `sem pico dominante (prom=${prominence.toFixed(2)})`);
-    if (Math.abs(lagSec) > maxLagSec) return done(0, prominence, false, 'fora da faixa');
-    // Consistência por metades: mídia periódica/ruído correlaciona em lag
-    // qualquer — metades independentes concordando é muito mais forte que
-    // um pico isolado (testsrc espúrio prom 1.63 vs beep↔flash real 1.73).
-    const mid = Math.floor(n / 2);
-    const h1 = correlateOffset(aOn.slice(0, mid), vOn.slice(0, mid), sampleHz, maxLagSec);
-    const h2 = correlateOffset(aOn.slice(mid), vOn.slice(mid), sampleHz, maxLagSec);
-    if (
-      Math.abs(h1.lagSec) < 0.5 ||
-      Math.abs(h2.lagSec) < 0.5 ||
-      Math.abs(h1.lagSec - h2.lagSec) > 1.0
-    ) {
-      return done(0, prominence, false, `inconsistente entre metades (${h1.lagSec.toFixed(1)}s vs ${h2.lagSec.toFixed(1)}s)`);
-    }
-    return done(Math.round(lagSec * 100) / 100, Math.round(prominence * 100) / 100, true, 'ok');
-  } catch (e) {
-    return no(`falha na medição: ${String(e).slice(0, 100)}`);
-  } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
-  }
-}
-
-export interface AudioCompensation {
-  /** Início do áudio na timeline do concat (≥0). */
-  startSec: number;
-  /** Fim do áudio na timeline do concat (−δ da janela de vídeo). */
-  endSec: number;
-  /** Silêncio a inserir no início (s): completa o head quando S−δ < 0. */
-  padSec: number;
-  /** Duração final (= vídeo): atrim de saída depois do adelay. */
-  outLenSec: number;
-  /** Head faltou material (pad > 0). */
-  clamped: boolean;
-  /** Cauda além do material de áudio (residual possível no fim). */
-  tailShort: boolean;
-  /** Janela útil degenerada: NÃO compensar. */
-  invalid: boolean;
-}
-
-/**
- * Compensação de skew A/V (δ>0 = áudio adiantado) para o áudio, dada a
- * janela de vídeo [S, E] na timeline do concat.
- *
- * A janela natural do áudio é [S−δ, E−δ] (mesma duração, conteúdo
- * realinhado). Quando S−δ < 0 (head fora do material), a janela começa em
- * 0 e o adelay preenche a diferença com SILÊNCIO — sem isso, um clamp
- * simples deixaria o clipe INTEIRO deslocado pelo residual. Quando E−δ
- * passa do material de áudio, a cauda fica curta (residual no fim —
- * material que não existe não dá para inventar).
- * Puro/testável.
- */
-export function computeAudioCompensation(
-  videoStartSec: number,
-  videoEndSec: number,
-  deltaSec: number,
-  materialEndSec: number,
-): AudioCompensation {
-  const len = videoEndSec - videoStartSec;
-  const rawStart = videoStartSec - deltaSec;
-  const rawEnd = videoEndSec - deltaSec;
-  const padSec = Math.max(0, -rawStart);
-  const startSec = Math.max(0, rawStart);
-  const clamped = padSec > 0.005;
-  const invalid = rawEnd - startSec < 0.2 || len < 0.2;
-  let endSec = rawEnd;
-  let tailShort = false;
-  if (Number.isFinite(materialEndSec) && endSec > materialEndSec) {
-    endSec = materialEndSec;
-    tailShort = true;
-  }
-  return { startSec, endSec, padSec, outLenSec: len, clamped, tailShort, invalid };
 }
 
 /**
@@ -618,12 +384,6 @@ export interface ConcatTimeline {
   mode: ConcatTimelineMode;
 }
 
-export function resolveOutputHeight(sourceHeight: number | null, requestedHeight: number): number {
-  return requestedHeight > 0 && (sourceHeight == null || sourceHeight < requestedHeight)
-    ? requestedHeight
-    : 0;
-}
-
 export function resolveConcatTimeline(args: {
   firstMtimeMs: number;
   lastMtimeMs: number;
@@ -645,21 +405,6 @@ export function resolveConcatTimeline(args: {
     lenSec: fileCount * segmentTimeSec,
     mode: 'legacy',
   };
-}
-
-/**
- * Âncora de fim do clipe (wall ms): volta ao fechamento REAL do round
- * (detecção − lag do placar) e anda AFTER_CLOSE — mirando ~5s antes da
- * ação do round seguinte (win panel + freeze ≈ 13s). Em timeout/pausa o
- * gap estica e a margem só cresce (nunca sangra p/ o próximo round).
- * Puro/testável.
- */
-export function computeAceEndMs(
-  detectionWallMs: number,
-  scoreboardDelayMs: number,
-  afterCloseSec: number,
-): number {
-  return detectionWallMs - scoreboardDelayMs + afterCloseSec * 1000;
 }
 
 /**
@@ -888,10 +633,11 @@ export function contiguousTail(files: string[], maxGapSec: number): { ok: string
  */
 export function detectTruncatedStart(
   files: string[],
-  opts: { segmentTimeSec: number; contextSec?: number; aceStartMs?: number },
+  opts: { segmentTimeSec: number; contextSec?: number; startMarginSec?: number; aceStartMs?: number },
 ): boolean {
   if (opts.aceStartMs == null || files.length === 0) return false;
-  const desiredStartMs = opts.aceStartMs - (opts.contextSec ?? 10) * 1000;
+  const contextSec = (opts.contextSec ?? 10) + (opts.startMarginSec ?? 0);
+  const desiredStartMs = opts.aceStartMs - contextSec * 1000;
   let oldestEndMs = Infinity;
   for (const f of files) {
     try {
@@ -1017,11 +763,13 @@ export async function buildClip(
   fs.mkdirSync(opts.clipsDir, { recursive: true });
 
   const wantSec = opts.preRollSec + opts.postRollSec;
+  // Contexto EFETIVO do início: contexto + margem de latência.
+  const startContextSec = (opts.contextSec ?? 10) + (opts.startMarginSec ?? 0);
   const picked = pickSegments(segments, {
     segmentTimeSec: opts.segmentTimeSec,
     preRollSec: opts.preRollSec,
     postRollSec: opts.postRollSec,
-    contextSec: opts.contextSec,
+    contextSec: startContextSec,
     aceStartMs: opts.aceStartMs,
     aceEndMs: opts.aceEndMs,
   });
@@ -1032,15 +780,16 @@ export async function buildClip(
       anchored: opts.aceStartMs != null,
       endAnchored: opts.aceEndMs != null,
       contextSec: opts.contextSec ?? 10,
+      startMarginSec: opts.startMarginSec ?? 0,
+      startContextSec,
       aceStart: opts.aceStartMs != null ? new Date(opts.aceStartMs).toISOString() : undefined,
       aceEnd: opts.aceEndMs != null ? new Date(opts.aceEndMs).toISOString() : undefined,
     },
     'montando clipe',
   );
 
-  const base = `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}${opts.outputSuffix ?? ''}`;
-  // Um diretório por clipe: mp4 + sidecar + thumb (+ variante _muxed, que
-  // compartilha a pasta por ser o mesmo clipe) ficam juntos. Refs de
+  const base = `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}`;
+  // Um diretório por clipe: mp4 + sidecar + thumb ficam juntos. Refs de
   // partida (clipsDir/refs) continuam fora — são compartilhadas entre aces.
   const clipDir = path.join(
     opts.clipsDir,
@@ -1112,7 +861,7 @@ export async function buildClip(
     firstSegMtimeMs,
     opts.segmentTimeSec,
     opts.aceStartMs,
-    opts.contextSec ?? 10,
+    startContextSec,
     firstSegStartMs,
   );
   // Fim EXATO: aceEndMs na timeline concatenada (menos o trim do começo).
@@ -1126,10 +875,22 @@ export async function buildClip(
     concatLenSec,
   );
   const sourceHeight = await probeVideoHeight(usable[0]);
-  const requestedHeight = opts.upscaleHeight ?? 0;
-  // Upscaling smaller sources may help platform codec selection, but
-  // downscaling a higher-resolution feed would throw away captured detail.
-  const height = resolveOutputHeight(sourceHeight, requestedHeight);
+  /**
+   * Upscale OPCIONAL (CLIP_UPSCALE_HEIGHT > 0): reescala na MESMA
+   * passada do encode (o denoise/sharpen já estão no filtro). Serve
+   * para forçar VP9/AV1 no YouTube (o YouTube entrega 1080p em
+   * AV1/H.264) e para fontes abaixo de 1440p. Custa CPU → opt-in.
+   */
+  const upscaleHeight = opts.upscaleHeight ?? 0;
+  const shouldUpscale =
+    upscaleHeight > 0 && sourceHeight != null && sourceHeight < upscaleHeight;
+  const outputHeight = shouldUpscale ? upscaleHeight : sourceHeight;
+  if (shouldUpscale) {
+    log.info(
+      { matchId: ace.matchId, sourceHeight, outputHeight },
+      'upscale aplicado no render (CLIP_UPSCALE_HEIGHT)',
+    );
+  }
   // Teto de duração como ALARME (nunca silencioso): se o trim resultante
   // excede o cap, força o corte e sinaliza — o cap não corrige causa, só
   // impede o clipe gigante enquanto o trim não ancora certo.
@@ -1143,11 +904,6 @@ export async function buildClip(
     trimEndSec = capped.trimEndSec;
   }
   // Preenchidos DENTRO da fila (job abaixo); lidos no log/sidecar depois.
-  let avMeasuredMs: number | null = null;
-  let avAppliedMs = 0;
-  let avSource: 'none' | 'auto' | 'static' = 'none';
-  const avMode = opts.avSync ?? 'log';
-  let avReason = avMode === 'off' ? 'desligado (CLIP_AV_SYNC=off)' : 'não executado';
   let avIssuesCount = 0;
   let avSegmentIssues: SegmentAvIssue[] = [];
   let freezeLog = '';
@@ -1228,48 +984,6 @@ export async function buildClip(
       // inspeção é best-effort
     }
 
-    // Auto-sync A/V por CONTEÚDO: 'auto' mede E aplica; 'log' mede e só
-    // registra (modo diagnóstico); 'off' pula. Sem medida válida, tudo
-    // abaixo equivale ao comportamento antigo (janelas idênticas).
-    let avDeltaSec = 0;
-    let avAudioMaterialSec: number | undefined;
-    let avVideoMaterialSec: number | undefined;
-    if (avMode !== 'off') {
-      try {
-        const r = await measureAvOffset(usable, resolveFfmpegBin());
-        avReason = r.reason;
-        avAudioMaterialSec = r.audioLenSec;
-        avVideoMaterialSec = r.videoLenSec;
-        log.info(
-          { avMode, avOffsetMs: r.measured ? Math.round(r.offsetSec * 1000) : null, prom: r.prominence, reason: r.reason },
-          'auto-sync A/V medido',
-        );
-        if (r.measured) avMeasuredMs = Math.round(r.offsetSec * 1000);
-      } catch {
-        avReason = 'falha na medição';
-      }
-    }
-    if (avMode === 'auto' && avMeasuredMs != null && Math.abs(avMeasuredMs) >= 500 && Math.abs(avMeasuredMs) <= 8000) {
-      avDeltaSec = avMeasuredMs / 1000;
-    } else if (avMeasuredMs != null && avMode === 'auto') {
-      log.info({ avOffsetMs: avMeasuredMs }, 'offset fora da faixa de atuação (±0.5s..8s), sem compensação');
-    } else if (avMeasuredMs != null) {
-      log.info({ avMode, avOffsetMs: avMeasuredMs }, 'offset medido (modo log: sem compensação)');
-    }
-    avAppliedMs = Math.round(avDeltaSec * 1000);
-    avSource = avDeltaSec !== 0 ? 'auto' : 'none';
-    // Offset estático (calibração manual): tem precedência sobre a medição.
-    const staticMs = opts.staticAvOffsetMs ?? 0;
-    if (staticMs > 0) {
-      if (avDeltaSec !== 0) {
-        log.warn({ auto: avAppliedMs, static: staticMs }, 'offset estático substitui medição automática');
-      }
-      avDeltaSec = staticMs / 1000;
-      avAppliedMs = staticMs;
-      avSource = 'static';
-      log.info({ avStaticMs: staticMs }, 'offset A/V estático aplicado (calibração manual)');
-    }
-
     const pads = usable.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('');
     // ATENÇÃO à timeline: trim/end do filtro são posições NO CONCAT. O
     // trimEndSec é DURAÇÃO (relativo ao trim) — o fim absoluto é S+dur.
@@ -1279,49 +993,16 @@ export async function buildClip(
     if (trimStartSec > 0.05) trimParts.push(`start=${trimStartSec.toFixed(2)}`);
     if (videoEndSec != null) trimParts.push(`end=${videoEndSec.toFixed(2)}`);
     const doTrim = trimParts.length > 0;
-    // Compensação de skew no áudio: janela [S−δ, E−δ] + adelay quando o head
-    // cai fora do material + corte final na duração do vídeo. Sem offset
-    // (ou medição inválida), as duas trilhas usam a MESMA janela.
-    // Fins REAIS do material vêm da medição (concatLen teórico mente com
-    // segmento curto — janela beyond-material = clipe com cauda esticada).
-    let acomp: AudioCompensation | null = null;
-    if (avDeltaSec !== 0) {
-      acomp = computeAudioCompensation(
-        trimStartSec,
-        videoEndSec ?? avVideoMaterialSec ?? concatLenSec,
-        avDeltaSec,
-        avAudioMaterialSec ?? concatLenSec,
-      );
-      if (acomp.invalid) {
-        log.warn({ avAppliedMs, acomp }, 'janela de áudio degenerada, sem compensação');
-        acomp = null;
-      } else if (acomp.clamped) {
-        log.warn({ padSec: acomp.padSec, avAppliedMs }, 'head do áudio fora do material: silêncio inserido');
-      }
-      if (acomp?.tailShort) {
-        log.warn({ endSec: acomp.endSec, avAppliedMs }, 'cauda do áudio além do material: residual no fim');
-      }
-    }
-    const aTrimParts: string[] = acomp
-      ? [
-          ...(acomp.startSec > 0.05 ? [`start=${acomp.startSec.toFixed(2)}`] : []),
-          ...(acomp.endSec < (avAudioMaterialSec ?? concatLenSec) - 0.5 ? [`end=${acomp.endSec.toFixed(2)}`] : []),
-        ]
-      : trimParts;
-    const aPadMs = acomp && acomp.padSec > 0.005 ? Math.round(acomp.padSec * 1000) : 0;
-    const doATrim = aTrimParts.length > 0;
-    const aparts = [
-      doATrim ? `atrim=${aTrimParts.join(':')},asetpts=PTS-STARTPTS` : '',
-      aPadMs > 0 ? `adelay=delays=${aPadMs}:all=1` : '',
-      acomp && aPadMs > 0 ? `atrim=end=${acomp.outLenSec.toFixed(2)},asetpts=PTS-STARTPTS` : '',
-    ]
-      .filter(Boolean)
-      .join(',');
+    // Áudio e vídeo vêm da MESMA fonte combinada: a janela do áudio é a do
+    // vídeo (não existe skew entre feeds separados para compensar).
+    const aparts = doTrim ? `atrim=${trimParts.join(':')},asetpts=PTS-STARTPTS` : '';
     const vparts = [
       doTrim ? `trim=${trimParts.join(':')},setpts=PTS-STARTPTS` : '',
       'freezedetect=n=-50dB:d=0.5',
       'hqdn3d=4:3:7:5',
-      height > 0 ? `scale=-2:${height}:flags=lanczos+accurate_rnd+full_chroma_int` : '',
+      shouldUpscale
+        ? `scale=-2:${upscaleHeight}:flags=lanczos+accurate_rnd+full_chroma_int`
+        : '',
       'cas=0.6',
     ]
       .filter(Boolean)
@@ -1403,8 +1084,8 @@ export async function buildClip(
     );
   }
   log.info(
-    { matchId: ace.matchId, segments: usable.length, sourceHeight, trimStartSec, trimEndSec, height, avAppliedMs, avSource, avIssues: avIssuesCount, timelineMode: timeline.mode },
-    'clipe montado (passada única: emenda A/V realinhada + upscale)',
+    { matchId: ace.matchId, segments: usable.length, sourceHeight, trimStartSec, trimEndSec, avIssues: avIssuesCount, timelineMode: timeline.mode },
+    'clipe montado (passada única: emenda A/V realinhada)',
   );
 
   const stat = fs.statSync(outPath);
@@ -1419,14 +1100,12 @@ export async function buildClip(
   // Thumbnail estilo canal de cortes: frame + selo ACE!/jogador/confronto.
   // Frame de ~3s antes do 5º kill (meio do ace) — meio do clipe costuma ser break/torcida.
   const thumbPath = path.join(clipDir, `${base}.jpg`);
-  if (opts.generateThumbnail !== false) {
-    try {
-      await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
-    } catch (e) {
-      // Com o erro real: "falha ao gerar thumbnail" sozinho já escondeu a
-      // causa raiz mais de uma vez (ex: frame ilegível vs sharp vs fontes).
-      log.warn({ err: String(e).slice(0, 300) }, 'falha ao gerar thumbnail, seguindo sem ela');
-    }
+  try {
+    await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
+  } catch (e) {
+    // Com o erro real: "falha ao gerar thumbnail" sozinho já escondeu a
+    // causa raiz mais de uma vez (ex: frame ilegível vs sharp vs fontes).
+    log.warn({ err: String(e).slice(0, 300) }, 'falha ao gerar thumbnail, seguindo sem ela');
   }
 
   // Início real do clipe (timeline do concat + trim): o sidecar é a
@@ -1439,20 +1118,17 @@ export async function buildClip(
     JSON.stringify(
       buildSidecar(ace, {
         clipFile: path.basename(outPath),
-        captureMode: opts.captureMode ?? 'separate',
+        captureMode: 'muxed',
         sourceHeight,
-        outputHeight: height || sourceHeight,
+        outputHeight,
+        streamName: opts.streamName,
+        streamLatencyMs: opts.streamLatencyMs,
+        killVideoOffsetMs: opts.killVideoOffsetMs,
         freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),
         clipStartMs,
         clipDurationSec: outDurSec,
-        avMode,
-        avOffsetMs: avMeasuredMs,
-        avAppliedMs,
-        avSource,
-        avStaticMs: opts.staticAvOffsetMs ?? 0,
-        avReason,
         avIssues: avIssuesCount,
         avSegmentIssues,
         timelineMode: timeline.mode,

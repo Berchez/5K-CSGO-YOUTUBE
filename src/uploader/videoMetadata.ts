@@ -6,7 +6,6 @@ export type MetadataMode = 'ai' | 'template' | 'legacy';
 export type MetadataPrivacy = 'private' | 'unlisted' | 'public';
 
 export const TITLE_MAX = 100;
-export const DESCRIPTION_MAX = 5000;
 /**
  * O YouTube limita a descrição em BYTES (não em caracteres): 5000 chars de
  * português com acento passam de 5000 bytes e o upload volta com
@@ -34,26 +33,24 @@ const KILL_COUNT_RE =
 const HEADSHOT_COUNT_RE =
   /(?<![\p{L}\d])(\d+)[ \t]*(?:hs|head\s?shots?|cabe[cç]adas?)(?![\p{L}\d])/giu;
 
-const utf8Encoder = new TextEncoder();
-
 /** Tamanho em bytes UTF-8 (o YouTube conta a descrição assim). */
 export function utf8Length(value: string): number {
-  return utf8Encoder.encode(value).length;
+  return Buffer.byteLength(value, 'utf8');
 }
 
-/** Corta o texto no limite de BYTES sem quebrar caractere multibyte. */
+/**
+ * Corta o texto no limite de BYTES sem quebrar caractere multibyte.
+ * Buffer.byteLength + recorte no início do caractere: sem alocar um
+ * TextEncoder por caractere.
+ */
 export function truncateUtf8(value: string, maxBytes: number): string {
   if (maxBytes <= 0) return '';
-  if (utf8Length(value) <= maxBytes) return value;
-  let out = '';
-  let used = 0;
-  for (const ch of value) {
-    const size = utf8Length(ch);
-    if (used + size > maxBytes) break;
-    out += ch;
-    used += size;
-  }
-  return out.replace(/\s+$/, '');
+  const buf = Buffer.from(value, 'utf8');
+  if (buf.length <= maxBytes) return value;
+  let end = Math.max(0, Math.min(maxBytes, buf.length));
+  // Recua até o início de um caractere (byte de continuação 10xxxxxx).
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf8').replace(/\s+$/, '');
 }
 
 export interface MetadataFeedRow {
@@ -98,12 +95,13 @@ export interface MetadataContext {
   /** Duração do clipe (s), quando conhecida. */
   clipDurationSec?: number;
   /**
-   * Atraso do placar (ms): quanto tempo o placar do HLTV demora a
-   * refletir um kill que já aconteceu. O `at` da kill é o MOMENTO DA
-   * OBSERVAÇÃO, não o do kill — sem esta compensação todo timestamp
-   * sai atrasado em SCOREBOARD_DELAY_MS.
+   * Offset (ms) entre o relógio do PLACAR (HLTV) e o relógio do VÍDEO
+   * gravado. O `at` da kill é o MOMENTO DA OBSERVAÇÃO no placar; no vídeo
+   * o kill aparece (latência da stream − atraso do placar) depois. Positivo
+   * = o vídeo mostra o kill depois do placar. É o que alinha os timestamps
+   * da descrição com o que está na tela. Ausente = 0 (sem deslocamento).
    */
-  killTimeOffsetMs: number;
+  killTimeOffsetMs?: number;
 }
 
 export interface MetadataValidation {
@@ -118,6 +116,12 @@ export interface MetadataDraft {
   /** Alias antigo: aceito como 'opening' quando a IA manda só 'description'. */
   description?: string;
   provider?: string;
+  /**
+   * A resposta da IA veio TRUNCADA (fim de contexto/token): o JSON
+   * precisou ser consertado. O texto pode estar cortado no meio — a
+   * guarda de fatos não pega frase pela metade.
+   */
+  truncated?: boolean;
 }
 
 export type MetadataAiFn = (ctx: MetadataContext) => Promise<MetadataDraft | null>;
@@ -134,9 +138,10 @@ export interface MetadataOptions {
   /** Duração real do clipe (s) — vira a linha "duração" da descrição. */
   clipDurationSec?: number;
   /**
-   * Atraso do placar (ms): o `at` da kill é o momento em que o placar
-   * MostROU o kill, não o instante em que ele aconteceu. Subtrair esse
-   * atraso deixa o timestamp da descrição alinhado com o vídeo.
+   * Offset (ms) entre o relógio do PLACAR e o relógio do VÍDEO gravado:
+   * o `at` da kill é o momento em que o placar MOSTROU o kill; no vídeo
+   * ele aparece (latência da stream − atraso do placar) depois. Somado ao
+   * `at`, deixa o timestamp da descrição alinhado com a tela.
    */
   killTimeOffsetMs?: number;
 }
@@ -182,17 +187,27 @@ export function buildMetadataContext(
   const summary = ace.summary;
   const kills = summary?.kills?.length ?? ace.kills.length;
   const rawKills = summary?.kills ?? ace.kills;
-  // O placar do HLTV reflete o kill alguns segundos depois dele ter
-  // acontecido (SCOREBOARD_DELAY_MS). O `at` da kill é o momento da
-  // OBSERVAÇÃO: sem descontar o atraso, todo timestamp da descrição
-  // aponta para depois da eliminação (o vídeo mostra o kill "adiantado"
-  // em relação ao texto).
-  const killOffsetMs = Math.max(0, Math.floor(killTimeOffsetMs ?? 0));
+  // O `at` da kill é o momento da OBSERVAÇÃO no placar do HLTV; no vídeo
+  // gravado o kill aparece depois (latência da stream − atraso do
+  // placar). O offset converte o primeiro relógio no segundo: sem ele
+  // todo timestamp da descrição aponta para antes da eliminação.
+  const killOffsetMs = Math.round(killTimeOffsetMs ?? 0);
+  const durationSec = clipDurationSec ?? ace.clipDurationSec;
   const feed: MetadataFeedRow[] = rawKills.map((k) => {
+    // Timestamp = posição da kill DENTRO do clipe. Fora do clipe
+    // (antes do início ou depois do fim) o horário seria mentira
+    // ("0:00 matou X" para uma kill que está depois do clipe): nesses
+    // casos a linha sai SEM timestamp (a kill continua na lista).
+    const rawSec =
+      clipStartMs != null && k.at != null ? (k.at + killOffsetMs - clipStartMs) / 1000 : undefined;
     const timeSec =
-      clipStartMs != null && k.at != null
-        ? Math.max(0, (k.at - killOffsetMs - clipStartMs) / 1000)
-        : undefined;
+      rawSec == null
+        ? undefined
+        : rawSec < 0
+          ? undefined
+          : durationSec != null && rawSec > durationSec + 1
+            ? undefined
+            : rawSec;
     return {
       victim: k.victim || '?',
       weapon: prettyWeapon(k.weapon ?? ''),
@@ -770,7 +785,11 @@ export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): s
         ? 'Corte automático. Vídeo não listado: aparece só para quem tem o link.'
         : `Corte automático de ${ctx.player}. Assine o canal para não perder nenhum highlight.`;
   const cta = (opts.cta ?? '').trim();
-  return cta ? `${base}\n${cta}` : base;
+  const footer = cta ? `${base}\n${cta}` : base;
+  // O rodapé entra DEPOIS do sanitize do corpo (o CTA pode ter URL, e
+  // link é aceito na descrição), mas < e > o YouTube rejeita com
+  // invalidDescription — então a limpeza é aplicada aqui.
+  return footer.replace(/[<>]/g, ' ');
 }
 
 /**
@@ -784,8 +803,23 @@ function trimTag(tag: string): string {
   return (lastSpace > TAG_CHARS_MAX / 2 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
+/**
+ * Tag de contagem de kills que contradiz o round ("ace"/"5k" num 4K).
+ * As tags padrão do dono entram sempre; estas não: publicar "5k" num
+ * 4K é informação falsa no vídeo.
+ */
+function contradictsKillCount(tag: string, kills: number): boolean {
+  const t = normalizeText(tag);
+  if (t === 'ace') return kills < 5;
+  const match = t.match(/^(\d)k$/);
+  if (!match) return false;
+  return Number(match[1]) > kills;
+}
+
 export function buildTags(ctx: MetadataContext, defaults: string[]): string[] {
-  const base = defaults.map((t) => t.trim()).filter(Boolean);
+  const base = defaults
+    .map((t) => t.trim())
+    .filter((t) => t && !contradictsKillCount(t, ctx.kills));
   const extra = [
     ctx.player,
     ctx.map,
@@ -860,6 +894,19 @@ export function buildTemplateMetadata(
   };
 }
 
+/**
+ * O texto termina em frase? (pontuação de fim de período). Uma resposta
+ * truncada no meio da frase passa pela guarda de fatos (que valida
+ * VERDADE, não completude) e ia para o vídeo com a abertura cortada.
+ */
+const SENTENCE_END_RE = /[.!?…]["'»”’)\]]*\s*$/;
+
+export function endsWithSentence(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return false;
+  return SENTENCE_END_RE.test(t);
+}
+
 export async function buildVideoMetadata(
   ace: AceEvent,
   opts: MetadataOptions = {},
@@ -906,6 +953,12 @@ export async function buildVideoMetadata(
   // exemplo) sem proteger contra alucinação nenhuma.
   const rawOpening = sanitizeDescription(draft.opening ?? draft.description ?? '');
   const openingCheck = validateDescription(rawOpening, ctx);
+  // Resposta truncada: a abertura pode estar cortada no meio da frase
+  // (a guarda de fatos não pega isso). Cai no gerador determinístico.
+  if (openingCheck.ok && draft.truncated && rawOpening.trim() && !endsWithSentence(rawOpening)) {
+    openingCheck.reason = 'abertura truncada (resposta da IA cortada)';
+    openingCheck.ok = false;
+  }
   if (openingCheck.ok && rawOpening.trim()) {
     description = composeDescription(rawOpening, ctx, opts);
   } else if (rawOpening.trim()) {
@@ -938,4 +991,27 @@ export async function buildVideoMetadata(
     provider: draft.provider,
     reason: reasons.length > 0 ? reasons.join(' | ') : undefined,
   };
+}
+
+/**
+ * Metadados com fallback: uma exceção na composição (sidecar nulo,
+ * regex, dado inesperado) NÃO pode derrubar o upload — sem metadados o
+ * upload segue pelo caminho legado (título/descrição fixos). O erro é
+ * logado; o clipe sobe.
+ */
+export async function buildVideoMetadataSafe(
+  ace: AceEvent,
+  opts: MetadataOptions = {},
+): Promise<VideoMetadata | undefined> {
+  try {
+    return await buildVideoMetadata(ace, opts);
+  } catch (e) {
+    getLogger()
+      .child({ feature: 'metadata' })
+      .warn(
+        { err: String(e).slice(0, 200) },
+        'falha ao compor os metadados — upload segue com o caminho legado',
+      );
+    return undefined;
+  }
 }

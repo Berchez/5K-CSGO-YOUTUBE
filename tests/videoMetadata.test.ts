@@ -7,10 +7,14 @@ import {
   buildTemplateDescription,
   buildTemplateTitle,
   buildVideoMetadata,
+  buildVideoMetadataSafe,
+  composeDescription,
+  DESCRIPTION_MAX_BYTES,
   resetTemplateRotation,
   resetUsedTitles,
   sanitizeDescription,
   sanitizeTitle,
+  truncateUtf8,
   utf8Length,
   validateDescription,
   validateTitle,
@@ -171,28 +175,40 @@ describe('descrição determinística', () => {
     expect(desc).toContain('1:05 matou b');
   });
 
-  it('desconta o atraso do placar (o `at` é a observação, não o kill)', () => {
-    // O placar do HLTV reflete o kill SCOREBOARD_DELAY_MS depois: o `at`
-    // da kill é o momento da OBSERVAÇÃO. Sem descontar o atraso, todo
-    // timestamp aponta para depois da eliminação no vídeo.
+  it('soma o offset placar→vídeo (o `at` é a observação no placar)', () => {
+    // O `at` da kill é o momento em que o PLACAR do HLTV mostrou o kill;
+    // no vídeo gravado ele aparece depois (latência da stream − atraso
+    // do placar). O offset alinha o timestamp com o que está na tela.
     const ace = makeAce({
       kills: [
         { killer: 'donk', victim: 'a', round: 12, map: 'Mirage', at: 1_010_000 },
         { killer: 'donk', victim: 'b', round: 12, map: 'Mirage', at: 1_075_000 },
       ],
     });
-    const ctx = buildMetadataContext(ace, 1_000_000, undefined, 10_000);
+    const ctx = buildMetadataContext(ace, 1_000_000, undefined, 20_000);
     const desc = buildTemplateDescription(ctx);
-    expect(desc).toContain('0:00 matou a');
-    expect(desc).toContain('1:05 matou b');
+    expect(desc).toContain('0:30 matou a');
+    expect(desc).toContain('1:35 matou b');
   });
 
-  it('timestamp nunca fica negativo (kill antes do início do clipe)', () => {
+  it('kill fora do clipe fica SEM timestamp (não inventa "0:00")', () => {
+    // Kill antes do início do clipe: o horário seria mentira ("0:00 matou
+    // X" para algo que está antes do vídeo). A linha sai sem timestamp.
     const ace = makeAce({
       kills: [{ killer: 'donk', victim: 'a', round: 12, map: 'Mirage', at: 900_000 }],
     });
     const ctx = buildMetadataContext(ace, 1_000_000, undefined, 10_000);
-    expect(ctx.feed[0].timeSec).toBe(0);
+    expect(ctx.feed[0].timeSec).toBeUndefined();
+    expect(buildTemplateDescription(ctx)).toContain('matou a');
+    expect(buildTemplateDescription(ctx)).not.toContain('0:00 matou a');
+  });
+
+  it('kill depois do fim do clipe fica SEM timestamp', () => {
+    const ace = makeAce({
+      kills: [{ killer: 'donk', victim: 'a', round: 12, map: 'Mirage', at: 1_100_000 }],
+    });
+    const ctx = buildMetadataContext(ace, 1_000_000, 30, 0);
+    expect(ctx.feed[0].timeSec).toBeUndefined();
   });
 
   it('sem âncora não inventa timestamp', () => {
@@ -341,6 +357,20 @@ describe('sanitização', () => {
     expect(utf8Length(desc)).toBeLessThanOrEqual(5000);
     expect(desc.length).toBeLessThan(3000);
   });
+
+  it('truncateUtf8 corta na fronteira do caractere multibyte', () => {
+    // 'á' = 2 bytes: cortar em 3 bytes não pode entregar metade do
+    // caractere (o YouTube rejeita UTF-8 inválido).
+    const cortado = truncateUtf8('ááá', 3);
+    expect(utf8Length(cortado)).toBeLessThanOrEqual(3);
+    expect(cortado).toBe('á');
+    expect(cortado.includes('\uFFFD')).toBe(false);
+  });
+
+  it('truncateUtf8 em byte inteiro não perde caractere', () => {
+    expect(truncateUtf8('abcde', 3)).toBe('abc');
+    expect(truncateUtf8('abcde', 0)).toBe('');
+  });
 });
 
 describe('buildVideoMetadata', () => {
@@ -487,6 +517,80 @@ describe('buildVideoMetadata', () => {
     expect(meta.description).toContain('https://youtube.com/@canal');
     expect(meta.description).toContain('10k inscritos');
   });
+
+  it('rodapé com < ou > não derruba a descrição (o YouTube rejeita)', async () => {
+    const meta = await buildVideoMetadata(makeAce(), {
+      mode: 'template',
+      cta: 'Siga o canal -> <5K CS>',
+    });
+    expect(meta.description).not.toContain('<');
+    expect(meta.description).not.toContain('>');
+    expect(meta.description).toContain('Siga o canal');
+  });
+
+  it('abertura truncada cai no determinístico (resposta da IA cortada)', async () => {
+    const meta = await buildVideoMetadata(makeAce(), {
+      mode: 'ai',
+      ai: async () => ({
+        titles: ['donk 5 KILLS no Mirage — PGL Masters 🔥'],
+        opening: 'donk dominou o round 12 no Mirage com 5 kills e',
+        truncated: true,
+        provider: 'gemini',
+      }),
+    });
+    // O título da IA é aproveitado; a descrição vai para o template.
+    expect(meta.source).toBe('ai');
+    expect(meta.title).toContain('donk');
+    expect(meta.description).not.toContain('dominou o round 12 no Mirage com 5 kills e');
+    expect(meta.reason).toContain('abertura truncada');
+  });
+
+  it('abertura truncada que termina em frase é aceita', async () => {
+    const meta = await buildVideoMetadata(makeAce(), {
+      mode: 'ai',
+      ai: async () => ({
+        titles: ['donk 5 KILLS no Mirage — PGL Masters 🔥'],
+        opening: 'donk dominou o round 12 no Mirage com 5 kills.',
+        truncated: true,
+        provider: 'gemini',
+      }),
+    });
+    expect(meta.source).toBe('ai');
+    expect(meta.description).toContain('donk dominou o round');
+  });
+});
+
+describe('buildVideoMetadataSafe (falha na composição não impede o upload)', () => {
+  it('devolve undefined (caminho legado) quando a composição estoura', async () => {
+    // Exceção na composição (aqui: um getter que quebra no summary) —
+    // antes ela derrubava o upload inteiro e o clipe ficava local.
+    const broken = makeAce({
+      summary: {
+        get kills(): never {
+          throw new Error('sidecar quebrado');
+        },
+      } as unknown as AceEvent['summary'],
+    });
+    const meta = await buildVideoMetadataSafe(broken, { mode: 'template' });
+    expect(meta).toBeUndefined();
+  });
+
+  it('composição normal devolve os metadados', async () => {
+    const meta = await buildVideoMetadataSafe(makeAce(), { mode: 'template' });
+    expect(meta?.title).toContain('donk');
+  });
+});
+
+describe('rodapé tem prioridade quando falta espaço', () => {
+  it('o corpo cede e o CTA sobrevive', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const desc = composeDescription('ABERTURA QUE NAO CABE EM LUGAR NENHUM', ctx, {
+      cta: 'CTA'.repeat(2000),
+    });
+    expect(utf8Length(desc)).toBeLessThanOrEqual(DESCRIPTION_MAX_BYTES);
+    expect(desc).toContain('CTA');
+    expect(desc).not.toContain('ABERTURA QUE NAO CABE');
+  });
 });
 
 describe('tags', () => {
@@ -507,5 +611,15 @@ describe('tags', () => {
     const tags = buildTags(ctx, []);
     for (const tag of tags) expect(tag.length).toBeLessThanOrEqual(30);
     expect(tags.join(',').length).toBeLessThanOrEqual(500);
+  });
+
+  it('descarta tag padrão que contradiz a contagem de kills', () => {
+    const ctx = buildMetadataContext(makeAce({ kills: makeKills(4) }));
+    const tags = buildTags(ctx, ['cs2', 'ace', '5k', 'highlights']);
+    expect(tags).not.toContain('ace');
+    expect(tags).not.toContain('5k');
+    expect(tags).toContain('cs2');
+    expect(tags).toContain('highlights');
+    expect(tags).toContain('4k');
   });
 });

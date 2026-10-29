@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ConfigSchema } from './config.js';
+import { boolEnv, ConfigSchema, parseBoolEnv } from './config.js';
 import type { AppConfig } from './config.js';
 
 export type ConfigGroup = 'capture' | 'stream' | 'clips' | 'youtube' | 'system';
@@ -100,6 +100,26 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     type: 'boolean',
   },
   {
+    key: 'HLTV_CLOSE_BROWSER_IDLE',
+    group: 'capture',
+    label: 'Fechar o browser ocioso',
+    help: 'Desligado = mantém o browser aberto entre polls (não pisca na tela ao relançar).',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
+    key: 'HLTV_CLOSE_BROWSER_MIN_IDLE_MS',
+    group: 'capture',
+    label: 'Espera mínima p/ fechar o browser',
+    help: 'Só fecha o browser ocioso depois desta espera (evita relançar o Chrome a cada ciclo).',
+    type: 'number',
+    min: 0,
+    max: 3_600_000,
+    step: 60_000,
+    unit: 'ms',
+    advanced: true,
+  },
+  {
     key: 'MAX_RECORDINGS',
     group: 'capture',
     label: 'Gravações simultâneas',
@@ -181,19 +201,6 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     advanced: true,
   },
   {
-    key: 'CLIP_UPSCALE_HEIGHT',
-    group: 'clips',
-    label: 'Upscale do clipe',
-    help: '1440p/2160p força codecs melhores no YouTube. 0 mantém a resolução nativa.',
-    type: 'select',
-    options: [
-      { value: '0', label: 'Nativo (sem upscale)' },
-      { value: '1080', label: '1080p' },
-      { value: '1440', label: '1440p' },
-      { value: '2160', label: '2160p (4K)' },
-    ],
-  },
-  {
     key: 'CLIP_STREAM_SYNC',
     group: 'clips',
     label: 'Sync pelo placar',
@@ -206,16 +213,64 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     ],
   },
   {
-    key: 'CLIP_AV_SYNC',
+    key: 'CLIP_STREAM_LATENCY_MS',
     group: 'clips',
-    label: 'Correção A/V automática',
-    help: 'auto mede e aplica quando os gates de confiança concordam; log só mede; off desliga.',
-    type: 'select',
-    options: [
-      { value: 'auto', label: 'Automática' },
-      { value: 'log', label: 'Só registrar' },
-      { value: 'off', label: 'Desligada' },
-    ],
+    label: 'Latência da stream',
+    help: 'Atraso do material gravado em relação ao jogo. Suba se o clipe abrir ANTES da 1ª kill; desça se abrir muito depois. O log "latência observada" mede o valor real de cada canal.',
+    type: 'number',
+    min: 0,
+    max: 120_000,
+    step: 1000,
+    unit: 'ms',
+    advanced: true,
+  },
+  {
+    key: 'SCOREBOARD_DELAY_MS',
+    group: 'clips',
+    label: 'Atraso do placar',
+    help: 'Quanto o placar do HLTV atrasa em relação ao jogo (por kill). Entra no offset dos timestamps da descrição.',
+    type: 'number',
+    min: 0,
+    max: 120_000,
+    step: 500,
+    unit: 'ms',
+    advanced: true,
+  },
+  {
+    key: 'CLIP_SCORE_DELAY_MS',
+    group: 'clips',
+    label: 'Atraso do placar final',
+    help: 'Quanto o HLTV demora para publicar o placar final do round (ancora o FIM do clipe quando o sync do vídeo não acha a virada).',
+    type: 'number',
+    min: 0,
+    max: 120_000,
+    step: 1000,
+    unit: 'ms',
+    advanced: true,
+  },
+  {
+    key: 'CLIP_END_AFTER_CLOSE_SEC',
+    group: 'clips',
+    label: 'Margem após o round',
+    help: 'Segundos depois do fechamento do round que entram no clipe (win panel/freeze).',
+    type: 'number',
+    min: 0,
+    max: 60,
+    step: 1,
+    unit: 's',
+    advanced: true,
+  },
+  {
+    key: 'CLIP_END_TAIL_SEC',
+    group: 'clips',
+    label: 'Cauda do fim estimado',
+    help: 'Folga extra no fim quando o round não foi ancorado no vídeo (proteger a última kill quando a latência real é maior que a configurada).',
+    type: 'number',
+    min: 0,
+    max: 120,
+    step: 1,
+    unit: 's',
+    advanced: true,
   },
   {
     key: 'REPLAY_AWARE',
@@ -251,34 +306,6 @@ export const EDITABLE_FIELDS: ConfigField[] = [
       { value: 'composed', label: 'Frame + selo' },
       { value: 'ai', label: 'IA (com fallback)' },
     ],
-  },
-  {
-    key: 'AV_STATIC_OFFSET_MS',
-    group: 'clips',
-    label: 'Offset A/V estático',
-    help: 'Correção manual em ms. Use 0 para desligar.',
-    type: 'number',
-    min: 0,
-    max: 8000,
-    step: 100,
-    unit: 'ms',
-    advanced: true,
-  },
-  {
-    key: 'AV_STATIC_MATCHES',
-    group: 'clips',
-    label: 'Escopo do offset (matchIds)',
-    help: 'IDs separados por vírgula. Vazio aplica em todas as partidas (cuidado).',
-    type: 'text',
-    advanced: true,
-  },
-  {
-    key: 'AV_STREAM_OFFSETS',
-    group: 'clips',
-    label: 'Offset por stream',
-    help: 'Ex.: "ESL TV=2000,Gaules=0".',
-    type: 'text',
-    advanced: true,
   },
   {
     key: 'YT_UPLOAD',
@@ -534,7 +561,15 @@ export function configValueForPanel(
   field: ConfigField,
 ): string {
   const raw = values[field.key];
-  return raw === undefined ? defaultValueFor(field.key) : raw;
+  const fallback = defaultValueFor(field.key);
+  if (field.type === 'boolean') {
+    // O .env aceita 1/true/yes/on/sim — o painel precisa mostrar o MESMO
+    // estado que o bot enxerga (antes, "1" era tratado como ligado pelo
+    // bot e como desligado pelo painel).
+    const source = raw === undefined ? fallback : raw;
+    return boolEnv(source, fallback === 'true') ? 'true' : 'false';
+  }
+  return raw === undefined ? fallback : raw;
 }
 
 export function panelConfigValues(values: Record<string, string>): Record<string, string> {
@@ -573,13 +608,15 @@ export function validateConfigPatch(patch: Record<string, unknown>): ConfigPatch
         continue;
       }
     }
-    if (key === 'YT_UPLOAD' || key === 'TOP_TIER_ONLY') {
-      const lower = value.toLowerCase();
-      if (!['true', 'false', '1', '0'].includes(lower)) {
+    if (field?.type === 'boolean') {
+      // Mesmo conjunto de valores do .env (1/true/yes/on/sim x
+      // 0/false/no/off/não) — gravado sempre como true/false.
+      const parsed = parseBoolEnv(value);
+      if (parsed === null) {
         errors.push({ key, message: 'Use ligado/desligado.' });
         continue;
       }
-      value = lower === 'true' || lower === '1' ? 'true' : 'false';
+      value = parsed ? 'true' : 'false';
     }
     if (key === 'STREAM_PREFERRED_COUNTRY') {
       value = value.toUpperCase();

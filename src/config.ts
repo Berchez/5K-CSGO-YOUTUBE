@@ -1,8 +1,26 @@
 import './env.js';
 import { z } from 'zod';
+import { parseLatencyMap } from './monitor/streamLatency.js';
 
 /** Valores aceitos como "ligado" nas variáveis de ambiente. */
 const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'sim']);
+/** Valores aceitos como "desligado" nas variáveis de ambiente. */
+const FALSEY = new Set(['0', 'false', 'no', 'off', 'nao', 'não']);
+
+/**
+ * Lê um valor booleano de env: null quando o valor NÃO é claramente
+ * ligado/desligado ("flase", "sim please"...). O mesmo conjunto vale
+ * para o .env, para o painel e para o validador — uma fonte só, senão o
+ * bot liga uma feature e o painel mostra "desligado".
+ */
+export function parseBoolEnv(value: string | undefined): boolean | null {
+  if (value == null) return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (TRUTHY.has(v)) return true;
+  if (FALSEY.has(v)) return false;
+  return null;
+}
 
 /**
  * Boolean de env sem pegadinha: "1"/"true"/"yes"/"on" ligam; "0"/
@@ -10,44 +28,47 @@ const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'sim']);
  * liga" desligava o recurso com POLL_ADAPTIVE=1.)
  */
 export function boolEnv(value: string | undefined, defaultValue: boolean): boolean {
-  if (value == null) return defaultValue;
-  const v = value.trim().toLowerCase();
-  if (!v) return defaultValue;
-  if (TRUTHY.has(v)) return true;
-  if (v === '0' || v === 'false' || v === 'no' || v === 'off' || v === 'nao') return false;
-  return defaultValue;
+  const parsed = parseBoolEnv(value);
+  return parsed === null ? defaultValue : parsed;
+}
+
+/**
+ * Chaves booleanas do schema (registradas aqui para o aviso de startup
+ * sobre valor inválido). Derivado do próprio schema: um booleano novo
+ * entra na lista sozinho.
+ */
+const BOOL_ENV_KEYS_SET = new Set<string>();
+
+/** Campo booleano de env: registra a chave e normaliza o valor. */
+function boolEnvField(key: string, defaultValue: boolean) {
+  BOOL_ENV_KEYS_SET.add(key);
+  return z
+    .string()
+    .default(defaultValue ? 'true' : 'false')
+    .transform((v) => boolEnv(v, defaultValue));
 }
 
 export const ConfigSchema = z.object({
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
   /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
   HLTV_PROFILE: z.string().default('./data/hltv-profile'),
-  /** 1 = headless (o Cloudflare costuma barrar; headed minimizado passa). */
-  HLTV_HEADLESS: z.string().default('0'),
+  /** Headless (o Cloudflare costuma barrar; headed minimizado passa). Aceita 1/true/0/false. */
+  HLTV_HEADLESS: boolEnvField('HLTV_HEADLESS', false),
   MIN_STARS: z.coerce.number().min(0).max(5).default(0),
-  TOP_TIER_ONLY: z
-    .string()
-    .default('false')
-    .transform((v) => boolEnv(v, false)),
+  TOP_TIER_ONLY: boolEnvField('TOP_TIER_ONLY', false),
   POLL_INTERVAL_MS: z.coerce.number().min(5000).default(45000),
   /**
    * Poll adaptativo (idle backoff): true = ocioso espera metade do tempo
    * que falta para a próxima partida (teto 30min); false = sempre no
    * intervalo base (comportamento antigo, kill switch).
    */
-  POLL_ADAPTIVE: z
-    .string()
-    .default('true')
-    .transform((v) => boolEnv(v, true)),
+  POLL_ADAPTIVE: boolEnvField('POLL_ADAPTIVE', true),
   /**
    * Fechar o browser (headed) durante a espera ociosa: libera RAM/CPU,
    * mas o relançamento no poll seguinte pode piscar na tela (foco em
    * jogo fullscreen). false = mantém o browser aberto.
    */
-  HLTV_CLOSE_BROWSER_IDLE: z
-    .string()
-    .default('true')
-    .transform((v) => boolEnv(v, true)),
+  HLTV_CLOSE_BROWSER_IDLE: boolEnvField('HLTV_CLOSE_BROWSER_IDLE', true),
   /**
    * Espera mínima (ms) para fechar o browser ocioso. Espera curta não
    * compensa fechar/relançar (e o relançamento é o que incomoda).
@@ -63,6 +84,22 @@ export const ConfigSchema = z.object({
   SEGMENT_TIME_SEC: z.coerce.number().min(5).max(30).default(10),
   // 24 × 10s = 240s: round longo (~140s) + contexto + espera do fim ancorado.
   SEGMENT_WRAP: z.coerce.number().min(6).max(60).default(24),
+  /**
+   * Seletor de formato do yt-dlp para a fonte COMBINADA (áudio + vídeo no
+   * mesmo formato). 'best' = a melhor variante combinada que a fonte
+   * expõe (sem teto artificial de resolução/FPS).
+   *
+   * É o kill-switch da camada de captura: se a fonte publicar uma
+   * variante combinada ruim (ou pesada demais para o CPU), dá para
+   * escolher outra sem mexer no código (ex.: 'best[height<=1080]').
+   * NÃO use seletores de vídeo separado ('bv*'): a captura precisa ser
+   * UM input com áudio e vídeo — dois inputs trazem o skew A/V de volta
+   * (e o subsistema que o corrigia foi removido).
+   */
+  CAPTURE_FORMAT: z
+    .string()
+    .default('best')
+    .transform((v) => v.trim() || 'best'),
   CLIP_PRE_ROLL_SEC: z.coerce.number().min(15).max(120).default(60),
   CLIP_POST_ROLL_SEC: z.coerce.number().min(5).max(60).default(15),
   /** Contexto antes do 1º kill do ace (o clipe começa aqui). */
@@ -82,6 +119,26 @@ export const ConfigSchema = z.object({
    */
   CLIP_CONTEXT_UNCERTAIN_SEC: z.coerce.number().min(0).max(120).default(25),
   /**
+   * Margem extra ANTES da 1ª kill (o clipe começa aqui).
+   *
+   * O erro de latência é assimétrico: com a latência REAL menor que a
+   * configurada, o clipe começa DEPOIS da 1ª kill (ela fica fora do
+   * clipe — o pior defeito); com a latência real maior, o clipe só
+   * abre mais cedo (material extra do round anterior). A margem paga o
+   * erro pelo lado barato: o clipe abre CLIP_CONTEXT_SEC +
+   * CLIP_START_MARGIN_SEC antes da 1ª kill.
+   * Default 5s.
+   */
+  CLIP_START_MARGIN_SEC: z.coerce.number().min(0).max(60).default(5),
+  /**
+   * Upscale (opcional) do clipe live: 0 = desligado (resolução nativa
+   * da fonte), 1440/2160 = reescala (denoise + scale + sharpen) na
+   * MESMA passada do encode. Serve para forçar VP9/AV1 no YouTube
+   * (o YouTube entrega 1080p em AV1/H.264). Custa CPU (1440p60 satura
+   * o encode) — por isso é opt-in.
+   */
+  CLIP_UPSCALE_HEIGHT: z.coerce.number().min(0).max(2160).default(0),
+  /**
    * Segundos após a virada do placar do round onde o clipe termina.
    * Default 8: cobre o win panel/freeze sem entrar muito no próximo round.
    */
@@ -96,7 +153,11 @@ export const ConfigSchema = z.object({
   CLIP_STREAM_SYNC_MAX_LAG_SEC: z.coerce.number().min(0).max(180).default(120),
   /** Crop normalizado x:y:w:h do placar no topo do vídeo. */
   CLIP_SCOREBOARD_CROP: z.string().default('0.30:0.03:0.40:0.10'),
-  /** Cauda extra quando a transição do placar não é encontrada. */
+  /**
+   * TEMPO extra de espera quando a transição do placar não é encontrada
+   * (o material precisa chegar). NÃO afeta o corte: o fim do clipe sai
+   * de CLIP_END_TAIL_SEC. Default 35s.
+   */
   CLIP_STREAM_SYNC_FALLBACK_SEC: z.coerce.number().min(0).max(120).default(35),
   /** Mínimo de kills no round em partidas com >= 1 estrela (4 = 4k/5k). */
   MIN_KILLS: z.coerce.number().min(2).max(5).default(4),
@@ -107,45 +168,56 @@ export const ConfigSchema = z.object({
    */
   MIN_KILLS_NO_STARS: z.coerce.number().min(2).max(5).default(5),
   /**
-   * Atraso estimado do placar live do HLTV em relação ao jogo real. O corte
-   * começa em (1º kill observado − este valor − CLIP_CONTEXT_SEC). Suba se
-   * o clipe começar DEPOIS da 1ª kill; desça se começar muito antes.
+   * Atraso estimado do placar live do HLTV em relação ao jogo real (o
+   * placar reflete o kill alguns segundos DEPOIS dele acontecer). O corte
+   * começa em (1º kill observado − este valor − CLIP_CONTEXT_SEC), já
+   * convertido para a timeline do vídeo por CLIP_STREAM_LATENCY_MS.
+   * Suba se o clipe começar DEPOIS da 1ª kill; desça se começar muito antes.
    */
-  SCOREBOARD_DELAY_MS: z.coerce.number().min(0).max(120_000).default(10_000),
-  /** Upscale do clipe p/ forçar VP9/AV1 no YouTube (1440/2160; 0 = desligado). */
-  CLIP_UPSCALE_HEIGHT: z.coerce.number().min(0).max(2160).default(1440),
+  SCOREBOARD_DELAY_MS: z.coerce.number().min(0).max(120_000).default(5_000),
   /**
-   * Auto-sync A/V por conteúdo. 'auto' (default) mede e aplica apenas
-   * quando o offset passa os gates de confiança e as duas metades concordam.
-   * 'log' mede sem aplicar; 'off' pula a medição.
+   * Atraso do VÍDEO gravado em relação ao jogo (ms). O recorder consome
+   * HLS: o conteúdo de um segmento chega ~20-30s depois de ter acontecido,
+   * e o mtime do arquivo marca QUANDO ele foi escrito — não quando foi
+   * gravado. Sem esta correção, a âncora (que vem do placar, no relógio
+   * do jogo) cai ~25s ANTES do material real e o clipe abre no round
+   * anterior, antes da 1ª kill.
+   *
+   * Calibrado no PGL/Nuke (out/2026), onde mediu ~20s; o default é 25s
+   * (folga p/ o lado que perde a última kill). Ajuste com o log de
+   * "latência observada" (o bot mede a latência real de cada canal
+   * quando o OCR acha a virada do placar no vídeo).
    */
-  CLIP_AV_SYNC: z.enum(['auto', 'off', 'log']).default('auto'),
+  CLIP_STREAM_LATENCY_MS: z.coerce.number().min(0).max(120_000).default(25_000),
   /**
-   * Correção A/V ESTÁTICA (ms de atraso aplicado ao áudio, 0 = desligado).
-   * Calibração manual para quando a medição automática não decide (gameplay
-   * denso: correlação sem pico dominante) mas o skew é sistemático e conhecido
-   * (ex: áudio ~2s adiantado em toda uma stream). Tem PRECEDÊNCIA sobre o
-   * 'auto'. Workflow: gere variantes com adelay, escolha ouvindo, sete aqui
-   * durante o evento, volte a 0 depois. NÃO é global seguro: o offset varia
-   * por stream (uma partida com 0 e outra com 2000 na mesma semana é normal).
+   * Latência por CANAL (ms), quando a fonte não entrega o material com
+   * o mesmo atraso do resto: JSON {"Gaules": 22000, "ESL TV": 30000}.
+   * Vazio = todos os canais usam CLIP_STREAM_LATENCY_MS. O nome é o da
+   * stream escolhida no log ("gravando buffer muxed").
    */
-  AV_STATIC_OFFSET_MS: z.coerce.number().min(0).max(8000).default(0),
+  CLIP_STREAM_LATENCY_BY_STREAM: z
+    .string()
+    .default('')
+    .transform((v) => parseLatencyMap(v)),
   /**
-   * Escopo do offset estático: matchIds separados por vírgula (ex:
-   * "2399233,2399204"). Vazio = aplica em TODAS as partidas (global —
-   * perigoso: o offset varia por stream; o bot avisa no startup).
-   * Fluxo: confirme o skew numa variante, escopete o match, reverta a 0
-   * no fim do evento.
+   * Atraso com que o placar do HLTV publica o PLACAR FINAL do round (ms).
+   * A coluna K reflete cada kill em poucos segundos, mas o placar da
+   * partida só vira depois do round fechar — bem depois do vídeo já ter
+   * mostrado o round ending. É esse atraso que ancora o FIM do clipe.
+   * Medido no PGL/Nuke (out/2026): ~20s.
    */
-  AV_STATIC_MATCHES: z.string().default(''),
+  CLIP_SCORE_DELAY_MS: z.coerce.number().min(0).max(120_000).default(20_000),
   /**
-   * Offset por STREAM (canal), ex: "ESL TV=2000,Gaules=0". O nome é o da
-   * stream escolhida no log ("gravando buffer") — estável por pipeline de
-   * transmissão. Calibre UMA vez por canal (variante + ouvido) e todos os
-   * clipes dele saem corrigidos sem revisão por clipe. Canais diferentes
-   * têm offsets diferentes (um global quebraria os clipes bons).
+   * Cauda extra no FIM do clipe quando o fim é ESTIMADO (o OCR do vídeo
+   * não achou a virada do placar, ou a varredura está desligada).
+   *
+   * O fim estimado depende da latência configurada: se a stream real
+   * atrasar MAIS do que o configurado, o corte fecha antes do round e
+   * perde a última kill do ace. O erro é assimétrico — clipe curto é
+   * pior que clipe longo — então a estimativa leva esta folga.
+   * Default 8s (somando com CLIP_END_AFTER_CLOSE_SEC).
    */
-  AV_STREAM_OFFSETS: z.string().default(''),
+  CLIP_END_TAIL_SEC: z.coerce.number().min(0).max(120).default(8),
   CLIPS_DIR: z.string().default('./data/clips'),
   /**
    * Espaço livre mínimo em disco (GB) para operar: abaixo disto o render
@@ -163,10 +235,7 @@ export const ConfigSchema = z.object({
 
   YT_PRIVACY: z.enum(['private', 'unlisted', 'public']).default('private'),
   /** false = gera o clipe e mantém local, sem fazer upload. */
-  YT_UPLOAD: z
-    .string()
-    .default('true')
-    .transform((v) => boolEnv(v, true)),
+  YT_UPLOAD: boolEnvField('YT_UPLOAD', true),
   YT_CLIENT_SECRETS: z.string().default('./client_secrets.json'),
   YT_TOKEN_PATH: z.string().default('./token.json'),
   YT_CATEGORY_ID: z.string().default('20'),
@@ -201,17 +270,14 @@ export const ConfigSchema = z.object({
   GEMINI_WEB_PROFILE: z.string().default('./data/gemini-profile'),
   /** Perfil do Chrome dentro do user-data-dir (ex.: "Profile 2"). Vazio = default do Chromium. */
   GEMINI_WEB_CHROME_PROFILE: z.string().default(''),
-  /** 1 = headless (default). Use 0 para o perfil persistente ser lido corretamente. */
-  GEMINI_WEB_HEADLESS: z
-    .string()
-    .default('1')
-    .transform((v) => (v === '0' || v.toLowerCase() === 'false' ? '0' : '1')),
+  /** Headless (default). Desligado = o perfil persistente é lido corretamente. */
+  GEMINI_WEB_HEADLESS: boolEnvField('GEMINI_WEB_HEADLESS', true),
   CHATGPT_PROFILE: z.string().default('./data/chatgpt-profile'),
-  /** 1 = janela minimizada (default; sem popup em jogo fullscreen). 0 = visível (se challenge implicar, reverta). */
-  CHATGPT_MINIMIZED: z.string().default('1'),
+  /** Janela minimizada (default; sem popup em jogo fullscreen). Desligado = visível (se o challenge implicar, reverta). */
+  CHATGPT_MINIMIZED: boolEnvField('CHATGPT_MINIMIZED', true),
   GROK_PROFILE: z.string().default('./data/grok-profile'),
   /** Idem CHATGPT_MINIMIZED. */
-  GROK_MINIMIZED: z.string().default('1'),
+  GROK_MINIMIZED: boolEnvField('GROK_MINIMIZED', true),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
@@ -225,55 +291,74 @@ export function getConfig(): AppConfig {
 }
 
 /**
- * Parse de AV_STREAM_OFFSETS ("ESL TV=2000,Gaules=0") → Map canal→ms.
- * Entradas inválidas são ignoradas. Puro/testável.
+ * Envs removidas (subsistema de A/V e upscale): continuam no .env antigo
+ * e são IGNORADAS em silêncio pelo zod — o dono acha que ainda valem.
+ * O startup avisa quais estão sobrando.
  */
-export function parseStreamOffsets(csv: string): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const part of csv.split(',')) {
-    const eq = part.indexOf('=');
-    if (eq < 0) continue;
-    const name = part.slice(0, eq).trim();
-    const vStr = part.slice(eq + 1).trim();
-    // Valor vazio explícito ("Canal=") é rejeitado: Number('') === 0 seria
-    // um typo silencioso virando calibragem zero.
-    if (!name || !vStr) continue;
-    const ms = Number(vStr);
-    if (!Number.isFinite(ms) || ms < 0 || ms > 8000) continue;
-    out.set(name, Math.round(ms));
+export const DEPRECATED_ENV_KEYS = [
+  'CLIP_AV_SYNC',
+  'AV_STATIC_OFFSET_MS',
+  'AV_STATIC_MATCHES',
+  'AV_STREAM_OFFSETS',
+];
+
+/** Envs depreciadas que ainda estão definidas no ambiente. */
+export function deprecatedEnvVars(env: NodeJS.ProcessEnv = process.env): string[] {
+  return DEPRECATED_ENV_KEYS.filter((key) => {
+    const raw = env[key];
+    return raw != null && String(raw).trim() !== '';
+  });
+}
+
+/**
+ * Envs booleanas conhecidas (derivadas do schema — sem lista manual). */
+export const BOOL_ENV_KEYS: string[] = [...BOOL_ENV_KEYS_SET];
+
+/**
+ * Envs de âncora/latência que mudam o CORTE do clipe.
+ *
+ * O INÍCIO do clipe, a cobertura e os timestamps dependem só da
+ * diferença (CLIP_STREAM_LATENCY_MS − SCOREBOARD_DELAY_MS): os dois
+ * valores não são identificáveis separadamente (medir um exige saber o
+ * outro). Um .env antigo com SCOREBOARD_DELAY_MS=10000 desloca o corte
+ * em 5s sem nenhuma pista — por isso o startup avisa quando elas estão
+ * no ambiente com valor DIFERENTE do default.
+ */
+export const LATENCY_ENV_KEYS = [
+  'SCOREBOARD_DELAY_MS',
+  'CLIP_STREAM_LATENCY_MS',
+  'CLIP_SCORE_DELAY_MS',
+] as const;
+
+/**
+ * Envs de âncora/latência do ambiente com valor diferente do default
+ * (o `.env.example` já vem com os defaults — copy colado não deve
+ * gerar aviso; um `.env` velho, sim).
+ */
+export function divergentLatencyEnvs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const defaults = ConfigSchema.parse({});
+  return LATENCY_ENV_KEYS.filter((key) => {
+    const raw = env[key];
+    if (raw == null || String(raw).trim() === '') return false;
+    const parsed = Number(String(raw).trim());
+    if (!Number.isFinite(parsed)) return false;
+    return parsed !== defaults[key];
+  });
+}
+
+/**
+ * Valores booleanos que não são claramente ligados/desligados ("flase",
+ * "sim please"...). Caiam no default em silêncio — o startup avisa.
+ */
+export function invalidBoolEnvs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const out: string[] = [];
+  for (const key of BOOL_ENV_KEYS) {
+    const raw = env[key];
+    if (raw == null) continue;
+    if (!String(raw).trim()) continue;
+    if (parseBoolEnv(raw) !== null) continue;
+    out.push(`${key}=${String(raw).trim()}`);
   }
   return out;
 }
 
-export type StaticOffsetRule = 'off' | 'global' | 'match' | 'stream';
-
-/**
- * Offset estático efetivo p/ o clipe + qual regra decidiu. Puro/testável.
- * Precedência: escopo por partida > por stream > global legado.
- * Escopo protege os clipes bons: offset global aplica em tudo — inclusive
- * onde não há skew. Sem regra aplicável, 0 (sem correção).
- */
-export function resolveStaticOffset(
-  offsetMs: number,
-  matchesCsv: string,
-  matchId: string,
-  streamOffsets?: Map<string, number>,
-  streamName?: string,
-): { ms: number; rule: StaticOffsetRule } {
-  const scoped = matchesCsv
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (scoped.length > 0) {
-    return scoped.includes(matchId)
-      ? { ms: offsetMs, rule: 'match' }
-      : { ms: 0, rule: 'off' };
-  }
-  if (streamOffsets && streamName && streamOffsets.has(streamName)) {
-    return { ms: streamOffsets.get(streamName) ?? 0, rule: 'stream' };
-  }
-  if (Number.isFinite(offsetMs) && offsetMs > 0) {
-    return { ms: offsetMs, rule: 'global' };
-  }
-  return { ms: 0, rule: 'off' };
-}

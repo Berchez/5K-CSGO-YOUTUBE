@@ -93,8 +93,9 @@ export async function getBrowser(): Promise<BrowserContext> {
     const { launchStealthContext } = await import('../clipper/stealthBrowser.js');
     const cfg = getConfig();
     // Headless é barrado pelo Cloudflare ("Just a moment" eterno); headed
-    // minimizado limpa em ~10s. HLTV_HEADLESS=1 volta p/ headless (debug).
-    const headless = cfg.HLTV_HEADLESS === '1';
+    // minimizado limpa em ~10s. HLTV_HEADLESS=1 (ou true) volta p/
+    // headless (debug).
+    const headless = cfg.HLTV_HEADLESS;
     const b = await launchStealthContext({
       profileDir: cfg.HLTV_PROFILE,
       headless,
@@ -531,13 +532,22 @@ export interface ListingCards {
   upcomingError: string | null;
   /**
    * Cards live que quebraram na extração. Um card live perdido = a
-   * partida some do listing = o recorder dela é parado e o buffer
-   * APAGADO. Por isso o erro é contabilizado: o listing inteiro é
-   * tratado como inutilizável (mantém recorder/buffer).
+   * partida pode sumir do listing = o recorder dela seria parado (e o
+   * buffer APAGADO) sem motivo. Por isso o listing é marcado como
+   * DEGRADADO: os cards bons seguem valendo, mas o chamador não pode
+   * parar os recorders que sumiram do listing.
    */
   liveCardErrors: number;
   /** Cards futuros que quebraram (a agenda fica não confiável). */
   upcomingCardErrors: number;
+  /**
+   * IDs dos cards live que quebraram. O card existe no DOM mas não pôde
+   * ser lido (sem link de partida / markup atípico) → a partida pode
+   * ter sumido do listing. O chamador NÃO pode parar o recorder desses
+   * ids (seria matar a gravação e apagar o buffer sem motivo), mas pode
+   * parar os outros.
+   */
+  brokenLiveIds: string[];
 }
 
 /**
@@ -579,6 +589,7 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
       upcomingError: string | null;
       liveCardErrors: number;
       upcomingCardErrors: number;
+      brokenLiveIds: string[];
     } = {
       live: [],
       upcoming: [],
@@ -587,6 +598,7 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
       upcomingError: null,
       liveCardErrors: 0,
       upcomingCardErrors: 0,
+      brokenLiveIds: [],
     };
 
     // O wrapper traz o número exato em data-stars (0-5). Os 5 <i> do
@@ -638,15 +650,26 @@ export async function extractListingCards(page: Page): Promise<ListingCards> {
         try {
           const matchId = w.getAttribute('data-livescore-match') ?? '';
           if (!matchId || seenLive.has(matchId)) continue;
+          seenLive.add(matchId);
           const anchor = w.querySelector('a[href*="/matches/"]');
           const href = anchor?.getAttribute('href') ?? '';
-          if (!/\/matches\/\d+/.test(href)) continue;
-          seenLive.add(matchId);
+          if (!/\/matches\/\d+/.test(href)) {
+            // Card live SEM link de partida: o markup mudou (ou o card
+            // está quebrado). A partida pode ter sumido do listing, e
+            // sumir = o recorder dela seria parado (e o buffer apagado)
+            // sem motivo → o listing fica DEGRADADO e este id é
+            // protegido pelo chamador.
+            out.liveCardErrors += 1;
+            out.brokenLiveIds.push(matchId);
+            continue;
+          }
           out.live.push(parseCard(w, matchId, href, isLiveCard(w)));
         } catch {
           // Card isolado quebrado: conta o erro (o listing pode ficar
           // inutilizável — ver liveCardErrors) e segue com o resto.
           out.liveCardErrors += 1;
+          const matchId = w.getAttribute('data-livescore-match') ?? '';
+          if (matchId) out.brokenLiveIds.push(matchId);
         }
       }
     } catch (e) {
@@ -696,8 +719,44 @@ export type ListingFailureReason =
   | 'extraction-error';
 
 export type ListingResult =
-  | { ok: true; listing: MatchListing }
+  | {
+      ok: true;
+      listing: MatchListing;
+      /**
+       * Listing DEGRADADO: algum card live quebrou na extração. Os cards
+       * bons valem (o poll continua) — mas a lista pode estar incompleta,
+       * então o chamador não pode parar recorders que sumiram do listing.
+       */
+      degraded: boolean;
+      /**
+       * IDs dos cards live que quebraram (só existem quando degraded):
+       * o recorder desses ids NÃO pode ser parado (o card quebrado pode
+       * ser o delas).
+       */
+      brokenLiveIds: string[];
+      detail?: string;
+    }
   | { ok: false; reason: ListingFailureReason; detail?: string };
+
+/**
+ * O recorder de uma partida deve ser parado (e o buffer apagado)?
+ *
+ * - a partida está no listing → não;
+ * - a partida sumiu do listing MAS o card dela quebrou na extração →
+ *   não (o card quebrado pode ser o dela: parar mataria a gravação e
+ *   apagaria o buffer sem motivo);
+ * - a partida sumiu do listing de verdade (acabou) → sim.
+ *
+ * Puro/testável: a decisão de limpeza não mora dentro do loop do poll.
+ */
+export function shouldStopRecorder(
+  matchId: string,
+  liveIds: Set<string>,
+  brokenLiveIds: string[],
+): boolean {
+  if (liveIds.has(matchId)) return false;
+  return !brokenLiveIds.includes(matchId);
+}
 
 /**
  * Busca o listing de /matches (layout HLTV 2026): partidas LIVE que passam
@@ -733,20 +792,31 @@ export async function fetchMatchListing(
     await page.waitForTimeout(3000);
 
     const cards = await extractListingCards(page);
-    if (cards.liveError || cards.liveCardErrors > 0) {
-      // Falha na extração dos live = listing inutilizável: o poll pula
-      // sem desmontar recorders/trackers. Um card live perdido também
-      // conta: a partida sumiria do listing e o recorder dela seria
-      // parado (e o buffer apagado) sem motivo.
+    if (cards.liveError) {
+      // Falha na extração INTEIRA dos live = listing inutilizável: o poll
+      // pula sem desmontar recorders/trackers.
       log.error(
-        { err: cards.liveError, cardErrors: cards.liveCardErrors },
+        { err: cards.liveError },
         'falha ao extrair as live do listing',
       );
       return {
         ok: false,
         reason: 'extraction-error',
-        detail: cards.liveError ?? `${cards.liveCardErrors} card(s) live quebrado(s)`,
+        detail: cards.liveError,
       };
+    }
+    // Um card live QUEBRADO (ex.: markup atípico) não invalida o listing
+    // inteiro: os cards bons seguem valendo e as partidas elegíveis
+    // continuam sendo gravadas. Antes, um card ruim derrubava o ciclo
+    // todo (nenhum recorder novo subia enquanto ele estivesse na
+    // página). O listing fica DEGRADADO: o chamador não pode parar
+    // recorders que sumiram (o card quebrado pode ser o delas).
+    const degraded = cards.liveCardErrors > 0;
+    if (degraded) {
+      log.warn(
+        { cardErrors: cards.liveCardErrors },
+        'card live quebrado no listing — listing degradado (os cards bons valem)',
+      );
     }
     if (cards.upcomingError || cards.upcomingCardErrors > 0) {
       // A agenda futura é opcional: o poll continua no intervalo base
@@ -777,7 +847,13 @@ export async function fetchMatchListing(
       },
       'live matches filtradas',
     );
-    return { ok: true, listing };
+    return {
+      ok: true,
+      listing,
+      degraded,
+      brokenLiveIds: cards.brokenLiveIds,
+      detail: degraded ? `${cards.liveCardErrors} card(s) live quebrado(s)` : undefined,
+    };
   } finally {
     await page.close().catch(() => undefined);
   }

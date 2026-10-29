@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { boolEnv, parseStreamOffsets, resolveStaticOffset } from '../src/config.js';
+import {
+  boolEnv,
+  ConfigSchema,
+  deprecatedEnvVars,
+  divergentLatencyEnvs,
+  invalidBoolEnvs,
+  parseBoolEnv,
+} from '../src/config.js';
 
 describe('boolEnv', () => {
   it('aceita 1/true/yes/on como ligado', () => {
@@ -24,57 +31,123 @@ describe('boolEnv', () => {
   });
 });
 
-describe('resolveStaticOffset (match > stream > global)', () => {
-  it('0/desligado: ms sempre 0 (regra indica o escopo que decidiu)', () => {
-    expect(resolveStaticOffset(0, '', '2399233')).toEqual({ ms: 0, rule: 'off' });
-    expect(resolveStaticOffset(0, '2399233', '2399233')).toEqual({ ms: 0, rule: 'match' });
-    expect(resolveStaticOffset(-5, '', '2399233')).toEqual({ ms: 0, rule: 'off' });
-    expect(resolveStaticOffset(Number.NaN, '', '2399233')).toEqual({ ms: 0, rule: 'off' });
+describe('parseBoolEnv (fonte única de verdade do ligado/desligado)', () => {
+  it('aceita as formas de ligado', () => {
+    expect(parseBoolEnv('1')).toBe(true);
+    expect(parseBoolEnv('true')).toBe(true);
+    expect(parseBoolEnv('TRUE')).toBe(true);
+    expect(parseBoolEnv('yes')).toBe(true);
+    expect(parseBoolEnv('on')).toBe(true);
+    expect(parseBoolEnv('sim')).toBe(true);
   });
 
-  it('escopo vazio + offset = global (legado)', () => {
-    expect(resolveStaticOffset(2000, '', '2399233')).toEqual({ ms: 2000, rule: 'global' });
-    expect(resolveStaticOffset(2000, '   ', '2399535')).toEqual({ ms: 2000, rule: 'global' });
+  it('aceita as formas de desligado (inclusive com acento)', () => {
+    expect(parseBoolEnv('0')).toBe(false);
+    expect(parseBoolEnv('false')).toBe(false);
+    expect(parseBoolEnv('no')).toBe(false);
+    expect(parseBoolEnv('off')).toBe(false);
+    expect(parseBoolEnv('nao')).toBe(false);
+    expect(parseBoolEnv('não')).toBe(false);
   });
 
-  it('escopo por partida tem precedência', () => {
-    expect(resolveStaticOffset(2000, '2399233', '2399233')).toEqual({ ms: 2000, rule: 'match' });
-    expect(resolveStaticOffset(2000, '2399233', '2399535')).toEqual({ ms: 0, rule: 'off' });
-    expect(resolveStaticOffset(2000, '2399204, 2399233', '2399204')).toEqual({ ms: 2000, rule: 'match' });
-  });
-
-  it('não confunde prefixo (239923 vs 2399233)', () => {
-    expect(resolveStaticOffset(2000, '239923', '2399233')).toEqual({ ms: 0, rule: 'off' });
-  });
-
-  it('por stream: canal calibrado aplica, resto não', () => {
-    const map = parseStreamOffsets('ESL TV=2000,Gaules=0');
-    expect(resolveStaticOffset(0, '', '2399233', map, 'ESL TV')).toEqual({ ms: 2000, rule: 'stream' });
-    expect(resolveStaticOffset(0, '', '2399535', map, 'dfragtv')).toEqual({ ms: 0, rule: 'off' });
-    expect(resolveStaticOffset(0, '', 'x', map, 'Gaules')).toEqual({ ms: 0, rule: 'stream' });
-  });
-
-  it('match vence stream', () => {
-    const map = parseStreamOffsets('ESL TV=2000');
-    expect(resolveStaticOffset(1500, '2399233', '2399233', map, 'ESL TV')).toEqual({ ms: 1500, rule: 'match' });
-    expect(resolveStaticOffset(1500, 'outra', '2399233', map, 'ESL TV')).toEqual({ ms: 0, rule: 'off' });
+  it('valor desconhecido = null (o chamador decide o default)', () => {
+    expect(parseBoolEnv('flase')).toBeNull();
+    expect(parseBoolEnv('')).toBeNull();
+    expect(parseBoolEnv(undefined)).toBeNull();
   });
 });
 
-describe('parseStreamOffsets', () => {
-  it('parses pares e ignora inválidos', () => {
-    const m = parseStreamOffsets('ESL TV=2000, Gaules=0,ruim,semvalor=,alto=99999,neg=-5');
-    expect(m.get('ESL TV')).toBe(2000);
-    expect(m.get('Gaules')).toBe(0);
-    expect(m.has('ruim')).toBe(false);
-    expect(m.has('semvalor')).toBe(false);
-    expect(m.has('alto')).toBe(false);
-    expect(m.has('neg')).toBe(false);
-    expect(m.size).toBe(2);
+describe('envs depreciadas', () => {
+  it('lista as que ainda estão no ambiente', () => {
+    expect(deprecatedEnvVars({ CLIP_AV_SYNC: '1', AV_STATIC_OFFSET_MS: '' })).toEqual([
+      'CLIP_AV_SYNC',
+    ]);
   });
 
-  it('vazio = mapa vazio', () => {
-    expect(parseStreamOffsets('').size).toBe(0);
-    expect(parseStreamOffsets('   ').size).toBe(0);
+  it('nada definido = nada a avisar', () => {
+    expect(deprecatedEnvVars({})).toEqual([]);
+  });
+});
+
+describe('envs booleanas inválidas', () => {
+  it('avisa o valor que não é ligado/desligado', () => {
+    expect(invalidBoolEnvs({ GEMINI_WEB_HEADLESS: 'flase' })).toEqual([
+      'GEMINI_WEB_HEADLESS=flase',
+    ]);
+  });
+
+  it('aceita as formas válidas (1/0/true/false/sim/não)', () => {
+    expect(
+      invalidBoolEnvs({
+        TOP_TIER_ONLY: '1',
+        POLL_ADAPTIVE: 'false',
+        HLTV_CLOSE_BROWSER_IDLE: 'on',
+        YT_UPLOAD: '0',
+        GEMINI_WEB_HEADLESS: 'TRUE',
+        CHATGPT_MINIMIZED: 'no',
+        GROK_MINIMIZED: '',
+      }),
+    ).toEqual([]);
+  });
+
+  it('não olha envs que não são booleanas', () => {
+    expect(invalidBoolEnvs({ POLL_INTERVAL_MS: 'talvez' })).toEqual([]);
+  });
+});
+
+describe('config dos clipes (latência e âncoras)', () => {
+  it('defaults: 25s de latência, 20s de atraso do placar final e 8s de cauda', () => {
+    const cfg = ConfigSchema.parse({});
+    expect(cfg.CLIP_STREAM_LATENCY_MS).toBe(25_000);
+    expect(cfg.CLIP_SCORE_DELAY_MS).toBe(20_000);
+    expect(cfg.CLIP_END_TAIL_SEC).toBe(8);
+    expect(cfg.CLIP_STREAM_LATENCY_BY_STREAM).toEqual({});
+  });
+  it('lê o mapa de latência por canal', () => {
+    const cfg = ConfigSchema.parse({
+      CLIP_STREAM_LATENCY_BY_STREAM: '{"Gaules": 22000, "ESL TV": 30000}',
+    });
+    expect(cfg.CLIP_STREAM_LATENCY_BY_STREAM).toEqual({ gaules: 22_000, 'esl tv': 30_000 });
+  });
+
+  it('mapa inválido não derruba o bot (fica vazio = global)', () => {
+    const cfg = ConfigSchema.parse({ CLIP_STREAM_LATENCY_BY_STREAM: 'nao é json' });
+    expect(cfg.CLIP_STREAM_LATENCY_BY_STREAM).toEqual({});
+  });
+});
+
+describe('envs de latência com valor diferente do default', () => {
+  it('lista as que divergem (o .env antigo desloca o corte)', () => {
+    expect(
+      divergentLatencyEnvs({ SCOREBOARD_DELAY_MS: '10000', CLIP_STREAM_LATENCY_MS: '25000' }),
+    ).toEqual(['SCOREBOARD_DELAY_MS']);
+  });
+
+  it('ignora as ausentes, vazias ou iguais ao default (copy do .env.example)', () => {
+    expect(divergentLatencyEnvs({})).toEqual([]);
+    expect(divergentLatencyEnvs({ SCOREBOARD_DELAY_MS: '  ' })).toEqual([]);
+    expect(
+      divergentLatencyEnvs({
+        SCOREBOARD_DELAY_MS: '5000',
+        CLIP_STREAM_LATENCY_MS: '25000',
+        CLIP_SCORE_DELAY_MS: '20000',
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe('formato de captura', () => {
+  it('default = melhor variante combinada da fonte', () => {
+    expect(ConfigSchema.parse({}).CAPTURE_FORMAT).toBe('best');
+  });
+
+  it('aceita outro seletor combinado (kill-switch da captura)', () => {
+    expect(ConfigSchema.parse({ CAPTURE_FORMAT: 'best[height<=1080]' }).CAPTURE_FORMAT).toBe(
+      'best[height<=1080]',
+    );
+  });
+
+  it('seletor vazio volta para o padrão (não derruba o bot)', () => {
+    expect(ConfigSchema.parse({ CAPTURE_FORMAT: '  ' }).CAPTURE_FORMAT).toBe('best');
   });
 });

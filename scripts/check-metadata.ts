@@ -4,6 +4,8 @@ import { getConfig } from '../src/config.js';
 import type { AceEvent } from '../src/types.js';
 import { buildVideoMetadata } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
+import { killVideoOffsetMs } from '../src/clipper/clipAnchors.js';
+import { resolveStreamLatencyMs } from '../src/monitor/streamLatency.js';
 
 interface Args {
   ai: boolean;
@@ -57,7 +59,13 @@ interface LoadedAce {
   clipDurationSec?: number;
 }
 
-function loadAces(clipsDir: string, player: string | undefined, contextSec: number): LoadedAce[] {
+function loadAces(
+  clipsDir: string,
+  player: string | undefined,
+  contextSec: number,
+  latencyMs: number,
+  byStream: Record<string, number>,
+): LoadedAce[] {
   const files = collectSidecars(clipsDir);
   const withTime = files.map((file) => {
     let mtime = 0;
@@ -76,13 +84,26 @@ function loadAces(clipsDir: string, player: string | undefined, contextSec: numb
       if (!raw.player || !raw.kills?.length) continue;
       if (player && raw.player.toLowerCase() !== player.toLowerCase()) continue;
       // Sidecar novo traz o início exato do clipe; o antigo é estimado
-      // (1ª kill menos o contexto padrão, como o corte faz).
+      // (1ª kill menos o contexto padrão, como o corte faz) — e a
+      // estimativa precisa da MESMA conversão do bot: o `startedAt` está
+      // no relógio do placar e o clipe vive na timeline do vídeo gravado
+      // (latência da stream).
       const startedAtMs = raw.startedAt ? Date.parse(raw.startedAt) : undefined;
+      // Latência do canal: o sidecar novo grava a latência USADA
+      // (streamLatencyMs) e o stream; o antigo cai na global.
+      const sidecarLatency =
+        typeof (raw as { streamLatencyMs?: number }).streamLatencyMs === 'number'
+          ? (raw as { streamLatencyMs?: number }).streamLatencyMs as number
+          : resolveStreamLatencyMs(
+              latencyMs,
+              byStream,
+              (raw as { streamName?: string }).streamName,
+            );
       const clipStartMs =
         typeof raw.clipStartMs === 'number'
           ? raw.clipStartMs
           : startedAtMs != null
-            ? startedAtMs - contextSec * 1000
+            ? startedAtMs + sidecarLatency - contextSec * 1000
             : undefined;
       out.push({ ace: raw, clipStartMs, clipDurationSec: raw.clipDurationSec });
     } catch {
@@ -95,7 +116,15 @@ function loadAces(clipsDir: string, player: string | undefined, contextSec: numb
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const cfg = getConfig();
-  const aces = loadAces(cfg.CLIPS_DIR, args.player, cfg.CLIP_CONTEXT_SEC).slice(0, args.count);
+  // Latência da stream: a mesma conversão do bot (placar → vídeo).
+  const latencyMs = cfg.CLIP_STREAM_LATENCY_MS;
+  const aces = loadAces(
+    cfg.CLIPS_DIR,
+    args.player,
+    cfg.CLIP_CONTEXT_SEC,
+    latencyMs,
+    cfg.CLIP_STREAM_LATENCY_BY_STREAM,
+  ).slice(0, args.count);
   if (aces.length === 0) {
     console.log('Nenhum sidecar encontrado em ' + cfg.CLIPS_DIR);
     return;
@@ -121,7 +150,13 @@ async function main(): Promise<void> {
       defaultTags: cfg.YT_DEFAULT_TAGS,
       clipStartMs,
       clipDurationSec,
-      killTimeOffsetMs: cfg.SCOREBOARD_DELAY_MS,
+      // O `at` da kill é o instante da observação no placar; no vídeo o
+      // kill aparece (latência da stream − atraso do placar) depois. O
+      // sidecar novo traz o offset usado na publicação.
+      killTimeOffsetMs:
+        typeof (ace as { killVideoOffsetMs?: number }).killVideoOffsetMs === 'number'
+          ? (ace as { killVideoOffsetMs?: number }).killVideoOffsetMs as number
+          : killVideoOffsetMs(latencyMs, cfg.SCOREBOARD_DELAY_MS),
     });
     results.push({
       jogador: ace.player,

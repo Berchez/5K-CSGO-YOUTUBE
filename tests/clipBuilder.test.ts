@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDurationCap, buildClip, computeAceEndMs, computeAudioCompensation, computeTrimEndSec, computeTrimStartSec, contiguousTail, correlateOffset, detectActionResume, detectTruncatedStart, findMotionResume, measureAvOffset, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, resolveOutputHeight, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { computeAceEndMs } from '../src/clipper/clipAnchors.js';
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
 // executável os e2es pulam (CI Linux sem os bins não falha).
@@ -226,6 +227,12 @@ describe('computeAceEndMs (âncora de fim: 5s antes da próxima ação)', () => 
     // fim ≈ 48s após a 1ª kill (round de ~40s + 8s) — dentro do round
     expect(endMs - aceStartMs).toBe(48_105);
   });
+  it('soma a latência da stream (o fim é instante de VÍDEO)', () => {
+    // round fechou em T; o placar mostrou em T+15s (lag 15) e o vídeo
+    // gravado só recebe esse material 25s depois (latência da stream).
+    const T = 1_000_000_000;
+    expect(computeAceEndMs(T + 15_000, 10_000, 8, 25_000)).toBe(T + 38_000);
+  });
 });
 
 describe('applyDurationCap (teto como alarme)', () => {
@@ -288,22 +295,6 @@ describe('resolveConcatTimeline (span medido → wall → legado)', () => {
     expect(trimEnd).toBeCloseTo(34.03, 1);
     // janela ≈ 34s: cap nem dispara
     expect(applyDurationCap(trim, trimEnd, t.lenSec, 105).clamped).toBe(false);
-  });
-});
-
-describe('resolveOutputHeight', () => {
-  it('upscales smaller sources to the configured target', () => {
-    expect(resolveOutputHeight(1080, 1440)).toBe(1440);
-  });
-
-  it('preserves source resolution at or above the target', () => {
-    expect(resolveOutputHeight(1440, 1440)).toBe(0);
-    expect(resolveOutputHeight(2160, 1440)).toBe(0);
-  });
-
-  it('retains the requested fallback when source metadata is unavailable', () => {
-    expect(resolveOutputHeight(null, 1440)).toBe(1440);
-    expect(resolveOutputHeight(2160, 0)).toBe(0);
   });
 });
 
@@ -457,61 +448,6 @@ describe('computeTrimStartSec', () => {
   });
 });
 
-describe('computeAudioCompensation (compensação de skew)', () => {
-  it('δ=0: sem pad, janela do vídeo', () => {
-    const c = computeAudioCompensation(12.6, 55, 0, 120);
-    expect(c.startSec).toBeCloseTo(12.6, 6);
-    expect(c.endSec).toBeCloseTo(55, 6);
-    expect(c.padSec).toBe(0);
-    expect(c.clamped).toBe(false);
-    expect(c.invalid).toBe(false);
-  });
-  it('áudio adiantado 5s: janela 5s mais cedo, mesma duração, sem pad', () => {
-    const c = computeAudioCompensation(12.6, 55, 5, 120);
-    expect(c.startSec).toBeCloseTo(7.6, 6);
-    expect(c.endSec).toBeCloseTo(50, 6);
-    expect(c.padSec).toBe(0);
-    expect(c.outLenSec).toBeCloseTo(42.4, 6);
-  });
-  it('head fora do material (S<δ): começa em 0 + pad de silêncio', () => {
-    const c = computeAudioCompensation(2, 50, 5, 120);
-    expect(c.startSec).toBe(0);
-    expect(c.padSec).toBeCloseTo(3, 6);
-    expect(c.clamped).toBe(true);
-    expect(c.outLenSec).toBeCloseTo(48, 6);
-  });
-  it('cauda além do material: tailShort com flag', () => {
-    const c = computeAudioCompensation(12.6, 55, 5, 45);
-    expect(c.endSec).toBeCloseTo(45, 6);
-    expect(c.tailShort).toBe(true);
-  });
-  it('áudio atrasado: janela mais tarde', () => {
-    const c = computeAudioCompensation(12.6, 55, -1.5, 120);
-    expect(c.startSec).toBeCloseTo(14.1, 6);
-    expect(c.endSec).toBeCloseTo(56.5, 6);
-  });
-  it('janela útil degenerada: invalid (não compensar)', () => {
-    const c = computeAudioCompensation(0, 5, 8, 120);
-    expect(c.invalid).toBe(true);
-  });
-});
-
-describe('correlateOffset', () => {
-  it('acha lag +2s com proeminência alta', () => {
-    const hz = 10;
-    const A = new Array(100).fill(0);
-    const V = new Array(100).fill(0);
-    A[20] = 10; // evento no áudio em t=2.0s...
-    V[40] = 10; // ...e no vídeo em t=4.0s (áudio 2s adiantado)
-    const { lagSec, prominence } = correlateOffset(A, V, hz, 10);
-    expect(lagSec).toBeCloseTo(2.0, 6);
-    expect(prominence).toBeGreaterThan(1.5);
-  });
-  it('sinais planos: sem medida (proeminência 0)', () => {
-    const { prominence } = correlateOffset(new Array(50).fill(1), new Array(50).fill(1), 10, 5);
-    expect(prominence).toBe(0);
-  });
-});
 
 describe('parseFreezeIntervals', () => {
   it('pairs freeze start/end metadata and closes a trailing freeze', () => {
@@ -692,7 +628,7 @@ describe.skipIf(!ffmpegOk)('trava de saída do render (nunca shippar vazio)', ()
       await expect(
         buildClip(ace, [seg], {
           bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
-          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'off', replayAware: 'off',
+          segmentTimeSec: 10, replayAware: 'off',
           aceStartMs: Date.now() + 50_000,
         }),
       ).rejects.toThrow();
@@ -798,10 +734,6 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           preRollSec: 60,
           postRollSec: 15,
           segmentTimeSec: 10,
-          upscaleHeight: 0,
-          // Este teste é do concat/trim — sync tem e2e próprio (e medir em
-          // testsrc periódico dá pico espúrio).
-          avSync: 'off',
         });
         expect(fs.existsSync(out.filePath)).toBe(true);
         // layout: um diretório por clipe (mp4 + sidecar + thumb juntos)
@@ -814,7 +746,7 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           captureMode?: string;
           freezeDetection?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] };
         };
-        expect(sidecar.captureMode).toBe('separate');
+        expect(sidecar.captureMode).toBe('muxed');
         expect(sidecar.freezeDetection).toMatchObject({
           thresholdDb: -50,
           minDurationSec: 0.5,
@@ -850,156 +782,4 @@ describe('sanitizeSegments', () => {
     expect(r.ok).toEqual([]);
     expect(r.dropped).toHaveLength(3);
   });
-});
-
-describe.skipIf(!ffmpegOk)('auto-sync A/V (flash+beep com offset conhecido)', () => {
-
-  // Mídia sintética: flashes brancos em instantes IRREGULARES no vídeo +
-  // beeps 880Hz 2s ANTES (áudio adiantado +2s). Irregular de propósito:
-  // eventos periódicos correlacionam em qualquer lag (prominência ~1).
-  // Flashes em 3, 6, 7.5, 11, 12.2s (300ms); beeps nos mesmos −2s.
-  async function makeOffsetMedia(dir: string): Promise<string> {
-    const f = path.join(dir, 'off.mp4');
-    const flashAt = (t: number): string => `gte(t\\,${t})*lte(t\\,${t + 0.3})`;
-    const beepAt = (t: number): string => `gte(t\\,${t})*lte(t\\,${t + 0.3})`;
-    const flashTimes = [3, 6, 7.5, 11, 12.2];
-    const beepTimes = flashTimes.map((t) => t - 2);
-    execFileSync(FF, [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-f', 'lavfi', '-i', 'color=color=black:duration=14:size=320x180:rate=30',
-      '-f', 'lavfi', '-i',
-      `aevalsrc=sin(2*PI*880*t)*(${beepTimes.map(beepAt).join('+')}):s=44100:d=14`,
-      '-map', '0:v', '-map', '1:a',
-      '-vf', `drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='${flashTimes.map(flashAt).join('+')}'`,
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
-      '-f', 'mp4', f,
-    ]);
-    return f;
-  }
-
-  // Offset beep↔flash no ARQUIVO: picos de loudness vs picos de luminância.
-  // Amostras crus NÃO emparelham por ordem (beep vira ~6 amostras M, flash
-  // ~3 frames) — agrupa em EVENTOS (gap > 0.5s separa) e compara inícios.
-  async function beepFlashOffset(file: string): Promise<number> {
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
-    const execFileAsync = promisify(execFile);
-    const eb = await execFileAsync(FF, [
-      // framelog=info: quiet SUPRIME as linhas t:/M: (0 beeps → NaN)
-      '-hide_banner', '-i', file, '-map', '0:a', '-af', 'ebur128=peak=true:framelog=info', '-f', 'null', '-',
-    ]).then((r) => String(r.stderr ?? ''));
-    const beepSamples: number[] = [];
-    for (const line of eb.split('\n')) {
-      const m = line.match(/t:\s*([\d.]+).*?M:\s*(-?[\d.]+)/);
-      if (m && Number.parseFloat(m[2]) > -25) beepSamples.push(Number.parseFloat(m[1]));
-    }
-    const fdir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncvf-'));
-    try {
-      execFileSync(FF, [
-        '-hide_banner', '-loglevel', 'error', '-y', '-i', file,
-        '-vf', 'fps=10,scale=160:-1', path.join(fdir, 'fr_%04d.png'),
-      ]);
-      const sharp = (await import('sharp')).default;
-      const flashSamples: number[] = [];
-      const fr = fs.readdirSync(fdir).filter((x) => x.endsWith('.png')).sort();
-      for (const [i, name] of fr.entries()) {
-        const { data, info } = await sharp(path.join(fdir, name)).raw().toBuffer({ resolveWithObject: true });
-        let sum = 0;
-        const ch = info.channels;
-        for (let p = 0; p < data.length; p += ch) sum += data[p];
-        if (sum / (data.length / ch) > 200) flashSamples.push(i / 10);
-      }
-      const events = (times: number[]): number[] => {
-        const out: number[] = [];
-        for (const t of times) {
-          if (out.length === 0 || t - out[out.length - 1] > 0.5) out.push(t);
-        }
-        return out;
-      };
-      const beeps = events(beepSamples);
-      const flashes = events(flashSamples);
-      if (beeps.length === 0 || flashes.length === 0) return Number.NaN;
-      const pairs = Math.min(beeps.length, flashes.length);
-      const diffs = beeps.slice(0, pairs).map((b, i) => b - flashes[i]);
-      diffs.sort((a, b) => a - b);
-      return diffs[Math.floor(diffs.length / 2)];
-    } finally {
-      fs.rmSync(fdir, { recursive: true, force: true });
-    }
-  }
-
-  function aceVazio(map = 'Cache') {
-    return {
-      matchId: 'sync', map, round: 1, player: 'x',
-      team1: 'A', team2: 'B', event: 'E',
-      detectedAt: new Date().toISOString(),
-      kills: [{ killer: 'x', victim: 'v', round: 1, map }],
-    };
-  }
-
-  it(
-    'mede δ≈+2s e entrega saída alinhada (<0.6s); sem compensação fica ~2s',
-    async () => {
-      if (!resolveFfprobeBin()) {
-        console.warn('sem ffprobe, pulando');
-        return;
-      }
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-'));
-      const clipsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncclips-'));
-      try {
-        const src = await makeOffsetMedia(dir);
-        const measured = await measureAvOffset([src], FF);
-        expect(measured.measured).toBe(true);
-        expect(measured.offsetSec).toBeGreaterThan(1.2);
-        expect(measured.offsetSec).toBeLessThan(2.8);
-
-        // Bases DIFERENTES (map distinto): mesmo path faria o build 'off'
-        // SOBRESCREVER o 'com' antes da medição (bug real deste teste).
-        const comClip = await buildClip(aceVazio('Cache'), [src], {
-          bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
-          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'auto',
-        });
-        const offClip = await buildClip(aceVazio('Mirage'), [src], {
-          bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
-          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'off',
-        });
-        const offCom = await beepFlashOffset(comClip.filePath);
-        const offOff = await beepFlashOffset(offClip.filePath);
-        expect(Number.isNaN(offCom)).toBe(false);
-        expect(Math.abs(offCom)).toBeLessThan(0.6);
-        // controle: sem compensação o skew original aparece
-        expect(Math.abs(offOff)).toBeGreaterThan(1.2);
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-        fs.rmSync(clipsDir, { recursive: true, force: true });
-      }
-    },
-    300_000,
-  );
-  it(
-    'offset estático (calibração manual) alinha sem medição',
-    async () => {
-      if (!resolveFfprobeBin()) {
-        console.warn('sem ffprobe, pulando');
-        return;
-      }
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncstatic-'));
-      const clipsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'syncstaticclips-'));
-      try {
-        const src = await makeOffsetMedia(dir);
-        // avSync off (sem medição!) + estático 2000 = saída alinhada
-        const clip = await buildClip(aceVazio('Nuke'), [src], {
-          bufferDir: dir, clipsDir, preRollSec: 60, postRollSec: 15,
-          segmentTimeSec: 10, upscaleHeight: 0, avSync: 'off', staticAvOffsetMs: 2000,
-        });
-        const off = await beepFlashOffset(clip.filePath);
-        expect(Number.isNaN(off)).toBe(false);
-        expect(Math.abs(off)).toBeLessThan(0.6);
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-        fs.rmSync(clipsDir, { recursive: true, force: true });
-      }
-    },
-    300_000,
-  );
 });

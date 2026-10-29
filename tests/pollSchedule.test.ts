@@ -4,6 +4,7 @@ import {
   nextPollDelayMs,
   pollForceReasons,
   POLL_MAX_BACKOFF_MS,
+  POLL_MIN_DELAY_MS,
   POLL_NEAR_MATCH_MS,
   POLL_NO_NEXT_MATCH_MS,
   POLL_START_GRACE_MS,
@@ -84,6 +85,16 @@ describe('nextPollDelayMs', () => {
     expect(delay(NOW + 10 * HOUR, false, 5 * 60_000)).toBe(POLL_MAX_BACKOFF_MS);
   });
 
+  it('near-match tem piso absoluto (nunca vira hot-loop)', () => {
+    // Partida começando em 3s com intervalo base de 5s: sem o piso o bot
+    // martelaria a página do HLTV (e o Cloudflare barra).
+    expect(delay(NOW + 3_000, false, 5_000)).toBe(POLL_MIN_DELAY_MS);
+    expect(delay(NOW + 500, false, 5_000)).toBe(POLL_MIN_DELAY_MS);
+    // Acima do piso, segue o intervalo base (sem passar do horário).
+    expect(delay(NOW + 60_000, false, 45_000)).toBe(BASE);
+    expect(delay(NOW + 30_000, false, 45_000)).toBe(30_000);
+  });
+
   it('agenda não confiável (extração quebrada) volta ao intervalo base', () => {
     // Fail-open: sem card futuro no listing o bot NÃO pode dormir 15min.
     expect(nextPollDelayMs({
@@ -131,6 +142,7 @@ describe('pollForceReasons', () => {
         pendingClips: 1,
         deferredCleanup: 1,
         blocked: true,
+        listingDegraded: true,
         watchlistChanged: true,
         watchlistStale: true,
       }),
@@ -141,6 +153,7 @@ describe('pollForceReasons', () => {
       'pending-clip',
       'deferred-cleanup',
       'blocked',
+      'listing-degraded',
       'watchlist',
       'watchlist-stale',
     ]);
@@ -193,6 +206,7 @@ describe('computePollDecision', () => {
       'pending-clip',
       'deferred-cleanup',
       'blocked',
+      'listing-degraded',
       'watchlist',
       'watchlist-stale',
     ] as PollForceReason[]) {

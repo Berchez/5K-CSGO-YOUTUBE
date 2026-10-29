@@ -18,6 +18,23 @@ const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_GEMINI_MODEL = 'gemini-3-flash-preview';
 const DEFAULT_HF_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
 const PROVIDER_FAILURE_LIMIT = 2;
+/**
+ * Cooldown do provider que falhou. O bot roda dias durante um evento:
+ * desligar o provider de vez deixava os metadados no template até o
+ * restart. Agora ele volta a ser tentado depois do cooldown (half-open).
+ */
+const PROVIDER_COOLDOWN_MS = 10 * 60_000;
+/**
+ * Erro de credencial/permissão (401/403, API key inválida) quase nunca
+ * se resolve sozinho: cooldown longo, mas ainda não permanente.
+ */
+const PROVIDER_AUTH_COOLDOWN_MS = 60 * 60_000;
+/**
+ * Teto da fila de chamadas: com muitos aces simultâneos a fila cresce e o
+ * metadados de um clipe atrasaria minutos. Acima do teto, cai direto no
+ * gerador determinístico (o template é instantâneo e sempre funciona).
+ */
+const PROVIDER_MAX_QUEUE = 3;
 
 export function metadataAiProviders(order: string | undefined): MetadataAiProvider[] {
   const raw = (order ?? DEFAULT_ORDER)
@@ -97,8 +114,10 @@ export function parseAiDraft(raw: string): MetadataDraft | null {
     : [];
   // A resposta truncada (fim de contexto/token) deixa o ÚLTIMO item pela
   // metade: ele passa na validação e vira título cortado no vídeo.
-  // Quando o JSON teve que ser consertado, o último título é descartado.
-  if (repaired && titles.length > 0) titles.pop();
+  // Só descarta quando o corte caiu DENTRO da lista de títulos — se o
+  // corte foi na abertura, os títulos estão inteiros e não devem
+  // perder um.
+  if (repaired && titles.length > 0 && titlesArrayTruncated(candidate)) titles.pop();
   const opening =
     typeof obj.opening === 'string'
       ? obj.opening
@@ -106,7 +125,41 @@ export function parseAiDraft(raw: string): MetadataDraft | null {
         ? obj.description
         : '';
   if (titles.length === 0 && !opening.trim()) return null;
-  return { titles, opening };
+  return { titles, opening, truncated: Boolean(repaired) };
+}
+
+/**
+ * A lista de títulos do JSON foi truncada? (o corte do texto caiu
+ * dentro/antes do fechamento do array). Varre o texto cru respeitando
+ * strings e colchetes aninhados. Puro/testável.
+ */
+export function titlesArrayTruncated(text: string): boolean {
+  const keyIdx = text.search(/"titles"\s*:/);
+  if (keyIdx < 0) return false;
+  const open = text.indexOf('[', keyIdx);
+  if (open < 0) return true;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) return false;
+    }
+  }
+  return true;
 }
 
 function tryParseJson(text: string): unknown {
@@ -308,12 +361,21 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
   const hfModel = opts.hfModel || DEFAULT_HF_MODEL;
   const providers = metadataAiProviders(opts.order);
   const log = getLogger().child({ feature: 'metadata-ai' });
+  /** Falhas CONSECUTIVAS por provider (zera no sucesso). */
   const failures = new Map<MetadataAiProvider, number>();
-  const disabled = new Set<MetadataAiProvider>();
+  /**
+   * Circuit breaker com cooldown: o provider que falhou sai de cena por
+   * um tempo, mas volta a ser tentado depois (half-open). Antes ele
+   * ficava desligado até o restart do bot — num evento de dias, a IA
+   * morria na primeira queda de rede e os metadados caíam no template
+   * pelo resto do evento.
+   */
+  const cooldownUntil = new Map<MetadataAiProvider, number>();
   // Fila de chamadas: com MAX_RECORDINGS > 1, dois aces simultâneos
   // estouravam o RPM do provider (e o rate limit derruba a sessão
   // inteira). Uma chamada por vez, na ordem em que chegaram.
   let queue: Promise<unknown> = Promise.resolve();
+  let pending = 0;
   const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = queue.then(fn, fn);
     queue = run.then(
@@ -325,7 +387,25 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
   const runProvider = async (ctx: MetadataContext): Promise<MetadataDraft | null> => {
     const prompt = buildMetadataPrompt(ctx);
     for (const provider of providers) {
-      if (disabled.has(provider)) continue;
+      const until = cooldownUntil.get(provider);
+      if (until != null) {
+        if (until > Date.now()) {
+          log.debug(
+            { provider, restanteMin: Math.ceil((until - Date.now()) / 60_000) },
+            'provider de texto em cooldown',
+          );
+          continue;
+        }
+        // Cooldown expirou: half-open — volta a tentar. O contador fica
+        // em (limite − 1): UMA nova falha já reabre o cooldown (o padrão
+        // de exigir 2 falhas chamava o provider 2x por cooldown).
+        cooldownUntil.delete(provider);
+        failures.set(provider, PROVIDER_FAILURE_LIMIT - 1);
+        log.info({ provider }, 'provider de texto saiu do cooldown — nova tentativa');
+      }
+      // Cronômetro da chamada: mostra se o orçamento de 45s está sendo
+      // consumido pelo provider (ou pelo timeout).
+      const startedAt = Date.now();
       try {
         let raw = '';
         if (provider === 'gemini') {
@@ -367,22 +447,56 @@ export function createMetadataAi(opts: MetadataAiOptions = {}): MetadataAiFn {
           continue;
         }
         failures.set(provider, 0);
-        log.info({ provider, titles: draft.titles.length }, 'metadados gerados pela IA');
+        cooldownUntil.delete(provider);
+        log.info(
+          { provider, titles: draft.titles.length, duracaoMs: Date.now() - startedAt },
+          'metadados gerados pela IA',
+        );
         return { ...draft, provider };
       } catch (e) {
         const count = (failures.get(provider) ?? 0) + 1;
         failures.set(provider, count);
         log.warn(
-          { provider, err: String(e).slice(0, 200), falhas: count },
+          {
+            provider,
+            err: String(e).slice(0, 200),
+            falhas: count,
+            duracaoMs: Date.now() - startedAt,
+          },
           'provider de texto falhou',
         );
-        if (count >= PROVIDER_FAILURE_LIMIT) {
-          disabled.add(provider);
-          log.warn({ provider }, 'provider de texto desligado nesta sessão');
+        // 401/403 (credencial) e 429 (rate limit) não são o mesmo
+        // problema: o primeiro quase não se resolve (cooldown longo
+        // JÁ na 1ª falha — repetir só gasta o orçamento de tempo), o
+        // segundo passa com um cooldown curto depois de 2 falhas.
+        const authError = !isRetriableError(e);
+        const cooldownMs = authError
+          ? PROVIDER_AUTH_COOLDOWN_MS
+          : PROVIDER_COOLDOWN_MS;
+        if (authError || count >= PROVIDER_FAILURE_LIMIT) {
+          cooldownUntil.set(provider, Date.now() + cooldownMs);
+          log.warn(
+            { provider, cooldownMin: Math.round(cooldownMs / 60_000), authError },
+            'provider de texto em cooldown',
+          );
         }
       }
     }
     return null;
   };
-  return (ctx: MetadataContext): Promise<MetadataDraft | null> => enqueue(() => runProvider(ctx));
+  return (ctx: MetadataContext): Promise<MetadataDraft | null> => {
+    if (pending >= PROVIDER_MAX_QUEUE) {
+      // Fila cheia: não espera (o clipe sairia com o metadado de outro).
+      log.warn(
+        { pending, max: PROVIDER_MAX_QUEUE },
+        'fila da IA cheia — usando metadados do template',
+      );
+      return Promise.resolve(null);
+    }
+    pending++;
+    const run = enqueue(() => runProvider(ctx));
+    return run.finally(() => {
+      pending--;
+    });
+  };
 }
