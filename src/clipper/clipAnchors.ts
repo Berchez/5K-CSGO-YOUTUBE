@@ -55,8 +55,24 @@ export function killVideoOffsetMs(
 export interface ClipAnchorsInput {
   /** Início do ace no relógio do PLACAR (1ª kill − compensação). */
   aceStartedAtMs?: number;
-  /** Latência da stream gravada (ms) — o valor efetivo do canal. */
+  /**
+   * Latência da stream gravada (ms) — o valor efetivo do canal
+   * (configurado). É o FALLBACK: quando não há medição, é ele quem
+   * manda nas âncoras.
+   */
   streamLatencyMs: number;
+  /**
+   * Latência (ms) a aplicar no INÍCIO do clipe e nos timestamps das
+   * kills. Vem da medição por round (OCR do placar): a amostra que
+   * estava em vigor no instante do evento. Ausente = usa
+   * `streamLatencyMs`.
+   */
+  startLatencyMs?: number;
+  /**
+   * Latência (ms) a aplicar no FIM ESTIMADO (quando o OCR do vídeo não
+   * achou a virada do placar). Ausente = usa `streamLatencyMs`.
+   */
+  endLatencyMs?: number;
   /** Atraso do placar por kill (ms). */
   scoreboardDelayMs: number;
   /** Atraso do placar para publicar o placar final do round (ms). */
@@ -100,6 +116,10 @@ export interface ClipAnchors {
   usedFallback: boolean;
   /** Offset entre o relógio do PLACAR e o do VÍDEO (timestamps da descrição). */
   killVideoOffsetMs: number;
+  /** Latência (ms) aplicada no início (e nos timestamps). */
+  startLatencyMs: number;
+  /** Latência (ms) aplicada no fim estimado. */
+  endLatencyMs: number;
 }
 
 /**
@@ -116,17 +136,19 @@ export interface ClipAnchors {
  *   assimétrico: clipe curto perde a última kill, clipe longo só pesa.
  */
 export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
+  // Latência do INÍCIO e a do FIM ESTIMADO podem ser diferentes: a
+  // primeira é a medida do regime em vigor na 1ª kill, a segunda é a
+  // estimativa conservadora do fim (o fim exato vem do OCR do vídeo).
+  const startLatencyMs = input.startLatencyMs ?? input.streamLatencyMs;
+  const endLatencyMs = input.endLatencyMs ?? input.streamLatencyMs;
   const videoStartMs =
     input.aceStartedAtMs != null
-      ? input.aceStartedAtMs + input.streamLatencyMs
+      ? input.aceStartedAtMs + startLatencyMs
       : undefined;
   const startContextSec = input.contextSec + (input.startMarginSec ?? 0);
   const estimatedClipStartMs =
     videoStartMs != null ? videoStartMs - startContextSec * 1000 : undefined;
-  const killVideoOffset = killVideoOffsetMs(
-    input.streamLatencyMs,
-    input.scoreboardDelayMs,
-  );
+  const killVideoOffset = killVideoOffsetMs(startLatencyMs, input.scoreboardDelayMs);
   const usedScoreboardEnd = input.syncApplied && input.scoreboardEndMs != null;
   const endMs = usedScoreboardEnd
     ? (input.scoreboardEndMs as number) + input.endAfterCloseSec * 1000
@@ -134,7 +156,7 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
         input.aceDetectedAtMs,
         input.scoreDelayMs,
         input.endAfterCloseSec,
-        input.streamLatencyMs,
+        endLatencyMs,
       ) + input.endTailSec * 1000;
   return {
     videoStartMs,
@@ -144,5 +166,7 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
     usedEstimatedEnd: !usedScoreboardEnd,
     usedFallback: !usedScoreboardEnd && input.syncScanned,
     killVideoOffsetMs: killVideoOffset,
+    startLatencyMs,
+    endLatencyMs,
   };
 }

@@ -158,3 +158,79 @@ Esta seção é nova: a seção 8 acima é o registro do que foi implementado em
 - **Diagnóstico:** o log distingue "a fonte não expõe formato combinado" (limitação da fonte) de "falha ao iniciar a gravação" (rede/ffmpeg/disco). Envs depreciadas, booleanos inválidos e mapa de latência malformado são avisados no startup (antes eram ignorados em silêncio). Exceção na composição dos metadados não derruba mais o upload (o clipe sobe pelo caminho legado).
 - **Qualidade (opt-in):** o clipe live sai na resolução nativa da fonte; `CLIP_UPSCALE_HEIGHT` (0 = desligado) reescala na mesma passada do encode para forçar VP9/AV1 no YouTube, ao custo de CPU.
 - **Pendente de validação ao vivo:** a captura única e as âncoras de latência só foram validadas de forma sintética. O critério de rollback continua sendo: se um clipe ao vivo abrir antes da 1ª kill ou perder a última kill, recalibrar `CLIP_STREAM_LATENCY_MS` (e `CLIP_START_MARGIN_SEC`/`CLIP_END_TAIL_SEC`) com o valor observado no log.
+
+## 10. Sincronização temporal medida (29/10/2026)
+
+O diagnóstico do log mostrou que a latência da stream **não é constante**: por canal, a
+latência observada (virada do placar dentro do vídeo) variou de 10,9s a 105,5s — e o
+histórico por canal mostra saltos de 60s+ dentro da mesma partida. A causa é o streamer
+pausar, o buffer do OBS engasgar ou o transcode do Twitch reiniciar: a stream passa a entregar
+material mais antigo, sem que nada no placar do HLTV mude. Como a latência configurada
+(25s) era usada para todas as partidas, os clipes abriam ou fechavam no lugar errado.
+
+O que foi implementado:
+
+- **Latência medida por round, aplicada às âncoras.** A medição do OCR do placar (virada
+  de round dentro do vídeo) passa a alimentar as âncoras: o início usa a latência em vigor
+  na 1ª kill e o fim usa o **maior** valor da janela recente (fechar mais tarde nunca
+  custa a última kill). A medição do round é feita no FIM do round, depois da 1ª kill:
+  ela só pode **antecipar** a abertura (quando é menor que a amostra anterior); quando é
+  maior, é ignorada, porque a subida pode ter acontecido depois do kill. O caso "regime
+  trocou" (|delta| > `CLIP_STREAM_SYNC_MAX_STEP_MS`, default 20s) fica no log e dispara
+  o killfeed, que mede o instante exato dentro do vídeo. A decisão é uma função pura
+  (`resolveAdaptiveLatency`), com testes.
+- **Estado persistido por canal** (`data/stream-latency.json`, escrita atômica): o
+  primeiro round de uma partida já começa com a latência medida na partida anterior.
+- **Killfeed como segunda medição.** O OCR do killfeed (killer+vítima na tela) dá o
+  instante **exato** da 1ª kill dentro do vídeo — uma âncora que não depende de latência
+  nenhuma. Entra como fallback quando o placar falha (`no-scoreboard`/`no-transition`) ou
+  quando o round trocou de regime (`CLIP_KILLFEED_SYNC=off|fallback|always`).
+- **Crop por canal.** O placar e o killfeed ficam em cantos diferentes conforme o canal:
+  `CLIP_SCOREBOARD_CROP_BY_STREAM` / `CLIP_KILLFEED_CROP_BY_STREAM` fixam o crop, e o
+  bot **memoriza** o crop que funcionou (e tenta fallbacks se o principal falhar) — antes,
+  25 das 74 leituras de placar falharam, concentradas por canal.
+- **Relógio de origem da playlist HLS (`#EXT-X-PROGRAM-DATE-TIME`).** Quando o PDT avança
+  mais que a duração do segmento, o conteúdo "envelheceu" — mas o sinal é **ambíguo**
+  (aumento de atraso OU conteúdo omitido) e uma pausa que mantém o PDT contínuo não gera
+  salto. O recorder lê a playlist a cada 15s e registra o evento (`pdt-gap`); o bot NÃO
+  move a âncora do início por inferência: o salto (a) dispara o OCR do killfeed, que mede
+  o instante exato da 1ª kill no vídeo, e (b) entra como candidato conservador do fim
+  estimado (fechar mais tarde nunca perde a última kill). Um salto detectado ao vivo num
+  pulo real de atraso ainda não foi observado; o probe `scripts/probe-hls-pdt.ts` fica
+  para essa validação. (Confirmado ao vivo: a playlist do Twitch traz PDT — segmentos de
+  2s, 15 por janela, sem descontinuidades.)
+- **Timer do round no placar do HLTV (probe `scripts/probe-hltv-timer.ts`).** O placar live
+  expõe o relógio do jogo em `.scoreboard .timeText`: o relógio contando (`1:07`) e
+  `Round over` quando o round acaba. O tracker passa a ler esse estado: o instante do
+  "Round over" é o **fim real do round no relógio do jogo**, que substitui a estimativa
+  (detecção do ace − `CLIP_SCORE_DELAY_MS`, erro de ~20s) na medição da latência — o
+  erro cai para o intervalo de um poll (3s). Sem o timer (formato diferente do placar), a
+  estimativa continua valendo; o log diz qual referência foi usada
+  (`referenciaFimRound: timer-hltv | estimada`).
+- **Buracos de timeline sinalizados.** Descontinuidade da fonte, salto de PTS, stall e
+  salto do relógio de origem viram eventos no recorder; os que caem na janela do clipe
+  marcam `timelineDiscontinuity` no sidecar (o material não contíguo é sinalizado, não
+  entregue em silêncio).
+
+Regras de segurança que valem para qualquer medição:
+
+1. o fim **exato** do OCR tem prioridade sobre qualquer estimativa;
+2. o **início** nunca é adiado por uma medição feita depois da 1ª kill (só antecipado
+   quando ela é menor) e o **fim** nunca fecha antes da amostra conservadora (o erro caro
+   — perder a 1ª ou a última kill — é sempre evitado);
+3. medição fora da faixa plausível (0–120s) é descartada;
+4. a referência do fim do round é o **timer real** do placar do HLTV quando existe; senão
+   a estimativa (que carrega o erro de `CLIP_SCORE_DELAY_MS`) — o log sempre mostra qual
+   das duas foi usada, para a medição nunca parecer mais exata do que é. Quando o "Round
+   over" só aparece depois da espera de assentamento das stats (10s), o instante gravado
+   é o do poll que viu a virada do placar, não o da leitura tardia;
+5. `CLIP_STREAM_SYNC=log` é **shadow**: mede e registra, mas não altera nenhuma âncora
+   (nem a adaptativa, nem a do killfeed); a aplicação só ocorre em `auto`.
+
+Diagnóstico: `npx tsx scripts/sync-report.ts` (por canal: n de medições, min/med/máx,
+maior salto, taxa de acerto do OCR, saltos do relógio de origem).
+
+Validação de código após as alterações: typecheck e suíte completa (37 arquivos, 565
+testes) passaram. A validação **ao vivo** ainda depende de uma partida gravada com o
+build novo: o critério continua sendo o mesmo (clipe que abre antes da 1ª kill ou perde
+a última kill ⇒ rollback da latência adaptativa via `CLIP_STREAM_SYNC_ADAPTIVE=false`).

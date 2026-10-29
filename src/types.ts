@@ -100,11 +100,17 @@ export interface AceEvent {
   startedAt?: string;
   /** ISO do fim do clipe (placar do round + CLIP_END_AFTER_CLOSE_SEC). */
   endedAt?: string;
+  /**
+   * ISO do FIM REAL do round no relógio do jogo (o placar do HLTV
+   * mostrou "Round over"). Ausente = o placar não expõe o timer e a
+   * estimativa (detecção − atraso do placar) vale.
+   */
+  roundEndedAt?: string;
   /** Calibração do fim do clipe pelo placar do round no vídeo. */
   streamSync?: {
     mode: 'auto' | 'log' | 'off';
     applied: boolean;
-    source?: 'scoreboard';
+    source?: 'scoreboard' | 'killfeed';
     marker?: 'score' | 'round' | null;
     offsetMs: number | null;
     matchedKills: number;
@@ -114,7 +120,25 @@ export interface AceEvent {
     roundEndAt?: string | null;
     scoreBefore?: string | null;
     scoreAfter?: string | null;
+    /** Latência observada no round (ms): vídeo − relógio do jogo. */
+    observedLatencyMs?: number | null;
+    /** Latência (ms) que ancorou o INÍCIO do clipe. */
+    startLatencyMs?: number | null;
+    /** Latência (ms) que ancorou o FIM estimado (sem âncora do OCR). */
+    endLatencyMs?: number | null;
+    /** De onde veio a latência do início (config/prior/current/min-safe). */
+    latencySource?: string | null;
+    /** O round trocou de regime de latência (início incerto). */
+    latencyChanged?: boolean;
+    /** Crop do placar que produziu a leitura. */
+    crop?: string | null;
   };
+  /**
+   * A janela do clipe contém quebra de continuidade da timeline da
+   * fonte (descontinuidade de PTS/salto/stall): o material pode ter um
+   * buraco — o clipe é sinalizado, não entregue em silêncio.
+   */
+  timelineDiscontinuity?: boolean;
   /**
    * Confiança na âncora de início: a "1ª kill" é a primeira OBSERVADA pelo
    * tracker — se ele entrou no meio do round, resetou a base ou a kill veio

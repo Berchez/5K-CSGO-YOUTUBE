@@ -161,6 +161,19 @@ export interface ClipOptions {
   streamName?: string;
   streamLatencyMs?: number;
   killVideoOffsetMs?: number;
+  /**
+   * Latência (ms) que ancorou o INÍCIO do clipe (medida por round) e a
+   * que ancorou o FIM estimado. different de `streamLatencyMs` quando a
+   * latência adaptativa entrou em ação.
+   */
+  startLatencyMs?: number;
+  endLatencyMs?: number;
+  /** De onde veio a latência do início (config/prior/current/min-safe). */
+  latencySource?: string;
+  /** O round trocou de regime de latência (início incerto). */
+  latencyChanged?: boolean;
+  /** A janela do clipe contém quebra de continuidade da timeline. */
+  timelineDiscontinuity?: boolean;
   /** Thumb: default composed; ai tenta fundo IA com fallback. */
   thumb?: SmartThumbOptions;
 }
@@ -1124,6 +1137,11 @@ export async function buildClip(
         streamName: opts.streamName,
         streamLatencyMs: opts.streamLatencyMs,
         killVideoOffsetMs: opts.killVideoOffsetMs,
+        startLatencyMs: opts.startLatencyMs,
+        endLatencyMs: opts.endLatencyMs,
+        latencySource: opts.latencySource,
+        latencyChanged: opts.latencyChanged,
+        timelineDiscontinuity: opts.timelineDiscontinuity,
         freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
         segmentsUsed: usable.map((p) => path.basename(p)),
         createdAt: new Date().toISOString(),

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { RoundTracker } from '../src/detector/aceDetector.js';
-import { MAX_KILLS_PER_ROUND, processPoll, shouldResetTracker } from '../src/detector/matchTracker.js';
+import {
+  MAX_KILLS_PER_ROUND,
+  parseRoundTimer,
+  processPoll,
+  roundOverObservation,
+  shouldResetTracker,
+} from '../src/detector/matchTracker.js';
 import type { RoundSnapshot } from '../src/detector/matchTracker.js';
 
 function snap(
@@ -228,6 +234,66 @@ describe('shouldResetTracker', () => {
     expect(shouldResetTracker(7, 8, now - 10_000, now)).toBe(false);
     expect(shouldResetTracker(7, 7, now - 200_000, now)).toBe(true);
     expect(shouldResetTracker(7, 10, now - 10_000, now)).toBe(true);
+  });
+});
+
+describe('parseRoundTimer (timer do round no placar do HLTV)', () => {
+  it('lê o relógio do round', () => {
+    expect(parseRoundTimer('1:07')).toEqual({ sec: 67, state: 'running' });
+    expect(parseRoundTimer('0:17')).toEqual({ sec: 17, state: 'running' });
+  });
+
+  it('reconhece o fim do round', () => {
+    expect(parseRoundTimer('Round over')).toEqual({ sec: null, state: 'round-over' });
+    expect(parseRoundTimer('round over')).toEqual({ sec: null, state: 'round-over' });
+  });
+
+  it('formato desconhecido não inventa relógio', () => {
+    expect(parseRoundTimer('')).toEqual({ sec: null, state: 'unknown' });
+    expect(parseRoundTimer('12:90')).toEqual({ sec: null, state: 'unknown' });
+    expect(parseRoundTimer('banana')).toEqual({ sec: null, state: 'unknown' });
+  });
+});
+
+describe('roundOverObservation (instante do fim do round)', () => {
+  const T = 1_700_000_000_000;
+
+  it('usa o instante do POLL que viu o "Round over"', () => {
+    expect(roundOverObservation(null, 'round-over', T, T - 3_000)).toBe(T);
+  });
+
+  it('a primeira observação vence (leitura tardia não sobrescreve)', () => {
+    expect(roundOverObservation(T - 10_000, 'round-over', T, T - 3_000)).toBe(T - 10_000);
+  });
+
+  it('não data o break anterior ao tracking (sem timer rodando recente)', () => {
+    expect(roundOverObservation(null, 'round-over', T, null)).toBeNull();
+    expect(roundOverObservation(null, 'round-over', T, T - 121_000)).toBeNull();
+  });
+
+  it('estado que não é "round over" não produz instante', () => {
+    expect(roundOverObservation(null, 'running', T, T - 3_000)).toBeNull();
+    expect(roundOverObservation(null, 'unknown', T, T - 3_000)).toBeNull();
+  });
+});
+
+describe('roundEndedAt (fim real do round no relógio do jogo)', () => {
+  it('o evento carrega o instante do "Round over" quando o placar o mostrou', () => {
+    const tr = new RoundTracker('inferno', 7);
+    const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
+    const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
+    let r = processPoll(tr, before, -1, 3, 10_000, before);
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, 1_700_000_000_000);
+    expect(r.event?.roundEndedAt).toBe(new Date(1_700_000_000_000).toISOString());
+  });
+
+  it('sem timer no placar, o evento não carrega o instante (a estimativa vale)', () => {
+    const tr = new RoundTracker('inferno', 7);
+    const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
+    const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
+    let r = processPoll(tr, before, -1, 3, 10_000, before);
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, null);
+    expect(r.event?.roundEndedAt).toBeUndefined();
   });
 });
 

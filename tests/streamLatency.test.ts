@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  gameRoundEndMs,
   latencyMapProblem,
   observedLatencyMs,
   parseLatencyMap,
+  resolveAdaptiveLatency,
   resolveStreamLatencyMs,
+  shouldApplyAdaptive,
   StreamLatencyTracker,
+  type LatencySample,
 } from '../src/monitor/streamLatency.js';
 
 describe('parseLatencyMap', () => {
@@ -85,7 +89,22 @@ describe('latencyMapProblem (aviso de mapa inválido)', () => {
 describe('observedLatencyMs', () => {
   it('é a virada no vídeo menos o fechamento real do round', () => {
     // Round fechou (relógio do jogo) em T+40s; a virada apareceu no vídeo em T+62s.
-    expect(observedLatencyMs(1_062_000, 1_060_000, 20_000)).toBe(22_000);
+    expect(observedLatencyMs(1_062_000, 1_040_000)).toBe(22_000);
+  });
+});
+
+describe('gameRoundEndMs', () => {
+  it('usa o fim real do round quando o placar mostrou "Round over"', () => {
+    expect(
+      gameRoundEndMs({ aceDetectedAtMs: 1_060_000, scoreDelayMs: 20_000, roundEndedAtMs: 1_040_000 }),
+    ).toBe(1_040_000);
+  });
+
+  it('sem o fim real, estima pela detecção menos o atraso do placar', () => {
+    expect(gameRoundEndMs({ aceDetectedAtMs: 1_060_000, scoreDelayMs: 20_000 })).toBe(1_040_000);
+    expect(
+      gameRoundEndMs({ aceDetectedAtMs: 1_060_000, scoreDelayMs: 20_000, roundEndedAtMs: null }),
+    ).toBe(1_040_000);
   });
 });
 
@@ -121,5 +140,346 @@ describe('StreamLatencyTracker', () => {
     expect(tracker.samplesCount('Gaules')).toBe(0);
     tracker.record('Gaules', 22_000);
     expect(tracker.median('Gaules')).toBe(22_000);
+  });
+});
+
+describe('StreamLatencyTracker (amostras com timestamp)', () => {
+  it('a amostra mais recente antes de um instante é a do regime vigente', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 40_000, { measuredAtMs: 1_000 });
+    tracker.record('Gaules', 55_000, { measuredAtMs: 2_000 });
+    tracker.record('Gaules', 70_000, { measuredAtMs: 3_000 });
+    // O evento aconteceu em 2.500: a amostra em vigor era a de 2.000.
+    expect(tracker.latestBefore('Gaules', 2_500)?.latencyMs).toBe(55_000);
+    // Antes da 1ª medição não há amostra (nem inventada).
+    expect(tracker.latestBefore('Gaules', 500)).toBeNull();
+    expect(tracker.latest('Gaules')?.latencyMs).toBe(70_000);
+  });
+
+  it('a janela recente ignora amostras antigas (idade), o histórico não', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 90_000, { measuredAtMs: 1_000 });
+    tracker.record('Gaules', 20_000, { measuredAtMs: 2_000 });
+    tracker.record('Gaules', 25_000, { measuredAtMs: 3_000 });
+    const now = 3_000 + 60_000;
+    expect(tracker.recent('Gaules', 3, 61_000, now).map((s) => s.latencyMs)).toEqual([
+      20_000,
+      25_000,
+    ]);
+    expect(tracker.recentMax('Gaules', 3, 61_000, now)).toBe(25_000);
+    // O histórico completo não perde a amostra antiga (só a janela ignora).
+    expect(tracker.allSamples('Gaules')).toHaveLength(3);
+    expect(tracker.recent('Gaules', 3, 15 * 60_000, now)).toHaveLength(3);
+  });
+
+  it('memoriza o crop do placar que funcionou no canal', () => {
+    const tracker = new StreamLatencyTracker();
+    expect(tracker.crop('Gaules')).toBeNull();
+    tracker.setCrop('Gaules', '0.02:0.02:0.30:0.14');
+    expect(tracker.crop('gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(tracker.crop('ESL TV')).toBeNull();
+  });
+
+  it('serializa e reconstitui o estado (persistência entre reinícios)', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 33_000, {
+      measuredAtMs: 1_000,
+      source: 'scoreboard',
+      quality: 'confident',
+      reference: 'timer-hltv',
+    });
+    tracker.setCrop('Gaules', '0.10:0.02:0.30:0.14');
+    const restored = StreamLatencyTracker.fromJSON(JSON.parse(JSON.stringify(tracker.toJSON())));
+    expect(restored.median('Gaules')).toBe(33_000);
+    expect(restored.latest('Gaules')?.measuredAtMs).toBe(1_000);
+    expect(restored.latest('Gaules')?.reference).toBe('timer-hltv');
+    expect(restored.crop('Gaules')).toBe('0.10:0.02:0.30:0.14');
+    expect(restored.channels()).toEqual(['gaules']);
+  });
+
+  it('ignora estado corrompido (JSON de outro formato)', () => {
+    const restored = StreamLatencyTracker.fromJSON({ streams: 'nope' });
+    expect(restored.channels()).toEqual([]);
+    expect(restored.median('Gaules')).toBeNull();
+  });
+
+  it('rejeita versão de schema desconhecida (estado vazio)', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 99,
+      streams: { gaules: { samples: [{ measuredAtMs: 1_000, latencyMs: 30_000, source: 'scoreboard', quality: 'confident' }] } },
+    });
+    expect(restored.channels()).toEqual([]);
+  });
+
+  it('rejeita origem/qualidade desconhecidas em vez de normalizar', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 1,
+      streams: {
+        gaules: {
+          samples: [
+            { measuredAtMs: 1_000, latencyMs: 30_000, source: 'ocr', quality: 'confident' },
+            { measuredAtMs: 2_000, latencyMs: 31_000, source: 'scoreboard', quality: 'maybe' },
+            { measuredAtMs: 0, latencyMs: 32_000, source: 'scoreboard', quality: 'confident' },
+            { measuredAtMs: 3_000, latencyMs: 33_000, source: 'killfeed', quality: 'after-only', reference: 'estimada' },
+            { measuredAtMs: 4_000, latencyMs: 34_000, source: 'scoreboard', quality: 'confident', reference: 'guess' },
+          ],
+        },
+      },
+    });
+    expect(restored.channels()).toEqual(['gaules']);
+    expect(restored.allSamples('Gaules').map((s) => s.latencyMs)).toEqual([33_000]);
+    expect(restored.latest('Gaules')?.reference).toBe('estimada');
+  });
+
+  it('ordena por instante e limita as amostras restauradas por canal', () => {
+    const samples = [5_000, 1_000, 7_000, 3_000, 6_000, 2_000, 4_000].map((at, index) => ({
+      measuredAtMs: at,
+      latencyMs: 10_000 + index,
+      source: 'scoreboard',
+      quality: 'confident',
+    }));
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 1,
+      streams: { gaules: { samples } },
+    });
+    const kept = restored.allSamples('Gaules');
+    expect(kept.map((s) => s.measuredAtMs)).toEqual([3_000, 4_000, 5_000, 6_000, 7_000]);
+    // Mantém as MAIS RECENTES, como o ring buffer em memória.
+    expect(restored.latest('Gaules')?.measuredAtMs).toBe(7_000);
+    expect(restored.samplesCount('Gaules')).toBe(5);
+  });
+});
+
+function sample(measuredAtMs: number, latencyMs: number): LatencySample {
+  return { measuredAtMs, latencyMs, source: 'scoreboard', quality: 'confident' };
+}
+
+describe('resolveAdaptiveLatency', () => {
+  it('sem medição: usa o valor configurado', () => {
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [],
+      recentSamples: [],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(25_000);
+    expect(decision.endLatencyMs).toBe(25_000);
+    expect(decision.startSource).toBe('config');
+    expect(decision.changed).toBe(false);
+  });
+
+  it('amostra do fim do round MAIOR não adianta o início (pode ter subido após o kill)', () => {
+    const prior = [sample(1_000, 40_000)];
+    const current = sample(2_000, 42_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    // A medição é do FIM do round: usá-la no início deslocaria a abertura
+    // para frente e poderia cortar a 1ª kill.
+    expect(decision.startLatencyMs).toBe(40_000);
+    expect(decision.startSource).toBe('prior');
+    expect(decision.endLatencyMs).toBe(42_000);
+    expect(decision.changed).toBe(false);
+  });
+
+  it('round trocou de regime: abre pelo MENOR valor (nunca perde a 1ª kill)', () => {
+    const prior = [sample(1_000, 60_000)];
+    const current = sample(2_000, 20_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.changed).toBe(true);
+    expect(decision.deltaMs).toBe(-40_000);
+    expect(decision.startLatencyMs).toBe(20_000);
+    expect(decision.startSource).toBe('min-safe');
+  });
+
+  it('salto do relógio de origem NÃO move o início por inferência', () => {
+    const prior = [sample(1_000, 30_000)];
+    const current = sample(2_000, 55_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current,
+      pendingShiftMs: 25_000,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    // O salto do PDT é ambíguo (atraso × conteúdo omitido): o início fica
+    // na amostra anterior (abre mais cedo) e o killfeed é que mede.
+    expect(decision.startLatencyMs).toBe(30_000);
+    expect(decision.startSource).toBe('prior');
+  });
+
+  it('salto sem medição do round: o fim abre pelo lado conservador', () => {
+    const prior = [sample(1_000, 30_000)];
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current: null,
+      pendingShiftMs: 25_000,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(30_000);
+    expect(decision.endLatencyMs).toBe(55_000);
+  });
+
+  it.each([5_000, 10_000, 15_000, 30_000])(
+    'aumento de %i ms no meio do round não adianta o início',
+    (delta) => {
+      const prior = [sample(1_000, 40_000)];
+      const current = sample(2_000, 40_000 + delta);
+      const decision = resolveAdaptiveLatency({
+        configuredMs: 25_000,
+        priorSamples: prior,
+        recentSamples: prior,
+        current,
+        maxStepMs: 20_000,
+        eventAtMs: 61_000,
+      });
+      expect(decision.startLatencyMs).toBe(40_000);
+      expect(decision.changed).toBe(delta > 20_000);
+      // O fim continua usando o valor medido (fechar mais tarde é barato).
+      expect(decision.endLatencyMs).toBe(40_000 + delta);
+    },
+  );
+
+  it.each([5_000, 10_000, 15_000, 30_000])(
+    'redução de %i ms no meio do round antecipa o início (seguro)',
+    (delta) => {
+      const prior = [sample(1_000, 60_000)];
+      const current = sample(2_000, 60_000 - delta);
+      const decision = resolveAdaptiveLatency({
+        configuredMs: 25_000,
+        priorSamples: prior,
+        recentSamples: prior,
+        current,
+        maxStepMs: 20_000,
+        eventAtMs: 61_000,
+      });
+      expect(decision.startLatencyMs).toBe(60_000 - delta);
+      expect(decision.startSource).toBe(delta > 20_000 ? 'min-safe' : 'current');
+    },
+  );
+
+  it('sem âncora do OCR: o fim estimado usa o MÁXIMO da janela recente', () => {
+    const recent = [sample(1_000, 40_000), sample(2_000, 75_000), sample(3_000, 50_000)];
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: recent,
+      recentSamples: recent,
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.endLatencyMs).toBe(75_000);
+    expect(decision.startLatencyMs).toBe(50_000);
+    expect(decision.startSource).toBe('prior');
+  });
+
+  it('medição só "after-only": o fim fica no máximo entre ela e a janela', () => {
+    const recent = [sample(1_000, 75_000)];
+    const current: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: 40_000,
+      source: 'scoreboard',
+      quality: 'after-only',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: recent,
+      recentSamples: recent,
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.endLatencyMs).toBe(75_000);
+  });
+
+  it('medição confiante no fim: ela manda (é a mais próxima da última kill)', () => {
+    const recent = [sample(1_000, 75_000)];
+    const current = sample(2_000, 40_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: recent,
+      recentSamples: recent,
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.endLatencyMs).toBe(40_000);
+  });
+
+  it('informa a idade da amostra anterior (amostra antiga = confiança baixa)', () => {
+    const prior = [sample(1_000, 40_000)];
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: [],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.priorAgeMs).toBe(60_000);
+    expect(decision.startLatencyMs).toBe(40_000);
+  });
+
+  it('amostra anterior velha e MAIOR que o configurado: início usa o configurado', () => {
+    const prior = [sample(1_000, 80_000)];
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+      maxPriorAgeMs: 30_000,
+    });
+    // O regime pode ter mudado (restart/outra partida): abrir pelo
+    // configurado é mais cedo que pela amostra velha — não perde a kill.
+    expect(decision.startLatencyMs).toBe(25_000);
+    expect(decision.startSource).toBe('config');
+    expect(decision.priorAgeMs).toBe(60_000);
+    // O fim continua conservador (fechar mais tarde é barato).
+    expect(decision.endLatencyMs).toBe(80_000);
+  });
+
+  it('amostra anterior velha e MENOR que o configurado: mantém a amostra', () => {
+    const prior = [sample(1_000, 10_000)];
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: prior,
+      recentSamples: prior,
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+      maxPriorAgeMs: 30_000,
+    });
+    expect(decision.startLatencyMs).toBe(10_000);
+    expect(decision.startSource).toBe('prior');
+  });
+});
+
+describe('shouldApplyAdaptive (modos do sync)', () => {
+  it("só aplica no modo 'auto'", () => {
+    expect(shouldApplyAdaptive('auto', true)).toBe(true);
+    expect(shouldApplyAdaptive('log', true)).toBe(false);
+    expect(shouldApplyAdaptive('off', true)).toBe(false);
+    expect(shouldApplyAdaptive('auto', false)).toBe(false);
   });
 });

@@ -41,6 +41,8 @@ export interface RoundEndEstimate {
   scoreAfter: string | null;
   marker: 'score' | 'round' | null;
   reason: 'confident' | 'after-only' | 'no-transition' | 'no-scoreboard';
+  /** Crop do placar que produziu a leitura (null = nenhum leu). */
+  crop?: string | null;
 }
 
 export interface RoundEndScanOptions {
@@ -52,6 +54,12 @@ export interface RoundEndScanOptions {
   scanFromMs: number;
   listSegments: () => string[];
   crop?: string;
+  /**
+   * Crops alternativos tentados quando o principal não produz leitura
+   * útil (o overlay do placar fica em outro lugar em alguns canais).
+   * O crop que funciona é devolvido em `crop` para ser memorizado.
+   */
+  crops?: string[];
   shouldStop?: () => boolean;
   pollIntervalMs?: number;
 }
@@ -79,6 +87,111 @@ export function parseScoreboardCrop(value?: string): ScoreboardCrop {
   }
   const [x, y, w, h] = DEFAULT_CROP.split(':').map(Number);
   return { x, y, w, h };
+}
+
+/** O texto do crop é um x:y:w:h válido? (para validar config/env). */
+export function isValidCrop(value: string): boolean {
+  const parts = value.split(':').map(Number);
+  return (
+    parts.length === 4 &&
+    parts.every(Number.isFinite) &&
+    parts[0] >= 0 &&
+    parts[1] >= 0 &&
+    parts[2] > 0 &&
+    parts[3] > 0 &&
+    parts[0] + parts[2] <= 1 &&
+    parts[1] + parts[3] <= 1
+  );
+}
+
+/**
+ * Mapa de crop por CANAL: JSON {"gaules": "0.02:0.02:0.30:0.14"}.
+ * Chave em minúsculas (o nome do canal varia de caixa); crop inválido
+ * é ignorado (o canal cai no crop global).
+ */
+export function parseCropMap(raw: string | undefined): Record<string, string> {
+  const text = (raw ?? '').trim();
+  if (!text) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const name = key.trim().toLowerCase();
+    if (!name || typeof value !== 'string') continue;
+    const crop = value.trim();
+    if (!isValidCrop(crop)) continue;
+    out[name] = crop;
+  }
+  return out;
+}
+
+/**
+ * Lista de crops alternativos ("x:y:w:h,x:y:w:h"): os válidos entram,
+ * na ordem. Inválidos são ignorados (não derrubam a lista inteira).
+ */
+export function parseCropList(raw: string | undefined): string[] {
+  const text = (raw ?? '').trim();
+  if (!text) return [];
+  const out: string[] = [];
+  for (const piece of text.split(',')) {
+    const crop = piece.trim();
+    if (!crop) continue;
+    if (!isValidCrop(crop)) continue;
+    if (!out.includes(crop)) out.push(crop);
+  }
+  return out;
+}
+
+/**
+ * Crop CONFIGURADO para o canal: nome exato primeiro, depois o nome
+ * configurado que é PREFIXO do canal real ("gaules" casa "gaules 2").
+ * Null quando o canal não tem entrada.
+ */
+export function configuredCropForStream(
+  byStream: Record<string, string>,
+  streamName?: string,
+): string | null {
+  const name = (streamName ?? '').trim().toLowerCase();
+  if (!name || !byStream) return null;
+  const exact = byStream[name];
+  if (typeof exact === 'string') return exact;
+  let bestKey: string | null = null;
+  for (const key of Object.keys(byStream)) {
+    if (!key || !name.startsWith(key)) continue;
+    if (!bestKey || key.length > bestKey.length) bestKey = key;
+  }
+  return bestKey ? byStream[bestKey] : null;
+}
+
+/**
+ * Lista de crops candidatos do canal: o configurado (manual), o
+ * memorizado (o que funcionou no último round) e o global — na ordem
+ * em que devem ser tentados.
+ */
+export function cropCandidatesForStream(params: {
+  globalCrop: string;
+  byStream: Record<string, string>;
+  streamName?: string;
+  remembered?: string | null;
+  fallbacks?: string[];
+}): string[] {
+  const out: string[] = [];
+  const push = (crop: string | null | undefined): void => {
+    if (!crop) return;
+    const trimmed = crop.trim();
+    if (!isValidCrop(trimmed)) return;
+    if (!out.includes(trimmed)) out.push(trimmed);
+  };
+  push(configuredCropForStream(params.byStream, params.streamName));
+  push(params.remembered);
+  push(params.globalCrop);
+  for (const fallback of params.fallbacks ?? []) push(fallback);
+  return out;
 }
 
 export function parseScoreboardText(text: string): ParsedScoreboard | null {
@@ -252,14 +365,34 @@ interface ScanSegmentArgs {
   crop: ScoreboardCrop;
   minStreamAtMs: number;
   segmentEndMs: number;
+  /** Fim do orçamento da varredura (ms) — aborta crops/frames. */
+  deadlineMs: number;
 }
 
-async function scanSegment(args: ScanSegmentArgs): Promise<ScoreboardObservation[]> {
-  const { file, durationSec, framesRoot, ffmpeg, worker, sharp, crop, minStreamAtMs, segmentEndMs } =
-    args;
+/** Candidate de crop: o texto original (para o log) e o corte efetivo. */
+interface CropCandidate {
+  raw: string;
+  crop: ScoreboardCrop;
+}
+
+async function scanSegmentWithCrop(
+  args: ScanSegmentArgs & { cropRaw: string },
+): Promise<ScoreboardObservation[]> {
+  const {
+    file,
+    durationSec,
+    framesRoot,
+    ffmpeg,
+    worker,
+    sharp,
+    crop,
+    minStreamAtMs,
+    segmentEndMs,
+    deadlineMs,
+  } = args;
   const framesDir = path.join(
     framesRoot,
-    `${path.basename(file, path.extname(file))}-${Math.round(segmentEndMs)}`,
+    `${path.basename(file, path.extname(file))}-${Math.round(segmentEndMs)}-${args.cropRaw.replace(/[^0-9.]/g, '_')}`,
   );
   fs.mkdirSync(framesDir, { recursive: true });
   const filter = [
@@ -286,6 +419,7 @@ async function scanSegment(args: ScanSegmentArgs): Promise<ScoreboardObservation
   const observations: ScoreboardObservation[] = [];
   const segmentStartMs = segmentEndMs - durationSec * 1000;
   for (let i = 0; i < frames.length; i++) {
+    if (Date.now() > deadlineMs) break;
     const streamAtMs = segmentStartMs + (i * 1000) / SAMPLE_FPS;
     if (streamAtMs < minStreamAtMs) continue;
     const image = await sharp(path.join(framesDir, frames[i]))
@@ -303,15 +437,51 @@ async function scanSegment(args: ScanSegmentArgs): Promise<ScoreboardObservation
   return observations;
 }
 
+/**
+ * Lê o segmento com o crop principal; se a leitura não for útil (não
+ * achou o placar esperado), tenta os crops alternativos.
+ *
+ * O custo do fallback é pago só quando o crop principal falha — e o crop
+ * que funciona é devolvido para ser memorizado pelo canal.
+ */
+async function scanSegment(
+  args: Omit<ScanSegmentArgs, 'crop'> & {
+    crops: CropCandidate[];
+    isUseful: (observations: ScoreboardObservation[]) => boolean;
+  },
+): Promise<{ observations: ScoreboardObservation[]; crop: string | null }> {
+  const merged: ScoreboardObservation[] = [];
+  let usedCrop: string | null = null;
+  for (const candidate of args.crops) {
+    if (Date.now() > args.deadlineMs) break;
+    try {
+      const observations = await scanSegmentWithCrop({
+        ...args,
+        crop: candidate.crop,
+        cropRaw: candidate.raw,
+      });
+      merged.push(...observations);
+      // Só memoriza o crop que LEU algo: um crop que não produziu
+      // nenhuma observação não pode virar o principal do canal.
+      if (observations.length > 0) usedCrop = candidate.raw;
+      if (args.isUseful(merged)) break;
+    } catch {
+      continue;
+    }
+  }
+  return { observations: merged, crop: usedCrop };
+}
+
 export async function scanRoundEndForScoreboard(
   options: RoundEndScanOptions,
 ): Promise<RoundEndEstimate> {
-  const empty = (reason: RoundEndEstimate['reason']): RoundEndEstimate => ({
+  const empty = (reason: RoundEndEstimate['reason'], crop: string | null = null): RoundEndEstimate => ({
     roundEndMs: null,
     scoreBefore: null,
     scoreAfter: null,
     marker: null,
     reason,
+    crop,
   });
   const ffprobe = resolveFfprobeBin();
   if (!ffprobe) throw new Error('ffprobe indisponível para calibragem do placar');
@@ -319,12 +489,22 @@ export async function scanRoundEndForScoreboard(
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clip-scoreboard-sync-'));
   const seen = new Set<string>();
   const observations: ScoreboardObservation[] = [];
-  const crop = parseScoreboardCrop(options.crop);
+  const cropCandidates: CropCandidate[] = [];
+  for (const raw of [options.crop ?? DEFAULT_CROP, ...(options.crops ?? [])]) {
+    if (!isValidCrop(raw)) continue;
+    if (cropCandidates.some((candidate) => candidate.raw === raw)) continue;
+    cropCandidates.push({ raw, crop: parseScoreboardCrop(raw) });
+  }
+  if (cropCandidates.length === 0) {
+    cropCandidates.push({ raw: DEFAULT_CROP, crop: parseScoreboardCrop(DEFAULT_CROP) });
+  }
   const deadlineMs = Date.now() + Math.max(
     60_000,
     options.maxLagSec * 1000 + options.segmentTimeSec * 1000 + 20_000,
   );
   let worker: OcrWorker | null = null;
+  /** Crop que produziu a última leitura (para o log/sidecar). */
+  let cropUsed: string | null = null;
 
   try {
     const { default: sharp } = await import('sharp');
@@ -337,10 +517,32 @@ export async function scanRoundEndForScoreboard(
       findScoreTransition(observations, options.expectedBefore, options.expectedAfter) ??
       findRoundTransition(observations, options.expectedRound);
 
+    /**
+     * A leitura é útil? O placar esperado (placar final do round) já
+     * apareceu em alguma frame? Sem isso, um crop que lê lixo impede os
+     * crops alternativos de serem tentados.
+     */
+    const hasExpectedScore = (list: ScoreboardObservation[]): boolean => {
+      const after = parseScorePair(options.expectedAfter);
+      if (after) {
+        const key = scoreKey(after);
+        if (list.some((observation) => scoreKey(observation.score) === key)) return true;
+      }
+      const before = parseScorePair(options.expectedBefore);
+      if (before) {
+        const key = scoreKey(before);
+        if (list.some((observation) => scoreKey(observation.score) === key)) return true;
+      }
+      return list.length > 0 && !after && !before;
+    };
+    const isUseful = (list: ScoreboardObservation[]): boolean =>
+      hasExpectedScore([...observations, ...list]);
+
     while (!options.shouldStop?.() && Date.now() <= deadlineMs) {
       const listed = options.listSegments();
       const stableSegments = listed.length > 1 ? listed.slice(0, -1) : [];
       for (const file of stableSegments) {
+        if (Date.now() > deadlineMs) break;
         let stat: fs.Stats;
         try {
           stat = fs.statSync(file);
@@ -362,19 +564,21 @@ export async function scanRoundEndForScoreboard(
         if (segmentStartMs > deadlineMs) continue;
 
         try {
-          observations.push(
-            ...(await scanSegment({
-              file,
-              durationSec,
-              framesRoot: dir,
-              ffmpeg,
-              worker,
-              sharp,
-              crop,
-              minStreamAtMs: options.scanFromMs,
-              segmentEndMs: stat.mtimeMs,
-            })),
-          );
+          const scanned = await scanSegment({
+            file,
+            durationSec,
+            framesRoot: dir,
+            ffmpeg,
+            worker,
+            sharp,
+            crops: cropCandidates,
+            minStreamAtMs: options.scanFromMs,
+            segmentEndMs: stat.mtimeMs,
+            deadlineMs,
+            isUseful,
+          });
+          observations.push(...scanned.observations);
+          if (scanned.crop) cropUsed = scanned.crop;
         } catch {
           continue;
         }
@@ -386,6 +590,7 @@ export async function scanRoundEndForScoreboard(
             scoreAfter: found.after,
             marker: found.marker,
             reason: found.reason,
+            crop: cropUsed,
           };
         }
       }
@@ -411,9 +616,10 @@ export async function scanRoundEndForScoreboard(
         scoreAfter: found.after,
         marker: found.marker,
         reason: found.reason,
+        crop: cropUsed,
       };
     }
-    return empty(observations.length === 0 ? 'no-scoreboard' : 'no-transition');
+    return empty(observations.length === 0 ? 'no-scoreboard' : 'no-transition', cropUsed);
   } finally {
     try {
       if (worker) await worker.terminate();

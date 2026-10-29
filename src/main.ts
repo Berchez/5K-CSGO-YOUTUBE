@@ -31,11 +31,17 @@ import {
   sleepUntilPoll,
 } from './monitor/pollSleep.js';
 import {
+  gameRoundEndMs,
   latencyMapProblem,
   observedLatencyMs,
+  RECENT_SAMPLE_LIMIT,
+  RECENT_SAMPLE_MAX_AGE_MS,
+  resolveAdaptiveLatency,
   resolveStreamLatencyMs,
+  shouldApplyAdaptive,
   StreamLatencyTracker,
 } from './monitor/streamLatency.js';
+import { loadLatencyState, saveLatencyState } from './monitor/latencyStore.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
 import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
@@ -44,7 +50,8 @@ import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
 import { buildClip, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
 import { computeClipAnchors } from './clipper/clipAnchors.js';
-import { scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
+import { cropCandidatesForStream, scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
+import { scanKillfeedForLatency } from './clipper/killfeedSync.js';
 import { uploadClip } from './uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
@@ -210,12 +217,27 @@ let metadataAiFn: MetadataAiFn | null = null;
  * Latência OBSERVADA por canal: quando o OCR acha a virada do placar
  * no vídeo, o instante medido é a latência real da stream (o instante
  * do round no vídeo menos o instante estimado no relógio do jogo).
- * Só mede — não ajusta as âncoras sozinho (uma calibração errada
- * quebraria todos os clipes do canal). Serve para o log dizer quanto a
- * stream está atrasando e o dono calibrar CLIP_STREAM_LATENCY_MS (ou o
- * mapa por canal).
+ *
+ * O estado guarda as medições COM TIMESTAMP (não só a mediana): a
+ * latência muda dentro da partida (pausa do streamer, buffering,
+ * catch-up) e o início do clipe precisa da amostra que estava em vigor
+ * na 1ª kill — não da média do canal nem da do round atual (medida
+ * depois da kill).
+ *
+ * O estado é persistido entre reinícios: é o que faz a sincronização
+ * "entre partidas" ser fácil (o 1º round da partida nova já começa com
+ * a latência medida na partida anterior).
  */
-const latencyTracker = new StreamLatencyTracker();
+let latencyTracker = new StreamLatencyTracker();
+
+/** Grava o estado de latência em disco (best-effort, mas avisa a falha). */
+function persistLatencyState(cfg: ReturnType<typeof getConfig>): void {
+  if (saveLatencyState(cfg.CLIP_STREAM_SYNC_STATE_PATH, latencyTracker)) return;
+  getLogger().warn(
+    { arquivo: cfg.CLIP_STREAM_SYNC_STATE_PATH },
+    'falha ao salvar o estado de latência (a medição volta no próximo round)',
+  );
+}
 
 function getMetadataAi(): MetadataAiFn {
   if (metadataAiFn) return metadataAiFn;
@@ -383,6 +405,7 @@ async function measureRoundEnd(
   recorder: StreamRecorder | undefined,
   shouldStop: () => boolean,
   scanFromMs: number,
+  aceDetectedAtMs: number,
 ): Promise<RoundEndMeasurement> {
   const log = getLogger();
   const mode = cfg.CLIP_STREAM_SYNC;
@@ -402,6 +425,7 @@ async function measureRoundEnd(
       roundEndAt: null,
       scoreBefore: ace.scoreBefore ?? null,
       scoreAfter: ace.scoreAfter ?? null,
+      observedLatencyMs: null,
     },
   });
 
@@ -415,6 +439,19 @@ async function measureRoundEnd(
   }
 
   try {
+    /**
+     * Crops do placar: o configurado para o canal, o que funcionou da
+     * última vez (memorizado) e o global — nessa ordem. Os fallbacks
+     * só entram na fila se os anteriores não lerem nada (o custo do
+     * fallback é pago só quando o crop principal falha).
+     */
+    const crops = cropCandidatesForStream({
+      globalCrop: cfg.CLIP_SCOREBOARD_CROP,
+      byStream: cfg.CLIP_SCOREBOARD_CROP_BY_STREAM,
+      streamName: recorder.streamName,
+      remembered: latencyTracker.crop(recorder.streamName),
+      fallbacks: cfg.CLIP_SCOREBOARD_CROP_FALLBACKS,
+    });
     const estimate = await scanRoundEndForScoreboard({
       expectedBefore: ace.scoreBefore,
       expectedAfter: ace.scoreAfter,
@@ -422,11 +459,38 @@ async function measureRoundEnd(
       maxLagSec: cfg.CLIP_STREAM_SYNC_MAX_LAG_SEC,
       segmentTimeSec: cfg.SEGMENT_TIME_SEC,
       scanFromMs,
-      crop: cfg.CLIP_SCOREBOARD_CROP,
+      crop: crops[0],
+      crops: crops.slice(1),
       listSegments: () => recorder.listSegments(),
       shouldStop,
     });
     const applied = mode === 'auto' && estimate.roundEndMs != null;
+    /**
+     * Latência OBSERVADA do round: a virada do placar vista no vídeo
+     * menos o fechamento do round no relógio do jogo. É a MEDIÇÃO (não
+     * a aplicação): entra no estado por canal e alimenta a âncora
+     * adaptativa dos rounds seguintes.
+     *
+     * O instante do ace (NÃO o "agora") é a referência: a varredura
+     * espera o material do round chegar ao buffer — e esse tempo de
+     * espera É a latência que estamos medindo. Usar o "agora" mediria a
+     * própria espera.
+     *
+     * O fim do round no relógio do jogo é o "Round over" do placar do
+     * HLTV (o timer real do round) quando disponível; senão a estimativa
+     * (detecção − atraso do placar), que carrega o erro de
+     * CLIP_SCORE_DELAY_MS.
+     */
+    const roundEndedAtMs = ace.roundEndedAt ? Date.parse(ace.roundEndedAt) : null;
+    const gameEndMs = gameRoundEndMs({
+      aceDetectedAtMs,
+      scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
+      roundEndedAtMs,
+    });
+    const observed =
+      estimate.roundEndMs != null
+        ? observedLatencyMs(estimate.roundEndMs, gameEndMs)
+        : null;
     const sync: RoundEndMeasurement['sync'] = {
       mode,
       applied,
@@ -440,6 +504,8 @@ async function measureRoundEnd(
       roundEndAt: estimate.roundEndMs != null ? new Date(estimate.roundEndMs).toISOString() : null,
       scoreBefore: estimate.scoreBefore,
       scoreAfter: estimate.scoreAfter,
+      observedLatencyMs: observed,
+      crop: estimate.crop ?? null,
     };
     const details = { matchId: ace.matchId, stream: recorder.streamName, ...sync };
     if (applied) {
@@ -447,6 +513,9 @@ async function measureRoundEnd(
     } else {
       log.warn(details, 'placar do round não aplicado — mantendo âncora original');
     }
+    // O crop que leu vira o principal do canal: o próximo round não
+    // precisa redescobrir onde o placar está.
+    if (estimate.crop) latencyTracker.setCrop(recorder.streamName, estimate.crop);
     return { detectedEndMs: estimate.roundEndMs, sync };
   } catch (e) {
     log.warn(
@@ -469,16 +538,49 @@ async function handleAce(
   }
   const recorder = activeRecorders.get(matchId);
   const aceStartMs = ace.startedAt ? Date.parse(ace.startedAt) : undefined;
+  const streamName = recorder?.streamName;
   /**
-   * Latência EFETIVA da stream: o valor do canal quando existe
-   * (CLIP_STREAM_LATENCY_BY_STREAM), senão o global. A latência não é
-   * igual em toda fonte — uma oficial e um mirror BR entregam o HLS com
-   * defasagens diferentes, e usar a média delas erra o corte.
+   * Latência CONFIGURADA do canal: o valor do canal quando existe
+   * (CLIP_STREAM_LATENCY_BY_STREAM), senão o global. É o FALLBACK —
+   * quando existe medição por round (OCR do placar no vídeo), ela é que
+   * manda, porque a latência muda dentro da partida (pausa do streamer,
+   * buffering, catch-up) e um valor fixo erra dezenas de segundos.
    */
   const streamLatencyMs = resolveStreamLatencyMs(
     cfg.CLIP_STREAM_LATENCY_MS,
     cfg.CLIP_STREAM_LATENCY_BY_STREAM,
-    recorder?.streamName,
+    streamName,
+  );
+  /**
+   * Amostras do canal medidas ANTES deste evento (a base da latência
+   * adaptativa). Sem filtro de idade: a última amostra do canal — mesmo
+   * de uma partida anterior — é o ponto de partida do 1º round da
+   * partida nova.
+   */
+  const eventAtMs = Date.parse(ace.detectedAt) || Date.now();
+  const priorSamples = latencyTracker
+    .allSamples(streamName)
+    .filter((sample) => sample.measuredAtMs < eventAtMs)
+    .slice(-RECENT_SAMPLE_LIMIT);
+  /**
+   * Janela RECENTE (idade limitada): base do fim estimado. Medição
+   * antiga não descreve o regime atual.
+   */
+  const recentSamples = latencyTracker.recent(
+    streamName,
+    RECENT_SAMPLE_LIMIT,
+    RECENT_SAMPLE_MAX_AGE_MS,
+    Date.now(),
+  );
+  /**
+   * Latência CONSERVADORA para o teste rápido de cobertura: o MAIOR
+   * valor plausível. Descartar um ace é DESTRUTIVO (some do banco e
+   * nunca mais é processado); manter um ace sem footage só gera um
+   * clipe marcado como truncado.
+   */
+  const conservativeLatencyMs = Math.max(
+    streamLatencyMs,
+    ...priorSamples.map((sample) => sample.latencyMs),
   );
   /**
    * Âncora na TIMELINE DO VÍDEO (a mesma dos mtimes dos segmentos).
@@ -488,9 +590,12 @@ async function handleAce(
    * aconteceu há ~CLIP_STREAM_LATENCY_MS. Sem empurrar a âncora para a
    * frente, o corte aponta para um instante que ainda não foi gravado e o
    * clipe abre no round ANTERIOR (medido: 30s antes da 1ª kill real).
+   *
+   * O valor final (adaptativo) só é conhecido depois da medição do
+   * round — até lá, esta âncora serve ao teste rápido de cobertura.
    */
-  const videoStartMs =
-    aceStartMs != null ? aceStartMs + streamLatencyMs : undefined;
+  let videoStartMs =
+    aceStartMs != null ? aceStartMs + conservativeLatencyMs : undefined;
   // Valida ANTES de gravar: stats velhas (repovoamento no break) podem
   // produzir um ace cuja 1ª kill já saiu do buffer — sem isso a linha
   // ficaria no banco e o hasAce bloquearia uma detecção legítima futura.
@@ -502,7 +607,7 @@ async function handleAce(
     kills: ace.kills,
     anchorMs: videoStartMs,
     oldestSegmentStartMs: initialStartMs,
-    streamLatencyMs,
+    streamLatencyMs: conservativeLatencyMs,
     scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
   });
   if (initialCoverage.discard) {
@@ -551,9 +656,186 @@ async function handleAce(
       recorder,
       () => stopping,
       aceDetectedAtMs - 30_000,
+      aceDetectedAtMs,
     );
     ace.streamSync = streamSync;
     if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
+    /** Fim REAL do round no relógio do jogo (timer do HLTV) ou null. */
+    const roundEndedAtMs = ace.roundEndedAt ? Date.parse(ace.roundEndedAt) : null;
+    const roundEndReference =
+      roundEndedAtMs != null && Number.isFinite(roundEndedAtMs)
+        ? 'timer-hltv'
+        : 'estimada';
+    /**
+     * AMOSTRA do round atual: a latência medida no fim do round. Ela
+     * entra no estado do canal (para os rounds seguintes) e serve para
+     * detectar troca de regime. No início só pode ANTECIPAR a abertura
+     * (quando é menor que a amostra anterior): foi medida DEPOIS da 1ª
+     * kill e, se for maior, a subida pode ter acontecido depois do kill.
+     */
+    const currentSample =
+      streamSync.observedLatencyMs != null
+        ? latencyTracker.record(streamName, streamSync.observedLatencyMs, {
+            measuredAtMs: Date.now(),
+            source: 'scoreboard',
+            quality:
+              streamSync.marker === 'score' && streamSync.reason === 'confident'
+                ? 'confident'
+                : 'after-only',
+            reference: roundEndReference,
+          })
+        : null;
+    if (currentSample) persistLatencyState(cfg);
+    /**
+     * Aumento do atraso CONHECIDO entre a medição anterior e a 1ª kill:
+     * o relógio de origem da playlist HLS mostra quando a stream "pulou"
+     * (pausa do streamer/buffering). Sem isso, um salto no meio da
+     * partida só apareceria no round seguinte.
+     */
+    const priorSample = priorSamples.length > 0 ? priorSamples[priorSamples.length - 1] : null;
+    const killEstimateMs =
+      aceStartMs != null ? aceStartMs + (priorSample?.latencyMs ?? streamLatencyMs) : eventAtMs;
+    const pendingShiftMs = recorder
+      ? recorder.delayShiftSince(priorSample?.measuredAtMs ?? eventAtMs - 60_000, killEstimateMs)
+      : 0;
+    if (pendingShiftMs > 0) {
+      log.info(
+        { matchId, stream: streamName, atrasoExtraMs: pendingShiftMs },
+        'atraso da stream cresceu antes da 1ª kill (salto no relógio de origem)',
+      );
+    }
+    /**
+     * Decisão da latência adaptativa:
+     * - início: a amostra em vigor na 1ª kill (a anterior ao evento),
+     *   ajustada pelo salto conhecido; se o round trocou de regime, vale
+     *   o MENOR valor (abrir mais cedo nunca tira a 1ª kill do clipe);
+     * - fim estimado: o MÁXIMO da janela recente (fechar mais tarde
+     *   nunca tira a última kill).
+     */
+    const adaptive = resolveAdaptiveLatency({
+      configuredMs: streamLatencyMs,
+      priorSamples,
+      recentSamples,
+      current: currentSample,
+      pendingShiftMs,
+      maxStepMs: cfg.CLIP_STREAM_SYNC_MAX_STEP_MS,
+      eventAtMs,
+      nowMs: Date.now(),
+    });
+    /**
+     * A latência adaptativa só é APLICADA no modo 'auto'. Em 'log' a
+     * varredura continua medindo e persistindo (shadow), mas o corte é
+     * idêntico ao antigo — é o modo para comparar o comportamento com e
+     * sem a medição. Em 'off' não há varredura.
+     */
+    const applyAdaptive = shouldApplyAdaptive(
+      cfg.CLIP_STREAM_SYNC,
+      cfg.CLIP_STREAM_SYNC_ADAPTIVE,
+    );
+    /**
+     * Modo shadow do sync: mede e LOGA, sem alterar nenhuma âncora
+     * (inclusive a do killfeed). É a garantia de que 'log' não muda o
+     * corte.
+     */
+    const applyVisualSync = cfg.CLIP_STREAM_SYNC !== 'log';
+    const startLatencyMs = applyAdaptive ? adaptive.startLatencyMs : streamLatencyMs;
+    const endLatencyMs = applyAdaptive ? adaptive.endLatencyMs : streamLatencyMs;
+    /**
+     * Segunda medição: OCR do KILLFEED (o nome do jogador no vídeo).
+     * Ela dá o instante do kill DENTRO do vídeo — não depende de
+     * nenhuma latência estimada. Entra só quando precisa: o placar do
+     * vídeo não pôde ser lido, ou o round trocou de regime.
+     */
+    let killfeedStartMs: number | null = null;
+    let killfeedOffsetMs: number | null = null;
+    const needKillfeed =
+      cfg.CLIP_KILLFEED_SYNC !== 'off' &&
+      recorder?.isRunning === true &&
+      (cfg.CLIP_KILLFEED_SYNC === 'always' ||
+        streamSync.reason === 'no-scoreboard' ||
+        streamSync.reason === 'no-transition' ||
+        // O salto do relógio de origem é ambíguo e não move a âncora:
+        // ele DISPARA a medição exata (killfeed), que é independente.
+        pendingShiftMs > 0 ||
+        adaptive.changed);
+    if (needKillfeed) {
+      try {
+        const killfeedCrops = cropCandidatesForStream({
+          globalCrop: cfg.CLIP_KILLFEED_CROP,
+          byStream: cfg.CLIP_KILLFEED_CROP_BY_STREAM,
+          streamName,
+          remembered: null,
+          fallbacks: cfg.CLIP_KILLFEED_CROP_FALLBACKS,
+        });
+        const killfeed = await scanKillfeedForLatency({
+          kills: ace.kills,
+          scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+          // A janela é só ONDE PROCURAR no vídeo: usa a faixa medida
+          // (adaptive) mesmo em shadow — em shadow ela não altera o
+          // corte, só a qualidade da medição. No modo 'auto' é a mesma
+          // faixa que foi aplicada no corte.
+          latencyHintMs: Math.min(adaptive.startLatencyMs, startLatencyMs),
+          // A janela cobre a faixa: o killfeed é acionado justamente
+          // quando o regime pode ter subido, e o hint do início é o
+          // valor ANTIGO (por regra, só antecipa).
+          latencyMaxMs: Math.max(adaptive.endLatencyMs, endLatencyMs),
+          segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+          listSegments: () => recorder?.listSegments() ?? [],
+          crops: killfeedCrops,
+          shouldStop: () => stopping,
+        });
+        log.info(
+          {
+            matchId,
+            stream: streamName,
+            motivo: killfeed.reason,
+            casadas: killfeed.matchedKills,
+            total: killfeed.totalKills,
+            primeiraCasada: killfeed.firstKillMatched,
+            desvioMedianoMs: killfeed.medianDeviationMs,
+            crop: killfeed.crop,
+          },
+          'calibração pelo killfeed do vídeo',
+        );
+        if (
+          applyVisualSync &&
+          killfeed.reason === 'confident' &&
+          killfeed.firstKillVideoMs != null
+        ) {
+          killfeedStartMs = killfeed.firstKillVideoMs;
+          killfeedOffsetMs = killfeed.killVideoOffsetMs;
+        }
+      } catch (e) {
+        log.warn(
+          { err: String(e).slice(0, 200), matchId, stream: streamName },
+          'calibração pelo killfeed falhou — mantendo a âncora do placar',
+        );
+      }
+    }
+    /**
+     * Âncora final do início: o instante da 1ª kill no vídeo quando o
+     * killfeed respondeu (exato), senão a âncora do placar convertida
+     * com a latência adaptativa.
+     */
+    videoStartMs =
+      killfeedStartMs != null
+        ? killfeedStartMs
+        : aceStartMs != null
+          ? aceStartMs + startLatencyMs
+          : undefined;
+    streamSync.startLatencyMs = startLatencyMs;
+    streamSync.endLatencyMs = endLatencyMs;
+    /**
+     * A fonte reportada tem que ser a que foi APLICADA: em shadow
+     * (`log`) ou com `CLIP_STREAM_SYNC_ADAPTIVE=false` o corte usa o
+     * configurado, mesmo que a decisão adaptativa tenha escolhido uma
+     * amostra. O killfeed, quando aplicado, continua sendo a fonte exata.
+     */
+    const appliedStartSource = applyAdaptive ? adaptive.startSource : 'config';
+    streamSync.latencySource =
+      killfeedStartMs != null ? 'killfeed' : appliedStartSource;
+    streamSync.latencyChanged = adaptive.changed;
+    ace.streamSync = streamSync;
     // Contexto adaptativo (mesma conta do corte): âncora de início incerta =
     // a kill pode não ser a 1ª real do round → abre mais cedo.
     const lowAnchor = isAnchorLowConfidence(
@@ -575,6 +857,8 @@ async function handleAce(
     const anchors = computeClipAnchors({
       aceStartedAtMs: aceStartMs,
       streamLatencyMs,
+      startLatencyMs,
+      endLatencyMs,
       scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
       scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
       endAfterCloseSec: cfg.CLIP_END_AFTER_CLOSE_SEC,
@@ -589,7 +873,13 @@ async function handleAce(
         streamSync.reason !== 'disabled' &&
         streamSync.reason !== 'recorder-unavailable',
     });
-    const { endMs, killVideoOffsetMs } = anchors;
+    /**
+     * Offset dos timestamps: latência − atraso do placar. Quando o
+     * killfeed mediu o instante das kills no vídeo, ele é a fonte mais
+     * precisa (não depende de latência estimada).
+     */
+    const killVideoOffsetMs = killfeedOffsetMs ?? anchors.killVideoOffsetMs;
+    const { endMs } = anchors;
     // Metadados: a CHAMADA da IA começa aqui (EM PARALELO ao corte do
     // clipe — só ela depende da rede, então não soma latência no
     // upload). A composição final espera o clipe real: o sidecar sabe o
@@ -618,32 +908,35 @@ async function handleAce(
     const waitTargetMs =
       endMs + (anchors.usedFallback ? cfg.CLIP_STREAM_SYNC_FALLBACK_SEC * 1000 : 0);
     /**
-     * Telemetria da latência: quando o OCR achou a virada do placar no
-     * vídeo, o instante medido é a latência REAL da stream (o round no
-     * vídeo menos o round no relógio do jogo). Compara com o valor
-     * configurado — a diferença é o ajuste que o dono precisa fazer.
+     * Telemetria da latência: o que foi MEDIDO no round (virada do
+     * placar no vídeo) e o que foi APLICADO nas âncoras. A diferença
+     * entre as duas é o ajuste que o dono faria no .env — e o log mostra
+     * se a latência está VARIANDO dentro da partida (o caso que um
+     * valor fixo não resolve).
      */
-    if (anchors.usedScoreboardEnd && detectedEndMs != null) {
-      const observed = observedLatencyMs(
-        detectedEndMs,
-        aceDetectedAtMs,
-        cfg.CLIP_SCORE_DELAY_MS,
-      );
-      latencyTracker.record(recorder?.streamName, observed);
-      const median = latencyTracker.median(recorder?.streamName);
+    if (streamSync.observedLatencyMs != null) {
+      const median = latencyTracker.median(streamName);
       log.info(
         {
           matchId,
-          stream: recorder?.streamName,
-          latenciaObservadaMs: observed,
+          stream: streamName,
+          latenciaObservadaMs: streamSync.observedLatencyMs,
           latenciaMedianaMs: median,
           latenciaConfiguradaMs: streamLatencyMs,
-          deltaMs: observed - streamLatencyMs,
-          // A latência observada é a virada no vídeo menos o fechamento
-          // ESTIMADO do round: ela carrega o erro do atraso do placar
-          // final. Sem logar esse valor, a medição parece exata.
+          latenciaAplicadaInicioMs: startLatencyMs,
+          latenciaAplicadaFimMs: endLatencyMs,
+          fonteLatencia: streamSync.latencySource,
+          roundMudouRegime: adaptive.changed,
+          deltaAnteriorMs: adaptive.deltaMs,
+          idadeAmostraMs: adaptive.priorAgeMs,
+          deltaMs: streamSync.observedLatencyMs - streamLatencyMs,
+          // A referência do fim do round: o timer real do placar do HLTV
+          // ("Round over") ou a estimativa (detecção − atraso do placar,
+          // que carrega o erro de CLIP_SCORE_DELAY_MS).
+          referenciaFimRound: roundEndedAtMs != null ? 'timer-hltv' : 'estimada',
+          fimRoundReal: roundEndedAtMs != null ? new Date(roundEndedAtMs).toISOString() : null,
           scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
-          amostras: latencyTracker.samplesCount(recorder?.streamName),
+          amostras: latencyTracker.samplesCount(streamName),
         },
         'latência observada da stream (virada do placar no vídeo)',
       );
@@ -660,6 +953,9 @@ async function handleAce(
         videoStart: videoStartMs != null ? new Date(videoStartMs).toISOString() : null,
         end: new Date(endMs).toISOString(),
         streamLatencyMs,
+        latenciaAplicadaInicioMs: startLatencyMs,
+        latenciaAplicadaFimMs: endLatencyMs,
+        fonteLatencia: streamSync.latencySource,
         scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
         scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
         endAnchored: anchors.usedScoreboardEnd,
@@ -667,6 +963,32 @@ async function handleAce(
       },
       'âncoras do clipe (placar → vídeo)',
     );
+    /**
+     * Quebra de continuidade da timeline dentro da janela do clipe: a
+     * fonte reiniciou a base de PTS (ou o probe viu salto/stall) e o
+     * material pode ter um buraco. O clipe é MARCADO — não é prova de
+     * que faltou conteúdo, mas a omissão silenciosa seria pior.
+     */
+    const timelineEvents =
+      recorder?.timelineEventsInWindow(
+        // O clipe começa no contexto ANTES da 1ª kill (e o pick inclui
+        // pré-roll atômico); a janela de eventos tem que cobrir o
+        // material que realmente entra no vídeo.
+        anchors.estimatedClipStartMs ?? videoStartMs ?? endMs,
+        endMs,
+      ) ?? [];
+    const timelineDiscontinuity = timelineEvents.length > 0;
+    if (timelineDiscontinuity) {
+      ace.timelineDiscontinuity = true;
+      log.warn(
+        {
+          matchId,
+          eventos: timelineEvents.length,
+          tipos: [...new Set(timelineEvents.map((event) => event.kind))],
+        },
+        'clipe com quebra de continuidade da timeline (material pode ter buraco)',
+      );
+    }
     let endCovered = false;
     const waitUntil =
       Date.now() +
@@ -742,11 +1064,23 @@ async function handleAce(
       // sidecar promete (foi o caso do 5K do jcobbb: round fechou minutos
       // depois e o corte pegou só o intervalo seguinte). Melhor não gerar.
       const oldestStartMs = oldestSegmentStartMs(sourceSegments, cfg.SEGMENT_TIME_SEC);
+      /**
+       * Régua da cobertura: quando o killfeed mediu o offset, ele é
+       * EXATO (o `at` da kill + offset do vídeo) — usar a latência do
+       * início aqui misturaria duas réguas e poderia esconder que a 1ª
+       * kill já saiu do buffer. Sem killfeed, vale a latência aplicada.
+       */
+      const coverageLatencyMs =
+        killfeedOffsetMs != null
+          ? killfeedOffsetMs + cfg.SCOREBOARD_DELAY_MS
+          : startLatencyMs;
       const coverage = evaluateAceCoverage({
         kills: ace.kills,
         anchorMs: videoStartMs,
         oldestSegmentStartMs: oldestStartMs,
-        streamLatencyMs,
+        // A latência que ancorou o início (medida quando existe): é a
+        // mesma régua do corte — as duas sides na MESMA timeline.
+        streamLatencyMs: coverageLatencyMs,
         scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
       });
       if (coverage.discard) {
@@ -803,6 +1137,11 @@ async function handleAce(
           upscaleHeight: cfg.CLIP_UPSCALE_HEIGHT,
           streamName: recorder?.streamName,
           streamLatencyMs,
+          startLatencyMs,
+          endLatencyMs,
+          latencySource: streamSync.latencySource ?? undefined,
+          latencyChanged: adaptive.changed,
+          timelineDiscontinuity,
           killVideoOffsetMs,
           thumb: {
             mode: cfg.THUMB_MODE,
@@ -1246,6 +1585,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
               startedAt: a.startedAt,
               kills: a.kills.map((kk) => ({ ...kk, map: a.map })),
               anchorConfidence: a.anchorConfidence,
+              roundEndedAt: a.roundEndedAt,
               scoreBefore: a.scoreBefore,
               scoreAfter: a.scoreAfter,
               score: a.scoreBefore,
@@ -1365,6 +1705,32 @@ async function main(): Promise<void> {
   startWatchlistWatcher();
   setTrayStatusPhase('monitoring');
   const log = getLogger();
+  /**
+   * Estado de latência por canal (persistido entre reinícios): o 1º
+   * round de uma partida nova já começa com a latência medida na
+   * partida anterior — a primeira transição de placar corrige o valor.
+   */
+  const latencyState = loadLatencyState(cfg.CLIP_STREAM_SYNC_STATE_PATH);
+  latencyTracker = latencyState.state;
+  if (latencyState.problem) {
+    log.warn(
+      { arquivo: cfg.CLIP_STREAM_SYNC_STATE_PATH, problema: latencyState.problem },
+      'estado de latência inválido — recomeçando do zero',
+    );
+  } else if (latencyTracker.channels().length > 0) {
+    log.info(
+      {
+        arquivo: cfg.CLIP_STREAM_SYNC_STATE_PATH,
+        canais: latencyTracker.channels().map((canal) => ({
+          canal,
+          medianaMs: latencyTracker.median(canal),
+          amostras: latencyTracker.samplesCount(canal),
+          crop: latencyTracker.crop(canal),
+        })),
+      },
+      'estado de latência carregado',
+    );
+  }
   // Faxina de snapshots órfãos: renders só existem com o bot vivo — qualquer
   // conteúdo em .build no startup é cadáver de sessão morta (kill/restart no
   // meio do handleAce). Já acumulou 20GB antes desta faxina.

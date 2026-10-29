@@ -10,6 +10,14 @@ import {
   slopePerStep,
   startDeltaSec,
 } from '../clipper/segmentProbe.js';
+import {
+  fetchPlaylist,
+  findTimelineShifts,
+  mergePlaylistSegments,
+  originOffsetMs,
+  parseHlsPlaylist,
+  type PlaylistSegment,
+} from './hlsTimeline.js';
 import { DEFAULT_DISK_MIN_FREE_BYTES, gb, getFreeBytes, isFreeSpaceOk } from '../diskSpace.js';
 
 export interface RecorderOptions {
@@ -39,6 +47,33 @@ const DISCONTINUITY_RE = /timestamp discontinuity|discontinuity/i;
 export function isDiscontinuityLine(line: string): boolean {
   return DISCONTINUITY_RE.test(line);
 }
+
+/**
+ * Evento que quebra a continuidade da timeline do vídeo.
+ *
+ * 'discontinuity': o ffmpeg avisou que a fonte reiniciou a base de PTS
+ * (o conteúdo pode ter pulado). 'pts-jump'/'stall': detectados no
+ * probe do segmento (salto de PTS / imagem congelada).
+ *
+ * Não é prova de buraco no conteúdo (muitas descontinuidades são
+ * normality da fonte), mas é o sinal de que o material na janela do
+ * clipe pode não ser contíguo — o clipe precisa ser marcado como tal.
+ */
+export interface TimelineEvent {
+  /** Quando o evento foi observado (wall ms). */
+  atMs: number;
+  kind: 'discontinuity' | 'pts-jump' | 'stall' | 'pdt-gap';
+  detail?: string;
+}
+
+/** Eventos guardados por recorder (buffer circular em memória). */
+const MAX_TIMELINE_EVENTS = 200;
+
+/** Intervalo da leitura da playlist HLS (ms) — relógio de origem. */
+const PLAYLIST_WATCH_INTERVAL_MS = 15_000;
+
+/** Quantidade de saltos de atraso guardados (buffer circular). */
+const MAX_DELAY_SHIFTS = 50;
 
 interface PlaylistHead {
   mediaSeq: number | null;
@@ -128,6 +163,35 @@ export class StreamRecorder {
   private avDeltas: number[] = [];
   /** Último estado do disco (null = desconhecido): avisa só em transição. */
   private diskOk: boolean | null = null;
+  /**
+   * Eventos de quebra de continuidade da timeline (descontinuidade da
+   * fonte, salto de PTS, stall, salto do relógio de origem). Vão para
+   * o clipe: material não contíguo na janela precisa ser sinalizado, não
+   * entregue em silêncio.
+   */
+  private timelineEvents: TimelineEvent[] = [];
+  /**
+   * URL do HLS resolvido (playlist viva): permite ler o relógio de
+   * ORIGEM do conteúdo (#EXT-X-PROGRAM-DATE-TIME).
+   */
+  private hlsUrl: string | null = null;
+  /**
+   * Saltos do relógio de origem: quando o PDT avança mais que o
+   * conteúdo, a stream passou a entregar material mais antigo (o
+   * atraso cresceu). É a mudança de atraso detectada SEM OCR.
+   */
+  private delayShifts: Array<{ atPdtMs: number; atMs: number; shiftSec: number }> = [];
+  private playlistTimer: NodeJS.Timeout | null = null;
+  private playlistBusy = false;
+  /** Último offset entre o relógio de origem (PDT) e o relógio local. */
+  private originOffsetMs: number | null = null;
+  /**
+   * Segmentos da playlist já vistos (com o PDT). A playlist VIVA tem
+   * janela deslizante: um salto que caia na borda da janela sumiria
+   * (o segmento seguinte viria "primeiro" na leitura). Guardando os
+   * últimos segmentos, o salto é detectado mesmo assim.
+   */
+  private originSegments: PlaylistSegment[] = [];
 
   constructor(private opts: RecorderOptions) {}
 
@@ -226,6 +290,7 @@ export class StreamRecorder {
       }
     };
     const urls = await Promise.all(plan.formats.map(grabUrl));
+    this.hlsUrl = urls[0] ?? null;
     // Borda da playlist na abertura (diagnóstico da fonte).
     try {
       const heads = await Promise.all(urls.map(fetchPlaylistHead));
@@ -291,6 +356,7 @@ export class StreamRecorder {
           // Restart do transcode na fonte: a partir daqui a linha do tempo
           // pode mudar — sinaliza no log para o clipe ser conferido.
           const restart = isDiscontinuityLine(t);
+          if (restart) this.recordTimelineEvent({ atMs: Date.now(), kind: 'discontinuity', detail: t });
           log.warn({ src: 'ffmpeg', line: t, restart }, 'ffmpeg sinalizou falha de input/dessincronia');
         } else {
           log.debug({ src: 'ffmpeg' }, t);
@@ -311,6 +377,125 @@ export class StreamRecorder {
       throw new Error('ffmpeg encerrou durante a inicialização');
     }
     this.startBufferWatch();
+    this.startPlaylistWatch();
+  }
+
+  /**
+   * Vigia do RELÓGIO DE ORIGEM: lê a playlist HLS e compara o
+   * #EXT-X-PROGRAM-DATE-TIME dos segmentos.
+   *
+   * Quando o PDT avança mais que o conteúdo (a fonte "pulou"), a
+   * stream passou a entregar material mais antigo: o atraso da stream
+   * CRESCU de exatamente o salto. É a detecção da mudança de atraso
+   * entre dois rounds (ou no meio deles) sem depender de OCR — e o
+   * instante do salto (no relógio local) diz se ele caiu ANTES ou
+   * DEPOIS da 1ª kill, o que desambigua a âncora do início.
+   */
+  private startPlaylistWatch(): void {
+    const log = getLogger();
+    this.playlistTimer = setInterval(() => {
+      if (!this.running || this.playlistBusy) return;
+      this.playlistBusy = true;
+      (async () => {
+        try {
+          const url = this.hlsUrl;
+          if (!url) return;
+          const text = await fetchPlaylist(url);
+          if (!text) return;
+          const parsed = parseHlsPlaylist(text);
+          this.originSegments = mergePlaylistSegments(this.originSegments, parsed);
+          const segments = this.originSegments;
+          const shifts = findTimelineShifts(segments, this.opts.segmentTimeSec);
+          if (segments.length === 0) return;
+          // Offset origem→local: o mtime do segmento local mais novo
+          // menos o PDT mais novo (o mesmo "agora" dos dois relógios).
+          const offset = this.estimateOriginOffsetMs(segments);
+          this.originOffsetMs = offset;
+          for (const shift of shifts) {
+            const atMs = shift.atPdtMs + offset;
+            // Dedup pelo PDT de ORIGEM: o offset origem→local é
+            // reestimado a cada leitura e pode variar 1-2s, então
+            // comparar `atMs` duplicava o mesmo salto. O PDT é estável.
+            const known = this.delayShifts.some(
+              (entry) => entry.atPdtMs === shift.atPdtMs,
+            );
+            if (known) continue;
+            this.delayShifts.push({
+              atPdtMs: shift.atPdtMs,
+              atMs,
+              shiftSec: shift.shiftSec,
+            });
+            while (this.delayShifts.length > MAX_DELAY_SHIFTS) this.delayShifts.shift();
+            this.recordTimelineEvent({
+              atMs,
+              kind: 'pdt-gap',
+              detail: `salto de ${shift.shiftSec}s no relógio de origem`,
+            });
+            log.warn(
+              {
+                stream: this.opts.streamName,
+                at: new Date(atMs).toISOString(),
+                shiftSec: shift.shiftSec,
+                esperadoSec: shift.expectedSec,
+              },
+              'atraso da stream aumentou (salto no relógio de origem da playlist)',
+            );
+          }
+        } catch {
+          // best-effort: nunca derruba o recorder
+        } finally {
+          this.playlistBusy = false;
+        }
+      })().catch(() => undefined);
+    }, PLAYLIST_WATCH_INTERVAL_MS);
+    this.playlistTimer.unref?.();
+  }
+
+  /**
+   * Offset entre o relógio de origem (PDT) e o relógio local (mtime).
+   * Aproxima pelo segmento local mais novo e o PDT mais novo — erro de
+   * um segmento (10s), o suficiente para dizer se um salto caiu antes
+   * ou depois da 1ª kill.
+   */
+  private estimateOriginOffsetMs(segments: Array<{ pdtMs: number | null }>): number {
+    const withPdt = segments
+      .map((segment) => segment.pdtMs)
+      .filter((value): value is number => value != null);
+    const local = this.listSegments();
+    if (local.length === 0) return 0;
+    let newestLocal = 0;
+    try {
+      newestLocal = fs.statSync(local[local.length - 1]).mtimeMs;
+    } catch {
+      return 0;
+    }
+    return originOffsetMs(withPdt, newestLocal);
+  }
+
+  /**
+   * Aumento do atraso (ms) acumulado na janela [fromMs, toMs] do
+   * relógio local. É o que corrige a âncora do início quando a stream
+   * "pulou" entre a medição anterior e a 1ª kill.
+   */
+  delayShiftSince(fromMs: number, toMs: number): number {
+    const from = Math.min(fromMs, toMs);
+    const to = Math.max(fromMs, toMs);
+    let total = 0;
+    for (const shift of this.delayShifts) {
+      if (shift.atMs < from || shift.atMs > to) continue;
+      total += shift.shiftSec;
+    }
+    return Math.round(total * 1000);
+  }
+
+  /** Saltos de atraso detectados (diagnóstico). */
+  delayShiftEvents(): Array<{ atMs: number; shiftSec: number }> {
+    return [...this.delayShifts];
+  }
+
+  /** Último offset origem→local (null = ainda não medido). */
+  originOffset(): number | null {
+    return this.originOffsetMs;
   }
 
   /**
@@ -356,8 +541,10 @@ export class StreamRecorder {
             // A chave inclui o mtime: o mesmo nome com mtime novo = novo
             // conteúdo = reanalisar.
             let key = base;
+            let mtimeMs = 0;
             try {
-              key = `${base}:${Math.round(fs.statSync(f).mtimeMs)}`;
+              mtimeMs = fs.statSync(f).mtimeMs;
+              key = `${base}:${Math.round(mtimeMs)}`;
             } catch {
               continue; // arquivo sumiu no meio (buffer rotacionando)
             }
@@ -382,6 +569,13 @@ export class StreamRecorder {
             if (verdict) {
               this.avIssues++;
               this.sinceSummary++;
+              if (verdict.kind === 'pts-jump' || verdict.kind === 'stall') {
+                this.recordTimelineEvent({
+                  atMs: mtimeMs,
+                  kind: verdict.kind,
+                  detail: `${base}: ${verdict.kind}`,
+                });
+              }
               log.warn({ seg: base, ...verdict }, 'segmento do buffer com divergência A/V');
             } else {
               this.sinceSummary++;
@@ -415,6 +609,10 @@ export class StreamRecorder {
     if (this.watchTimer) {
       clearInterval(this.watchTimer);
       this.watchTimer = null;
+    }
+    if (this.playlistTimer) {
+      clearInterval(this.playlistTimer);
+      this.playlistTimer = null;
     }
     const ff = this.ffmpeg;
     if (ff) {
@@ -455,5 +653,31 @@ export class StreamRecorder {
       }
     }
     return out.sort((a, b) => a.mtimeMs - b.mtimeMs).map((s) => s.file);
+  }
+
+  /** Registra um evento de quebra de continuidade (buffer circular). */
+  private recordTimelineEvent(event: TimelineEvent): void {
+    this.timelineEvents.push(event);
+    while (this.timelineEvents.length > MAX_TIMELINE_EVENTS) this.timelineEvents.shift();
+  }
+
+  /**
+   * Eventos de quebra de continuidade dentro da janela [fromMs, toMs]
+   * (timeline do vídeo = mtime dos segmentos).
+   *
+   * Um evento aqui significa que o material do clipe pode ter um buraco
+   * (a fonte reiniciou a base de PTS ou o probe viu salto/stall). Não é
+   * prova de conteúdo perdido, mas o clipe precisa ser marcado.
+   */
+  timelineEventsInWindow(fromMs: number, toMs: number): TimelineEvent[] {
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) return [];
+    const from = Math.min(fromMs, toMs);
+    const to = Math.max(fromMs, toMs);
+    return this.timelineEvents.filter((event) => event.atMs >= from && event.atMs <= to);
+  }
+
+  /** Todos os eventos de quebra registrados (diagnóstico). */
+  allTimelineEvents(): TimelineEvent[] {
+    return [...this.timelineEvents];
   }
 }

@@ -1,6 +1,7 @@
 import './env.js';
 import { z } from 'zod';
 import { parseLatencyMap } from './monitor/streamLatency.js';
+import { parseCropList, parseCropMap } from './clipper/scoreboardSync.js';
 
 /** Valores aceitos como "ligado" nas variáveis de ambiente. */
 const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'sim']);
@@ -151,8 +152,75 @@ export const ConfigSchema = z.object({
   CLIP_STREAM_SYNC: z.enum(['auto', 'log', 'off']).default('auto'),
   /** Maior espera pela transição do placar no buffer. */
   CLIP_STREAM_SYNC_MAX_LAG_SEC: z.coerce.number().min(0).max(180).default(120),
+  /**
+   * Aplica a latência ADAPTATIVA (medida por round) nas âncoras.
+   *
+   * true (default): com CLIP_STREAM_SYNC=auto, início/fim/timestamps usam
+   * a latência observada do canal; false: mantém o valor configurado e só
+   * registra a medição (shadow). No modo 'log' a medição é registrada mas
+   * nunca aplicada (o modo inteiro é shadow).
+   */
+  CLIP_STREAM_SYNC_ADAPTIVE: boolEnvField('CLIP_STREAM_SYNC_ADAPTIVE', true),
+  /**
+   * Delta (ms) acima do qual o round é considerado "regime trocou": a
+   * medição do fim do round discorda da amostra anterior. O início NÃO é
+   * adiantado por essa medição (só antecipado quando ela é menor — a
+   * subida pode ter acontecido depois da 1ª kill); o flag dispara o
+   * killfeed, que mede o instante exato dentro do vídeo.
+   */
+  CLIP_STREAM_SYNC_MAX_STEP_MS: z.coerce.number().min(0).max(120_000).default(20_000),
+  /**
+   * Arquivo do estado de latência por canal (medições + crop que
+   * funcionou). Persistir entre reinícios é o que faz a sincronização
+   * "entre partidas" ser fácil: o 1º round da partida nova já começa com
+   * a latência medida na partida anterior.
+   */
+  CLIP_STREAM_SYNC_STATE_PATH: z.string().default('./data/stream-latency.json'),
+  /**
+   * OCR do KILLFEED (nome do jogador no vídeo) como segunda medição.
+   *
+   * 'off': nunca; 'fallback' (default): só quando a medição do placar
+   * falhou ou o round trocou de regime; 'always': sempre.
+   * O killfeed dá o instante EXATO da kill no vídeo (independe da
+   * latência), mas é mais frágil: overlay escondido, feed rápido e
+   * nomes estilizados quebram o OCR.
+   */
+  CLIP_KILLFEED_SYNC: z.enum(['off', 'fallback', 'always']).default('fallback'),
   /** Crop normalizado x:y:w:h do placar no topo do vídeo. */
   CLIP_SCOREBOARD_CROP: z.string().default('0.30:0.03:0.40:0.10'),
+  /**
+   * Crop do placar por CANAL: JSON {"gaules": "0.02:0.02:0.30:0.14"}.
+   * Cada canal tem o overlay do placar em outro lugar — um crop que não
+   * lê nada deixa o canal sem medição (e sem âncora de fim).
+   */
+  CLIP_SCOREBOARD_CROP_BY_STREAM: z
+    .string()
+    .default('')
+    .transform((v) => parseCropMap(v)),
+  /**
+   * Crops alternativos (separados por vírgula) tentados quando o crop
+   * principal não produz nenhuma leitura. O crop que funciona é
+   * memorizado por canal e vira o principal no round seguinte.
+   */
+  CLIP_SCOREBOARD_CROP_FALLBACKS: z
+    .string()
+    .default('0.02:0.02:0.30:0.14,0.60:0.02:0.38:0.14,0.18:0.02:0.64:0.14')
+    .transform((v) => parseCropList(v)),
+  /**
+   * Crop do KILLFEED (nome do jogador no vídeo), usado como segunda
+   * medição de sincronização. Default: canto superior direito.
+   */
+  CLIP_KILLFEED_CROP: z.string().default('0.70:0.05:0.30:0.25'),
+  /** Crop do killfeed por CANAL: JSON {"gaules": "0.02:0.05:0.30:0.25"}. */
+  CLIP_KILLFEED_CROP_BY_STREAM: z
+    .string()
+    .default('')
+    .transform((v) => parseCropMap(v)),
+  /** Crops alternativos do killfeed (quando o principal não casa). */
+  CLIP_KILLFEED_CROP_FALLBACKS: z
+    .string()
+    .default('0.02:0.05:0.30:0.25,0.35:0.05:0.30:0.25,0.55:0.05:0.30:0.25')
+    .transform((v) => parseCropList(v)),
   /**
    * TEMPO extra de espera quando a transição do placar não é encontrada
    * (o material precisa chegar). NÃO afeta o corte: o fim do clipe sai

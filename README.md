@@ -183,10 +183,7 @@ quality even when watching at 1080p (the ~8 Mbps Twitch source remains the
 ceiling). The upscale includes light restoration (denoise before the scale
 so blocks are not amplified + adaptive sharpen afterwards) and the download is a stream copy
 (without the CRF 23 re-encode that `--force-keyframes-at-cuts` imposed).
-Live mode keeps the source resolution by default; `CLIP_UPSCALE_HEIGHT`
-(0 = off, 1440/2160) applies the same upscale to the live clip, in the same
-encode pass.
-`.json` + sqlite entry. Everything comes out tagged `[TESTE]` — never confuse it with a real clip.
+Everything comes out tagged `[TESTE]` — never confuse it with a real clip.
 On Windows prefer `npx tsx` directly (the `npm run ... --` sometimes swallows the flags).
 
 Rich metadata (optional, but recommended — they feed the title, description,
@@ -228,6 +225,76 @@ The live clip is rendered at the source resolution by default. `CLIP_UPSCALE_HEI
 it forces YouTube's VP9/AV1 pipeline (YouTube serves 1080p as AV1/H.264) but costs CPU,
 so it is opt-in.
 
+### Latência adaptativa (medida, não estimada)
+
+A latência real varia DENTRO da partida (o streamer pausa, o buffer do OBS engasga, a
+transcodificação do Twitch reinicia): entre 10s e 105s no histórico do bot. A latência
+configurada é só o ponto de partida — o bot passa a **medir** por round:
+
+| fonte da medição | o que dá |
+| --- | --- |
+| OCR do placar (virada de round no vídeo) | a latência da stream no round (sensor primário) |
+| OCR do killfeed (killer/vítima na tela) | o instante EXATO da 1ª kill dentro do vídeo |
+| `#EXT-X-PROGRAM-DATE-TIME` da playlist HLS | a hora em que a stream "andou" atrás do jogo (sem OCR) |
+| timer do placar do HLTV (`.scoreboard .timeText`) | o fim REAL do round no relógio do jogo (erro de ~3s, não ~20s) |
+
+Com isso, por round:
+
+- **início** do clipe = a latência em vigor na 1ª kill (a amostra medida **antes** do
+  evento). A amostra do fim do round só pode **antecipar** a abertura: quando é menor que
+  a anterior, vale ela; quando é maior, é ignorada — foi medida depois da 1ª kill e a
+  subida pode ter acontecido depois do kill. O caso "regime trocou" (|delta| >
+  `CLIP_STREAM_SYNC_MAX_STEP_MS`, default 20s) fica no log e dispara o killfeed, que mede
+  o instante exato dentro do vídeo. Amostra anterior com mais de 15min é tratada como
+  "prior velho": o início usa `min(prior, configurado)` em vez de confiar cegamente no
+  valor antigo (a stream pode ter mudado de regime entre as partidas).
+- **fim** do clipe = o **maior** valor entre a amostra do round, a janela recente e a
+  amostra anterior ajustada pelo salto do PDT: fechar mais tarde só custa cauda; fechar
+  mais cedo custa a última kill.
+- a medição fica persistida em `data/stream-latency.json` (`CLIP_STREAM_SYNC_STATE_PATH`),
+  então o primeiro round da partida seguinte já começa com a latência real da anterior.
+  O `reference` (`timer-hltv` ou `estimada`) também é persistido para o relatório.
+
+O OCR do killfeed varre da **1ª kill + latência de início** até a **última kill +
+latência de fim**, com tolerância dos dois lados: procurar cedo demais não acha a kill (o
+vídeo ainda não chegou nela) e procurar tarde demais perde o frame. O vídeo não pode ser
+varrido além do `scanDeadlineMs`, senão um crop que não acha o killfeed trava a próxima
+rodada.
+
+O casamento do killfeed exige **killer + vítima** (é o que prova que a kill é a do
+jogador). Quando o placar do HLTV não traz as vítimas, o bot as sintetiza a partir das
+stats e o killfeed pode não casar — nesse caso a medição é descartada (`after-only`/nada)
+e o corte segue pela âncora do placar. É a limitação conhecida do sensor, e a razão de o
+placar continuar sendo o sensor primário.
+
+O salto do relógio de origem (`#EXT-X-PROGRAM-DATE-TIME`) é **ambíguo**: um avanço do PDT
+pode ser aumento de atraso OU conteúdo omitido (e uma reprodução pausada que mantém o PDT
+contínuo não gera salto). Por isso ele não move a âncora do início por inferência — ele
+(a) dispara o OCR do killfeed, que mede o instante exato da 1ª kill no vídeo, e (b) entra
+como candidato conservador do fim estimado. O caso sem salto continua coberto pela
+medição do round seguinte.
+
+O modo `CLIP_STREAM_SYNC=log` é **shadow**: a varredura mede e registra (inclusive no
+estado persistido), mas nenhuma âncora — nem a adaptativa, nem a do killfeed — altera o
+corte. É o modo para comparar o comportamento antigo com o novo antes de confiar na
+medição; a aplicação só acontece com `CLIP_STREAM_SYNC=auto`.
+
+| variável | padrão | efeito |
+| --- | --- | --- |
+| `CLIP_STREAM_SYNC_ADAPTIVE` | `true` | aplica a latência medida nas âncoras (só com `CLIP_STREAM_SYNC=auto`) |
+| `CLIP_STREAM_SYNC_MAX_STEP_MS` | `20000` | acima disso, o round "trocou de regime" |
+| `CLIP_STREAM_SYNC_STATE_PATH` | `./data/stream-latency.json` | estado persistido por canal |
+| `CLIP_KILLFEED_SYNC` | `fallback` | `off` \| `fallback` (só quando o placar falha) \| `always` |
+| `CLIP_SCOREBOARD_CROP_BY_STREAM` | vazio | `{"gaules":"0.02:0.02:0.30:0.14"}` — crop do placar por canal |
+| `CLIP_SCOREBOARD_CROP_FALLBACKS` | 3 crops | crops tentados quando o principal não acha o placar |
+| `CLIP_KILLFEED_CROP` | `0.70:0.05:0.30:0.25` | crop do killfeed (canto direito) |
+| `CLIP_KILLFEED_CROP_BY_STREAM` | vazio | crop do killfeed por canal |
+| `CLIP_KILLFEED_CROP_FALLBACKS` | vazio | crops alternativos do killfeed |
+
+O relatório por canal sai de `npx tsx scripts/sync-report.ts` (lê o log + o estado
+persistido): n de medições, min/med/máx, maior salto, taxa de acerto do OCR e os saltos
+do relógio de origem.
+
 ## Structure
 
 ```text
@@ -237,14 +304,20 @@ src/monitor/hltvMonitor.ts (stars + preferência official/en + extração live/f
 src/monitor/pollSchedule.ts (puro: quanto tempo dormir até o próximo poll)
 src/monitor/pollSleep.ts (puro: deadline, wake e debounce da watchlist)
 src/monitor/liveTelemetry.ts (puro: latência de detecção da live)
-src/detector/aceDetector.ts (puro, testado) + matchTracker.ts (poll MR12: 13 pts)
-src/recorder/streamRecorder.ts (buffer circular)
+src/detector/aceDetector.ts + aceCoverage.ts + killParse.ts (puros, testados) + matchTracker.ts (poll MR12: 13 pts + timer do round)
+src/monitor/streamLatency.ts + latencyStore.ts (latência por canal: prior, round, persistência)
+src/recorder/streamRecorder.ts (buffer circular + playlist HLS)
+src/recorder/hlsTimeline.ts (puro: PDT e saltos do relógio de origem)
+src/clipper/scoreboardSync.ts (OCR da virada de round no vídeo; crop por canal)
+src/clipper/killfeedSync.ts (OCR do killfeed: instante exato da 1ª kill)
+src/clipper/clipAnchors.ts (puro: âncoras de início/fim do clipe)
 src/clipper/clipBuilder.ts (concat + sidecar json)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/uploader/youtubeUploader.ts (private)
 src/main.ts (supervisor asyncio-like)
 scripts/auth-youtube.ts
+scripts/sync-report.ts (latência por canal: log + estado persistido)
 tests/
 ```
 
@@ -409,10 +482,11 @@ The kill timestamps point at where the elimination happens in the video: they
 are measured from the **real** clip start (stored in the sidecar as
 `clipStartMs`; the estimate — first kill minus the context — is only the
 fallback for a clip whose opening was truncated by the buffer) and they apply
-the scoreboard→video offset (`CLIP_STREAM_LATENCY_MS` − `SCOREBOARD_DELAY_MS`),
+the scoreboard→video offset (the latency in force at the first kill —
+`startLatencyMs` in the sidecar — minus `SCOREBOARD_DELAY_MS`),
 because the timestamp of a kill is the moment the HLTV scoreboard *showed* it,
 while the recorded video only receives that material
-`CLIP_STREAM_LATENCY_MS` later (the HLS feed the recorder consumes runs that
+the latency later (the HLS feed the recorder consumes runs that
 much behind the game). With the default context (10s) the first elimination
 lands at `0:10`.
 

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  configuredCropForStream,
+  cropCandidatesForStream,
   findRoundTransition,
   findScoreTransition,
+  isValidCrop,
+  parseCropList,
+  parseCropMap,
   parseScoreboardCrop,
   parseScoreboardText,
   scoreKey,
@@ -140,5 +145,61 @@ describe('parseScoreboardCrop', () => {
       h: 0.1,
     });
     expect(parseScoreboardCrop('lixo')).toEqual({ x: 0.3, y: 0.03, w: 0.4, h: 0.1 });
+  });
+});
+
+describe('crop por canal', () => {
+  it('valida o formato x:y:w:h', () => {
+    expect(isValidCrop('0.02:0.02:0.30:0.14')).toBe(true);
+    expect(isValidCrop('0.8:0.1:0.5:0.2')).toBe(false);
+    expect(isValidCrop('lixo')).toBe(false);
+    expect(isValidCrop('0.02:0.02:0.30')).toBe(false);
+  });
+
+  it('lê o mapa de crops por canal (JSON, minúsculas)', () => {
+    const map = parseCropMap('{"Gaules":"0.02:0.02:0.30:0.14","bad":"invalido"}');
+    expect(map).toEqual({ gaules: '0.02:0.02:0.30:0.14' });
+    expect(parseCropMap('nao é json')).toEqual({});
+    expect(parseCropMap(undefined)).toEqual({});
+  });
+
+  it('lê a lista de crops alternativos (ignora inválidos, sem repetir)', () => {
+    expect(
+      parseCropList('0.02:0.02:0.30:0.14, 0.60:0.02:0.38:0.14, 0.02:0.02:0.30:0.14, lixo'),
+    ).toEqual(['0.02:0.02:0.30:0.14', '0.60:0.02:0.38:0.14']);
+    expect(parseCropList('')).toEqual([]);
+  });
+
+  it('acha o crop do canal pelo nome exato e pelo prefixo mais longo', () => {
+    const map = { gaules: '0.1:0.1:0.2:0.1', 'gaules 2': '0.2:0.2:0.2:0.1' };
+    expect(configuredCropForStream(map, 'gaules')).toBe('0.1:0.1:0.2:0.1');
+    expect(configuredCropForStream(map, 'Gaules 2 Oficial')).toBe('0.2:0.2:0.2:0.1');
+    expect(configuredCropForStream(map, 'outro')).toBeNull();
+  });
+
+  it('ordena os candidatos: configurado, memorizado, global e fallbacks', () => {
+    const candidates = cropCandidatesForStream({
+      globalCrop: '0.30:0.03:0.40:0.10',
+      byStream: { gaules: '0.02:0.02:0.30:0.14' },
+      streamName: 'gaules',
+      remembered: '0.60:0.02:0.38:0.14',
+      fallbacks: ['0.18:0.02:0.64:0.14', '0.02:0.02:0.30:0.14'],
+    });
+    expect(candidates[0]).toBe('0.02:0.02:0.30:0.14');
+    expect(candidates[1]).toBe('0.60:0.02:0.38:0.14');
+    expect(candidates[2]).toBe('0.30:0.03:0.40:0.10');
+    expect(candidates).toContain('0.18:0.02:0.64:0.14');
+    // Sem repetição.
+    expect(new Set(candidates).size).toBe(candidates.length);
+  });
+
+  it('sem crop configurado usa o memorizado e o global', () => {
+    const candidates = cropCandidatesForStream({
+      globalCrop: '0.30:0.03:0.40:0.10',
+      byStream: {},
+      streamName: 'gaules',
+      remembered: '0.60:0.02:0.38:0.14',
+    });
+    expect(candidates).toEqual(['0.60:0.02:0.38:0.14', '0.30:0.03:0.40:0.10']);
   });
 });

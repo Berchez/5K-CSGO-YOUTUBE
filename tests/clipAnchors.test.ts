@@ -85,3 +85,21 @@ describe('killVideoOffsetMs', () => {
     expect(killVideoOffsetMs(20_000, 5_000)).toBe(15_000);
   });
 });
+
+describe('computeClipAnchors (latência adaptativa por âncora)', () => {
+  it('usa a latência do INÍCIO para abrir o corte e a do FIM para fechar', () => {
+    const a = anchors({ startLatencyMs: 40_000, endLatencyMs: 70_000 });
+    expect(a.videoStartMs).toBe(T + 40_000);
+    expect(a.killVideoOffsetMs).toBe(35_000);
+    // Fim estimado: 60.000 − 20.000 + 70.000 + 8.000 + 8.000
+    expect(a.endMs).toBe(T + 126_000);
+    expect(a.startLatencyMs).toBe(40_000);
+    expect(a.endLatencyMs).toBe(70_000);
+  });
+
+  it('sem latência específica, cai na latência da stream', () => {
+    const a = anchors();
+    expect(a.startLatencyMs).toBe(25_000);
+    expect(a.endLatencyMs).toBe(25_000);
+  });
+});

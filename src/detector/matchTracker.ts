@@ -18,6 +18,63 @@ export interface RoundSnapshot {
   tScore: number;
   map: string;
   round: number;
+  /** Timer do round (s restantes) lido do placar do HLTV — null se ausente. */
+  timerSec?: number | null;
+  /** Estado do timer do round no placar do HLTV. */
+  timerState?: RoundTimerState;
+}
+
+/**
+ * Estado do timer do round no placar do HLTV:
+ * - 'running': o round está roando (timer contando);
+ * - 'round-over': o placar mostra "Round over" (o round acabou);
+ * - 'unknown': o placar não expõe o timer (formato diferente/ausente).
+ */
+export type RoundTimerState = 'running' | 'round-over' | 'unknown';
+
+/**
+ * Lê o timer do round no texto do placar ("1:07" = 67s; "Round over" =
+ * o round acabou). Puro/testável.
+ */
+export function parseRoundTimer(text: string): { sec: number | null; state: RoundTimerState } {
+  const raw = (text ?? '').replace(/\s+/g, ' ').trim();
+  if (!raw) return { sec: null, state: 'unknown' };
+  if (/round\s*over/i.test(raw)) return { sec: null, state: 'round-over' };
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return { sec: null, state: 'unknown' };
+  const sec = Number(match[1]) * 60 + Number(match[2]);
+  if (!Number.isFinite(sec) || sec < 0 || sec > 600) return { sec: null, state: 'unknown' };
+  return { sec, state: 'running' };
+}
+
+/**
+ * Instante do "Round over" a registrar (puro/testável).
+ *
+ * A PRIMEIRA observação válida vence. `observedAtMs` é o instante do
+ * POLL que viu o estado — não o "agora" de uma leitura tardia: quando o
+ * "Round over" só aparece depois da espera de assentamento das stats
+ * (10s), o instante certo é o do poll que detectou a virada do placar,
+ * não o da leitura 10s depois (que atrasaria o relógio do jogo e
+ * contaminaria a latência medida).
+ *
+ * `lastRunningAtMs` evita datar o break anterior ao tracking: sem um
+ * timer RODANDO visto recentemente, "Round over" é estado antigo.
+ */
+export function roundOverObservation(
+  previousMs: number | null,
+  timerState: RoundTimerState,
+  observedAtMs: number,
+  lastRunningAtMs: number | null,
+  maxSinceRunningMs = 120_000,
+): number | null {
+  if (previousMs != null) return previousMs;
+  if (timerState !== 'round-over') return null;
+  if (lastRunningAtMs == null) return null;
+  const sinceRunning = observedAtMs - lastRunningAtMs;
+  if (!Number.isFinite(sinceRunning) || sinceRunning < 0 || sinceRunning >= maxSinceRunningMs) {
+    return null;
+  }
+  return observedAtMs;
 }
 
 /**
@@ -81,10 +138,20 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
         if (mapText) map = mapText.slice(0, 30);
       }
       const round = ct + t + 1;
-      return { players, ctScore: ct, tScore: t, map, round };
+      // Timer do round: o placar do HLTV publica o relógio do jogo
+      // ("1:07") e "Round over" quando o round acaba. O texto bruto é
+      // parseado no Node (parseRoundTimer): o page.evaluate não pode
+      // chamar funções importadas (o tsx injeta __name e quebra).
+      const timerEl =
+        document.querySelector('.scoreboard .timeText') ||
+        document.querySelector('.scoreboard [class*="timeText"]') ||
+        document.querySelector('.timeText');
+      const timerText = ((timerEl && timerEl.textContent) || '').replace(/\s+/g, ' ').trim();
+      return { players, ctScore: ct, tScore: t, map, round, timerText };
     });
     if (!snap) return null;
-    return snap as RoundSnapshot;
+    const timer = parseRoundTimer(snap.timerText);
+    return { ...snap, timerSec: timer.sec, timerState: timer.state };
   } catch {
     return null;
   }
@@ -98,11 +165,13 @@ export interface TrackerCallbacks {
     kills: KillEvent[];
     /** ISO do 1º kill — ancora o início do clipe. */
     startedAt?: string;
-    /** Confiança na âncora (1ª kill pode não ser a 1ª real). */
+    /** Confiança da âncora (1ª kill pode não ser a 1ª real). */
     anchorConfidence?: AnchorConfidence;
     /** Placar antes/depois do fechamento do round. */
     scoreBefore?: string;
     scoreAfter?: string;
+    /** Fim real do round no relógio do jogo ("Round over" no placar). */
+    roundEndedAt?: string;
   }) => void;
   shouldStop: () => boolean;
 }
@@ -113,11 +182,17 @@ export interface PollEvent {
   round: number;
   kills: KillEvent[];
   startedAt?: string;
-  /** Confiança na âncora de início (1ª kill pode não ser a 1ª real). */
+  /** Confiança da âncora de início (1ª kill pode não ser a 1ª real). */
   anchorConfidence?: AnchorConfidence;
   /** Placar antes/depois do fechamento do round. */
   scoreBefore?: string;
   scoreAfter?: string;
+  /**
+   * Fim REAL do round no relógio do jogo (o placar do HLTV mostrou
+   * "Round over"). Ausente = sem timer no placar (aí a estimativa
+   * "detecção − atraso do placar" vale).
+   */
+  roundEndedAt?: string;
 }
 
 /** Máximo de kills possíveis num round (5 adversários). Acima = dado corrompido (gap). */
@@ -161,6 +236,7 @@ export function processPoll(
   minKills: MinKillsRule,
   delayCompMs = 10_000,
   lastSnapshot?: RoundSnapshot | null,
+  roundEndedAtMs?: number | null,
 ): { event: PollEvent | null; dropped: string | null; roundClosed: { map: string; round: number; score: string } | null; lastTotal: number } {
   const total = snap.ctScore + snap.tScore;
   let event: PollEvent | null = null;
@@ -225,6 +301,10 @@ export function processPoll(
           anchorConfidence,
           scoreBefore,
           scoreAfter: `${snap.ctScore}-${snap.tScore}`,
+          // Fim REAL do round no relógio do jogo (o placar mostrou
+          // "Round over") — quando não há, a estimativa (detecção −
+          // atraso do placar) continua valendo.
+          roundEndedAt: roundEndedAtMs ? new Date(roundEndedAtMs).toISOString() : undefined,
         };
       }
     } else {
@@ -281,6 +361,19 @@ export async function trackMatch(
     let lastSnap: RoundSnapshot | null = null;
     let lastSeenRound = -1;
     let lastGoodAt = 0;
+    /**
+     * Instante (wall) em que o placar mostrou "Round over": o fim
+     * REAL do round no relógio do jogo. É a referência que substitui a
+     * estimativa (detecção do ace − atraso do placar) na medição da
+     * latência — erro de um poll (3s) em vez de dezenas de segundos.
+     */
+    let roundOverAtMs: number | null = null;
+    /**
+     * Última vez que o timer do round apareceu RODANDO: sem isso, um
+     * tracker que entra no meio do break veria "Round over" e dataria
+     * o fim do round antigo como se fosse o do round atual.
+     */
+    let lastRunningAtMs: number | null = null;
     log.info('iniciando tracking do match');
 
     while (!cb.shouldStop()) {
@@ -295,6 +388,27 @@ export async function trackMatch(
         await page.waitForTimeout(5000);
         continue;
       }
+      /** Instante do poll que produziu o snapshot (não o "agora" tardio). */
+      const snapshotAtMs = Date.now();
+      // O placar mostrou "Round over"? Guarda o instante (o relógio do
+      // jogo, sem chute de atraso de publicação) — mas só se o timer
+      // estava RODANDO antes (senão é o break de antes do tracking).
+      const noteTimer = (snapshot: RoundSnapshot, observedAtMs: number): void => {
+        if (snapshot.timerState === 'running') {
+          lastRunningAtMs = observedAtMs;
+          return;
+        }
+        const next = roundOverObservation(
+          roundOverAtMs,
+          snapshot.timerState ?? 'unknown',
+          observedAtMs,
+          lastRunningAtMs,
+        );
+        if (next == null || next === roundOverAtMs) return;
+        roundOverAtMs = next;
+        log.info({ roundOverAt: new Date(roundOverAtMs).toISOString() }, 'round over no placar');
+      };
+      noteTimer(snap, snapshotAtMs);
       // Placar virou? Espera a coluna K assentar (ela atrasa em relação ao
       // placar — sem isso o último kill do round cai no round seguinte ou
       // some, e um 5k vira "4k"). 10s é seguro: rounds duram ~100s+.
@@ -302,7 +416,15 @@ export async function trackMatch(
       if (lastTotal >= 0 && total !== lastTotal) {
         await page.waitForTimeout(10000);
         const fresh = await readMatchSnapshot(page);
-        if (fresh) snap = fresh;
+        if (fresh) {
+          snap = fresh;
+          // O "Round over" pode ter aparecido só depois da virada do
+          // placar. Se ele ainda não tinha sido observado antes da
+          // espera, atribui o instante ao poll que viu a VIRADA (o round
+          // já havia acabado), não ao "agora" 10s depois — assim a
+          // medição não carrega o atraso artificial do assentamento.
+          noteTimer(snap, roundOverAtMs == null ? snapshotAtMs : Date.now());
+        }
       }
       // Apagão longo ou rounds pulados: reancora sem emitir (evita falsos
       // multikills gigantes com kills de vários rounds somados).
@@ -313,6 +435,7 @@ export async function trackMatch(
       }
       lastSeenRound = snap.round;
       lastGoodAt = nowMs;
+      const roundChanged = lastTotal >= 0 && snap.ctScore + snap.tScore !== lastTotal;
       const { event, dropped, roundClosed, lastTotal: next } = processPoll(
         tracker,
         snap,
@@ -320,7 +443,16 @@ export async function trackMatch(
         minKills,
         getConfig().SCOREBOARD_DELAY_MS,
         lastSnap,
+        roundOverAtMs,
       );
+      // O round fechou: o próximo "round over" é de outro round. O
+      // "running" anterior também é de outro round — sem resetar, o
+      // freeze que ainda mostra "Round over" dataria o fim do round
+      // SEGUINTE como se fosse o atual (latência medida negativa/errada).
+      if (roundChanged) {
+        roundOverAtMs = null;
+        lastRunningAtMs = null;
+      }
       lastTotal = next;
       lastSnap = snap;
       if (event) {
