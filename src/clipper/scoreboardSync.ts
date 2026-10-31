@@ -32,7 +32,13 @@ export interface ScoreTransition {
   before: string | null;
   after: string;
   marker: 'score' | 'round';
-  reason: 'confident' | 'after-only';
+  reason: 'confident' | 'after-only' | 'gap-inferred';
+  /**
+   * Instante do primeiro frame legível do placar NOVO (o "after"). Em
+   * `gap-inferred` ele é DEPOIS do fim real: o overlay ficou ilegível
+   * durante a tela de fim de round/replay e só voltou no round seguinte.
+   */
+  afterAtMs?: number;
 }
 
 export interface RoundEndEstimate {
@@ -40,9 +46,11 @@ export interface RoundEndEstimate {
   scoreBefore: string | null;
   scoreAfter: string | null;
   marker: 'score' | 'round' | null;
-  reason: 'confident' | 'after-only' | 'no-transition' | 'no-scoreboard';
+  reason: 'confident' | 'after-only' | 'gap-inferred' | 'no-transition' | 'no-scoreboard';
   /** Crop do placar que produziu a leitura (null = nenhum leu). */
   crop?: string | null;
+  /** Instante do primeiro frame legível do placar novo (diagnóstico). */
+  afterAtMs?: number | null;
 }
 
 export interface RoundEndScanOptions {
@@ -62,6 +70,12 @@ export interface RoundEndScanOptions {
   crops?: string[];
   shouldStop?: () => boolean;
   pollIntervalMs?: number;
+  /**
+   * Descarta o segmento mais novo da lista (ainda sendo escrito pelo
+   * recorder). Default true; quando a lista vem do freezer (arquivos já
+   * fechados), não há o que descartar.
+   */
+  skipNewest?: boolean;
 }
 
 export interface ScoreboardCrop {
@@ -244,6 +258,18 @@ export function formatScore(score: ScoreboardScore): string {
   return `${score.left}-${score.right}`;
 }
 
+/**
+ * Gap mínimo (ms) entre o último frame com o placar "before" e o primeiro
+ * com o "after" para o fim ser inferido: acima disto o "after" legível é
+ * do round SEGUINTE (o overlay some na tela de fim de round/replay).
+ */
+export const GAP_INFERENCE_MIN_MS = 20_000;
+/**
+ * Folga somada ao último frame "before" quando o fim é inferido: a tela
+ * de fim de round entra logo depois do último frame legível do placar.
+ */
+export const GAP_INFERENCE_ALLOWANCE_MS = 3_000;
+
 export function findScoreTransition(
   observations: ScoreboardObservation[],
   expectedBefore?: string | null,
@@ -273,12 +299,37 @@ export function findScoreTransition(
           }
         }
       }
+      const afterAtMs = sorted[i].streamAtMs;
+      /**
+       * O placar "after" só ficou legível no frame `afterAtMs` — mas o
+       * round pode ter fechado muito antes: na tela de fim de round e no
+       * replay o overlay some, e o primeiro frame legível com o placar
+       * novo é o do INÍCIO DO ROUND SEGUINTE (medido: +84,6s no caso
+       * 2399753_Dust2_r18_iM). Quando existe um gap longo entre o último
+       * "before" e o "after", o fim real fica no início do gap (o último
+       * frame em que o placar do round ainda estava na tela) — datar o
+       * fim no fim do gap produzia clipes de 180s com ~70s de cauda.
+       */
+      if (before != null && afterAtMs - before.streamAtMs > GAP_INFERENCE_MIN_MS) {
+        return {
+          streamAtMs: Math.min(
+            before.streamAtMs + GAP_INFERENCE_ALLOWANCE_MS,
+            afterAtMs - 1_000,
+          ),
+          before: formatScore(before.score),
+          after: formatScore(sorted[i].score),
+          marker: 'score',
+          reason: 'gap-inferred',
+          afterAtMs,
+        };
+      }
       return {
-        streamAtMs: sorted[i].streamAtMs,
+        streamAtMs: afterAtMs,
         before: before ? formatScore(before.score) : null,
         after: formatScore(sorted[i].score),
         marker: 'score',
         reason: before ? 'confident' : 'after-only',
+        afterAtMs,
       };
     }
     return null;
@@ -482,6 +533,7 @@ export async function scanRoundEndForScoreboard(
     marker: null,
     reason,
     crop,
+    afterAtMs: null,
   });
   const ffprobe = resolveFfprobeBin();
   if (!ffprobe) throw new Error('ffprobe indisponível para calibragem do placar');
@@ -540,7 +592,8 @@ export async function scanRoundEndForScoreboard(
 
     while (!options.shouldStop?.() && Date.now() <= deadlineMs) {
       const listed = options.listSegments();
-      const stableSegments = listed.length > 1 ? listed.slice(0, -1) : [];
+      const stableSegments =
+        (options.skipNewest ?? true) && listed.length > 1 ? listed.slice(0, -1) : listed;
       for (const file of stableSegments) {
         if (Date.now() > deadlineMs) break;
         let stat: fs.Stats;
@@ -591,6 +644,7 @@ export async function scanRoundEndForScoreboard(
             marker: found.marker,
             reason: found.reason,
             crop: cropUsed,
+            afterAtMs: found.afterAtMs ?? null,
           };
         }
       }
@@ -617,6 +671,7 @@ export async function scanRoundEndForScoreboard(
         marker: found.marker,
         reason: found.reason,
         crop: cropUsed,
+        afterAtMs: found.afterAtMs ?? null,
       };
     }
     return empty(observations.length === 0 ? 'no-scoreboard' : 'no-transition', cropUsed);

@@ -117,9 +117,10 @@ export interface ClipOptions {
   postRollSec: number;
   segmentTimeSec: number;
   /**
-   * Replay-aware SHADOW (Fase 1): 'shadow' (default) detecta a retomada de
-   * ação e LOGA o fim alternativo (ação − 2s) sem aplicar; 'off' pula;
-   * 'on' reservado à Fase 2 (por enquanto comporta-se como shadow).
+   * Replay-aware: 'auto' (default) fecha o clipe antes da retomada de
+   * ação do round seguinte quando o fim fixo passa dela com folga;
+   * 'on' aplica com qualquer sobreposição; 'shadow' só mede/loga;
+   * 'off' pula a detecção.
    */
   replayAware?: ReplayAwareMode;
   /** Contexto antes do 1º kill (default 10s). */
@@ -135,6 +136,12 @@ export interface ClipOptions {
   aceStartMs?: number;
   /** Epoch ms do fim do clipe (win panel parcial). Sem ele, usa cauda pós-detect. */
   aceEndMs?: number;
+  /**
+   * Fonte congelada (SegmentFreezer): todos os arquivos já estão fechados,
+   * então o mais novo NÃO é "em gravação" e não deve ser descartado —
+   * descartá-lo perderia a cauda do ace (que é justamente o fim do clipe).
+   */
+  frozenSource?: boolean;
   /** Optional fallback span; the builder probes its final sanitized inputs first. */
   concatSpanSec?: number;
   /** Optional fallback result of the span-vs-wall check. */
@@ -174,8 +181,11 @@ export interface ClipOptions {
   latencyChanged?: boolean;
   /** A janela do clipe contém quebra de continuidade da timeline. */
   timelineDiscontinuity?: boolean;
-  /** Thumb: default composed; ai tenta fundo IA com fallback. */
-  thumb?: SmartThumbOptions;
+  /**
+   * Piso do FIM (epoch ms) para o corte replay-aware: a última kill do
+   * ace tem que continuar no clipe — o corte nunca fecha antes dele.
+   */
+  minEndMs?: number | null;
 }
 
 export interface PickOptions {
@@ -309,11 +319,14 @@ async function probeVideoHeight(file: string): Promise<number | null> {
  * Sem isso um único segmento ruim derruba o concat inteiro (moov atom
  * not found) e o .txt órfão fica para trás.
  */
-export async function sanitizeSegments(files: string[]): Promise<{ ok: string[]; dropped: string[] }> {
+export async function sanitizeSegments(
+  files: string[],
+  opts?: { newestIsClosed?: boolean },
+): Promise<{ ok: string[]; dropped: string[] }> {
   const log = getLogger();
   const dropped: string[] = [];
   let rest = [...files];
-  if (rest.length > 2) {
+  if (opts?.newestIsClosed !== true && rest.length > 2) {
     const newest = rest.pop()!;
     dropped.push(newest);
     log.info({ dropped: path.basename(newest) }, 'segmento mais novo descartado (em gravação)');
@@ -439,7 +452,46 @@ export function applyDurationCap(
   return { trimEndSec, clamped: false };
 }
 
-export type ReplayAwareMode = 'off' | 'shadow' | 'on';
+export type ReplayAwareMode = 'off' | 'shadow' | 'auto' | 'on';
+
+/** Folga mínima entre o fim fixo e a retomada para o 'auto' cortar. */
+export const REPLAY_AWARE_MIN_OVERLAP_MS = 5_000;
+
+/**
+ * Fim efetivo do clipe quando a ação do round seguinte já RETOMOU.
+ *
+ * O fim ancorado pode passar do freeze e entrar no replay/ação do round
+ * seguinte (caso 2399753_Dust2_r18_iM: ~70s de cauda, 180s de clipe).
+ * Quando a ação retoma antes do fim fixo — com a folga de
+ * REPLAY_AWARE_MIN_OVERLAP_MS — o clipe fecha 2s antes da retomada (fim
+ * do freeze), preservando o win panel e cortando o replay.
+ *
+ * `minEndMs` é o PISO do corte: a última kill do ace tem que continuar
+ * no clipe. Sem o piso, o corte fechava ANTES da última kill (2399756:
+ * r9 terminava 0,8s depois da kill e r14 nem a continha) — quando a
+ * retomada cai antes do piso, o corte é descartado e vale o fim fixo.
+ *
+ * 'auto' aplica com a folga (o fim tem que passar CLARAMENTE da
+ * retomada); 'on' aplica com qualquer sobreposição (override manual);
+ * 'shadow'/'off' nunca aplicam. Puro/testável.
+ */
+export function resolveReplayAwareEndMs(
+  fixedEndMs: number | null,
+  actionStartMs: number | null,
+  mode: ReplayAwareMode,
+  fallbackEndMs: number,
+  minEndMs?: number | null,
+): { endMs: number | null; trimmed: boolean } {
+  if (mode !== 'auto' && mode !== 'on') return { endMs: fixedEndMs, trimmed: false };
+  if (actionStartMs == null) return { endMs: fixedEndMs, trimmed: false };
+  const replayEndMs = actionStartMs - 2_000;
+  const floorMs = Math.max(0, minEndMs ?? 0);
+  if (replayEndMs < floorMs) return { endMs: fixedEndMs, trimmed: false };
+  const guardMs = mode === 'on' ? 0 : REPLAY_AWARE_MIN_OVERLAP_MS;
+  const currentEndMs = fixedEndMs ?? fallbackEndMs;
+  if (currentEndMs <= replayEndMs + guardMs) return { endMs: fixedEndMs, trimmed: false };
+  return { endMs: replayEndMs, trimmed: true };
+}
 
 export interface MotionResume {
   /** Segundos do início do concat; null quando sem retomada clara. */
@@ -830,7 +882,9 @@ export async function buildClip(
       'segmentos intercalados (fantasma?) descartados — usando cauda contígua',
     );
   }
-  const { ok: usable, dropped } = await sanitizeSegments(tail.ok);
+  const { ok: usable, dropped } = await sanitizeSegments(tail.ok, {
+    newestIsClosed: opts.frozenSource === true,
+  });
   if (usable.length === 0) {
     throw new Error(
       `sem segmentos legíveis no buffer (descartados: ${dropped.map((d) => path.basename(d)).join(', ') || 'nenhum'})`,
@@ -949,16 +1003,53 @@ export async function buildClip(
     const stale = killStale(path.resolve(outPath));
     if (stale > 0) log.warn({ stale }, 'render fantasma morto');
 
-    // Replay-aware SHADOW (Fase 1): detecta onde a ação do round seguinte
-    // retoma e LOGA o fim alternativo (ação − 2s, incluindo o replay) vs a
-    // âncora fixa — sem aplicar. 'on' ainda age como shadow (Fase 2 futura).
-    const replayMode = opts.replayAware ?? 'shadow';
+    // Replay-aware: detecta onde a ação do round seguinte retoma e, em
+    // 'auto'/'on', fecha o clipe ANTES dela (ação − 2s = fim do freeze).
+    // Sem isso o fim ancorado pode entrar no replay e no round seguinte
+    // (medido: 70s de cauda no caso 2399753_Dust2_r18_iM).
+    const replayMode = opts.replayAware ?? 'auto';
     if (replayMode !== 'off') {
       try {
         actionResume = await detectActionResume(usable, resolveFfmpegBin());
-        if (actionResume.actionStartSec != null) {
-          // actionStartSec é relativo ao início do concat (pré-trim).
-          replayAwareEndMs = Math.round(firstSegStartMs + actionResume.actionStartSec * 1000 - 2000);
+        // actionStartSec é relativo ao início do concat (pré-trim).
+        const actionStartVideoMs =
+          actionResume.actionStartSec != null
+            ? Math.round(firstSegStartMs + actionResume.actionStartSec * 1000)
+            : null;
+        if (actionStartVideoMs != null) replayAwareEndMs = actionStartVideoMs - 2_000;
+        const replayEnd = resolveReplayAwareEndMs(
+          opts.aceEndMs ?? null,
+          actionStartVideoMs,
+          replayMode,
+          firstSegStartMs + concatLenSec * 1000,
+          opts.minEndMs ?? null,
+        );
+        if (replayEnd.trimmed && replayEnd.endMs != null) {
+          const adjusted = computeTrimEndSec(
+            firstSegStartMs,
+            usable.length,
+            opts.segmentTimeSec,
+            replayEnd.endMs,
+            trimStartSec,
+            concatLenSec,
+          );
+          // Só encurta — nunca estende o fim já decidido.
+          if (adjusted != null && (trimEndSec == null || adjusted < trimEndSec)) {
+            log.warn(
+              {
+                matchId: ace.matchId,
+                actionStartMs:
+                  actionStartVideoMs != null ? new Date(actionStartVideoMs).toISOString() : null,
+                replayAwareEnd: new Date(replayEnd.endMs).toISOString(),
+                fixedEnd: opts.aceEndMs != null ? new Date(opts.aceEndMs).toISOString() : null,
+                pisoFim: opts.minEndMs != null ? new Date(opts.minEndMs).toISOString() : null,
+                antesSec: trimEndSec != null ? Math.round(trimEndSec) : null,
+                depoisSec: Math.round(adjusted),
+              },
+              'replay-aware: clipe fechado antes da ação do round seguinte (replay fora)',
+            );
+            trimEndSec = adjusted;
+          }
         }
         log.info(
           {
@@ -972,13 +1063,10 @@ export async function buildClip(
             windowSec: actionResume.windowSec,
             reason: actionResume.reason,
           },
-          'retomada de ação (shadow replay-aware)',
+          'retomada de ação (replay-aware)',
         );
-        if (replayMode === 'on') {
-          log.warn('REPLAY_AWARE=on ainda sem aplicação (Fase 2) — agindo como shadow');
-        }
       } catch {
-        // best-effort: shadow nunca quebra o pipeline
+        // best-effort: nunca quebra o pipeline
       }
     }
 
@@ -1101,7 +1189,6 @@ export async function buildClip(
     'clipe montado (passada única: emenda A/V realinhada)',
   );
 
-  const stat = fs.statSync(outPath);
   const durationSec =
     trimEndSec != null
       ? Math.max(5, Math.round(trimEndSec))
@@ -1110,22 +1197,14 @@ export async function buildClip(
           Math.min(wantSec, usable.length * opts.segmentTimeSec) - Math.round(trimStartSec),
         );
 
-  // Thumbnail estilo canal de cortes: frame + selo ACE!/jogador/confronto.
-  // Frame de ~3s antes do 5º kill (meio do ace) — meio do clipe costuma ser break/torcida.
-  const thumbPath = path.join(clipDir, `${base}.jpg`);
-  try {
-    await makeSmartThumbnail(outPath, thumbPath, ace, Math.max(1, opts.preRollSec - 3), opts.thumb);
-  } catch (e) {
-    // Com o erro real: "falha ao gerar thumbnail" sozinho já escondeu a
-    // causa raiz mais de uma vez (ex: frame ilegível vs sharp vs fontes).
-    log.warn({ err: String(e).slice(0, 300) }, 'falha ao gerar thumbnail, seguindo sem ela');
-  }
-
   // Início real do clipe (timeline do concat + trim): o sidecar é a
   // fonte da verdade para os timestamps da descrição (a estimativa
   // "1ª kill − contexto" erra quando a abertura foi truncada).
   const clipStartMs = Math.round(firstSegStartMs + trimStartSec * 1000);
 
+  // Sidecar ANTES da thumbnail (F4): o .json nasce junto com o vídeo —
+  // a geração da thumb (IA, até minutos) NÃO pode impedir o registro do
+  // clipe (caso 2399755_Dust2_r21_zorte, que ficou sem .json).
   fs.writeFileSync(
     sidecarPath,
     JSON.stringify(
@@ -1162,7 +1241,6 @@ export async function buildClip(
   return {
     filePath: outPath,
     sidecarPath,
-    thumbnailPath: fs.existsSync(thumbPath) ? thumbPath : undefined,
     durationSec,
     clipStartMs,
     clipDurationSec: outDurSec,
@@ -1206,4 +1284,57 @@ export function buildSidecar(ace: AceEvent, extra: Record<string, unknown> = {})
     ? { ...ace.summary, kills: undefined, killCount: ace.summary.kills.length }
     : undefined;
   return { ...ace, summary, ...extra };
+}
+
+export interface ClipThumbnailOptions {
+  /** Jpg de saída (default: mesmo nome do mp4, ao lado). */
+  outPath?: string;
+  /** Segundo do clipe a fotografar (default 57 = meio do ace). */
+  atSec?: number;
+  thumb?: SmartThumbOptions;
+}
+
+/**
+ * Gera a thumbnail de um clipe JÁ RENDERIZADO.
+ *
+ * F4: roda DEPOIS do upload — a IA de thumbnail pode levar minutos
+ * (THUMB_AI_TIMEOUT_MS) e o vídeo não pode esperar por ela para subir.
+ * Best-effort: devolve null quando falha (o vídeo segue sem thumb).
+ */
+export async function makeClipThumbnail(
+  ace: AceEvent,
+  clipPath: string,
+  opts: ClipThumbnailOptions = {},
+): Promise<string | null> {
+  const outPath =
+    opts.outPath ??
+    (clipPath.toLowerCase().endsWith('.mp4')
+      ? `${clipPath.slice(0, -4)}.jpg`
+      : `${clipPath}.jpg`);
+  try {
+    await makeSmartThumbnail(clipPath, outPath, ace, opts.atSec ?? 57, opts.thumb);
+    return fs.existsSync(outPath) ? outPath : null;
+  } catch (e) {
+    // Com o erro real: "falha ao gerar thumbnail" sozinho já escondeu a
+    // causa raiz mais de uma vez (ex: frame ilegível vs sharp vs fontes).
+    getLogger().warn({ err: String(e).slice(0, 300) }, 'falha ao gerar thumbnail, seguindo sem ela');
+    return null;
+  }
+}
+
+/**
+ * Anota a thumbnail no sidecar depois da geração (o .json nasce antes,
+ * para o clipe nunca ficar sem registro se a thumb falhar).
+ */
+export function patchSidecarThumbnail(sidecarPath: string, thumbnailPath: string | null): void {
+  try {
+    const doc = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
+    doc.thumbnailFile = thumbnailPath != null ? path.basename(thumbnailPath) : null;
+    fs.writeFileSync(sidecarPath, JSON.stringify(doc, null, 2));
+  } catch (e) {
+    getLogger().warn(
+      { err: String(e).slice(0, 200) },
+      'falha ao anotar a thumbnail no sidecar',
+    );
+  }
 }

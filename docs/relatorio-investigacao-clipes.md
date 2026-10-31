@@ -234,3 +234,206 @@ Validação de código após as alterações: typecheck e suíte completa (37 ar
 testes) passaram. A validação **ao vivo** ainda depende de uma partida gravada com o
 build novo: o critério continua sendo o mesmo (clipe que abre antes da 1ª kill ou perde
 a última kill ⇒ rollback da latência adaptativa via `CLIP_STREAM_SYNC_ADAPTIVE=false`).
+
+## 11. Correções dos 4 clipes de 29/10/2026 (29/10/2026)
+
+Casos analisados (registros em `data/clips/`): `2399949_Mirage_r13_biguzera` (23,2s, só
+replay), `2399755_Dust2_r21_zorte` (17,9s, sem `.json`/`.jpg`), `2399948_Inferno_r18_saadzin`
+(10,7s, 100% replay) e `2399753_Dust2_r18_iM` (180s de cap, ~70s de cauda). Causas raiz
+independentes — cada correção abaixo fecha uma delas:
+
+- **F3 — `roundEndedAt` do round certo.** A observação "Round over" era a **primeira que
+  vence** desde o início da partida: quando o timer falhava num round, o valor antigo era
+  reaproveitado e o clipe do iM foi ancorado no fim do round ANTERIOR (latência medida de
+  238s). O tracker agora devolve `{round, atMs}` e o evento do round só aceita a observação
+  **daquele round** (janela de 120s); observações de outro round são logadas e ignoradas.
+- **F2a — buraco no OCR do placar vira inferência, não início do próximo round.** A
+  varredura leva ~90s (frames seriais); quando o frame "antes" e o "depois" ficam a mais de
+  20s, o primeiro frame legível do placar "depois" já é o **início do round seguinte** — era
+  isso que adiantava o fim em +84,6s no iM. `findScoreTransition` agora marca
+  `reason: 'gap-inferred'` e ancora no último frame "antes" + 3s, com o `afterAtMs` gravado
+  no log/sidecar para auditoria.
+- **F2b — virada implausível no vídeo é rejeitada.** Se a virada do placar encontrada no
+  vídeo cai **depois** da estimativa + `CLIP_END_PLAUSIBILITY_SEC` (default 60s), ela só
+  pode ser de um round posterior: o fim estimado prevalece (`ocrEndRejected` no log). O
+  teste é assimétrico de propósito: uma virada **mais cedo** que a estimativa continua
+  valendo (latência menor que a configurada é possível e a âncora exata tem prioridade);
+  uma virada tardia demais, não — o round já teria acabado.
+- **F2c — replay-aware (o fix real do iM).** O cap de 180s não era o problema: com a
+  latência adaptativa (~105s), o round terminava ~90s antes do vídeo mostrar a ação, e o
+  clipe incluía ~70s do round seguinte — começando pelo **replay**. A fila de render agora
+  detecta a retomada de ação depois do fim fixo (`detectActionResume`) e fecha o clipe 2s
+  antes dela, **só encurtando** e só quando a sobreposição passa de 5s. `REPLAY_AWARE=auto`
+  (default) aplica com a folga; `shadow` só loga; `off`/`on` desligam/forçam.
+- **F1 — freezer de segmentos (o OCR não pode esperar o anel).** O snapshot era tirado
+  **depois** do OCR (serial, ~90s) e o anel de 240s já tinha rotacionado os segmentos do
+  início do ace — o clipe abria no meio. Ao detectar o ace, os segmentos são **copiados
+  imediatamente** para `CLIPS_DIR/.build/<id>-freeze` (`SegmentFreezer`, polling 1,5s,
+  para no arquivo em gravação, respeita `DISK_MIN_FREE_GB`); OCR, killfeed e render leem
+  dessa cópia congelada. `CLIP_FREEZE=off` volta ao caminho antigo. Sem o freezer, o
+  `skipNewest` do OCR/killfeed continua valendo; com o freezer não (todos os arquivos já
+  estão fechados).
+- **F5 — cobertura estrita: ace sem a 1ª kill é descartado.** No saadzin, a 1ª kill
+  antecedia o buffer e o clipe saía 100% replay. `evaluateAceCoverage` agora distingue três
+  motivos: `no-kills` (nada no buffer), `first-kill-missing` (a 1ª kill antecede o material)
+  e `first-kill-not-seen` (o killfeed varreu a janela **inteira** — `windowCovered` — e
+  achou outras kills, mas não a 1ª ⇒ a régua de latência estava otimista). Em qualquer um,
+  o evento é descartado no DB (não vira clipe) quando `CLIP_COVERAGE_STRICT=true` (default).
+  Aborto/timeout do killfeed **não** descarta (não é evidência de ausência).
+  *(Histórico — revogado no §12/K6: `first-kill-not-seen` saiu porque "OCR não leu o
+  nome" destruiu 3 aces bons do 2399756; o strict agora exige posição exata ou régua
+  que prove ausência.)*
+- **F4 — ordem mp4 → json → jpg.** A thumb IA (até 600s) rodava **antes** do upload e o
+  zorte ficou sem `.json` porque o processo caiu no meio. `buildClip` agora escreve o
+  sidecar logo após o render e não gera mais thumbnail; o upload sobe só o mp4, a thumb é
+  gerada depois (`makeClipThumbnail`, best-effort, falha = sem thumb) e aplicada via
+  `thumbnails.set` (`applyThumbnail`), com o sidecar anotado por `patchSidecarThumbnail`.
+  Um clipe sem thumbnail é aceitável; um clipe sem metadados/upload não é.
+- **Latência do DutchBoyCasts.** Os clipes de 29/10 mostraram ~13s reais nesse canal (o
+  configurado era 25s): `.env` ganhou `CLIP_STREAM_LATENCY_BY_STREAM={"dutchboycasts":15000}`
+  (a chave é prefixo, case-insensitive). A medição adaptativa continua corrigindo ao vivo.
+
+Novas configs: `CLIP_FREEZE` (default `auto`), `CLIP_COVERAGE_STRICT` (default `true`),
+`CLIP_END_PLAUSIBILITY_SEC` (default `60`), `REPLAY_AWARE` (default `auto`). Rollbacks
+independentes: `CLIP_FREEZE=off`, `CLIP_COVERAGE_STRICT=false`, `REPLAY_AWARE=off`,
+`CLIP_STREAM_SYNC_ADAPTIVE=false`.
+
+Validação de código: typecheck e suíte completa (38 arquivos, 598 testes) passaram. A
+validação **ao vivo** segue pendente (os 4 casos já saíram do anel do buffer); critério:
+clipe que abrir no replay, antes da 1ª kill ou perder a última kill ⇒ conferir o log
+(`sync.reason`, `ocrEndRejected`, `replayAwareEnd`, `falta`) e aplicar o rollback da
+camada correspondente.
+
+## 12. Regressão dos 6 clipes do 2399756 — killfeed como âncora primária (30/10/2026)
+
+Os 6 clipes de `2399756_Cache` (gaules, PGL Masters Bucharest 2026) saíram com os mesmos
+defeitos de antes do F1–F5: `r9` com a 1ª kill 1s após a abertura, `r11`/`r14`/`r8` sem a
+1ª kill (replay/round seguinte), `r4` cortando as kills 2–3, `r10` com "render vazio".
+Regressão do `517401e` (latência medida por round aplicada ao INÍCIO).
+
+**Modelo errado:** o `observedLatencyMs` do placar é **latência da stream + atraso de
+publicação do placar** (~13–20s), não latência. No gaules a latência real era **45,0s**;
+as amostras registradas diziam 58–63s — e o código as aplicou na âncora do INÍCIO
+(`fonteLatency: "prior"`). As 5 amostras do canal eram todas `after-only`.
+
+**Medição empírica (harness offline de OCR, ffmpeg+tesseract via pipe sobre os clipes
+renderizados, sem escrever em disco):**
+
+- o crop do killfeed funciona (leitura em 4/4 aces testáveis) — o defeito era o **matching**:
+  `khaN→haN`, `KaiR0N-→KaiRON-`, `jL→IL`, `Xant3r→Yont3r`;
+- `kill.at` (poll do HLTV) atrasa 5,2s / 5,3s / **16,4s** na mesma partida ⇒ o offset por
+  kill varia 11s e o cluster de 2,5s divide conjuntos legítimos;
+- self-kill (`ZywOo→ZywOo`, `jL→jL`) casava qualquer frame com o nome (falso positivo);
+- o matcher antigo nunca casava `jL` (mínimo de 3 letras);
+- com matching tolerante, a **1ª aparição** da linha da 1ª kill é a âncora exata em 4/4 aces.
+
+**Correções (6 camadas independentes):**
+
+- **K1 — matcher tolerante + âncora direta (`killfeedSync.ts`).** Distância de edição ≤1
+  com as confusões do OCR (0↔O, 1↔l/I) — inclusive para nomes de 2 letras (evidência r5:
+  `jL` lido `IL`; o falso positivo fica preso por exigir killer+vítima próximos no texto
+  e, no fim, pelo teto da última kill), killer e
+  vítima precisam estar próximos no texto (mesma linha) e self-kill exige o nome 2x. A
+  âncora do início passou a ser a **1ª aparição da linha da 1ª kill − 1s** (medição direta,
+  não depende de `kill.at` nem de latência); o offset (mediana do cluster) só alimenta os
+  timestamps/estado quando há corroboração (≥2 kills no mesmo cluster) — novo motivo
+  `first-kill-only` (âncora exata, offset sem corroboração). `minimumMatches` caiu de 3/3
+  para 2/3. Novo campo `lastKillVideoMs` (1ª aparição da última kill lida), com TETO
+  (âncora + intervalo placar entre kills + 25s) para um casamento falso no round seguinte
+  não empurrar o fim. A varredura só para cedo quando TODAS as kills foram lidas — antes,
+  `confident` na 2ª kill truncava o `lastKillVideoMs` (e o `windowCovered` mentia).
+- **K2 — o placar nunca define o início (`streamLatency.ts`).** `resolveAdaptiveLatency` só
+  usa amostras `confident` com fim vindo do **timer do HLTV** para o início (as
+  `estimada` carregam o erro de `CLIP_SCORE_DELAY_MS`); `after-only`/`gap-inferred` são
+  âncoras de FIM. Estado v2 (`LATENCY_STATE_VERSION=2`): as amostras v1 são descartadas
+  (as do gaules estavam envenenadas) mas os **crops memorizados** são resgatados; a
+  restauração só aceita `confident`. `main.ts` só **registra** amostra com transição
+  confiante.
+- **K3 — killfeed aciona sempre que o placar não é confiante (`main.ts`).** O gatilho era
+  só `no-scoreboard`/`no-transition`: nos rounds `after-only`/`gap-inferred` (os piores) o
+  killfeed nem rodava. Não roda com `CLIP_STREAM_SYNC=off` (o sync todo desligado) e, em
+  `log` (shadow), o resultado é só do log — não entra em âncora nem em descarte. A janela
+  de varredura ganhou folga (máx do dobro do configurado ou +30s) — o regime real (45s)
+  escapava da janela do config (25s).
+- **K4 — piso do fim SEMPRE presente e fim impossível rejeitado (`clipAnchors.ts`).** O
+  fim nunca fica abaixo do piso (`endFloorMs` no log/sidecar), que é o máximo entre: a
+  última kill **medida** pelo killfeed + cauda; a última kill **estimada**
+  (`at − atraso + latência + cauda`) — vale mesmo sem killfeed (placar confiante); a
+  virada **genuína** do placar (o round acaba depois da última kill); e
+  `videoStart + 10s` (`MIN_CLIP_DURATION_SEC`, `endPinnedBy`). Mata o "render vazio"
+  (4,1s) e o corte das últimas kills. E a virada lida **antes** do fim do round no
+  relógio do jogo (`gameRoundEndedAtMs`, com tolerância de um poll do placar) é
+  rejeitada: o vídeo é sempre posterior (r4/r10 tinham −11s e −10,3s de "latência").
+- **K5 — replay-aware com piso (`clipBuilder.ts`).** `resolveReplayAwareEndMs` ganhou
+  `minEndMs` (= `endFloorMs`): o corte nunca fecha antes do piso — sem ele o corte
+  `auto` fechava no MEIO do ace quando a última transição quieto→ativo detectada era
+  intra-round (r8: compra→ação do próprio round; as 3 kills saíam do clipe).
+- **K6 — F5 só com evidência forte (`aceCoverage.ts`).** O descarte por "killfeed varreu e
+  não viu a 1ª kill" saiu (OCR falho ≠ ausência). O strict agora descarta só com a posição
+  **exata** da 1ª kill (killfeed) fora do buffer, ou com régua confiável (teto conservador
+  na checagem inicial; offset medido na checagem final). Recupera os 3 aces destruídos.
+
+**Config:** `.env` ganhou `"gaules":45000` no `CLIP_STREAM_LATENCY_BY_STREAM` (medido;
+enquanto o killfeed não é a âncora padrão, é o fallback que abre no lado certo).
+
+Rollbacks independentes: `CLIP_STREAM_SYNC_ADAPTIVE=false` (início volta ao configurado),
+`CLIP_KILLFEED_SYNC=off`, `CLIP_COVERAGE_STRICT=false`, `REPLAY_AWARE=off`.
+
+**Revisão (review externo, 31/10):** 6 correções incorporadas — a varredura do killfeed só
+para cedo com TODAS as kills lidas (o `confident` na 2ª kill truncava o `lastKillVideoMs` e
+o `windowCovered` mentia); piso do fim **sempre** presente (última kill estimada + virada
+genuína do placar, `endFloorMs`), inclusive sem killfeed — sem ele o corte replay-aware
+`auto` fechava no meio do ace (r8); `log`/`off` não deixam mais o killfeed alterar âncoras
+nem descartar aces; `insertClip`/tray agora ANTES da thumbnail (crash = vídeo no ar sem
+registro no banco); teto para o `lastKillVideoMs` (casamento falso no round seguinte);
+freezer para logo após a cobertura e reconfere a origem pós-cópia (anel reescrito durante a
+cópia = cópia mistura descartada); estado v1 resgata só os crops; amostras `estimada`
+não alimentam o início; a checagem inicial usa o teto real de plausibilidade (120s); a
+thumb ancora na última kill dentro do clipe. Recusados (com motivo): voltar
+`REPLAY_AWARE=shadow` (o piso resolve a causa), distância 0 para nomes de 2 letras
+(evidência r5 `jL` lido `IL`), max() do `gap-inferred` como âncora de fim (o piso já
+protege as kills; revisar após a validação ao vivo), semáforo de OCR/freezer por partida
+(arquitetura — follow-up).
+
+**Revisão 2 (review externo, 31/10 — mesmo diff):** 10 correções incorporadas —
+matcher com a CLASSE de confusão {1,i,j,l} e distância 0 para nomes de até 3
+letras (uma leitura falsa virava âncora e descarte sem corroboração; o r5 `jL`
+lido `IL` continua casando, `al` não); `lastKillVideoMs` só com âncora
+(`confident`/`first-kill-only` e teto também na âncora derivada — sem âncora o
+valor é null, senão um casamento no round seguinte virava barreira dura do
+replay-aware); o piso ESTIMADO não passa do fim genuíno do OCR (a última kill é
+sempre anterior ao fim do round; sem o cap o piso conservador devolvia cauda);
+tolerância da virada do placar soma `CLIP_SCORE_DELAY_MS` quando o fim do round
+é a ESTIMATIVA (±20s); amostra de latência só é gravada DEPOIS da sanidade do
+fim (um OCR do round seguinte persistia um fim 80s tarde e atrasava o início do
+próximo ace); `loadLatencyState` passou a aceitar v1 (recusava antes do
+`fromJSON`, deixando o resgate de crops inalcançável); crop do KILLFEED
+memorizado por canal (mapa separado do crop do placar); cópia do freezer
+assíncrona com passadas não sobrepostas e contador de falhas; fallback ao anel
+quando o freezer não produziu cópia nenhuma (antes desistia do clipe com o anel
+íntegro); thumb de fallback limitada à duração do clipe. Recusados: piso
+"estrito" separado para o replay-aware (o piso conservador é a proteção que o
+r8 exigiu — a inflação só acontece sem amostra do round e o custo é cauda, não
+kill perdida); soft-discard do ace (o descarte já vai para `discarded_events`
+com motivo — auditoria, não perda silenciosa); cobertura inicial com o teto de
+120s (é de propósito: descartar é destrutivo); `gap-inferred` como âncora de fim
+(o piso já protege as kills); `UploadOptions.thumbnailPath` removido (usado pelo
+`scripts/test-vod.ts`). Skipped (follow-up): freezer por partida, semáforo/worker
+compartilhado de OCR, orçamento de frames, timestamps por kill no killfeed,
+amostras `source:'killfeed'`, quebra do PR em lotes.
+
+**Revisão 2 — validação com o corpus (harness, 31/10):** rodando o código real
+sobre os 4 clipes, as âncoras de INÍCIO reproduziram exatamente as do
+`clipStartMs` gravado (0,0s de diferença) e o matcher endurecido não perdeu
+nenhum casamento (`jL`/`IL`/`ll` continuam casando). O harness expôs um defeito
+que o review não viu: o piso ESTIMADO da última kill entrava **mesmo com a
+última kill MEDIDA** e, como `endLatencyMs` é score→score (61,8s vs 45,2s
+reais no r9), dominava o piso e forçava 20–46s de cauda (r11: piso 46s depois
+da kill real) — o corte replay-aware ficava impossibilitado. Correção: o piso
+estimado só vale quando o killfeed NÃO mediu a última kill, e o chamador só
+passa `lastKillVideoMs` com cobertura COMPLETA (`confident` + todas as kills
+lidas) — com 1 de 3 (r4) o valor seria a PRIMEIRA kill e o piso ficaria cedo.
+Tradeoff conhecido e mantido: o piso da VIRADA do placar (`ocrEndMs`) continua
+valendo, então o clipe pode terminar no instante em que o placar publica o
+novo score (~3s depois do fim real do round no vídeo, ~24s depois da última
+kill no r9) — é a proteção que o r8 exigiu (corte no meio do ace).

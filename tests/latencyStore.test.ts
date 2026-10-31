@@ -53,6 +53,30 @@ describe('loadLatencyState / saveLatencyState', () => {
     expect(loaded.state.channels()).toEqual([]);
   });
 
+  it('v1 chega ao fromJSON e resgata os crops (as amostras não)', () => {
+    // Regressão: recusar v1 aqui deixava o resgate de crops do fromJSON
+    // inalcançável — o canal perdia o crop que já funcionava.
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        streams: {
+          gaules: {
+            samples: [{ measuredAtMs: 1_000, latencyMs: 58_779, source: 'scoreboard', quality: 'after-only' }],
+            crop: '0.02:0.02:0.30:0.14',
+            killfeedCrop: '0.70:0.05:0.30:0.25',
+          },
+        },
+      }),
+    );
+    const loaded = loadLatencyState(file);
+    expect(loaded.problem).toBeNull();
+    expect(loaded.state.median('gaules')).toBeNull();
+    expect(loaded.state.crop('gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(loaded.state.killfeedCrop('gaules')).toBe('0.70:0.05:0.30:0.25');
+  });
+
   it('a escrita é atômica (não deixa arquivo temporário para trás)', () => {
     const tracker = new StreamLatencyTracker();
     tracker.record('Gaules', 10_000);

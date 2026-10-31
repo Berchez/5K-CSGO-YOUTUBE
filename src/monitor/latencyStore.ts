@@ -35,7 +35,12 @@ export function loadLatencyState(file: string): LoadedLatencyState {
       return { state: new StreamLatencyTracker(), problem: 'JSON inválido' };
     }
     const version = Number((parsed as { version?: unknown })?.version);
-    if (Number.isFinite(version) && version !== LATENCY_STATE_VERSION) {
+    /**
+     * v1 é aceito para o `fromJSON` resgatar os CROPS memorizados (o
+     * schema das amostras mudou, mas o crop não): rejeitar aqui deixava o
+     * resgate inalcançável. O `fromJSON` já ignora as amostras v1.
+     */
+    if (Number.isFinite(version) && version !== LATENCY_STATE_VERSION && version !== 1) {
       return { state: new StreamLatencyTracker(), problem: `versão ${version} incompatível` };
     }
     return { state: StreamLatencyTracker.fromJSON(parsed), problem: null };

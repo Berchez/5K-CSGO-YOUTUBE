@@ -34,6 +34,7 @@ import {
   gameRoundEndMs,
   latencyMapProblem,
   observedLatencyMs,
+  OBSERVED_LATENCY_MAX_MS,
   RECENT_SAMPLE_LIMIT,
   RECENT_SAMPLE_MAX_AGE_MS,
   resolveAdaptiveLatency,
@@ -41,6 +42,7 @@ import {
   shouldApplyAdaptive,
   StreamLatencyTracker,
 } from './monitor/streamLatency.js';
+import type { LatencySample } from './monitor/streamLatency.js';
 import { loadLatencyState, saveLatencyState } from './monitor/latencyStore.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
 import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
@@ -48,11 +50,12 @@ import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
-import { buildClip, detectTruncatedStart, newestSegmentEndMs, oldestSegmentStartMs, pickSegments } from './clipper/clipBuilder.js';
+import { buildClip, detectTruncatedStart, makeClipThumbnail, newestSegmentEndMs, oldestSegmentStartMs, patchSidecarThumbnail, pickSegments } from './clipper/clipBuilder.js';
+import { SegmentFreezer } from './clipper/segmentFreezer.js';
 import { computeClipAnchors } from './clipper/clipAnchors.js';
 import { cropCandidatesForStream, scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
-import { scanKillfeedForLatency } from './clipper/killfeedSync.js';
-import { uploadClip } from './uploader/youtubeUploader.js';
+import { scanKillfeedForLatency, type KillfeedSyncResult } from './clipper/killfeedSync.js';
+import { uploadClip, applyThumbnail } from './uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
 import type { MetadataAiFn } from './uploader/videoMetadata.js';
@@ -70,7 +73,38 @@ import {
 import type { TrayMatchState, TrayStatusMatch } from './trayStatus.js';
 import type { AceEvent, ClipResult, LiveMatch, StreamInfo } from './types.js';
 import type { ReferenceImages } from './clipper/referenceImages.js';
+import type { SmartThumbOptions } from './clipper/thumbnail.js';
 import type { WatchlistDoc } from './watchlist.js';
+
+/** Opções da thumbnail do clipe (gerada DEPOIS do upload — F4). */
+function clipThumbOptions(
+  cfg: ReturnType<typeof getConfig>,
+  references: ReferenceImages,
+): SmartThumbOptions {
+  return {
+    mode: cfg.THUMB_MODE,
+    ai: {
+      order: cfg.THUMB_AI_ORDER.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean) as Array<
+        'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'
+      >,
+      timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
+      hfToken: cfg.HF_TOKEN || undefined,
+      hfModel: cfg.HF_IMAGE_MODEL,
+      geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+      geminiModel: cfg.GEMINI_IMAGE_MODEL,
+      geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
+      geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
+      geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS,
+      chatgptProfileDir: cfg.CHATGPT_PROFILE,
+      chatgptMinimized: cfg.CHATGPT_MINIMIZED,
+      grokProfileDir: cfg.GROK_PROFILE,
+      grokMinimized: cfg.GROK_MINIMIZED,
+      references,
+    },
+  };
+}
 
 // Streams por partida (a página do match raramente muda mid-game —
 // buscar 1x evita N page loads por ciclo e rate-limit do Cloudflare).
@@ -406,6 +440,7 @@ async function measureRoundEnd(
   shouldStop: () => boolean,
   scanFromMs: number,
   aceDetectedAtMs: number,
+  freezer: SegmentFreezer | null = null,
 ): Promise<RoundEndMeasurement> {
   const log = getLogger();
   const mode = cfg.CLIP_STREAM_SYNC;
@@ -430,7 +465,7 @@ async function measureRoundEnd(
   });
 
   if (mode === 'off') return skip('disabled');
-  if (!recorder?.isRunning) {
+  if (!recorder || (!recorder.isRunning && freezer == null)) {
     log.warn(
       { matchId: ace.matchId, stream: recorder?.streamName },
       'calibragem do placar indisponível — mantendo âncora original',
@@ -461,7 +496,11 @@ async function measureRoundEnd(
       scanFromMs,
       crop: crops[0],
       crops: crops.slice(1),
-      listSegments: () => recorder.listSegments(),
+      // Com o freezer, a varredura lê as cópias FECHADAS — imunes à
+      // rotação do anel. Sem ele, cai no snapshot tardio (comportamento
+      // antigo, sujeito a perder a abertura).
+      listSegments: freezer != null ? () => freezer.listFrozen() : () => recorder.listSegments(),
+      skipNewest: freezer == null,
       shouldStop,
     });
     const applied = mode === 'auto' && estimate.roundEndMs != null;
@@ -607,10 +646,21 @@ async function handleAce(
     kills: ace.kills,
     anchorMs: videoStartMs,
     oldestSegmentStartMs: initialStartMs,
-    streamLatencyMs: conservativeLatencyMs,
+    // Teto REAL de plausibilidade (o mesmo das amostras): o regime pode
+    // ter subido acima de tudo que já foi medido — usar max(config,
+    // amostras) como "teto" descartaria aces bons nesse salto. Com o
+    // teto, o strict só descarta quando NENHUMA latência plausível
+    // alcança o buffer (kills muito antigas — stats de outra época).
+    streamLatencyMs: Math.max(conservativeLatencyMs, OBSERVED_LATENCY_MAX_MS),
     scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+    strict: cfg.CLIP_COVERAGE_STRICT,
+    rulerTrusted: true,
   });
   if (initialCoverage.discard) {
+    const motivo =
+      initialCoverage.discardReason === 'first-kill-missing'
+        ? '1ª kill do ace precede o buffer'
+        : 'nenhuma kill do ace está no buffer';
     log.warn(
       {
         matchId,
@@ -618,16 +668,17 @@ async function handleAce(
         map: ace.map,
         round: ace.round,
         kills: initialCoverage.totalKills,
+        falta: initialCoverage.discardReason,
         oldestStart: initialStartMs != null ? new Date(initialStartMs).toISOString() : null,
       },
-      'nenhuma kill do ace está no buffer — evento descartado (sem footage)',
+      `${motivo} — evento descartado (sem footage)`,
     );
     recordDiscardedEvent(cfg.DB_PATH, {
       matchId: ace.matchId,
       map: ace.map,
       round: ace.round,
       player: ace.player,
-      reason: 'sem footage no buffer',
+      reason: motivo,
       detectedAt: ace.detectedAt,
     });
     return;
@@ -638,18 +689,62 @@ async function handleAce(
   // o fim do poll — a janela logo após a detecção é a mais crítica.
   patchTrayStatus({ pendingClips: pendingClipCount() });
   const snapDirs: string[] = [];
+  let freezer: SegmentFreezer | null = null;
   try {
     let segments = recorder?.listSegments() ?? [];
     if (segments.length === 0) {
       log.warn('sem buffer para cortar (stream caiu ou iniciou agora), evento salvo sem clipe');
       return;
     }
+    /**
+     * F1 — congela o buffer ANTES dos OCRs. O placar e o killfeed podem
+     * levar minutos; nesse tempo o anel (SEGMENT_WRAP) reescreve os
+     * primeiros segmentos e a abertura do round some (caso
+     * 2399949_Mirage_r13_biguzera). As cópias fechadas são a ÚNICA fonte
+     * do corte daqui em diante.
+     */
+    const freezeRecorder = recorder;
+    if (cfg.CLIP_FREEZE === 'auto' && freezeRecorder?.isRunning) {
+      try {
+        const freezeDir = path.join(
+          cfg.CLIPS_DIR,
+          '.build',
+          `${matchId}-r${ace.round}-${Date.now()}-freeze`,
+        );
+        freezer = new SegmentFreezer({
+          listSegments: () => freezeRecorder.listSegments(),
+          destDir: freezeDir,
+          segmentTimeSec: cfg.SEGMENT_TIME_SEC,
+          shouldStop: () => stopping,
+          minFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
+        });
+        snapDirs.push(freezeDir);
+        freezer.start();
+        log.info(
+          { congelados: freezer.listFrozen().length },
+          'buffer congelado para os OCRs (imune à rotação do anel)',
+        );
+      } catch (e) {
+        freezer?.stop();
+        freezer = null;
+        log.warn(
+          { err: String(e).slice(0, 200) },
+          'freezer do buffer indisponível — usando o snapshot do fim',
+        );
+      }
+    }
     // Referências visuais rodam EM PARALELO à espera do buffer (browser
     // + downloads podem levar minutos; antes somavam na latência do clipe).
     const refsPromise = getRefs(matchId, ace.player, ace.team1, ace.team2, ace.map, cfg.CLIPS_DIR, cfg.HLTV_PROFILE).catch(
       () => ({}) as ReferenceImages,
     );
-    const aceDetectedAtMs = Date.now();
+    /**
+     * Instante em que o ace foi detectado = o `detectedAt` do poll do
+     * HLTV (não o "agora" do processamento): o freezer pode ter copiado
+     * dezenas de segmentos antes daqui, e esse bloqueio deslocaria o fim
+     * estimado e a latência observada.
+     */
+    const aceDetectedAtMs = eventAtMs;
     const { detectedEndMs, sync: streamSync } = await measureRoundEnd(
       ace,
       cfg,
@@ -657,6 +752,7 @@ async function handleAce(
       () => stopping,
       aceDetectedAtMs - 30_000,
       aceDetectedAtMs,
+      freezer,
     );
     ace.streamSync = streamSync;
     if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
@@ -667,25 +763,29 @@ async function handleAce(
         ? 'timer-hltv'
         : 'estimada';
     /**
-     * AMOSTRA do round atual: a latência medida no fim do round. Ela
-     * entra no estado do canal (para os rounds seguintes) e serve para
-     * detectar troca de regime. No início só pode ANTECIPAR a abertura
-     * (quando é menor que a amostra anterior): foi medida DEPOIS da 1ª
-     * kill e, se for maior, a subida pode ter acontecido depois do kill.
+     * AMOSTRA do round atual — só entra no estado quando é LATÊNCIA de
+     * verdade (a virada lida com o placar "antes" e "depois": confident).
+     * `after-only`/`gap-inferred` são âncoras de FIM: o atraso de
+     * publicação do placar (~13-20s) ia junto e contaminou as âncoras do
+     * INÍCIO (medido no 2399756: 58-63s registrados para 45s reais —
+     * clipes abrindo 1s antes da 1ª kill).
+     *
+     * A gravação é ADIADA até a sanidade do fim (computeClipAnchors): um
+     * OCR que leu o placar do round seguinte é "confident" para o fluxo
+     * score→score e mede um fim 80s tarde; persistir essa amostra atrasaria
+     * o INÍCIO do próximo ace. Aqui ele fica só como candidato.
      */
-    const currentSample =
-      streamSync.observedLatencyMs != null
-        ? latencyTracker.record(streamName, streamSync.observedLatencyMs, {
+    const scoreboardConfident = streamSync.marker === 'score' && streamSync.reason === 'confident';
+    const currentSample: LatencySample | null =
+      scoreboardConfident && streamSync.observedLatencyMs != null
+        ? {
             measuredAtMs: Date.now(),
+            latencyMs: Math.round(streamSync.observedLatencyMs),
             source: 'scoreboard',
-            quality:
-              streamSync.marker === 'score' && streamSync.reason === 'confident'
-                ? 'confident'
-                : 'after-only',
+            quality: 'confident',
             reference: roundEndReference,
-          })
+          }
         : null;
-    if (currentSample) persistLatencyState(cfg);
     /**
      * Aumento do atraso CONHECIDO entre a medição anterior e a 1ª kill:
      * o relógio de origem da playlist HLS mostra quando a stream "pulou"
@@ -748,23 +848,40 @@ async function handleAce(
      */
     let killfeedStartMs: number | null = null;
     let killfeedOffsetMs: number | null = null;
+    let killfeedResult: KillfeedSyncResult | null = null;
     const needKillfeed =
+      // O sync 'off' desliga TODO o sync visual (placar e killfeed): sem
+      // este gate o motivo 'disabled' acionaria o OCR pesado do killfeed
+      // em todo ace — e o aplicaria.
+      cfg.CLIP_STREAM_SYNC !== 'off' &&
       cfg.CLIP_KILLFEED_SYNC !== 'off' &&
       recorder?.isRunning === true &&
       (cfg.CLIP_KILLFEED_SYNC === 'always' ||
-        streamSync.reason === 'no-scoreboard' ||
-        streamSync.reason === 'no-transition' ||
+        // O placar do vídeo é a medição FRACA: a virada pode ter ficado
+        // ilegível na tela de fim de round/replay — 'after-only'/
+        // 'gap-inferred' datam o fim no round seguinte. Qualquer motivo
+        // sem transição confiante aciona o killfeed, que mede o instante
+        // das kills DENTRO do vídeo (no 2399756 os rounds gap-inferred —
+        // justamente os piores clipes — nem chegavam a varrer).
+        streamSync.reason !== 'confident' ||
         // O salto do relógio de origem é ambíguo e não move a âncora:
         // ele DISPARA a medição exata (killfeed), que é independente.
         pendingShiftMs > 0 ||
         adaptive.changed);
     if (needKillfeed) {
       try {
+        // `freezer` é `let` do escopo externo: o const preserva o
+        // estreitamento dentro do closure de listSegments.
+        const freezerScan = freezer;
         const killfeedCrops = cropCandidatesForStream({
           globalCrop: cfg.CLIP_KILLFEED_CROP,
           byStream: cfg.CLIP_KILLFEED_CROP_BY_STREAM,
           streamName,
-          remembered: null,
+          // O crop que já leu o killfeed neste canal entra ANTES dos
+          // fallbacks: cada canal tem o overlay em outro canto e re-testar
+          // 4 crops × ~10 frames de tesseract por segmento sem match é o
+          // grosso do custo do OCR.
+          remembered: latencyTracker.killfeedCrop(streamName),
           fallbacks: cfg.CLIP_KILLFEED_CROP_FALLBACKS,
         });
         const killfeed = await scanKillfeedForLatency({
@@ -775,23 +892,47 @@ async function handleAce(
           // corte, só a qualidade da medição. No modo 'auto' é a mesma
           // faixa que foi aplicada no corte.
           latencyHintMs: Math.min(adaptive.startLatencyMs, startLatencyMs),
-          // A janela cobre a faixa: o killfeed é acionado justamente
-          // quando o regime pode ter subido, e o hint do início é o
-          // valor ANTIGO (por regra, só antecipa).
-          latencyMaxMs: Math.max(adaptive.endLatencyMs, endLatencyMs),
+          // A janela tem que cobrir o regime REAL, que pode ser bem maior
+          // que o configurado (2399756: config 25s, real 45s) — e as
+          // amostras do placar são infladas pelo atraso de publicação.
+          // Folga: o dobro do configurado ou +30s, o que for maior.
+          latencyMaxMs: Math.max(
+            adaptive.endLatencyMs,
+            endLatencyMs,
+            streamLatencyMs * 2,
+            streamLatencyMs + 30_000,
+          ),
           segmentTimeSec: cfg.SEGMENT_TIME_SEC,
-          listSegments: () => recorder?.listSegments() ?? [],
+          listSegments: freezerScan != null
+            ? () => freezerScan.listFrozen()
+            : () => recorder?.listSegments() ?? [],
+          skipNewest: freezerScan == null,
           crops: killfeedCrops,
           shouldStop: () => stopping,
         });
+        // Em shadow ('log') a medição é registrada no LOG, mas o
+        // resultado NÃO entra nas âncoras nem na cobertura: o modo
+        // inteiro não pode alterar cortes nem descartar aces.
+        if (applyVisualSync) killfeedResult = killfeed;
+        // Lembra o crop que leu o killfeed: o próximo ace do canal começa
+        // por ele (os fallbacks só entram se ele parar de funcionar).
+        if (killfeed.crop && latencyTracker.killfeedCrop(streamName) !== killfeed.crop) {
+          latencyTracker.setKillfeedCrop(streamName, killfeed.crop);
+          persistLatencyState(cfg);
+        }
         log.info(
           {
             matchId,
             stream: streamName,
             motivo: killfeed.reason,
             casadas: killfeed.matchedKills,
+            noCluster: killfeed.clusterKills,
             total: killfeed.totalKills,
             primeiraCasada: killfeed.firstKillMatched,
+            primeiraKillVideo:
+              killfeed.firstKillVideoMs != null ? new Date(killfeed.firstKillVideoMs).toISOString() : null,
+            ultimaKillVideo:
+              killfeed.lastKillVideoMs != null ? new Date(killfeed.lastKillVideoMs).toISOString() : null,
             desvioMedianoMs: killfeed.medianDeviationMs,
             crop: killfeed.crop,
           },
@@ -799,11 +940,24 @@ async function handleAce(
         );
         if (
           applyVisualSync &&
-          killfeed.reason === 'confident' &&
+          // 'confident' = âncora + offset corroborados (≥2 kills no mesmo
+          // cluster); 'first-kill-only' = âncora EXATA da leitura da 1ª
+          // kill, mesmo sem corroboração — a linha do killfeed só existe
+          // quando o kill aconteceu. Ambos dão o instante da 1ª kill no
+          // vídeo, que não depende de latência estimada.
+          (killfeed.reason === 'confident' || killfeed.reason === 'first-kill-only') &&
           killfeed.firstKillVideoMs != null
         ) {
           killfeedStartMs = killfeed.firstKillVideoMs;
-          killfeedOffsetMs = killfeed.killVideoOffsetMs;
+          /**
+           * O offset dos timestamps só vale com o cluster corroborado:
+           * em 'first-kill-only' ele vem de UMA leitura e carrega o
+           * atraso do poll do HLTV daquela kill (medido: 5,2/5,3/16,4s
+           * no mesmo round) — usá-lo desalinharia as kills 2..n da
+           * descrição.
+           */
+          killfeedOffsetMs =
+            killfeed.reason === 'confident' ? killfeed.killVideoOffsetMs : null;
         }
       } catch (e) {
         log.warn(
@@ -854,6 +1008,23 @@ async function handleAce(
      * Âncoras do clipe (do relógio do placar para a timeline do vídeo).
      * Puro/testável em clipAnchors.ts.
      */
+    const lastKillAt = ace.kills.length > 0 ? ace.kills[ace.kills.length - 1] : undefined;
+    /**
+     * Última kill MEDIDA pelo killfeed — só entra com o motivo que a
+     * sustenta. Sem isso, um casamento falso (par killer→vítima repetido
+     * no round seguinte) vira piso do fim e empurra o corte para dentro
+     * do replay.
+     *
+     * Exige TODAS as kills lidas: com 1 de 3 (o caso `first-kill-only` do
+     * r4) o `lastKillVideoMs` é a PRIMEIRA kill e o piso ficaria cedo
+     * demais — nesse caso o piso estimado (por `at`) cobre.
+     */
+    const killfeedLastKillMs =
+      killfeedResult != null &&
+      killfeedResult.reason === 'confident' &&
+      killfeedResult.matchedKills === killfeedResult.totalKills
+        ? killfeedResult.lastKillVideoMs
+        : null;
     const anchors = computeClipAnchors({
       aceStartedAtMs: aceStartMs,
       streamLatencyMs,
@@ -867,12 +1038,41 @@ async function handleAce(
       startMarginSec,
       aceDetectedAtMs,
       scoreboardEndMs: detectedEndMs,
+      lastKillVideoMs: killfeedLastKillMs,
+      // Base do piso da última kill SEM killfeed (placar confiante).
+      lastKillAtMs:
+        lastKillAt != null && Number.isFinite(lastKillAt.at) ? lastKillAt.at : null,
+      // Fim do round no relógio do JOGO: o timer real do HLTV quando
+      // existe; senão a estimativa (detecção − atraso do placar). O vídeo
+      // é sempre posterior — virada lida antes disso é leitura errada
+      // (2399756: −11s e −10,3s de "latência" = OCR lendo placar trocado).
+      gameRoundEndedAtMs: gameRoundEndMs({
+        aceDetectedAtMs,
+        scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
+        roundEndedAtMs,
+      }),
+      gameEndReference: roundEndReference,
       syncApplied: streamSync.applied,
       syncScanned:
         cfg.CLIP_STREAM_SYNC === 'auto' &&
         streamSync.reason !== 'disabled' &&
         streamSync.reason !== 'recorder-unavailable',
+      endPlausibilitySec: cfg.CLIP_END_PLAUSIBILITY_SEC,
     });
+    /**
+     * A amostra de latência só é PERSISTIDA com o fim plausível: um OCR
+     * que leu o placar do round seguinte mede um fim ~80s tarde e, como
+     * virada, atrasaria o INÍCIO do próximo ace.
+     */
+    if (currentSample && !anchors.ocrEndRejected) {
+      latencyTracker.record(streamName, currentSample.latencyMs, {
+        measuredAtMs: currentSample.measuredAtMs,
+        source: currentSample.source,
+        quality: currentSample.quality,
+        reference: currentSample.reference,
+      });
+      persistLatencyState(cfg);
+    }
     /**
      * Offset dos timestamps: latência − atraso do placar. Quando o
      * killfeed mediu o instante das kills no vídeo, ele é a fonte mais
@@ -880,6 +1080,19 @@ async function handleAce(
      */
     const killVideoOffsetMs = killfeedOffsetMs ?? anchors.killVideoOffsetMs;
     const { endMs } = anchors;
+    if (anchors.ocrEndRejected) {
+      log.warn(
+        {
+          matchId,
+          round: ace.round,
+          viradaVista: detectedEndMs != null ? new Date(detectedEndMs).toISOString() : null,
+          fimEstimado: new Date(endMs).toISOString(),
+          toleranciaSec: cfg.CLIP_END_PLAUSIBILITY_SEC,
+          fimRoundReal: roundEndedAtMs != null ? new Date(roundEndedAtMs).toISOString() : null,
+        },
+        'virada do placar no vídeo implausível (round posterior ou antes do fim real) — fim estimado aplicado',
+      );
+    }
     // Metadados: a CHAMADA da IA começa aqui (EM PARALELO ao corte do
     // clipe — só ela depende da rede, então não soma latência no
     // upload). A composição final espera o clipe real: o sidecar sabe o
@@ -959,6 +1172,7 @@ async function handleAce(
         scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
         scoreDelayMs: cfg.CLIP_SCORE_DELAY_MS,
         endAnchored: anchors.usedScoreboardEnd,
+        fimPisoMs: anchors.endFloorMs != null ? new Date(anchors.endFloorMs).toISOString() : null,
         contextSec,
       },
       'âncoras do clipe (placar → vídeo)',
@@ -996,15 +1210,44 @@ async function handleAce(
         150_000,
         waitTargetMs - Date.now() + cfg.SEGMENT_TIME_SEC * 1000 + 20_000,
       );
-    while (!stopping && Date.now() < waitUntil) {
-      segments = recorder?.listSegments() ?? [];
-      if (segments.length === 0) break;
-      endCovered =
-        newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
-      if (endCovered) {
-        break;
+    if (freezer != null) {
+      // A espera acompanha as cópias CONGELADAS: o anel pode rotacionar
+      // à vontade — o material do round já está no diretório privado.
+      endCovered = await freezer.waitForCoverage(endMs, waitUntil - Date.now());
+      await freezer.scan();
+      segments = freezer.listFrozen();
+      // O material do clipe está TODO nas cópias: o render só lê a
+      // lista. Parar aqui evita copiar o anel inteiro durante o
+      // render/upload/thumb (minutos de cópia × ~1GB por ace em voo).
+      freezer.stop();
+      if (segments.length === 0) {
+        // Nenhuma cópia (disco baixo, erro de cópia ou TOCTOU em todas):
+        // o anel ainda pode ter o material — cai no caminho sem freezer
+        // em vez de desistir do clipe.
+        log.warn(
+          { congelados: 0, falhasCopia: freezer.copyFailures },
+          'freezer sem cópias — usando o anel como fallback',
+        );
+        freezer = null;
+        // A espera da cobertura já consumiu o prazo: o fallback começa
+        // com o que o anel tem AGORA (o loop abaixo só alonga).
+        segments = recorder?.listSegments() ?? [];
+        endCovered =
+          segments.length > 0 &&
+          newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
       }
-      await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (freezer == null) {
+      while (!stopping && Date.now() < waitUntil) {
+        segments = recorder?.listSegments() ?? [];
+        if (segments.length === 0) break;
+        endCovered =
+          newestSegmentEndMs(segments) >= endMs + cfg.SEGMENT_TIME_SEC * 1000 + 5_000;
+        if (endCovered) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
     }
     if (segments.length === 0) {
       log.warn('sem buffer para cortar (stream caiu ou iniciou agora), evento salvo sem clipe');
@@ -1037,12 +1280,12 @@ async function handleAce(
       log.warn('âncora precede o buffer (truncatedStart): abertura incompleta');
     }
 
-    // SNAPSHOT dos segmentos escolhidos: o buffer é CIRCULAR (SEGMENT_WRAP
-    // sobrescreve os arquivos) e a partida pode sair do ar (poll para o
-    // recorder e apaga o buffer) enquanto refs/render/thumb ainda rodam —
-    // minutos. Copia preservando mtime (seleção/trim são mtime-driven) e
-    // constrói o clipe a partir da cópia imune ao churn do buffer.
+    // SNAPSHOT dos segmentos escolhidos: com o freezer (F1) a seleção já
+    // vem de cópias privadas e fechadas, imunes à rotação do anel e à
+    // queda da stream. Sem o freezer (fallback), mantém a cópia do fim
+    // preservando mtime (seleção/trim são mtime-driven).
     let coverageDiscarded = false;
+    let coverageDiscardReason = 'nenhuma kill do ace no buffer';
     const buildClipFromBuffer = async (): Promise<ClipResult | null> => {
       const sourceSegments = segments;
       const sourceEndMs = aceEndMs;
@@ -1074,6 +1317,19 @@ async function handleAce(
         killfeedOffsetMs != null
           ? killfeedOffsetMs + cfg.SCOREBOARD_DELAY_MS
           : startLatencyMs;
+      /**
+       * F5 (evidência forte): só a posição EXATA da 1ª kill (lida pelo
+       * killfeed) prova que a abertura não está no material. "O OCR não
+       * leu o nome" NÃO é ausência — nomes truncados são comuns (medido:
+       * khaN→haN, KaiR0N-→KaiRON-) e esse descarte destruiu 3 aces bons
+       * do 2399756 com apenas 1 kill casada.
+       */
+      const firstKillVideoMsTrusted =
+        killfeedResult != null &&
+        killfeedResult.firstKillMatched &&
+        killfeedResult.firstKillVideoMs != null
+          ? killfeedResult.firstKillVideoMs
+          : null;
       const coverage = evaluateAceCoverage({
         kills: ace.kills,
         anchorMs: videoStartMs,
@@ -1082,11 +1338,30 @@ async function handleAce(
         // mesma régua do corte — as duas sides na MESMA timeline.
         streamLatencyMs: coverageLatencyMs,
         scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+        strict: cfg.CLIP_COVERAGE_STRICT,
+        firstKillVideoMsTrusted,
+        // A régua prova ausência quando é o TETO conservador (posição
+        // mais tarde possível — inicial) ou medida no vídeo (killfeed).
+        rulerTrusted: killfeedOffsetMs != null,
       });
       if (coverage.discard) {
+        coverageDiscardReason =
+          coverage.discardReason === 'first-kill-missing'
+            ? '1ª kill do ace precede o material'
+            : 'nenhuma kill do ace no buffer';
         log.warn(
-          { matchId, kills: coverage.totalKills },
-          'nenhuma kill do ace está no buffer — clipe descartado (não conteria o ace)',
+          {
+            matchId,
+            falta: coverage.discardReason,
+            kills: coverage.totalKills,
+            killfeedCasadas: killfeedResult?.matchedKills ?? null,
+            killfeedCobriuJanela: killfeedResult?.windowCovered ?? null,
+            primeiraKillVideoMs:
+              killfeedResult?.firstKillVideoMs != null
+                ? new Date(killfeedResult.firstKillVideoMs).toISOString()
+                : null,
+          },
+          `${coverageDiscardReason} — clipe descartado (não conteria o ace)`,
         );
         coverageDiscarded = true;
         return null;
@@ -1109,21 +1384,27 @@ async function handleAce(
         aceStartMs: videoStartMs,
         aceEndMs: sourceEndMs,
       });
-      const snapDir = path.join(
-        cfg.CLIPS_DIR,
-        '.build',
-        `${matchId}-r${ace.round}-${Date.now()}`,
-      );
-      snapDirs.push(snapDir);
-      const snapshot = snapshotSegments(picked, snapDir);
-      log.info(
-        { picked: picked.length, snap: path.basename(snapDir) },
-        'segmentos congelados (snapshot)',
-      );
+      let renderSegments: string[];
+      let snapDir: string | null = null;
+      if (freezer != null) {
+        // Já são cópias privadas e fechadas: não há o que copiar de novo.
+        renderSegments = picked;
+      } else {
+        snapDir = path.join(
+          cfg.CLIPS_DIR,
+          '.build',
+          `${matchId}-r${ace.round}-${Date.now()}`,
+        );
+        snapDirs.push(snapDir);
+        renderSegments = snapshotSegments(picked, snapDir);
+        log.info(
+          { picked: picked.length, snap: path.basename(snapDir) },
+          'segmentos congelados (snapshot)',
+        );
+      }
       try {
-        const references = await refsPromise;
-        return await buildClip(clipAce, snapshot, {
-          bufferDir: snapDir,
+        return await buildClip(clipAce, renderSegments, {
+          bufferDir: snapDir ?? (picked[0] != null ? path.dirname(picked[0]) : cfg.BUFFER_DIR),
           clipsDir: cfg.CLIPS_DIR,
           preRollSec: cfg.CLIP_PRE_ROLL_SEC,
           postRollSec: cfg.CLIP_POST_ROLL_SEC,
@@ -1133,6 +1414,7 @@ async function handleAce(
           aceStartMs: videoStartMs,
           aceEndMs: sourceEndMs,
           replayAware: cfg.REPLAY_AWARE,
+          frozenSource: freezer != null,
           diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
           upscaleHeight: cfg.CLIP_UPSCALE_HEIGHT,
           streamName: recorder?.streamName,
@@ -1143,31 +1425,16 @@ async function handleAce(
           latencyChanged: adaptive.changed,
           timelineDiscontinuity,
           killVideoOffsetMs,
-          thumb: {
-            mode: cfg.THUMB_MODE,
-            ai: {
-              order: cfg.THUMB_AI_ORDER.split(',').map((s) => s.trim()).filter(Boolean) as Array<'huggingface' | 'pollinations' | 'gemini' | 'gemini-web' | 'chatgpt' | 'grok'>,
-              timeoutMs: cfg.THUMB_AI_TIMEOUT_MS,
-              hfToken: cfg.HF_TOKEN || undefined,
-              hfModel: cfg.HF_IMAGE_MODEL,
-              geminiApiKey: cfg.GEMINI_API_KEY || undefined,
-              geminiModel: cfg.GEMINI_IMAGE_MODEL,
-              geminiWebProfileDir: cfg.GEMINI_WEB_PROFILE,
-              geminiWebChromeProfile: cfg.GEMINI_WEB_CHROME_PROFILE || undefined,
-              geminiWebHeadless: cfg.GEMINI_WEB_HEADLESS,
-              chatgptProfileDir: cfg.CHATGPT_PROFILE,
-              chatgptMinimized: cfg.CHATGPT_MINIMIZED,
-              grokProfileDir: cfg.GROK_PROFILE,
-              grokMinimized: cfg.GROK_MINIMIZED,
-              references: references ?? {},
-            },
-          },
+          // Piso do replay-aware: o corte nunca fecha antes dele — a
+          // última kill (medida ou estimada) e a virada genuína do
+          // placar ficam dentro do clipe (r8: o corte removia as 3 kills).
+          minEndMs: anchors.endFloorMs,
         });
       } catch (e) {
         log.error({ err: String(e), matchId }, 'falha ao montar o clipe');
         return null;
       } finally {
-        fs.rmSync(snapDir, { recursive: true, force: true });
+        if (snapDir != null) fs.rmSync(snapDir, { recursive: true, force: true });
       }
     };
 
@@ -1181,7 +1448,7 @@ async function handleAce(
         map: ace.map,
         round: ace.round,
         player: ace.player,
-        reason: 'nenhuma kill do ace no buffer',
+        reason: coverageDiscardReason,
         detectedAt: ace.detectedAt,
       });
       log.warn(
@@ -1225,13 +1492,15 @@ async function handleAce(
             privacy: cfg.YT_PRIVACY,
             categoryId: cfg.YT_CATEGORY_ID,
             defaultTags: cfg.YT_DEFAULT_TAGS,
-            thumbnailPath: clip.thumbnailPath,
             metadata,
           });
         } catch (e) {
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');
         }
       }
+      // Registro no banco ANTES da thumbnail: se o processo cair na
+      // geração da thumb (minutos com IA), o vídeo já está no YouTube e
+      // o clipe precisa estar no banco com o videoId (cenário zorte).
       insertClip(cfg.DB_PATH, aceId, clip.filePath, cfg.YT_PRIVACY, videoId);
       setTrayStatusClip({
         at: new Date().toISOString(),
@@ -1244,10 +1513,45 @@ async function handleAce(
         uploaded: Boolean(videoId),
         privacy: cfg.YT_PRIVACY,
       });
+      // F4: thumbnail DEPOIS do upload e do registro. A geração (IA até
+      // minutos) não atrasa mais o vídeo no ar; falha aqui não derruba o
+      // clipe.
+      try {
+        const references = await refsPromise;
+        // O momento da thumb: a última kill do ace DENTRO do clipe (o
+        // corte agora é ancorado — o kill a +15s e não mais em preRoll−3,
+        // que caía depois da ação em clipes curtos). O fallback também é
+        // limitado à duração: com clipe curto, `preRoll−3` cai fora do
+        // vídeo e o ffmpeg devolve o último frame (ou nada).
+        const aceActionSec =
+          killfeedLastKillMs != null && clip.clipStartMs != null
+            ? (killfeedLastKillMs - clip.clipStartMs) / 1000
+            : null;
+        const maxThumbSec = Math.max(1, (clip.clipDurationSec ?? 60) - 1);
+        const thumbAtSec =
+          aceActionSec != null && Number.isFinite(aceActionSec)
+            ? Math.min(Math.max(1, aceActionSec - 1), maxThumbSec)
+            : Math.min(Math.max(1, cfg.CLIP_PRE_ROLL_SEC - 3), maxThumbSec);
+        const thumbPath = await makeClipThumbnail(ace, clip.filePath, {
+          atSec: thumbAtSec,
+          thumb: clipThumbOptions(cfg, references),
+        });
+        clip.thumbnailPath = thumbPath ?? undefined;
+        patchSidecarThumbnail(clip.sidecarPath, thumbPath);
+        if (thumbPath != null && videoId != null) {
+          await applyThumbnail(videoId, thumbPath, {
+            clientSecretsPath: cfg.YT_CLIENT_SECRETS,
+            tokenPath: cfg.YT_TOKEN_PATH,
+          });
+        }
+      } catch (e) {
+        log.warn({ err: String(e).slice(0, 200) }, 'falha ao gerar/aplicar thumbnail');
+      }
     }
   } catch (e) {
     log.error({ err: String(e) }, 'falha ao montar clipe');
   } finally {
+    freezer?.stop();
     for (const dir of snapDirs) fs.rmSync(dir, { recursive: true, force: true });
     removePendingClip(matchId);
     patchTrayStatus({ pendingClips: pendingClipCount() });

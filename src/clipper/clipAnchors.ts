@@ -95,10 +95,51 @@ export interface ClipAnchorsInput {
   aceDetectedAtMs: number;
   /** Virada do placar vista NO VÍDEO (ms) — âncora exata, quando existe. */
   scoreboardEndMs?: number | null;
+  /**
+   * Instante no vídeo da ÚLTIMA kill do ace (killfeed). Piso do fim: a
+   * última kill tem que estar no clipe mesmo quando a âncora do placar
+   * falhou (sem transição) ou leu o placar de outro round.
+   *
+   * CONTRATO: só pode vir preenchido quando é de fato a última kill do
+   * round (offset corroborado e TODAS as kills lidas). Com uma kill só
+   * lida (o caso `first-kill-only`) isto seria a PRIMEIRA kill e o piso
+   * ficaria cedo demais — o chamador passa `null` e vale o estimado.
+   */
+  lastKillVideoMs?: number | null;
+  /**
+   * `at` da última kill no placar do HLTV (relógio do jogo + poll).
+   * Base do piso SEMPRE presente: `at − atraso + latência + cauda`
+   * estima a posição da última kill quando o killfeed não mediu — sem
+   * ele o corte replay-aware (`auto`) podia fechar o clipe no MEIO do
+   * ace (transição quieto→ativo intra-round detectada antes das kills,
+   * caso r8 do 2399756).
+   */
+  lastKillAtMs?: number | null;
+  /**
+   * Fim do round no relógio do JOGO (timer do HLTV, ms). O vídeo gravado
+   * é sempre POSTERIOR ao jogo (latência ≥ 0): uma virada lida antes
+   * disso é leitura errada (2399756: o OCR leu placar trocado e "datou"
+   * o fim 11s antes do round fechar).
+   */
+  gameRoundEndedAtMs?: number | null;
+  /**
+   * De onde veio `gameRoundEndedAtMs`: timer real do HLTV ou a
+   * estimativa (detecção − CLIP_SCORE_DELAY_MS). A estimativa carrega o
+   * erro do atraso de publicação do placar (± o próprio scoreDelay):
+   * a tolerância da checagem tem que crescer junto, senão uma virada
+   * GENUÍNA é rejeitada.
+   */
+  gameEndReference?: 'timer-hltv' | 'estimada';
   /** A âncora do vídeo foi aplicada (modo 'auto' + OCR achou a virada). */
   syncApplied: boolean;
   /** O OCR foi tentado (modo 'auto' e recorder disponível). */
   syncScanned: boolean;
+  /**
+   * Tolerância (s) entre o fim visto no OCR e o fim ESTIMADO. Acima
+   * disto o OCR leu o placar de um round POSTERIOR (overlay ilegível na
+   * tela de fim/replay) e a âncora é descartada. 0/ausente = sem clamp.
+   */
+  endPlausibilitySec?: number;
 }
 
 export interface ClipAnchors {
@@ -110,10 +151,24 @@ export interface ClipAnchors {
   endMs: number;
   /** O fim veio do OCR do vídeo (âncora exata). */
   usedScoreboardEnd: boolean;
+  /** O OCR achou uma virada, mas ELA foi rejeitada por implausível. */
+  ocrEndRejected: boolean;
   /** O fim foi estimado (sem âncora do OCR). */
   usedEstimatedEnd: boolean;
   /** O OCR tentou e não achou a virada (espera extra pelo material). */
   usedFallback: boolean;
+  /**
+   * O que puxou o fim para cima (piso aplicado): 'last-kill' (a última
+   * kill do ace) ou 'min-duration' (duração mínima). Null = o fim não
+   * foi alterado pelo piso.
+   */
+  endPinnedBy: 'last-kill' | 'min-duration' | null;
+  /**
+   * Piso efetivo do fim (ms) — o MENOR fim aceitável. É o que o corte
+   * replay-aware não pode atravessar: cortar antes daqui tiraria a
+   * última kill (ou o próprio fim de round) do clipe. Null = sem piso.
+   */
+  endFloorMs: number | null;
   /** Offset entre o relógio do PLACAR e o do VÍDEO (timestamps da descrição). */
   killVideoOffsetMs: number;
   /** Latência (ms) aplicada no início (e nos timestamps). */
@@ -121,6 +176,14 @@ export interface ClipAnchors {
   /** Latência (ms) aplicada no fim estimado. */
   endLatencyMs: number;
 }
+
+/**
+ * Duração mínima do clipe (s) medida da 1ª kill. Abaixo disso as âncoras
+ * estão incoerentes (o fim caiu antes da própria ação do round —
+ * "render vazio" com 4,1s no 2399756 quando a âncora do placar leu
+ * round errado).
+ */
+export const MIN_CLIP_DURATION_SEC = 10;
 
 /**
  * Calcula as âncoras do clipe.
@@ -149,22 +212,134 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
   const estimatedClipStartMs =
     videoStartMs != null ? videoStartMs - startContextSec * 1000 : undefined;
   const killVideoOffset = killVideoOffsetMs(startLatencyMs, input.scoreboardDelayMs);
-  const usedScoreboardEnd = input.syncApplied && input.scoreboardEndMs != null;
+  const estimatedEndMs =
+    computeAceEndMs(
+      input.aceDetectedAtMs,
+      input.scoreDelayMs,
+      input.endAfterCloseSec,
+      endLatencyMs,
+    ) +
+    input.endTailSec * 1000;
+  /**
+   * Sanidade do fim do OCR (F2b): quando o overlay do placar fica
+   * ilegível na tela de fim de round/replay, o primeiro frame legível
+   * com o placar NOVO é o início do round seguinte (medido: +84,6s no
+   * caso 2399753_Dust2_r18_iM). Se a virada lida está MUITO depois do
+   * fim estimado, o que foi lido não é o fim deste round.
+   *
+   * A assimetria é intencional: um OCR mais CEDO que a estimativa é
+   * aceito (a estimativa é conservadora e erra para o lado longo); só o
+   * atraso absurdo é rejeitado. O outro lado (cedo DEMAIS) é checado
+   * contra o fim do round no relógio do JOGO — ver abaixo.
+   */
+  const endPlausibilityMs = Math.max(0, input.endPlausibilitySec ?? 0) * 1000;
+  const ocrEndMs = input.scoreboardEndMs ?? null;
+  /**
+   * Sanidade do fim do OCR, nos DOIS lados:
+   *
+   * - Tarde demais (F2b): o overlay ficou ilegível na tela de fim de
+   *   round/replay e o primeiro frame legível com o placar NOVO é o
+   *   início do round seguinte (medido: +84,6s no caso
+   *   2399753_Dust2_r18_iM). A assimetria clássica continua: um OCR mais
+   *   CEDO que a estimativa é aceito (a estimativa é conservadora e erra
+   *   para o lado longo).
+   * - Cedo DEMAIS: a virada lida é anterior ao fechamento do round no
+   *   relógio do JOGO — impossível, porque o vídeo está sempre atrasado.
+   *   É o OCR lendo placar de round errado (2399756: fim "medido" 11s
+   *   antes do round fechar → clipe de 4,1s ou render vazio). A
+   *   tolerância é o atraso do placar: o "Round over" do HLTV é
+   *   OBSERVAÇÃO (o poll atrasa), então uma virada genuína pode aparecer
+   *   no vídeo até ~um poll antes do instante registrado. Sem o timer do
+   *   HLTV o fim é a ESTIMATIVA (detecção − CLIP_SCORE_DELAY_MS), que
+   *   erra pelo menos o quanto o atraso real de publicação do placar
+   *   diferir do configurado — a tolerância soma o scoreDelay.
+   */
+  const gameEndToleranceMs =
+    Math.max(0, input.scoreboardDelayMs) +
+    (input.gameEndReference === 'estimada' ? Math.max(0, input.scoreDelayMs) : 0);
+  const ocrEndAfterGameRound =
+    input.gameRoundEndedAtMs == null ||
+    ocrEndMs == null ||
+    ocrEndMs >= input.gameRoundEndedAtMs - gameEndToleranceMs;
+  const ocrEndRejected =
+    (ocrEndMs != null && endPlausibilityMs > 0 && ocrEndMs > estimatedEndMs + endPlausibilityMs) ||
+    (ocrEndMs != null && !ocrEndAfterGameRound);
+  const usedScoreboardEnd =
+    input.syncApplied && ocrEndMs != null && !ocrEndRejected;
   const endMs = usedScoreboardEnd
-    ? (input.scoreboardEndMs as number) + input.endAfterCloseSec * 1000
-    : computeAceEndMs(
-        input.aceDetectedAtMs,
-        input.scoreDelayMs,
-        input.endAfterCloseSec,
-        endLatencyMs,
-      ) + input.endTailSec * 1000;
+    ? ocrEndMs + input.endAfterCloseSec * 1000
+    : estimatedEndMs;
+  /**
+   * Piso do fim — o MENOR fim aceitável, sempre presente:
+   *
+   * 1. a última kill MEDIDA pelo killfeed (exata, quando existe);
+   * 2. a última kill ESTIMADA (`at − atraso + latência + cauda`) — é o
+   *    piso que vale quando o killfeed não rodou (placar confiante): sem
+   *    ele o corte replay-aware podia fechar no meio do ace (r8);
+   * 3. a virada GENUÍNA do placar no vídeo — o round termina DEPOIS da
+   *    última kill, então cortar antes dela corta o próprio round;
+   * 4. a duração mínima (fim antes da própria ação do round).
+   *
+   * O `endFloorMs` vai para o corte replay-aware: o corte pode encurtar
+   * a cauda (win panel + freeze), nunca abaixo do piso.
+   */
+  const tailMs = Math.max(0, input.endTailSec) * 1000;
+  const lastKillFloorMs =
+    input.lastKillVideoMs != null ? input.lastKillVideoMs + tailMs : null;
+  /**
+   * Piso ESTIMADO da última kill. `endLatencyMs` é CONSERVADOR por
+   * desenho (máximo da janela quando o round não teve medição), então o
+   * piso não pode passar do fim GENUÍNO do round visto no vídeo: a
+   * última kill é sempre anterior a ele. Sem o cap, o piso superestimado
+   * virava barreira do corte replay-aware e devolvia dezenas de segundos
+   * de cauda (o bug que o piso existe para evitar, ao contrário).
+   *
+   * Só vale quando o killfeed NÃO mediu a última kill: com a medição
+   * exata (offset corroborado, todas as kills lidas) a estimativa é
+   * redundante e chega a 20s+ depois — `endLatencyMs` é score→score e
+   * carrega o atraso de publicação do placar, que não existe no instante
+   * da kill (medido: 61,8s vs 45,2s reais no 2399756 r9).
+   */
+  const lastKillEstimateFloorMs =
+    input.lastKillVideoMs == null &&
+    input.lastKillAtMs != null &&
+    Number.isFinite(input.lastKillAtMs)
+      ? Math.min(
+          input.lastKillAtMs - input.scoreboardDelayMs + endLatencyMs + tailMs,
+          usedScoreboardEnd && ocrEndMs != null ? ocrEndMs + tailMs : Number.POSITIVE_INFINITY,
+        )
+      : null;
+  const ocrEndFloorMs = usedScoreboardEnd ? ocrEndMs : null;
+  const minDurationFloorMs =
+    videoStartMs != null ? videoStartMs + MIN_CLIP_DURATION_SEC * 1000 : null;
+  const floorCandidates = [
+    lastKillFloorMs,
+    lastKillEstimateFloorMs,
+    ocrEndFloorMs,
+    minDurationFloorMs,
+  ].filter((value): value is number => value != null);
+  const endFloorMs = floorCandidates.length > 0 ? Math.max(...floorCandidates) : null;
+  let finalEndMs = endMs;
+  let endPinnedBy: ClipAnchors['endPinnedBy'] = null;
+  if (endFloorMs != null && endFloorMs > finalEndMs) {
+    finalEndMs = endFloorMs;
+    endPinnedBy =
+      endFloorMs === minDurationFloorMs
+        ? 'min-duration'
+        : endFloorMs === lastKillFloorMs || endFloorMs === lastKillEstimateFloorMs
+          ? 'last-kill'
+          : null;
+  }
   return {
     videoStartMs,
     estimatedClipStartMs,
-    endMs,
+    endMs: finalEndMs,
     usedScoreboardEnd,
+    ocrEndRejected,
     usedEstimatedEnd: !usedScoreboardEnd,
     usedFallback: !usedScoreboardEnd && input.syncScanned,
+    endPinnedBy,
+    endFloorMs,
     killVideoOffsetMs: killVideoOffset,
     startLatencyMs,
     endLatencyMs,

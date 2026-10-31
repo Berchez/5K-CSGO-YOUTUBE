@@ -180,6 +180,17 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
     expect(tracker.crop('ESL TV')).toBeNull();
   });
 
+  it('crop do KILLFEED é separado do crop do placar e persiste', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.setCrop('gaules', '0.02:0.02:0.30:0.14');
+    tracker.setKillfeedCrop('gaules', '0.70:0.05:0.30:0.25');
+    expect(tracker.crop('Gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(tracker.killfeedCrop('Gaules')).toBe('0.70:0.05:0.30:0.25');
+    const restored = StreamLatencyTracker.fromJSON(JSON.parse(JSON.stringify(tracker.toJSON())));
+    expect(restored.crop('Gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(restored.killfeedCrop('Gaules')).toBe('0.70:0.05:0.30:0.25');
+  });
+
   it('serializa e reconstitui o estado (persistência entre reinícios)', () => {
     const tracker = new StreamLatencyTracker();
     tracker.record('Gaules', 33_000, {
@@ -211,16 +222,50 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
     expect(restored.channels()).toEqual([]);
   });
 
-  it('rejeita origem/qualidade desconhecidas em vez de normalizar', () => {
+  it('amostras v1 não sobrevivem (after-only envenenado), mas crops sim', () => {
+    // v2: after-only deixou de ser latência — as AMOSTRAS do arquivo v1
+    // saem; os crops memorizados são independentes do schema e valem
+    // (inclusive o do killfeed).
     const restored = StreamLatencyTracker.fromJSON({
       version: 1,
+      streams: {
+        gaules: {
+          samples: [{ measuredAtMs: 1_000, latencyMs: 58_779, source: 'scoreboard', quality: 'after-only' }],
+          crop: '0.02:0.02:0.30:0.14',
+          killfeedCrop: '0.70:0.05:0.30:0.25',
+        },
+      },
+    });
+    expect(restored.median('Gaules')).toBeNull();
+    expect(restored.crop('Gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(restored.killfeedCrop('Gaules')).toBe('0.70:0.05:0.30:0.25');
+  });
+
+  it('só amostras confident sobrevivem à restauração (after-only não é latência)', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 2,
+      streams: {
+        gaules: {
+          samples: [
+            { measuredAtMs: 3_000, latencyMs: 58_779, source: 'scoreboard', quality: 'after-only', reference: 'timer-hltv' },
+            { measuredAtMs: 4_000, latencyMs: 33_000, source: 'scoreboard', quality: 'confident', reference: 'timer-hltv' },
+          ],
+        },
+      },
+    });
+    expect(restored.allSamples('Gaules').map((s) => s.latencyMs)).toEqual([33_000]);
+  });
+
+  it('rejeita origem/qualidade desconhecidas em vez de normalizar', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 2,
       streams: {
         gaules: {
           samples: [
             { measuredAtMs: 1_000, latencyMs: 30_000, source: 'ocr', quality: 'confident' },
             { measuredAtMs: 2_000, latencyMs: 31_000, source: 'scoreboard', quality: 'maybe' },
             { measuredAtMs: 0, latencyMs: 32_000, source: 'scoreboard', quality: 'confident' },
-            { measuredAtMs: 3_000, latencyMs: 33_000, source: 'killfeed', quality: 'after-only', reference: 'estimada' },
+            { measuredAtMs: 3_000, latencyMs: 33_000, source: 'killfeed', quality: 'confident', reference: 'estimada' },
             { measuredAtMs: 4_000, latencyMs: 34_000, source: 'scoreboard', quality: 'confident', reference: 'guess' },
           ],
         },
@@ -239,7 +284,7 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
       quality: 'confident',
     }));
     const restored = StreamLatencyTracker.fromJSON({
-      version: 1,
+      version: 2,
       streams: { gaules: { samples } },
     });
     const kept = restored.allSamples('Gaules');
@@ -268,6 +313,74 @@ describe('resolveAdaptiveLatency', () => {
     expect(decision.endLatencyMs).toBe(25_000);
     expect(decision.startSource).toBe('config');
     expect(decision.changed).toBe(false);
+  });
+
+  it('REGRESSÃO 2399756: amostra after-only não alimenta o início (cai no configurado)', () => {
+    // As 5 amostras do gaules eram after-only (58-63s para 45s reais):
+    // usá-las como latência do início abriu o clipe 1s antes da 1ª kill.
+    const afterOnly: LatencySample = {
+      measuredAtMs: 1_000,
+      latencyMs: 60_000,
+      source: 'scoreboard',
+      quality: 'after-only',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [afterOnly],
+      recentSamples: [afterOnly],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(25_000);
+    expect(decision.startSource).toBe('config');
+    // O FIM continua conservador (fechar mais tarde nunca perde a kill).
+    expect(decision.endLatencyMs).toBe(60_000);
+  });
+
+  it('a última amostra CONFIDENT anterior vence (mesmo com after-only mais recente)', () => {
+    const confident = sample(1_000, 45_000);
+    const afterOnly: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: 62_000,
+      source: 'scoreboard',
+      quality: 'after-only',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [confident, afterOnly],
+      recentSamples: [confident, afterOnly],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(45_000);
+    expect(decision.startSource).toBe('prior');
+    expect(decision.endLatencyMs).toBe(62_000);
+  });
+
+  it('amostra confident com fim ESTIMADO não alimenta o início (erro de CLIP_SCORE_DELAY_MS)', () => {
+    // Sem o timer do HLTV, o "fim do round" é detecção − 20s: o erro do
+    // atraso de publicação (±20s) ia junto para a âncora do início.
+    const estimada: LatencySample = {
+      measuredAtMs: 1_000,
+      latencyMs: 60_000,
+      source: 'scoreboard',
+      quality: 'confident',
+      reference: 'estimada',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [estimada],
+      recentSamples: [estimada],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(25_000);
+    expect(decision.startSource).toBe('config');
+    // O fim continua conservador (a amostra ainda é candidata).
+    expect(decision.endLatencyMs).toBe(60_000);
   });
 
   it('amostra do fim do round MAIOR não adianta o início (pode ter subido após o kill)', () => {

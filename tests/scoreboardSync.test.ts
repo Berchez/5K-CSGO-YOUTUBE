@@ -101,6 +101,38 @@ describe('findScoreTransition', () => {
       reason: 'after-only',
     });
   });
+
+  it('REGRESSÃO: gap longo no overlay — o fim é o último "before", não o round seguinte', () => {
+    // Caso real (2399753_Dust2_r18_iM): o placar "before" aparece até o
+    // fim do round, o overlay some na tela de fim/replay e o "after" só
+    // fica legível ~85s depois, já no round seguinte.
+    const observations = [
+      obs(1_000, 12, 5),
+      obs(2_000, 12, 5),
+      obs(3_000, 12, 5),
+      obs(88_000, 12, 6),
+      obs(89_000, 12, 6),
+    ];
+    expect(findScoreTransition(observations, '12-5', '12-6')).toMatchObject({
+      streamAtMs: 6_000,
+      before: '12-5',
+      after: '12-6',
+      reason: 'gap-inferred',
+      afterAtMs: 88_000,
+    });
+  });
+
+  it('gap curto continua usando o instante do placar "after"', () => {
+    const observations = [
+      obs(1_000, 5, 2),
+      obs(2_000, 6, 2),
+      obs(3_000, 6, 2),
+    ];
+    expect(findScoreTransition(observations, '5-2', '6-2')).toMatchObject({
+      streamAtMs: 2_000,
+      reason: 'confident',
+    });
+  });
 });
 
 describe('findRoundTransition', () => {

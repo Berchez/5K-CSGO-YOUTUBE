@@ -106,12 +106,13 @@ export const ConfigSchema = z.object({
   /** Contexto antes do 1º kill do ace (o clipe começa aqui). */
   CLIP_CONTEXT_SEC: z.coerce.number().min(0).max(30).default(10),
   /**
-   * Replay-aware (Fase 1: shadow). 'shadow' (default): detecta a retomada
-   * de ação do round seguinte e LOGA o fim alternativo (incluindo o replay)
-   * sem aplicar; 'off': pula a detecção; 'on': reservado à Fase 2
-   * (por enquanto comporta-se como shadow).
+   * Replay-aware: corta o clipe antes da AÇÃO do round seguinte (o fim
+   * ancorado entrava no replay/freeze e deixava dezenas de segundos de
+   * cauda). 'auto' (default): aplica quando o fim fixo passa da retomada
+   * com folga; 'on': aplica com qualquer sobreposição (override);
+   * 'shadow': só mede/loga; 'off': pula a detecção.
    */
-  REPLAY_AWARE: z.enum(['off', 'shadow', 'on']).default('shadow'),
+  REPLAY_AWARE: z.enum(['off', 'shadow', 'auto', 'on']).default('auto'),
   /**
    * Contexto quando a âncora de início é incerta (tracker entrou no meio
    * do round, resetou a base, ou a 1ª kill veio da janela de assentamento):
@@ -177,15 +178,36 @@ export const ConfigSchema = z.object({
    */
   CLIP_STREAM_SYNC_STATE_PATH: z.string().default('./data/stream-latency.json'),
   /**
-   * OCR do KILLFEED (nome do jogador no vídeo) como segunda medição.
+   * OCR do KILLFEED (nome do jogador no vídeo) como medição primária.
    *
-   * 'off': nunca; 'fallback' (default): só quando a medição do placar
-   * falhou ou o round trocou de regime; 'always': sempre.
+   * 'off': nunca; 'fallback' (default): sempre que o placar do vídeo
+   * não produziu transição confiante (inclui 'after-only'/'gap-inferred'
+   * — justamente os rounds em que a âncora do placar é fraca); 'always':
+   * sempre. Não roda com CLIP_STREAM_SYNC=off (o sync todo desligado).
    * O killfeed dá o instante EXATO da kill no vídeo (independe da
    * latência), mas é mais frágil: overlay escondido, feed rápido e
-   * nomes estilizados quebram o OCR.
+   * nomes estilizados quebram o OCR — por isso a âncora final do início
+   * é exata só quando a 1ª kill foi lida (com corroboração de outra
+   * kill) e o corte cai na latência configurada (abre cedo) quando não.
    */
   CLIP_KILLFEED_SYNC: z.enum(['off', 'fallback', 'always']).default('fallback'),
+  /**
+   * Congela o buffer circular antes dos OCRs. 'auto' (default): copia os
+   * segmentos fechados para um diretório privado enquanto o placar/
+   * killfeed são lidos — sem isso o anel pode reescrever a abertura do
+   * round durante a varredura ('off' volta ao snapshot do fim).
+   */
+  CLIP_FREEZE: z.enum(['auto', 'off']).default('auto'),
+  /**
+   * Cobertura estrita do ace: descarta o evento quando a 1ª kill NÃO
+   * está no material — mas só com evidência forte: a posição EXATA da
+   * 1ª kill (lida pelo killfeed) fora do buffer, ou uma régua de
+   * latência que prove ausência (teto de plausibilidade na checagem
+   * inicial; offset medido na checagem final). "O OCR varreu e não leu
+   * o nome" NÃO descarta — nomes truncados são comuns e esse descarte
+   * destruiu aces bons (2399756). Default true.
+   */
+  CLIP_COVERAGE_STRICT: boolEnvField('CLIP_COVERAGE_STRICT', true),
   /** Crop normalizado x:y:w:h do placar no topo do vídeo. */
   CLIP_SCOREBOARD_CROP: z.string().default('0.30:0.03:0.40:0.10'),
   /**
@@ -286,6 +308,14 @@ export const ConfigSchema = z.object({
    * Default 8s (somando com CLIP_END_AFTER_CLOSE_SEC).
    */
   CLIP_END_TAIL_SEC: z.coerce.number().min(0).max(120).default(8),
+  /**
+   * Tolerância (s) entre o fim do round visto no OCR do vídeo e o fim
+   * ESTIMADO. Acima disto o que o OCR leu é o placar de um round
+   * POSTERIOR (o overlay some na tela de fim/replay e só volta no round
+   * seguinte) — a âncora é descartada e vale a estimativa.
+   * Default 60; 0 desliga o clamp.
+   */
+  CLIP_END_PLAUSIBILITY_SEC: z.coerce.number().min(0).max(300).default(60),
   CLIPS_DIR: z.string().default('./data/clips'),
   /**
    * Espaço livre mínimo em disco (GB) para operar: abaixo disto o render

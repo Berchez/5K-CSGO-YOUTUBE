@@ -259,21 +259,35 @@ describe('roundOverObservation (instante do fim do round)', () => {
   const T = 1_700_000_000_000;
 
   it('usa o instante do POLL que viu o "Round over"', () => {
-    expect(roundOverObservation(null, 'round-over', T, T - 3_000)).toBe(T);
+    expect(roundOverObservation(null, 'round-over', T, { round: 7, atMs: T - 3_000 })).toEqual({
+      round: 7,
+      atMs: T,
+    });
   });
 
-  it('a primeira observação vence (leitura tardia não sobrescreve)', () => {
-    expect(roundOverObservation(T - 10_000, 'round-over', T, T - 3_000)).toBe(T - 10_000);
+  it('a primeira observação do MESMO round vence', () => {
+    expect(
+      roundOverObservation({ round: 7, atMs: T - 10_000 }, 'round-over', T, { round: 7, atMs: T - 3_000 }),
+    ).toEqual({ round: 7, atMs: T - 10_000 });
+  });
+
+  it('REGRESSÃO: observação de outro round não bloqueia o round atual', () => {
+    // O placar do HLTV mostra "Round over" do round anterior durante o
+    // freeze do seguinte: com a regra global antiga, esse valor vazava
+    // para o evento do round novo (latência de 94s/238s).
+    expect(
+      roundOverObservation({ round: 7, atMs: T - 10_000 }, 'round-over', T, { round: 8, atMs: T - 3_000 }),
+    ).toEqual({ round: 8, atMs: T });
   });
 
   it('não data o break anterior ao tracking (sem timer rodando recente)', () => {
     expect(roundOverObservation(null, 'round-over', T, null)).toBeNull();
-    expect(roundOverObservation(null, 'round-over', T, T - 121_000)).toBeNull();
+    expect(roundOverObservation(null, 'round-over', T, { round: 7, atMs: T - 121_000 })).toBeNull();
   });
 
   it('estado que não é "round over" não produz instante', () => {
-    expect(roundOverObservation(null, 'running', T, T - 3_000)).toBeNull();
-    expect(roundOverObservation(null, 'unknown', T, T - 3_000)).toBeNull();
+    expect(roundOverObservation(null, 'running', T, { round: 7, atMs: T - 3_000 })).toBeNull();
+    expect(roundOverObservation(null, 'unknown', T, { round: 7, atMs: T - 3_000 })).toBeNull();
   });
 });
 
@@ -283,8 +297,23 @@ describe('roundEndedAt (fim real do round no relógio do jogo)', () => {
     const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
     const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
     let r = processPoll(tr, before, -1, 3, 10_000, before);
-    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, 1_700_000_000_000);
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, {
+      round: 7,
+      atMs: 1_700_000_000_000,
+    });
     expect(r.event?.roundEndedAt).toBe(new Date(1_700_000_000_000).toISOString());
+  });
+
+  it('REGRESSÃO: "Round over" de OUTRO round não data o evento', () => {
+    const tr = new RoundTracker('inferno', 7);
+    const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
+    const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
+    let r = processPoll(tr, before, -1, 3, 10_000, before);
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, {
+      round: 6,
+      atMs: 1_700_000_000_000,
+    });
+    expect(r.event?.roundEndedAt).toBeUndefined();
   });
 
   it('sem timer no placar, o evento não carrega o instante (a estimativa vale)', () => {

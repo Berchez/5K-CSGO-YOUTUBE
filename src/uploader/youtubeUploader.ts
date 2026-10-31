@@ -57,6 +57,45 @@ export interface UploadOptions {
   metadata?: VideoMetadata;
 }
 
+export interface ThumbnailAuthOptions {
+  clientSecretsPath: string;
+  tokenPath: string;
+}
+
+/**
+ * Aplica a thumbnail num vídeo JÁ enviado (F4: a thumb é gerada DEPOIS
+ * do upload, pela IA). Best-effort: devolve false em falha — o vídeo
+ * segue sem ela.
+ */
+export async function applyThumbnail(
+  videoId: string,
+  thumbnailPath: string,
+  opts: ThumbnailAuthOptions,
+): Promise<boolean> {
+  const log = getLogger();
+  if (!fs.existsSync(thumbnailPath)) {
+    log.warn({ videoId, thumbnailPath }, 'thumbnail não encontrada — vídeo segue sem ela');
+    return false;
+  }
+  try {
+    const auth = loadOAuthClient(opts.clientSecretsPath, opts.tokenPath);
+    const youtube = google.youtube({ version: 'v3', auth });
+    await youtube.thumbnails.set({
+      videoId,
+      media: {
+        mimeType: 'image/jpeg',
+        body: fs.createReadStream(thumbnailPath),
+      },
+    });
+    log.info({ videoId }, 'thumbnail aplicada');
+    return true;
+  } catch (e) {
+    // Thumb é cosmético: não falha o pipeline (custo 50u de quota, pode estourar antes do upload)
+    log.warn({ err: String(e).slice(0, 200) }, 'falha ao aplicar thumbnail, vídeo segue sem ela');
+    return false;
+  }
+}
+
 /**
  * Upload sempre como private no MVP (revisão humana no YouTube Studio).
  * Quota: videos.insert tem bucket próprio (~100/dia). Projetos novos precisam
@@ -98,19 +137,10 @@ export async function uploadClip(
   log.info({ videoId }, 'upload concluído (privado, aguardando revisão)');
 
   if (opts.thumbnailPath && fs.existsSync(opts.thumbnailPath)) {
-    try {
-      await youtube.thumbnails.set({
-        videoId,
-        media: {
-          mimeType: 'image/jpeg',
-          body: fs.createReadStream(opts.thumbnailPath),
-        },
-      });
-      log.info({ videoId }, 'thumbnail aplicada');
-    } catch (e) {
-      // Thumb é cosmético: não falha o pipeline (custo 50u de quota, pode estourar antes do upload)
-      log.warn({ err: String(e).slice(0, 200) }, 'falha ao aplicar thumbnail, vídeo segue sem ela');
-    }
+    await applyThumbnail(videoId, opts.thumbnailPath, {
+      clientSecretsPath: opts.clientSecretsPath,
+      tokenPath: opts.tokenPath,
+    });
   }
   return videoId;
 }

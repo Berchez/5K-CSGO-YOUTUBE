@@ -90,3 +90,108 @@ describe('evaluateAceCoverage (footage do ace no buffer)', () => {
     expect(semDesconto.killsInBuffer).toBe(1);
   });
 });
+
+describe('evaluateAceCoverage (cobertura estrita — F5, evidência forte)', () => {
+  it('REGRESSÃO: 1ª kill fora do material → descarta com régua conservadora', () => {
+    // Caso típico do round longo: as últimas kills estão no buffer, mas
+    // a abertura do ace (e a 1ª kill) já saiu — o clipe não é o ace. A
+    // régua aqui é o TETO (posição mais tarde possível): se nem ela
+    // alcança o buffer, nenhuma latência menor alcança.
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(190_000), kill(200_000)],
+      anchorMs: 100_000,
+      oldestSegmentStartMs: 150_000,
+      strict: true,
+      rulerTrusted: true,
+    });
+    expect(coverage.killsInBuffer).toBe(2);
+    expect(coverage.firstKillInBuffer).toBe(false);
+    expect(coverage.discard).toBe(true);
+    expect(coverage.discardReason).toBe('first-kill-missing');
+  });
+
+  it('sem strict mantém o comportamento antigo (produz truncado)', () => {
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(200_000)],
+      anchorMs: 100_000,
+      oldestSegmentStartMs: 150_000,
+    });
+    expect(coverage.discard).toBe(false);
+    expect(coverage.truncatedStart).toBe(true);
+    expect(coverage.discardReason).toBe('none');
+  });
+
+  it('posição EXATA da 1ª kill (killfeed) fora do buffer → descarta', () => {
+    // A régua (latência 100s) colocaria a 1ª kill em 195s (dentro), mas
+    // o killfeed MEDIU 120s: medição vence estimativa.
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(190_000)],
+      anchorMs: 190_000,
+      oldestSegmentStartMs: 150_000,
+      streamLatencyMs: 100_000,
+      scoreboardDelayMs: 5_000,
+      strict: true,
+      firstKillVideoMsTrusted: 120_000,
+    });
+    expect(coverage.firstKillInBuffer).toBe(false);
+    expect(coverage.discard).toBe(true);
+    expect(coverage.discardReason).toBe('first-kill-missing');
+  });
+
+  it('posição EXATA da 1ª kill dentro do buffer → régua otimista não derruba', () => {
+    // Sem a medição, a régua (latência 0) diria 95s → fora → descartaria.
+    // O killfeed mediu 160s: o ace fica.
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(190_000)],
+      anchorMs: 190_000,
+      oldestSegmentStartMs: 150_000,
+      streamLatencyMs: 0,
+      strict: true,
+      firstKillVideoMsTrusted: 160_000,
+    });
+    expect(coverage.firstKillInBuffer).toBe(true);
+    expect(coverage.discard).toBe(false);
+    expect(coverage.discardReason).toBe('none');
+  });
+
+  it('REGRESSÃO 2399756: régua não medida + OCR sem a 1ª kill NÃO descarta', () => {
+    // O descarte antigo ("killfeed varreu e não viu") destruiu 3 aces
+    // bons com 1 kill casada: nomes truncados são comuns (khaN→haN) e
+    // régua subestimada move a 1ª kill para fora do buffer no papel.
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(190_000), kill(200_000)],
+      anchorMs: 100_000,
+      oldestSegmentStartMs: 150_000,
+      strict: true,
+    });
+    expect(coverage.discard).toBe(false);
+    expect(coverage.discardReason).toBe('none');
+  });
+
+  it('régua medida no vídeo (killfeed) que diz "fora" → descarta', () => {
+    // Offset do killfeed: a 1ª kill (at 100s, delay 5s) está em 115s —
+    // antes do buffer (150s). Régua medida = evidência.
+    const coverage = evaluateAceCoverage({
+      kills: [kill(100_000), kill(190_000)],
+      anchorMs: 115_000,
+      oldestSegmentStartMs: 150_000,
+      streamLatencyMs: 20_000,
+      scoreboardDelayMs: 5_000,
+      strict: true,
+      rulerTrusted: true,
+    });
+    expect(coverage.firstKillInBuffer).toBe(false);
+    expect(coverage.discard).toBe(true);
+    expect(coverage.discardReason).toBe('first-kill-missing');
+  });
+
+  it('fantasma (nenhuma kill no buffer) descarta independente do strict', () => {
+    const coverage = evaluateAceCoverage({
+      kills: [kill(1_000), kill(2_000)],
+      anchorMs: 1_000,
+      oldestSegmentStartMs: 150_000,
+    });
+    expect(coverage.discard).toBe(true);
+    expect(coverage.discardReason).toBe('no-kills');
+  });
+});

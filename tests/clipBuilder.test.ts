@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, newestSegmentEndMs, parseFreezeIntervals, pickSegments, probeConcatSpan, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, makeClipThumbnail, newestSegmentEndMs, parseFreezeIntervals, patchSidecarThumbnail, pickSegments, probeConcatSpan, REPLAY_AWARE_MIN_OVERLAP_MS, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, resolveReplayAwareEndMs, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
 import { computeAceEndMs } from '../src/clipper/clipAnchors.js';
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
@@ -696,6 +696,71 @@ describe.skipIf(!ffmpegOk)('detectActionResume (shadow replay-aware)', () => {
   }, 120_000);
 });
 
+describe('resolveReplayAwareEndMs (replay-aware aplicado)', () => {
+  const T = 1_700_000_000_000;
+
+  it('auto: fim fixo bem depois da retomada → corta 2s antes da ação', () => {
+    expect(resolveReplayAwareEndMs(T + 100_000, T + 60_000, 'auto', T + 200_000)).toEqual({
+      endMs: T + 58_000,
+      trimmed: true,
+    });
+  });
+
+  it('auto: fim dentro da folga não corta (evita cortar o win panel)', () => {
+    const r = resolveReplayAwareEndMs(
+      T + 60_000,
+      T + 60_000,
+      'auto',
+      T + 200_000,
+    );
+    expect(r.trimmed).toBe(false);
+    expect(r.endMs).toBe(T + 60_000);
+    expect(REPLAY_AWARE_MIN_OVERLAP_MS).toBe(5_000);
+  });
+
+  it('on: aplica com qualquer sobreposição', () => {
+    expect(resolveReplayAwareEndMs(T + 59_000, T + 60_000, 'on', T + 200_000)).toEqual({
+      endMs: T + 58_000,
+      trimmed: true,
+    });
+  });
+
+  it('shadow/off nunca cortam', () => {
+    expect(resolveReplayAwareEndMs(T + 100_000, T + 60_000, 'shadow', T + 200_000).trimmed).toBe(false);
+    expect(resolveReplayAwareEndMs(T + 100_000, T + 60_000, 'off', T + 200_000).trimmed).toBe(false);
+  });
+
+  it('sem retomada detectada não corta', () => {
+    expect(resolveReplayAwareEndMs(T + 100_000, null, 'auto', T + 200_000)).toEqual({
+      endMs: T + 100_000,
+      trimmed: false,
+    });
+  });
+
+  it('sem fim fixo usa a cauda do concat como referência', () => {
+    expect(resolveReplayAwareEndMs(null, T + 60_000, 'auto', T + 100_000)).toEqual({
+      endMs: T + 58_000,
+      trimmed: true,
+    });
+    expect(resolveReplayAwareEndMs(null, T + 60_000, 'auto', T + 50_000)).toEqual({
+      endMs: null,
+      trimmed: false,
+    });
+  });
+
+  it('REGRESSÃO 2399756: retomada antes da última kill → o corte é descartado (piso)', () => {
+    // O fim fixo T+100s passaria da retomada (T+60s → corte T+58s), mas a
+    // última kill do ace está em T+70s: fechar em T+58s a perderia.
+    expect(
+      resolveReplayAwareEndMs(T + 100_000, T + 60_000, 'auto', T + 200_000, T + 78_000),
+    ).toEqual({ endMs: T + 100_000, trimmed: false });
+    // Piso antes da retomada: o corte segue valendo.
+    expect(
+      resolveReplayAwareEndMs(T + 100_000, T + 60_000, 'auto', T + 200_000, T + 50_000),
+    ).toEqual({ endMs: T + 58_000, trimmed: true });
+  });
+});
+
 describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', () => {
   // ffmpeg pelo nome (isSegmentReadable/render): .tools no PATH
   process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
@@ -739,9 +804,9 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
         // layout: um diretório por clipe (mp4 + sidecar + thumb juntos)
         expect(out.filePath).toBe(path.join(clipsDir, 'bb_Cache_r3_x', 'bb_Cache_r3_x.mp4'));
         expect(out.sidecarPath).toBe(path.join(clipsDir, 'bb_Cache_r3_x', 'bb_Cache_r3_x.json'));
-        if (out.thumbnailPath) {
-          expect(path.dirname(out.thumbnailPath)).toBe(path.join(clipsDir, 'bb_Cache_r3_x'));
-        }
+        // F4: a thumb NÃO nasce mais no render — ela roda depois do upload.
+        expect(out.thumbnailPath).toBeUndefined();
+        expect(fs.existsSync(out.sidecarPath)).toBe(true);
         const sidecar = JSON.parse(fs.readFileSync(out.sidecarPath, 'utf8')) as {
           captureMode?: string;
           freezeDetection?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] };
@@ -781,5 +846,85 @@ describe('sanitizeSegments', () => {
     const r = await sanitizeSegments(['/nao/existe/a.mp4', '/nao/existe/b.mp4', '/nao/existe/c.mp4']);
     expect(r.ok).toEqual([]);
     expect(r.dropped).toHaveLength(3);
+  });
+});
+
+describe.skipIf(!ffmpegOk)('sanitizeSegments (fonte congelada: o mais novo está fechado)', () => {
+  function makeReal(dir: string, name: string): string {
+    const f = path.join(dir, name);
+    execFileSync(FF, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x180:rate=30',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
+      f,
+    ]);
+    return f;
+  }
+
+  it('newestIsClosed: mantém o arquivo mais novo (ninguém está gravando)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'frozen-'));
+    try {
+      const files = [makeReal(dir, 'a.mp4'), makeReal(dir, 'b.mp4'), makeReal(dir, 'c.mp4')];
+      const r = await sanitizeSegments(files, { newestIsClosed: true });
+      expect(r.ok).toHaveLength(3);
+      expect(r.dropped).toHaveLength(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('padrão: descarta o mais novo (em gravação)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gravando-'));
+    try {
+      const files = [makeReal(dir, 'a.mp4'), makeReal(dir, 'b.mp4'), makeReal(dir, 'c.mp4')];
+      const r = await sanitizeSegments(files);
+      expect(r.ok).toHaveLength(2);
+      expect(r.dropped).toContain(files[2]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!ffmpegOk)('makeClipThumbnail (F4: thumb depois do upload)', () => {
+  process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
+
+  it('gera a jpg ao lado do mp4 e anota no sidecar', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbclip-'));
+    try {
+      const clipPath = path.join(dir, 'clipe.mp4');
+      execFileSync(FF, [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc=duration=6:size=320x180:rate=30',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+        clipPath,
+      ]);
+      const ace = {
+        matchId: 'm1', map: 'Mirage', round: 3, player: 'x',
+        team1: 'A', team2: 'B', event: 'E',
+        detectedAt: new Date().toISOString(),
+        kills: [1, 2, 3, 4, 5].map((i) => ({ killer: 'x', victim: `v${i}`, round: 3, map: 'Mirage' })),
+      };
+      const thumb = await makeClipThumbnail(ace, clipPath, {
+        atSec: 2,
+        thumb: { mode: 'composed' },
+      });
+      expect(thumb).toBe(path.join(dir, 'clipe.jpg'));
+      expect(fs.statSync(thumb!).size).toBeGreaterThan(5_000);
+
+      const sidecar = path.join(dir, 'clipe.json');
+      fs.writeFileSync(sidecar, JSON.stringify({ clipFile: 'clipe.mp4' }, null, 2));
+      patchSidecarThumbnail(sidecar, thumb);
+      expect((JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { thumbnailFile?: string }).thumbnailFile).toBe('clipe.jpg');
+      patchSidecarThumbnail(sidecar, null);
+      expect((JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { thumbnailFile?: string | null }).thumbnailFile).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('sidecar inexistente não lança (best-effort)', () => {
+    expect(() => patchSidecarThumbnail(path.join(os.tmpdir(), 'nao-existe-xyz.json'), null)).not.toThrow();
   });
 });

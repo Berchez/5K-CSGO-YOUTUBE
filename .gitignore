@@ -15,3 +15,5 @@ playwright-report/
 test-results/
 # cache do tesseract.js (scripts/ocr-probe.ts baixa p/ o CWD)
 eng.traineddata
+# artefatos de sessão de agente (planos locais)
+.opencode/
