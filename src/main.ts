@@ -35,6 +35,7 @@ import {
   latencyMapProblem,
   observedLatencyMs,
   OBSERVED_LATENCY_MAX_MS,
+  plausibleLatencyMs,
   RECENT_SAMPLE_LIMIT,
   RECENT_SAMPLE_MAX_AGE_MS,
   resolveAdaptiveLatency,
@@ -52,7 +53,7 @@ import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
 import { buildClip, detectTruncatedStart, makeClipThumbnail, newestSegmentEndMs, oldestSegmentStartMs, patchSidecarThumbnail, pickSegments } from './clipper/clipBuilder.js';
 import { SegmentFreezer } from './clipper/segmentFreezer.js';
-import { computeClipAnchors } from './clipper/clipAnchors.js';
+import { computeClipAnchors, type ScoreboardEndReason } from './clipper/clipAnchors.js';
 import { cropCandidatesForStream, scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { scanKillfeedForLatency, type KillfeedSyncResult } from './clipper/killfeedSync.js';
 import { uploadClip, applyThumbnail } from './uploader/youtubeUploader.js';
@@ -565,6 +566,17 @@ async function measureRoundEnd(
   }
 }
 
+/**
+ * Motivo da virada do placar que muda as âncoras (`null` = não houve
+ * virada: no-transition/disabled/etc.). O `gap-inferred` é o único que
+ * NÃO representa o instante do fim — ver computeClipAnchors.
+ */
+function scoreboardEndReasonOf(reason: string): ScoreboardEndReason | null {
+  return reason === 'confident' || reason === 'after-only' || reason === 'gap-inferred'
+    ? reason
+    : null;
+}
+
 async function handleAce(
   ace: AceEvent,
   matchId: string,
@@ -690,6 +702,46 @@ async function handleAce(
   patchTrayStatus({ pendingClips: pendingClipCount() });
   const snapDirs: string[] = [];
   let freezer: SegmentFreezer | null = null;
+  /**
+   * Solta a marca de "clipe em construção". É idempotente: o clipe deixa
+   * de segurar o poll/buffer assim que é REGISTRADO (a thumb de IA pode
+   * levar 20 min depois disso, e não precisa de buffer nem de poll
+   * forçado), e o `finally` garante a soltura em qualquer saída.
+   */
+  let pendingReleased = false;
+  const releasePendingClip = (): void => {
+    if (pendingReleased) return;
+    pendingReleased = true;
+    removePendingClip(matchId);
+    patchTrayStatus({ pendingClips: pendingClipCount() });
+  };
+  /**
+   * Apaga os diretórios de snapshot já drenados. O `rmSync` no Windows
+   * pode dar EBUSY/EPERM com uma cópia em voo ou antivírus segurando o
+   * arquivo: a falha é só um aviso (o startup limpa `.build`), e NUNCA
+   * pode pular a limpeza de estado do `finally`.
+   */
+  const cleanupSnapDirs = async (): Promise<void> => {
+    if (freezer != null) {
+      try {
+        await freezer.stopAndDrain();
+      } catch {
+        // best-effort
+      }
+    }
+    while (snapDirs.length > 0) {
+      const dir = snapDirs.pop();
+      if (dir == null) continue;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      } catch (e) {
+        log.warn(
+          { err: String(e).slice(0, 200), dir: path.basename(dir) },
+          'falha ao limpar snapshot do clipe (o startup limpa .build)',
+        );
+      }
+    }
+  };
   try {
     let segments = recorder?.listSegments() ?? [];
     if (segments.length === 0) {
@@ -774,13 +826,19 @@ async function handleAce(
      * OCR que leu o placar do round seguinte é "confident" para o fluxo
      * score→score e mede um fim 80s tarde; persistir essa amostra atrasaria
      * o INÍCIO do próximo ace. Aqui ele fica só como candidato.
+     *
+     * A FAIXA é validada AQUI, antes da decisão: o `record()` só roda
+     * depois (persistência), e uma amostra negativa/enorme (o OCR casou o
+     * round errado: −11s e 238s medidos no relatório) deslocaria o corte
+     * inteiro — início ~1min cedo e fim para fora do round.
      */
     const scoreboardConfident = streamSync.marker === 'score' && streamSync.reason === 'confident';
+    const observedMs = streamSync.observedLatencyMs;
     const currentSample: LatencySample | null =
-      scoreboardConfident && streamSync.observedLatencyMs != null
+      scoreboardConfident && plausibleLatencyMs(observedMs)
         ? {
             measuredAtMs: Date.now(),
-            latencyMs: Math.round(streamSync.observedLatencyMs),
+            latencyMs: Math.round(observedMs),
             source: 'scoreboard',
             quality: 'confident',
             reference: roundEndReference,
@@ -968,15 +1026,25 @@ async function handleAce(
     }
     /**
      * Âncora final do início: o instante da 1ª kill no vídeo quando o
-     * killfeed respondeu (exato), senão a âncora do placar convertida
-     * com a latência adaptativa.
+     * killfeed respondeu, senão a âncora do placar convertida com a
+     * latência adaptativa.
+     *
+     * A leitura DIRETA da linha da 1ª kill é medição (o killfeed só
+     * mostra a linha quando o kill aconteceu). A âncora DERIVADA (offset
+     * do cluster aplicado ao `at` da 1ª kill) carrega o atraso do poll
+     * daquela leitura (5-16s medidos no relatório): como ela pode abrir
+     * DEPOIS da 1ª kill, vale o MENOR entre ela e a âncora do placar —
+     * abrir mais cedo nunca perde a abertura.
      */
+    const scoreboardVideoStartMs =
+      aceStartMs != null ? aceStartMs + startLatencyMs : undefined;
+    const killfeedStartExact = killfeedResult?.firstKillMatched === true;
     videoStartMs =
       killfeedStartMs != null
-        ? killfeedStartMs
-        : aceStartMs != null
-          ? aceStartMs + startLatencyMs
-          : undefined;
+        ? killfeedStartExact || scoreboardVideoStartMs == null
+          ? killfeedStartMs
+          : Math.min(killfeedStartMs, scoreboardVideoStartMs)
+        : scoreboardVideoStartMs;
     streamSync.startLatencyMs = startLatencyMs;
     streamSync.endLatencyMs = endLatencyMs;
     /**
@@ -1027,6 +1095,10 @@ async function handleAce(
         : null;
     const anchors = computeClipAnchors({
       aceStartedAtMs: aceStartMs,
+      // O MESMO início que o corte aplica (killfeed, quando medido): o
+      // piso de duração, o início estimado e os metadados não podem usar
+      // uma âncora diferente da que abre o vídeo.
+      videoStartOverrideMs: videoStartMs,
       streamLatencyMs,
       startLatencyMs,
       endLatencyMs,
@@ -1038,6 +1110,10 @@ async function handleAce(
       startMarginSec,
       aceDetectedAtMs,
       scoreboardEndMs: detectedEndMs,
+      // `gap-inferred` é um limite INFERIOR do fim (o overlay ficou
+      // ilegível por 20s+): o piso estimado da última kill não pode ser
+      // capado por ele, senão o clipe fecha no meio do ace.
+      scoreboardEndReason: scoreboardEndReasonOf(streamSync.reason),
       lastKillVideoMs: killfeedLastKillMs,
       // Base do piso da última kill SEM killfeed (placar confiante).
       lastKillAtMs:
@@ -1425,6 +1501,12 @@ async function handleAce(
           latencyChanged: adaptive.changed,
           timelineDiscontinuity,
           killVideoOffsetMs,
+          // Diagnóstico do fim no sidecar (o log se perde no restart e a
+          // validação dos clipes compara justamente os sidecars).
+          endFloorMs: anchors.endFloorMs,
+          endPinnedBy: anchors.endPinnedBy,
+          ocrEndRejected: anchors.ocrEndRejected,
+          scoreboardEndReason: scoreboardEndReasonOf(streamSync.reason),
           // Piso do replay-aware: o corte nunca fecha antes dele — a
           // última kill (medida ou estimada) e a virada genuína do
           // placar ficam dentro do clipe (r8: o corte removia as 3 kills).
@@ -1439,6 +1521,10 @@ async function handleAce(
     };
 
     const clip = await buildClipFromBuffer();
+    // As cópias congeladas (centenas de MB) já cumpriram o papel: o clipe
+    // está renderizado. Apagar AGORA libera o disco antes do upload e da
+    // thumb de IA (que pode levar minutos) em vez de só no `finally`.
+    await cleanupSnapDirs();
     // Nenhum clipe sobreviveu: só é fantasma se caiu por falta de footage.
     // Falha de ffmpeg/disco mantém o evento no banco (o clipe pode ser
     // refeito manualmente).
@@ -1513,6 +1599,10 @@ async function handleAce(
         uploaded: Boolean(videoId),
         privacy: cfg.YT_PRIVACY,
       });
+      // Clipe renderizado, enviado e REGISTRADO: o buffer já pode ser
+      // limpo e o poll volta ao intervalo normal. A thumb abaixo (até
+      // 2 × 10 min de IA) não segura mais o estado de "clipe pendente".
+      releasePendingClip();
       // F4: thumbnail DEPOIS do upload e do registro. A geração (IA até
       // minutos) não atrasa mais o vídeo no ar; falha aqui não derruba o
       // clipe.
@@ -1551,10 +1641,12 @@ async function handleAce(
   } catch (e) {
     log.error({ err: String(e) }, 'falha ao montar clipe');
   } finally {
-    freezer?.stop();
-    for (const dir of snapDirs) fs.rmSync(dir, { recursive: true, force: true });
-    removePendingClip(matchId);
-    patchTrayStatus({ pendingClips: pendingClipCount() });
+    // Ordem que não pode falhar: drenar o freezer e apagar os snapshots
+    // (best-effort, cada um com try próprio) e SÓ ENTÃO soltar a marca
+    // do clipe — um EBUSY no rmSync não pode deixar `pendingClips` > 0
+    // para sempre (poll forçado, buffer nunca limpo, restart travado).
+    await cleanupSnapDirs();
+    releasePendingClip();
   }
 }
 

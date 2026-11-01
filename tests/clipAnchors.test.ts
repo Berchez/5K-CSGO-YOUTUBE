@@ -261,6 +261,31 @@ describe('computeClipAnchors (piso do fim)', () => {
     expect(a.usedScoreboardEnd).toBe(false);
   });
 
+  it('REGRESSÃO gap-inferred: o "fim" inferido é antigo e não pode capar o piso da última kill', () => {
+    // Overlay ilegível por 20s+ antes da virada: o último frame legível
+    // (T+40s) NÃO é o fim do round. Capar o piso estimado (T+78s) por ele
+    // fecharia o clipe no meio do ace.
+    const gap = anchors({
+      scoreboardEndMs: T + 40_000,
+      syncApplied: true,
+      scoreboardEndReason: 'gap-inferred',
+      lastKillAtMs: T + 50_000,
+    });
+    expect(gap.endFloorMs).toBe(T + 78_000);
+    expect(gap.endMs).toBe(T + 78_000);
+    expect(gap.endPinnedBy).toBe('last-kill');
+    // Com o fim GENUÍNO do OCR o cap continua valendo (a última kill é
+    // sempre anterior ao fim do round).
+    const confident = anchors({
+      scoreboardEndMs: T + 40_000,
+      syncApplied: true,
+      scoreboardEndReason: 'confident',
+      lastKillAtMs: T + 50_000,
+    });
+    expect(confident.endFloorMs).toBe(T + 48_000);
+    expect(confident.endMs).toBe(T + 48_000);
+  });
+
   it('piso ESTIMADO não passa do fim GENUÍNO do round (sem cauda extra)', () => {
     // endLatency conservador (90s) jogaria o piso estimado para T+143s —
     // muito depois do fim do round lido (T+90s). A última kill é sempre
@@ -307,5 +332,18 @@ describe('computeClipAnchors (latência adaptativa por âncora)', () => {
     const a = anchors();
     expect(a.startLatencyMs).toBe(25_000);
     expect(a.endLatencyMs).toBe(25_000);
+  });
+
+  it('início definido pelo chamador (killfeed) alimenta corte, margem e pisos', () => {
+    // O início é o que o corte aplica: o piso de duração não pode usar
+    // outra âncora (senão o replay-aware "encurta" até um ponto que não
+    // existe no vídeo).
+    const a = anchors({ videoStartOverrideMs: T + 120_000 });
+    expect(a.videoStartMs).toBe(T + 120_000);
+    expect(a.estimatedClipStartMs).toBe(T + 110_000);
+    expect(a.endMs).toBe(T + 130_000);
+    expect(a.endPinnedBy).toBe('min-duration');
+    // O offset kill→vídeo continua sendo latência − atraso do placar.
+    expect(a.killVideoOffsetMs).toBe(20_000);
   });
 });

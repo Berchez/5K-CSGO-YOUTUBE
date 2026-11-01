@@ -186,6 +186,17 @@ export interface ClipOptions {
    * ace tem que continuar no clipe — o corte nunca fecha antes dele.
    */
   minEndMs?: number | null;
+  /**
+   * Diagnóstico do fim (sidecar): piso efetivo, o que o pinou e se a
+   * virada do placar no vídeo foi rejeitada por implausível. É o que
+   * permite comparar clipes depois (o log sozinho se perde quando o
+   * processo reinicia).
+   */
+  endFloorMs?: number | null;
+  endPinnedBy?: 'last-kill' | 'min-duration' | null;
+  ocrEndRejected?: boolean;
+  /** Motivo da virada do placar (confident/after-only/gap-inferred). */
+  scoreboardEndReason?: string | null;
 }
 
 export interface PickOptions {
@@ -1232,6 +1243,11 @@ export async function buildClip(
         concatLenSec: Math.round(concatLenSec * 100) / 100,
         replayAwareEndMs,
         actionResume,
+        minEndMs: opts.minEndMs ?? null,
+        endFloorMs: opts.endFloorMs ?? null,
+        endPinnedBy: opts.endPinnedBy ?? null,
+        ocrEndRejected: opts.ocrEndRejected ?? null,
+        scoreboardEndReason: opts.scoreboardEndReason ?? null,
       }),
       null,
       2,

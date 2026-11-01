@@ -175,6 +175,28 @@ const SAMPLES_PER_STREAM = 5;
 export const OBSERVED_LATENCY_MIN_MS = 0;
 export const OBSERVED_LATENCY_MAX_MS = 120_000;
 
+/**
+ * A latência (ms) está dentro da faixa plausível? Fora dela o OCR casou o
+ * round errado (ou a diferença de relógio) e o valor NÃO é latência —
+ * um negativo abriria o clipe antes do round, um >120s fecharia tarde
+ * demais. Usado tanto na gravação (record) quanto na DECISÃO
+ * (resolveAdaptiveLatency): a amostra pode chegar por caminhos que não
+ * passam pelo record (a do round atual é montada no handleAce).
+ */
+export function plausibleLatencyMs(ms: number | null | undefined): ms is number {
+  return (
+    ms != null &&
+    Number.isFinite(ms) &&
+    ms >= OBSERVED_LATENCY_MIN_MS &&
+    ms <= OBSERVED_LATENCY_MAX_MS
+  );
+}
+
+/** A amostra é utilizável? (latência finita e na faixa plausível) */
+export function plausibleSample(sample: LatencySample | null | undefined): sample is LatencySample {
+  return sample != null && plausibleLatencyMs(sample.latencyMs);
+}
+
 /** Idade máxima de uma amostra para contar como "histórico recente" (ms). */
 export const RECENT_SAMPLE_MAX_AGE_MS = 15 * 60_000;
 
@@ -216,8 +238,7 @@ export class StreamLatencyTracker {
       reference?: LatencyEndReference;
     },
   ): LatencySample | null {
-    if (!Number.isFinite(latencyMs)) return null;
-    if (latencyMs < OBSERVED_LATENCY_MIN_MS || latencyMs > OBSERVED_LATENCY_MAX_MS) return null;
+    if (!plausibleLatencyMs(latencyMs)) return null;
     const key = streamKey(streamName);
     // Sem timestamp explícito, o relógio avança de 1 em 1ms para manter a
     // ordem estável (várias medidas no mesmo ms).
@@ -511,9 +532,12 @@ export interface AdaptiveLatencyParams {
    * Mais antiga que isso, a medição não descreve o regime atual.
    */
   recentSamples: LatencySample[];
-  /** Amostra medida no round atual (depois da 1ª kill) — pode ser null. */
-  current: LatencySample | null;
   /**
+   * Amostra medida no round atual (depois da 1ª kill) — pode ser null.
+   * Amostra fora da faixa plausível é IGNORADA (o OCR casou o round
+   * errado): ela nunca move o início nem o fim.
+   */
+  current: LatencySample | null;  /**
    * Aumento do atraso (ms) conhecido entre a amostra anterior e a
    * 1ª kill (salto do relógio de origem da playlist HLS).
    *
@@ -567,7 +591,15 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
     eventAtMs = Date.now(),
     pendingShiftMs = 0,
   } = params;
-  const prior = priorSamples.length > 0 ? priorSamples[priorSamples.length - 1] : null;
+  /**
+   * Toda amostra passa pela faixa plausível ANTES de decidir: a do round
+   * atual chega montada pelo chamador (não pelo record, que já filtra) e
+   * um valor negativo/enorme do OCR deslocaria o corte inteiro.
+   */
+  const sanePrior = priorSamples.filter(plausibleSample);
+  const saneRecent = recentSamples.filter(plausibleSample);
+  const currentSample = plausibleSample(current) ? current : null;
+  const prior = sanePrior.length > 0 ? sanePrior[sanePrior.length - 1] : null;
   /**
    * Amostra CONFIÁVEL para o início: a mais recente medida antes do
    * evento cuja qualidade seja `confident` E cujo fim de round veio do
@@ -577,7 +609,7 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
    * (±20s) — nenhuma das duas é latência.
    */
   const startPrior =
-    [...priorSamples]
+    [...sanePrior]
       .reverse()
       .find((sample) => sample.quality === 'confident' && sample.reference !== 'estimada') ?? null;
   const shiftMs = Number.isFinite(pendingShiftMs) && pendingShiftMs > 0 ? pendingShiftMs : 0;
@@ -606,12 +638,25 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
   let startSource: StartLatencySource = baseSample ? 'prior' : 'config';
   let changed = false;
   let deltaMs: number | null = null;
-  if (current) {
-    deltaMs = current.latencyMs - base;
+  /**
+   * A amostra do round só pode ANTECIPAR o início quando é latência de
+   * verdade: `confident` e fim do round pelo timer do HLTV. Com o fim
+   * ESTIMADO o valor carrega o erro do atraso de publicação do placar
+   * (±CLIP_SCORE_DELAY_MS) e antecipar com ele pode abrir DEPOIS da 1ª
+   * kill — a mesma razão pela qual ela não alimenta o `startPrior`.
+   */
+  const currentForStart =
+    currentSample != null &&
+    currentSample.quality === 'confident' &&
+    currentSample.reference !== 'estimada'
+      ? currentSample
+      : null;
+  if (currentSample) {
+    deltaMs = currentSample.latencyMs - base;
     changed = Math.abs(deltaMs) > maxStepMs;
-    if (current.latencyMs <= base) {
+    if (currentForStart != null && currentForStart.latencyMs <= base) {
       // Menor que a amostra em vigor: abrir mais cedo é sempre seguro.
-      startLatencyMs = current.latencyMs;
+      startLatencyMs = currentForStart.latencyMs;
       startSource = changed ? 'min-safe' : 'current';
     }
     // current > base: mantém a base. A medição pode ter subido DEPOIS
@@ -623,22 +668,22 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
    * o lado conservador. Só entra no fim estimado — nunca no início.
    */
   const shiftAdjustedPrior = prior ? prior.latencyMs + shiftMs : null;
-  const endSample = current ?? prior;
+  const endSample = currentSample ?? prior;
   let endLatencyMs = configuredMs;
-  if (current) {
+  if (currentSample) {
     const recentMax =
-      recentSamples.length > 0 ? Math.max(...recentSamples.map((sample) => sample.latencyMs)) : null;
+      saneRecent.length > 0 ? Math.max(...saneRecent.map((sample) => sample.latencyMs)) : null;
     endLatencyMs =
-      current.quality === 'confident'
-        ? current.latencyMs
+      currentSample.quality === 'confident'
+        ? currentSample.latencyMs
         : Math.max(
-            current.latencyMs,
+            currentSample.latencyMs,
             recentMax ?? Number.NEGATIVE_INFINITY,
             shiftAdjustedPrior ?? Number.NEGATIVE_INFINITY,
           );
   } else {
     const candidates = [
-      ...recentSamples.map((sample) => sample.latencyMs),
+      ...saneRecent.map((sample) => sample.latencyMs),
       ...(shiftAdjustedPrior != null ? [shiftAdjustedPrior] : []),
     ];
     endLatencyMs =
@@ -652,7 +697,8 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
     startLatencyMs,
     endLatencyMs,
     startSource,
-    startSample: startSource === 'current' || startSource === 'min-safe' ? current : baseSample,
+    startSample:
+      startSource === 'current' || startSource === 'min-safe' ? currentSample : baseSample,
     endSample,
     deltaMs,
     changed,

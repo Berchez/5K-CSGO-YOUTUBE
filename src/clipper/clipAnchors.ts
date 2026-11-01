@@ -52,9 +52,24 @@ export function killVideoOffsetMs(
   return streamLatencyMs - scoreboardDelayMs;
 }
 
+/**
+ * Motivo da virada do placar no vídeo (`streamSync.reason`). `gap-inferred`
+ * NÃO é o instante do fim: com o overlay ilegível entre o último frame
+ * "before" e o primeiro "after", o valor é o último frame legível + folga
+ * — um LIMITE INFERIOR do fim (o round pode ter fechado 20s+ depois).
+ */
+export type ScoreboardEndReason = 'confident' | 'after-only' | 'gap-inferred';
+
 export interface ClipAnchorsInput {
   /** Início do ace no relógio do PLACAR (1ª kill − compensação). */
   aceStartedAtMs?: number;
+  /**
+   * Início do clipe na timeline do VÍDEO já decidido pelo chamador (ex.:
+   * âncora do killfeed). Sem ele, o início é `aceStartedAtMs +
+   * startLatencyMs`. Existe para o piso de duração, o início estimado e os
+   * metadados usarem o MESMO início que o corte aplica.
+   */
+  videoStartOverrideMs?: number;
   /**
    * Latência da stream gravada (ms) — o valor efetivo do canal
    * (configurado). É o FALLBACK: quando não há medição, é ele quem
@@ -95,6 +110,13 @@ export interface ClipAnchorsInput {
   aceDetectedAtMs: number;
   /** Virada do placar vista NO VÍDEO (ms) — âncora exata, quando existe. */
   scoreboardEndMs?: number | null;
+  /**
+   * Motivo da virada (`streamSync.reason`). Só `gap-inferred` muda a
+   * conta: ali `scoreboardEndMs` é um limite INFERIOR do fim, então ele
+   * não pode limitar o piso estimado da última kill (ver
+   * `lastKillEstimateFloorMs`).
+   */
+  scoreboardEndReason?: ScoreboardEndReason | null;
   /**
    * Instante no vídeo da ÚLTIMA kill do ace (killfeed). Piso do fim: a
    * última kill tem que estar no clipe mesmo quando a âncora do placar
@@ -205,9 +227,8 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
   const startLatencyMs = input.startLatencyMs ?? input.streamLatencyMs;
   const endLatencyMs = input.endLatencyMs ?? input.streamLatencyMs;
   const videoStartMs =
-    input.aceStartedAtMs != null
-      ? input.aceStartedAtMs + startLatencyMs
-      : undefined;
+    input.videoStartOverrideMs ??
+    (input.aceStartedAtMs != null ? input.aceStartedAtMs + startLatencyMs : undefined);
   const startContextSec = input.contextSec + (input.startMarginSec ?? 0);
   const estimatedClipStartMs =
     videoStartMs != null ? videoStartMs - startContextSec * 1000 : undefined;
@@ -299,14 +320,24 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
    * redundante e chega a 20s+ depois — `endLatencyMs` é score→score e
    * carrega o atraso de publicação do placar, que não existe no instante
    * da kill (medido: 61,8s vs 45,2s reais no 2399756 r9).
+   *
+   * O cap pelo fim do OCR só vale quando ele é o fim GENUÍNO do round.
+   * Em `gap-inferred` ele é o último frame legível + folga: o overlay
+   * ficou ilegível por 20s+ (justamente quando o OCR falha antes da
+   * virada), então o "fim" inferido é ANTIGO e capar por ele anularia o
+   * piso — o clipe fecharia no meio do ace (o defeito que o piso existe
+   * para evitar).
    */
+  const endInferredFromGap = input.scoreboardEndReason === 'gap-inferred';
   const lastKillEstimateFloorMs =
     input.lastKillVideoMs == null &&
     input.lastKillAtMs != null &&
     Number.isFinite(input.lastKillAtMs)
       ? Math.min(
           input.lastKillAtMs - input.scoreboardDelayMs + endLatencyMs + tailMs,
-          usedScoreboardEnd && ocrEndMs != null ? ocrEndMs + tailMs : Number.POSITIVE_INFINITY,
+          usedScoreboardEnd && ocrEndMs != null && !endInferredFromGap
+            ? ocrEndMs + tailMs
+            : Number.POSITIVE_INFINITY,
         )
       : null;
   const ocrEndFloorMs = usedScoreboardEnd ? ocrEndMs : null;
@@ -324,10 +355,10 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
   if (endFloorMs != null && endFloorMs > finalEndMs) {
     finalEndMs = endFloorMs;
     endPinnedBy =
-      endFloorMs === minDurationFloorMs
-        ? 'min-duration'
-        : endFloorMs === lastKillFloorMs || endFloorMs === lastKillEstimateFloorMs
-          ? 'last-kill'
+      endFloorMs === lastKillFloorMs || endFloorMs === lastKillEstimateFloorMs
+        ? 'last-kill'
+        : endFloorMs === minDurationFloorMs
+          ? 'min-duration'
           : null;
   }
   return {

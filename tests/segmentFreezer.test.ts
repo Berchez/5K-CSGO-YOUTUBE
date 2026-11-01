@@ -100,4 +100,52 @@ describe('SegmentFreezer', () => {
     expect(await freezer.waitForCoverage(T, 500)).toBe(true);
     freezer.stop();
   });
+
+  it('passada em voo: scan() devolve a MESMA passada (não lê lista incompleta)', async () => {
+    const src = tmpDir();
+    const dest = tmpDir();
+    const a = makeSegment(src, 'seg_1.ts', T);
+    const b = makeSegment(src, 'seg_2.ts', T + 10_000);
+    const c = makeSegment(src, 'seg_3.ts', T + 20_000);
+    const freezer = new SegmentFreezer({
+      listSegments: () => [a, b, c],
+      destDir: dest,
+      segmentTimeSec: 10,
+    });
+    const first = freezer.scan();
+    const second = freezer.scan();
+    // Antes, a 2ª chamada retornava de imediato com a cópia pela metade
+    // (o chamador então lia uma lista incompleta e podia cortar o clipe
+    // cedo demais).
+    expect(second).toBe(first);
+    await first;
+    expect(freezer.listFrozen()).toHaveLength(2);
+  });
+
+  it('stopAndDrain espera a passada terminar e não copia nada depois', async () => {
+    const src = tmpDir();
+    const dest = tmpDir();
+    const a = makeSegment(src, 'seg_1.ts', T);
+    const b = makeSegment(src, 'seg_2.ts', T + 10_000);
+    const c = makeSegment(src, 'seg_3.ts', T + 20_000);
+    const files = [a, b, c];
+    const freezer = new SegmentFreezer({
+      listSegments: () => byMtime(files),
+      destDir: dest,
+      segmentTimeSec: 10,
+    });
+    void freezer.scan();
+    await freezer.stopAndDrain();
+
+    // Nada ficou pela metade: o chamador pode apagar o destino logo depois.
+    for (const file of freezer.listFrozen()) {
+      expect(fs.readFileSync(file).length).toBe(64);
+    }
+    const after = freezer.listFrozen().length;
+    // Segmento fechado DEPOIS do stop não é copiado.
+    files.push(makeSegment(src, 'seg_4.ts', T + 30_000));
+    files.push(makeSegment(src, 'seg_5.ts', T + 40_000));
+    await freezer.scan();
+    expect(freezer.listFrozen()).toHaveLength(after);
+  });
 });

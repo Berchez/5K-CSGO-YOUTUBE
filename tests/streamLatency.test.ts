@@ -586,6 +586,68 @@ describe('resolveAdaptiveLatency', () => {
     expect(decision.startLatencyMs).toBe(10_000);
     expect(decision.startSource).toBe('prior');
   });
+
+  it('amostra do round fora da faixa plausível é IGNORADA (não desloca o corte)', () => {
+    // Medido no relatório: o OCR casou o round errado e devolveu −11s e
+    // 238s. Antes da guarda, a negativa abria o clipe ~1min antes e a
+    // enorme fechava fora do round.
+    const priorMs = 40_000;
+    const current: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: -11_000,
+      source: 'scoreboard',
+      quality: 'confident',
+      reference: 'timer',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [sample(1_000, priorMs)],
+      recentSamples: [sample(1_000, priorMs)],
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(priorMs);
+    expect(decision.endLatencyMs).toBe(priorMs);
+    expect(decision.endSample?.latencyMs).toBe(priorMs);
+  });
+
+  it('amostra anterior fora da faixa não vira referência do início', () => {
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [sample(1_000, -30_000)],
+      recentSamples: [sample(1_000, -30_000)],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(25_000);
+    expect(decision.startSource).toBe('config');
+    expect(decision.endLatencyMs).toBe(25_000);
+  });
+
+  it('fim ESTIMADO do round no `current` não antecipa o início', () => {
+    // `estimada` carrega o erro de CLIP_SCORE_DELAY_MS (±20s): antecipar
+    // com ela pode abrir DEPOIS da 1ª kill. Ela só alimenta o FIM.
+    const current: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: 30_000,
+      source: 'scoreboard',
+      quality: 'confident',
+      reference: 'estimada',
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 40_000,
+      priorSamples: [],
+      recentSamples: [],
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(40_000);
+    expect(decision.startSource).toBe('config');
+    expect(decision.endLatencyMs).toBe(30_000);
+  });
 });
 
 describe('shouldApplyAdaptive (modos do sync)', () => {

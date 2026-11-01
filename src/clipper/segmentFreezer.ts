@@ -50,7 +50,8 @@ export class SegmentFreezer {
   private readonly frozen = new Map<string, FrozenCopy>();
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
-  private scanning = false;
+  /** Passada em voo (dedupe + drenagem no stop). */
+  private inFlight: Promise<void> | null = null;
   private lowDiskWarned = false;
   private copyErrorWarned = false;
   private failures = 0;
@@ -86,22 +87,54 @@ export class SegmentFreezer {
   }
 
   /**
+   * Para e ESPERA a passada em voo terminar.
+   *
+   * O `stop()` sozinho não garante que ninguém está escrevendo no
+   * diretório: apagar as cópias com um `copyFile` em voo dá EBUSY/EPERM
+   * no Windows (e o `finally` do chamador pularia a limpeza de estado).
+   * A passada em voo vê `stopped` no próximo arquivo e sai rápido, então
+   * a drenagem é curta.
+   */
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    const pending = this.inFlight;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch {
+        // best-effort: quem chama só quer o diretório livre
+      }
+    }
+  }
+
+  /**
    * Copia os segmentos que já fecharam (o mais novo pode estar em escrita).
    *
    * A cópia é ASSÍNCRONA de propósito: são centenas de MB por passada e o
    * `copyFileSync` travava o event loop (polls do HLTV, recorder e outros
-   * OCRs) por segundos a cada 1,5s. As passadas não se sobrepõem
-   * (`scanning`): uma varredura lenta pula as seguintes em vez de
-   * empilhar I/O.
+   * OCRs) por segundos a cada 1,5s. As passadas não se sobrepõem: quem
+   * chama `scan()` com uma passada em voo recebe a MESMA promise (antes
+   * ela retornava de imediato e o chamador lia uma lista incompleta).
    */
-  async scan(): Promise<void> {
-    if (this.stopped || this.scanning) return;
-    this.scanning = true;
-    try {
-      await this.scanOnce();
-    } finally {
-      this.scanning = false;
-    }
+  scan(): Promise<void> {
+    if (this.inFlight != null) return this.inFlight;
+    if (this.stopped) return Promise.resolve();
+    const run = this.scanOnce()
+      .catch((e) => {
+        // `scanOnce` já trata os erros por arquivo; isto é a rede de
+        // segurança para que uma exceção inesperada não vire
+        // unhandledRejection (derruba o processo no Node >= 15).
+        this.failures += 1;
+        getLogger().warn(
+          { err: String(e).slice(0, 200) },
+          'falha inesperada na passada do freezer do buffer',
+        );
+      })
+      .finally(() => {
+        this.inFlight = null;
+      });
+    this.inFlight = run;
+    return run;
   }
 
   private async scanOnce(): Promise<void> {
@@ -125,6 +158,9 @@ export class SegmentFreezer {
       return;
     }
     for (const file of closed) {
+      // Drenagem: uma passada longa (centenas de MB) não pode continuar
+      // copiando depois do stop (o diretório é apagado logo em seguida).
+      if (this.stopped) return;
       let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
