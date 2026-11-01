@@ -15,5 +15,7 @@ playwright-report/
 test-results/
 # cache do tesseract.js (scripts/ocr-probe.ts baixa p/ o CWD)
 eng.traineddata
+# benchmark local de latencia por modelo (artefato local)
+latencia.txt
 # artefatos de sessão de agente (planos locais)
 .opencode/
