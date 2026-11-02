@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   estimateStreamOffset,
+  killfeedExpectedWindowStartMs,
   killfeedScanWindowMs,
   matchKillfeedText,
+  orderCrops,
   type KillfeedObservation,
 } from '../src/clipper/killfeedSync.js';
 import type { KillEvent } from '../src/types.js';
@@ -20,28 +22,39 @@ function kill(at: number, killer: string, victim: string): KillEvent {
 }
 
 describe('killfeedScanWindowMs', () => {
-  it('sem faixa, usa o hint com as tolerâncias (comportamento antigo)', () => {
+  it('começa no instante MAIS CEDO plausível, sem depender do hint (regressão 2399858)', () => {
+    // Hint de 45s fazia a janela começar em at1+25s — exatamente onde o
+    // corte abre. A 1ª kill (no vídeo ~at1+20s) nunca era lida.
     const kills = [kill(100_000, 'a', 'b'), kill(160_000, 'a', 'c')];
     const window = killfeedScanWindowMs({
       kills,
       scoreboardDelayMs: 5_000,
-      latencyHintMs: 25_000,
+      latencyHintMs: 45_000,
+      latencyMaxMs: 90_000,
     });
-    expect(window).toEqual({ startMs: 105_000, endMs: 195_000 });
+    // A tolerância ANTES da kill é de 5s (=|MIN_ALLOWED_OFFSET_MS|): antes
+    // disso a leitura seria DESCARTADA pelo filtro de faixa — varrer era
+    // custo de OCR sem chance de match.
+    expect(window).toEqual({ startMs: 90_000, endMs: 260_000 });
   });
 
-  it('com faixa de latência, cobre o kill quando o regime subiu', () => {
+  it('o hint não muda o início (só o limite superior)', () => {
     const kills = [kill(100_000, 'a', 'b'), kill(160_000, 'a', 'c')];
-    const window = killfeedScanWindowMs({
+    const base = killfeedScanWindowMs({
       kills,
       scoreboardDelayMs: 5_000,
       latencyHintMs: 25_000,
-      latencyMaxMs: 70_000,
     });
-    expect(window).toEqual({ startMs: 105_000, endMs: 240_000 });
+    const higher = killfeedScanWindowMs({
+      kills,
+      scoreboardDelayMs: 5_000,
+      latencyHintMs: 70_000,
+    });
+    expect(base!.startMs).toBe(higher!.startMs);
+    expect(higher!.endMs).toBeGreaterThan(base!.endMs);
   });
 
-  it('com faixa invertida, a janela começa pela menor latência', () => {
+  it('com faixa invertida, o fim usa o maior dos dois (nunca corta a kill)', () => {
     const kills = [kill(100_000, 'a', 'b')];
     const window = killfeedScanWindowMs({
       kills,
@@ -49,12 +62,72 @@ describe('killfeedScanWindowMs', () => {
       latencyHintMs: 70_000,
       latencyMaxMs: 25_000,
     });
-    expect(window).toEqual({ startMs: 105_000, endMs: 180_000 });
+    expect(window).toEqual({ startMs: 90_000, endMs: 180_000 });
   });
 
   it('sem kills com timestamp não há janela', () => {
     expect(
       killfeedScanWindowMs({
+        kills: [kill(Number.NaN, 'a', 'b')],
+        scoreboardDelayMs: 5_000,
+        latencyHintMs: 25_000,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('orderCrops (custo do OCR)', () => {
+  const crops = [
+    { raw: 'a:0:0:1:1' },
+    { raw: 'b:0:0:1:1' },
+    { raw: 'c:0:0:1:1' },
+  ];
+
+  it('sem crop usado, mantém a ordem original', () => {
+    expect(orderCrops(crops, null).map((c) => c.raw)).toEqual(['a:0:0:1:1', 'b:0:0:1:1', 'c:0:0:1:1']);
+  });
+
+  it('o crop que já leu o killfeed vai PRIMEIRO (sticky)', () => {
+    // Cada segmento da janela testava a cadeia inteira de crops (4×
+    // ffmpeg + ~10 frames de tesseract): o custo do OCR é o gargalo.
+    expect(orderCrops(crops, 'b:0:0:1:1').map((c) => c.raw)).toEqual([
+      'b:0:0:1:1',
+      'a:0:0:1:1',
+      'c:0:0:1:1',
+    ]);
+  });
+
+  it('crop usado que não está na lista não muda nada', () => {
+    expect(orderCrops(crops, 'z:0:0:1:1').map((c) => c.raw)).toEqual([
+      'a:0:0:1:1',
+      'b:0:0:1:1',
+      'c:0:0:1:1',
+    ]);
+  });
+
+  it('não mexe na lista original', () => {
+    const original = [...crops];
+    orderCrops(crops, 'c:0:0:1:1');
+    expect(crops).toEqual(original);
+  });
+});
+
+describe('killfeedExpectedWindowStartMs (janela esperada)', () => {
+  it('é o instante da 1ª kill + a latência estimada − a tolerância', () => {
+    const kills = [kill(100_000, 'a', 'b'), kill(160_000, 'a', 'c')];
+    // 100.000 − 5.000 (atraso do placar) + 25.000 (latência) − 5.000
+    expect(
+      killfeedExpectedWindowStartMs({
+        kills,
+        scoreboardDelayMs: 5_000,
+        latencyHintMs: 25_000,
+      }),
+    ).toBe(115_000);
+  });
+
+  it('sem kills com timestamp não há janela esperada', () => {
+    expect(
+      killfeedExpectedWindowStartMs({
         kills: [kill(Number.NaN, 'a', 'b')],
         scoreboardDelayMs: 5_000,
         latencyHintMs: 25_000,
@@ -174,8 +247,10 @@ describe('estimateStreamOffset', () => {
     expect(result.matchedKills).toBe(3);
     expect(result.firstKillMatched).toBe(false);
     expect(result.firstKillVideoMs).toBe(124_000);
-    // O offset vem do cluster (para os timestamps), não da leitura direta.
-    expect(result.killVideoOffsetMs).toBe(25_000);
+    // O offset vem do cluster (para os timestamps), não da leitura direta —
+    // e desconta o atraso de aparecimento do killfeed (1s), como a âncora
+    // derivada: sem isso as marcas de tempo ficavam 1s fora do vídeo.
+    expect(result.killVideoOffsetMs).toBe(24_000);
   });
 
   it('descarta a leitura errada (nome parecido) e mantém o cluster', () => {
@@ -333,5 +408,27 @@ describe('estimateStreamOffset', () => {
     const result = estimateStreamOffset(kills, observations, 5_000, 180);
     expect(result.reason).toBe('insufficient-matches');
     expect(result.offsetMs).toBeNull();
+  });
+
+  it('falso positivo na banda negativa NÃO come a leitura legítima', () => {
+    // A janela começa 15s antes do tempo de jogo da kill: um falso
+    // positivo do OCR nessa banda era o "first seen" e, descartado
+    // depois pelo MIN_ALLOWED, levava junto a leitura legítima (a kill
+    // ficava sem observação → 'insufficient-matches').
+    const kills = [kill(100_000, 'a', 'b'), kill(130_000, 'c', 'd')];
+    const observations: KillfeedObservation[] = [
+      // Falso positivo: offset −8s (abaixo de MIN_ALLOWED = −5s).
+      { killIndex: 0, streamAtMs: 87_000 },
+      // Leitura legítima: offset +30s.
+      { killIndex: 0, streamAtMs: 125_000 },
+      { killIndex: 1, streamAtMs: 155_000 },
+    ];
+    const result = estimateStreamOffset(kills, observations, 5_000, 180);
+    expect(result.reason).toBe('confident');
+    expect(result.matchedKills).toBe(2);
+    expect(result.offsetMs).toBe(30_000);
+    // A âncora é a leitura legítima (125s), não o falso positivo.
+    expect(result.firstKillVideoMs).toBe(124_000);
+    expect(result.firstKillMatched).toBe(true);
   });
 });

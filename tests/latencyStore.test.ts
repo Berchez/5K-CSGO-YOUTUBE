@@ -77,6 +77,48 @@ describe('loadLatencyState / saveLatencyState', () => {
     expect(loaded.state.killfeedCrop('gaules')).toBe('0.70:0.05:0.30:0.25');
   });
 
+  it('v2 é aproveitado e a migração é logada (nada de perder a medição)', () => {
+    // O schema v2 é o mesmo: as amostras sobrevivem (o `startOnly` vai
+    // para o anel do início) e o startup precisa saber que o arquivo
+    // veio de outra versão.
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 2,
+        streams: {
+          gaules: {
+            samples: [
+              { measuredAtMs: 1_000, latencyMs: 33_000, source: 'scoreboard', quality: 'confident' },
+              { measuredAtMs: 2_000, latencyMs: 20_000, source: 'killfeed', quality: 'confident', startOnly: true },
+            ],
+            crop: '0.02:0.02:0.30:0.14',
+          },
+        },
+      }),
+    );
+    const loaded = loadLatencyState(file);
+    expect(loaded.problem).toBeNull();
+    expect(loaded.state.median('gaules')).toBe(33_000);
+    expect(loaded.state.startSamplesCount('gaules')).toBe(1);
+    expect(loaded.state.crop('gaules')).toBe('0.02:0.02:0.30:0.14');
+    // A migração é reportada (de → para, amostras e canais).
+    expect(loaded.migration).toEqual({
+      from: 2,
+      to: 3,
+      samples: 2,
+      channels: ['gaules'],
+    });
+  });
+
+  it('arquivo no schema atual não reporta migração', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 42_000);
+    saveLatencyState(file, tracker);
+    const loaded = loadLatencyState(file);
+    expect(loaded.migration).toBeNull();
+  });
+
   it('a escrita é atômica (não deixa arquivo temporário para trás)', () => {
     const tracker = new StreamLatencyTracker();
     tracker.record('Gaules', 10_000);

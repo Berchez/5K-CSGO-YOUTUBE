@@ -163,10 +163,33 @@ export interface LatencySample {
    * confiança da medição mesmo depois de um restart.
    */
   reference?: LatencyEndReference;
+  /**
+   * A amostra vale SÓ para o INÍCIO (estimativa baixa da latência).
+   *
+   * A medição pelo killfeed é `offset(1ª kill) + SCOREBOARD_DELAY_MS`:
+   * como o `at` do placar é uma OBSERVAÇÃO (o poll chegou depois da
+   * kill), o valor tends a ficar ABAIXO da latência real (é um limite
+   * inferior enquanto o atraso do placar configurado for o real — se
+   * o placar real publica antes do configurado, o valor passa do real).
+   * No início ele é o lado seguro (abre mais cedo, nunca perde a 1ª
+   * kill); no fim estimado ele fecharia o clipe antes do round acabar —
+   * por isso fica fora do fim.
+   */
+  startOnly?: boolean;
 }
 
 /** Amostras guardadas por canal (mediana das últimas). */
 const SAMPLES_PER_STREAM = 5;
+/**
+ * Amostras `startOnly` (medidas pelo killfeed) guardadas por canal.
+ *
+ * Anel SEPARADO de propósito: elas são estimativas baixas da latência e
+ * servem só ao INÍCIO do clipe. No anel único elas expulsavam as
+ * amostras do placar — que alimentam o FIM estimado (fechar mais tarde
+ * nunca perde a última kill) — e a mediana passava a misturar um
+ * limite inferior com medições de verdade.
+ */
+const START_SAMPLES_PER_STREAM = 5;
 /**
  * Faixa de sanidade da latência observada (ms). Abaixo de 0 ou acima de
  * 120s o OCR não mediu latência: casou o round errado (ou a diferença
@@ -220,13 +243,25 @@ export const RECENT_SAMPLE_LIMIT = 3;
  */
 export class StreamLatencyTracker {
   private readonly samples = new Map<string, LatencySample[]>();
+  private readonly startSamples = new Map<string, LatencySample[]>();
   private readonly crops = new Map<string, string>();
   private readonly killfeedCrops = new Map<string, string>();
   private lastMeasuredAtMs = 0;
+  /**
+   * Versão do arquivo de onde o estado foi restaurado (null = estado novo,
+   * sem arquivo). Diagnóstico da migração: o log do startup precisa dizer
+   * que o arquivo veio de outra versão e o que foi aproveitado.
+   */
+  restoredFromVersion: number | null = null;
+  /** Amostras restauradas (latência completa + do início). */
+  restoredSamplesCount = 0;
 
   /**
    * Registra uma medição. Amostra fora da faixa plausível é descartada
    * (o OCR casou o round errado). Devolve a amostra gravada ou null.
+   *
+   * Amostra `startOnly` (killfeed) vai para o anel do INÍCIO; as demais
+   * para o anel da latência completa.
    */
   record(
     streamName: string | undefined,
@@ -236,6 +271,7 @@ export class StreamLatencyTracker {
       source?: LatencySource;
       quality?: LatencyQuality;
       reference?: LatencyEndReference;
+      startOnly?: boolean;
     },
   ): LatencySample | null {
     if (!plausibleLatencyMs(latencyMs)) return null;
@@ -252,11 +288,18 @@ export class StreamLatencyTracker {
       source: meta?.source ?? 'scoreboard',
       quality: meta?.quality ?? 'confident',
       ...(meta?.reference != null ? { reference: meta.reference } : {}),
+      ...(meta?.startOnly === true ? { startOnly: true } : {}),
     };
-    const list = this.samples.get(key) ?? [];
+    const startOnly = meta?.startOnly === true;
+    const list = startOnly
+      ? this.startSamples.get(key) ?? []
+      : this.samples.get(key) ?? [];
     list.push(sample);
-    while (list.length > SAMPLES_PER_STREAM) list.shift();
-    this.samples.set(key, list);
+    while (list.length > (startOnly ? START_SAMPLES_PER_STREAM : SAMPLES_PER_STREAM)) {
+      list.shift();
+    }
+    if (startOnly) this.startSamples.set(key, list);
+    else this.samples.set(key, list);
     return sample;
   }
 
@@ -275,15 +318,37 @@ export class StreamLatencyTracker {
     return this.samples.get(streamKey(streamName))?.length ?? 0;
   }
 
-  /** Todas as amostras do canal, da mais antiga para a mais recente. */
-  allSamples(streamName: string | undefined): LatencySample[] {
-    return [...(this.samples.get(streamKey(streamName)) ?? [])];
+  /**
+   * Quantidade de amostras do INÍCIO (killfeed, limite inferior).
+   * Não entram na mediana nem no fim estimado — só no início do clipe.
+   */
+  startSamplesCount(streamName: string | undefined): number {
+    return this.startSamples.get(streamKey(streamName))?.length ?? 0;
   }
 
-  /** A amostra mais recente do canal (null = sem medição). */
+  /**
+   * Todas as amostras do canal (latência completa + as do início), da mais
+   * antiga para a mais recente.
+   *
+   * A união é o que a decisão do INÍCIO consulta: a amostra do killfeed
+   * (limite inferior) entra só quando não há medição completa do canal.
+   */
+  allSamples(streamName: string | undefined): LatencySample[] {
+    const key = streamKey(streamName);
+    const list = [...(this.samples.get(key) ?? []), ...(this.startSamples.get(key) ?? [])];
+    return list.sort((a, b) => a.measuredAtMs - b.measuredAtMs);
+  }
+
+  /**
+   * A amostra mais recente do canal (latência COMPLETA).
+   *
+   * Só a latência completa: a amostra do INÍCIO (killfeed) é um limite
+   * inferior e não substitui uma medição — quem quiser o histórico dos
+   * dois anéis usa `allSamples`.
+   */
   latest(streamName: string | undefined): LatencySample | null {
-    const list = this.samples.get(streamKey(streamName));
-    return list && list.length > 0 ? list[list.length - 1] : null;
+    const list = this.samples.get(streamKey(streamName)) ?? [];
+    return list.length > 0 ? list[list.length - 1] : null;
   }
 
   /**
@@ -292,10 +357,12 @@ export class StreamLatencyTracker {
    * É a consulta do INÍCIO do clipe: a amostra do round atual é medida
    * depois da 1ª kill, então usá-la no início deslocaria a abertura
    * para o regime errado quando a latência mudou no meio do round.
+   *
+   * Só a latência COMPLETA (o limite inferior do killfeed não vale como
+   * medição do regime — ver `allSamples` para o histórico dos dois).
    */
   latestBefore(streamName: string | undefined, beforeMs: number): LatencySample | null {
-    const list = this.samples.get(streamKey(streamName));
-    if (!list) return null;
+    const list = this.samples.get(streamKey(streamName)) ?? [];
     for (let i = list.length - 1; i >= 0; i--) {
       if (list[i].measuredAtMs < beforeMs) return list[i];
     }
@@ -360,9 +427,15 @@ export class StreamLatencyTracker {
     this.killfeedCrops.set(key, crop);
   }
 
-  /** Canais com medição (diagnóstico). */
+  /**
+   * Canais com medição (diagnóstico).
+   *
+   * União dos DOIS anéis: um canal que só tem amostra do INÍCIO
+   * (killfeed) também tem medição — omiti-lo fazia o canal sumir do
+   * log de startup (e do `sync-report`).
+   */
   channels(): string[] {
-    return [...this.samples.keys()];
+    return [...new Set([...this.samples.keys(), ...this.startSamples.keys()])];
   }
 
   /** Serializa o estado (persistência entre reinícios do bot). */
@@ -370,6 +443,12 @@ export class StreamLatencyTracker {
     const streams: LatencyStateFile['streams'] = {};
     for (const [key, list] of this.samples) {
       streams[key] = { samples: list.map((sample) => ({ ...sample })) };
+    }
+    for (const [key, list] of this.startSamples) {
+      streams[key] = {
+        ...(streams[key] ?? { samples: [] }),
+        startSamples: list.map((sample) => ({ ...sample })),
+      };
     }
     for (const [key, crop] of this.crops) {
       streams[key] = { ...(streams[key] ?? { samples: [] }), crop };
@@ -400,13 +479,21 @@ export class StreamLatencyTracker {
     const file = raw as Partial<LatencyStateFile>;
     const version = Number(file.version);
     /**
-     * v1 é aceito SÓ para resgatar os crops memorizados (independentes
-     * do schema de amostras): as amostras v1 podem ser `after-only` —
-     * atraso de publicação do placar contado como latência — e voltariam
-     * a contaminar as âncoras. Amostras só do schema atual (v2).
+     * v1 é aceito SÓ para resgatar os crops memorizados (independentes do
+     * schema de amostras): as amostras v1 podem ser `after-only` — atraso
+     * de publicação do placar contado como latência — e o código v1
+     * não distinguia `startOnly` (limite inferior) de latência
+     * completa: um código antigo leria o limite como completo e o usaria
+     * no FIM (cortando a última kill). As amostras v1 ficam de fora.
+     *
+     * v2 É aproveitada: o schema das amostras é o mesmo, e o `startOnly`
+     * que pode existir nela é SEPARADO pelo roteamento abaixo (o anel
+     * do início). Descartar o arquivo inteiro jogava fora a medição
+     * completa de um canal por causa de uma amostra marcada.
      */
-    if (version !== LATENCY_STATE_VERSION && version !== 1) return tracker;
-    const samplesAllowed = version === LATENCY_STATE_VERSION;
+    if (version !== LATENCY_STATE_VERSION && version !== 1 && version !== 2) return tracker;
+    const samplesAllowed = version >= 2;
+    tracker.restoredFromVersion = version;
     const streams = file.streams;
     if (!streams || typeof streams !== 'object' || Array.isArray(streams)) return tracker;
     for (const [key, entry] of Object.entries(streams)) {
@@ -414,8 +501,10 @@ export class StreamLatencyTracker {
       const channel = streamKey(key);
       if (!channel) continue;
       const list = Array.isArray(entry.samples) ? entry.samples : [];
+      const startList = Array.isArray(entry.startSamples) ? entry.startSamples : [];
       const restored: LatencySample[] = [];
-      for (const sample of samplesAllowed ? list : []) {
+      const restoredStart: LatencySample[] = [];
+      for (const sample of samplesAllowed ? [...list, ...startList] : []) {
         if (!sample || typeof sample !== 'object' || Array.isArray(sample)) continue;
         const measuredAtMs = Number(sample.measuredAtMs);
         const latencyMs = Number(sample.latencyMs);
@@ -440,18 +529,35 @@ export class StreamLatencyTracker {
         ) {
           continue;
         }
-        restored.push({
+        const restoredSample: LatencySample = {
           measuredAtMs: Math.round(measuredAtMs),
           latencyMs: Math.round(latencyMs),
           source: sample.source,
           quality: sample.quality,
           ...(sample.reference != null ? { reference: sample.reference } : {}),
-        });
+          ...(sample.startOnly === true ? { startOnly: true } : {}),
+        };
+        // `startOnly` NUNCA entra no anel da latência completa: ali ele
+        // viraria teto do fim estimado (fecharia antes do round acabar).
+        if (restoredSample.startOnly === true) restoredStart.push(restoredSample);
+        else restored.push(restoredSample);
       }
       if (restored.length > 0) {
         restored.sort((a, b) => a.measuredAtMs - b.measuredAtMs);
         const kept = restored.slice(-SAMPLES_PER_STREAM);
         tracker.samples.set(channel, kept);
+        tracker.restoredSamplesCount += kept.length;
+        for (const sample of kept) {
+          if (sample.measuredAtMs > tracker.lastMeasuredAtMs) {
+            tracker.lastMeasuredAtMs = sample.measuredAtMs;
+          }
+        }
+      }
+      if (restoredStart.length > 0) {
+        restoredStart.sort((a, b) => a.measuredAtMs - b.measuredAtMs);
+        const kept = restoredStart.slice(-START_SAMPLES_PER_STREAM);
+        tracker.startSamples.set(channel, kept);
+        tracker.restoredSamplesCount += kept.length;
         for (const sample of kept) {
           if (sample.measuredAtMs > tracker.lastMeasuredAtMs) {
             tracker.lastMeasuredAtMs = sample.measuredAtMs;
@@ -478,7 +584,17 @@ function streamKey(streamName: string | undefined): string {
 export interface LatencyStateFile {
   version: number;
   updatedAt: string;
-  streams: Record<string, { samples: LatencySample[]; crop?: string; killfeedCrop?: string }>;
+  streams: Record<
+    string,
+    {
+      /** Amostras de latência completa (alimentam o fim estimado). */
+      samples: LatencySample[];
+      /** Amostras do INÍCIO (killfeed): limite inferior, fora do fim. */
+      startSamples?: LatencySample[];
+      crop?: string;
+      killfeedCrop?: string;
+    }
+  >;
 }
 
 /**
@@ -488,8 +604,14 @@ export interface LatencyStateFile {
  * publicação do placar ia junto — 58-63s medidos para 45s reais no
  * 2399756) e só `confident` entra no estado. O bump descarta o estado
  * v1 envenenado em vez de ressuscitar amostras contaminadas.
+ *
+ * v3: as amostras do KILLFEED (`startOnly`) ganharam anel próprio. Sem
+ * o bump, um rollback para o código v2 leria o limite inferior como
+ * latência completa e o usaria no FIM estimado — fechando o clipe
+ * antes da última kill. O arquivo v2 perde as amostras (só os crops,
+ * que são independentes do schema, são resgatados).
  */
-export const LATENCY_STATE_VERSION = 2;
+export const LATENCY_STATE_VERSION = 3;
 
 /** De onde veio a latência aplicada no INÍCIO do clipe. */
 export type StartLatencySource = 'config' | 'prior' | 'current' | 'min-safe';
@@ -579,7 +701,8 @@ export interface AdaptiveLatencyParams {
  *
  * FIM ESTIMADO (sem âncora do OCR): o MÁXIMO entre a amostra do round,
  * a janela recente e a amostra anterior ajustada pelo salto — fechar
- * mais tarde nunca tira a última kill, só pode pesar o arquivo.
+ * mais tarde nunca tira a última kill, só pode pesar o arquivo. Amostras
+ * `startOnly` (killfeed = limite INFERIOR da latência) ficam de fora.
  */
 export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveLatencyDecision {
   const {
@@ -599,7 +722,6 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
   const sanePrior = priorSamples.filter(plausibleSample);
   const saneRecent = recentSamples.filter(plausibleSample);
   const currentSample = plausibleSample(current) ? current : null;
-  const prior = sanePrior.length > 0 ? sanePrior[sanePrior.length - 1] : null;
   /**
    * Amostra CONFIÁVEL para o início: a mais recente medida antes do
    * evento cuja qualidade seja `confident` E cujo fim de round veio do
@@ -607,12 +729,59 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
    * (a virada apareceu no vídeo, mas sem o "antes" não se sabe quando o
    * round fechou) e `estimada` carrega o erro de CLIP_SCORE_DELAY_MS
    * (±20s) — nenhuma das duas é latência.
+   *
+   * A amostra do KILLFEED (`startOnly`) é limite INFERIOR: ela serve
+   * quando não há medição completa do canal, mas NUNCA substitui uma
+   * medição de verdade. No mesmo round o killfeed é gravado DEPOIS do
+   * placar — usá-lo como base trocaria a latência precisa pelo limite
+   * inferior (e o `delta` contra ele dispararia "regime trocou" a toa,
+   * reacendendo o OCR caro do killfeed).
+   */
+  const reversedPrior = [...sanePrior].reverse();
+  const startPriorMeasured =
+    reversedPrior.find(
+      (sample) =>
+        sample.quality === 'confident' &&
+        sample.reference !== 'estimada' &&
+        sample.startOnly !== true,
+    ) ?? null;
+  const startPriorKillfeed =
+    reversedPrior.find(
+      (sample) =>
+        sample.quality === 'confident' &&
+        sample.reference !== 'estimada' &&
+        sample.startOnly === true,
+    ) ?? null;
+  const maxPriorAgeMs = params.maxPriorAgeMs ?? RECENT_SAMPLE_MAX_AGE_MS;
+  const ageOf = (sample: LatencySample): number =>
+    Math.max(0, eventAtMs - sample.measuredAtMs);
+  const isStale = (sample: LatencySample | null): boolean =>
+    sample != null && ageOf(sample) > maxPriorAgeMs;
+  /**
+   * Prior do INÍCIO: medição completa (enquanto não estiver velha) >
+   * medição do killfeed (enquanto não estiver velha) > a mais recente
+   * das duas (velha). Uma medição velha perde para uma recente — o
+   * regime da stream pode ter mudado entre as partidas.
    */
   const startPrior =
-    [...sanePrior]
-      .reverse()
-      .find((sample) => sample.quality === 'confident' && sample.reference !== 'estimada') ?? null;
+    (startPriorMeasured != null && !isStale(startPriorMeasured)
+      ? startPriorMeasured
+      : null) ??
+    (startPriorKillfeed != null && !isStale(startPriorKillfeed)
+      ? startPriorKillfeed
+      : null) ??
+    startPriorMeasured ??
+    startPriorKillfeed;
   const shiftMs = Number.isFinite(pendingShiftMs) && pendingShiftMs > 0 ? pendingShiftMs : 0;
+  /**
+   * Amostras `startOnly` (medidas pelo killfeed) são LIMITE INFERIOR da
+   * latência: valem para abrir o clipe mais cedo, mas no FIM estimado
+   * fechariam antes do round terminar. O fim só considera as demais.
+   */
+  const endPrior = [...sanePrior].reverse().find((sample) => sample.startOnly !== true) ?? null;
+  const endRecent = saneRecent.filter((sample) => sample.startOnly !== true);
+  const endCurrent =
+    currentSample != null && currentSample.startOnly !== true ? currentSample : null;
   /**
    * Amostra anterior VELHA demais: o canal pode ter mudado de regime
    * (restart da fonte, outra partida horas depois) e usar o valor
@@ -624,13 +793,24 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
   const stalePrior =
     startPrior != null &&
     priorAgeMs != null &&
-    priorAgeMs > (params.maxPriorAgeMs ?? RECENT_SAMPLE_MAX_AGE_MS);
+    priorAgeMs > maxPriorAgeMs;
   const base = startPrior
     ? stalePrior
       ? Math.min(startPrior.latencyMs, configuredMs)
       : startPrior.latencyMs
     : configuredMs;
   const baseSample = startPrior && base === startPrior.latencyMs ? startPrior : null;
+  /**
+   * Base da COMPARAÇÃO (delta / "regime trocou"): a última medição
+   * COMPLETA do canal. Sem ela, o limite inferior do killfeed serviria
+   * de referência — e a diferença entre ele e a medição do round (5-16s
+   * do atraso de poll) dispararia "regime trocou" sem trocar de regime
+   * (o efeito: outro OCR caro do killfeed no mesmo round).
+   */
+  const comparisonBaseMs =
+    startPriorMeasured != null && !isStale(startPriorMeasured)
+      ? startPriorMeasured.latencyMs
+      : configuredMs;
   // A base do INÍCIO é a amostra anterior (sem o salto): o salto é
   // ambíguo e só é usado onde o erro é barato (fim) ou onde há medição
   // independente (killfeed).
@@ -652,7 +832,7 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
       ? currentSample
       : null;
   if (currentSample) {
-    deltaMs = currentSample.latencyMs - base;
+    deltaMs = currentSample.latencyMs - comparisonBaseMs;
     changed = Math.abs(deltaMs) > maxStepMs;
     if (currentForStart != null && currentForStart.latencyMs <= base) {
       // Menor que a amostra em vigor: abrir mais cedo é sempre seguro.
@@ -667,30 +847,30 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
    * (ou omitiu conteúdo) depois da última medição, fechar mais tarde é
    * o lado conservador. Só entra no fim estimado — nunca no início.
    */
-  const shiftAdjustedPrior = prior ? prior.latencyMs + shiftMs : null;
-  const endSample = currentSample ?? prior;
+  const shiftAdjustedPrior = endPrior ? endPrior.latencyMs + shiftMs : null;
+  const endSample = endCurrent ?? endPrior;
   let endLatencyMs = configuredMs;
-  if (currentSample) {
+  if (endCurrent) {
     const recentMax =
-      saneRecent.length > 0 ? Math.max(...saneRecent.map((sample) => sample.latencyMs)) : null;
+      endRecent.length > 0 ? Math.max(...endRecent.map((sample) => sample.latencyMs)) : null;
     endLatencyMs =
-      currentSample.quality === 'confident'
-        ? currentSample.latencyMs
+      endCurrent.quality === 'confident'
+        ? endCurrent.latencyMs
         : Math.max(
-            currentSample.latencyMs,
+            endCurrent.latencyMs,
             recentMax ?? Number.NEGATIVE_INFINITY,
             shiftAdjustedPrior ?? Number.NEGATIVE_INFINITY,
           );
   } else {
     const candidates = [
-      ...saneRecent.map((sample) => sample.latencyMs),
+      ...endRecent.map((sample) => sample.latencyMs),
       ...(shiftAdjustedPrior != null ? [shiftAdjustedPrior] : []),
     ];
     endLatencyMs =
       candidates.length > 0
         ? Math.max(...candidates)
-        : prior
-          ? prior.latencyMs
+        : endPrior
+          ? endPrior.latencyMs
           : configuredMs;
   }
   return {
@@ -708,6 +888,76 @@ export function resolveAdaptiveLatency(params: AdaptiveLatencyParams): AdaptiveL
 
 /** Modos de sincronização declarados pelo config (espelha CLIP_STREAM_SYNC). */
 export type StreamSyncMode = 'auto' | 'log' | 'off';
+
+/**
+ * Decisão da latência de ABERTURA do clipe (puro/testável).
+ *
+ * A latência estimada pode ser de duas naturezas:
+ * - MEDIDA (amostra do placar/killfeed): a melhor estimativa da latência
+ *   real — o corte e os timestamps usam o valor inteiro;
+ * - CONFIGURADA (palpite do dono, sem medição do canal): pode estar
+ *   inflada, e aí o corte abriria DEPOIS da 1ª kill (o defeito mais
+ *   caro). Nesse caso — e só nesse caso — o teto limita a ABERTURA.
+ *
+ * O teto NÃO mexe na estimativa: os timestamps e a cobertura continuam
+ * com a melhor estimativa disponível. Abrir cedo é o lado barato do
+ * corte; para os timestamps não existe lado barato, e usar um valor
+ * limitado ali deslocaria a marca de tempo das kills na descrição.
+ */
+export interface StartLatencyParams {
+  /** Latência estimada (ms): a melhor estimativa da latência real. */
+  estimatedMs: number;
+  /** Houve MEDIÇÃO do canal na decisão (amostra do placar/killfeed)? */
+  measured: boolean;
+  /** O killfeed ancorou o início (posição exata da 1ª kill no vídeo)? */
+  killfeedAnchored: boolean;
+  /** Teto da latência de ABERTURA (ms). 0 = desligado. */
+  capMs: number;
+  /** O modo adaptativo está sendo aplicado? */
+  applyAdaptive: boolean;
+}
+
+/** Resultado da decisão da latência de abertura. */
+export interface StartLatencyDecision {
+  /** Latência estimada (ms): timestamps, sidecar e cobertura. */
+  estimatedMs: number;
+  /** Latência (ms) que o CORTE usa para abrir o clipe. */
+  openMs: number;
+  /** O teto limitou a abertura. */
+  capped: boolean;
+  /** Por quê (diagnóstico). */
+  reason: 'adaptive-off' | 'killfeed' | 'measured' | 'capped' | 'config';
+}
+
+/**
+ * Decide a latência de ABERTURA do clipe (puro/testável).
+ *
+ * Regras (em ordem):
+ * 1. adaptativo desligado (`CLIP_STREAM_SYNC_ADAPTIVE=false` ou modo
+ *    shadow): o corte usa o configurado como é — o teto é inativo
+ *    (ninguém pediu a medição, ninguém quer a heurística);
+ * 2. killfeed ancorou o início: a posição da 1ª kill é medição dentro do
+ *    vídeo — o teto não se aplica (e o corte nem usa a latência);
+ * 3. latência MEDIDA: o valor é a melhor estimativa — o teto não se
+ *    aplica (silenciar uma medição seria mudar o corte sem motivo);
+ * 4. sem medição: o teto limita a abertura ao valor configurado.
+ */
+export function resolveStartLatency(params: StartLatencyParams): StartLatencyDecision {
+  const estimatedMs = params.estimatedMs;
+  if (!params.applyAdaptive) {
+    return { estimatedMs, openMs: estimatedMs, capped: false, reason: 'adaptive-off' };
+  }
+  if (params.killfeedAnchored) {
+    return { estimatedMs, openMs: estimatedMs, capped: false, reason: 'killfeed' };
+  }
+  if (params.measured) {
+    return { estimatedMs, openMs: estimatedMs, capped: false, reason: 'measured' };
+  }
+  if (params.capMs > 0 && estimatedMs > params.capMs) {
+    return { estimatedMs, openMs: params.capMs, capped: true, reason: 'capped' };
+  }
+  return { estimatedMs, openMs: estimatedMs, capped: false, reason: 'config' };
+}
 
 /**
  * A latência adaptativa só é APLICADA no modo `auto`. Em `log` a

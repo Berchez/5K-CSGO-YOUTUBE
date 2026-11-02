@@ -26,6 +26,9 @@
  *   --privacy <p>      private|unlisted|public (default: SHORTS_PRIVACY)
  *   --no-ai            não chama a IA de metadados (usa o gerador local)
  *   --force            re-renderiza mesmo com o vertical já existente
+ *                      (e publica Shorts com a abertura limitada pelo
+ *                      teto de latência — as posições das kills não são
+ *                      confiáveis)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -444,6 +447,28 @@ async function processCandidate(
       `- ${name}: já publicado (${previous?.youtubeId ?? publishedId}) — pulando`,
     );
     return null;
+  }
+  /**
+   * Abertura limitada pelo TETO de latência: o bot desconfiou da
+   * latência estimada (abriu o clipe pelo teto) e as posições das kills
+   * vêm dessa mesma estimativa — elas podem estar deslocadas, e a
+   * janela do Short (montada em cima delas) cortaria o começo do ace.
+   * Publicar assim é afirmar horários que ninguém mediu: o Short só sai
+   * com `--force` (a decisão é do dono).
+   */
+  const capped =
+    (side.streamSync as { startLatencyCapped?: boolean } | undefined)?.startLatencyCapped ===
+    true;
+  if (capped && !args.force) {
+    console.log(
+      `- ${name}: ignorado (abertura limitada pelo teto de latência — as posições das kills não são confiáveis; use --force para publicar assim)`,
+    );
+    return null;
+  }
+  if (capped) {
+    console.log(
+      `- ${name}: ATENÇÃO (--force) — a abertura foi limitada pelo teto de latência; as posições das kills podem estar deslocadas`,
+    );
   }
 
   console.log(`\n== ${name} ==`);

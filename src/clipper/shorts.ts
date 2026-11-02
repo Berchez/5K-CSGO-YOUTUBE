@@ -207,12 +207,20 @@ export function planShortWindow(
 
 export interface ShortKillRef {
   /**
-   * Instante da kill no relógio do PLACAR (epoch ms). Os sidecars do bot
-   * gravam número; os gerados pelo script de VOD gravam ISO — os dois
-   * são aceitos.
+   * Instante da kill no rel�gio do PLACAR (epoch ms). Os sidecars do bot
+   * gravam n�mero; os gerados pelo script de VOD gravam ISO - os dois
+   * sao aceitos.
    */
   at?: number | string | null;
+  /**
+   * A posição da kill foi ESTIMADA (não medida no vídeo) — o mesmo
+   * sentido de `KillEvent.estimated`: a descrição não pode afirmar um
+   * horário que ninguém mediu, e o Short não pode montar a janela em
+   * cima de uma posição estimada.
+   */
+  estimated?: boolean;
 }
+
 
 export interface ShortClipInfo {
   /** Epoch ms do início do clipe na timeline do vídeo (sidecar). */
@@ -257,6 +265,10 @@ export function killPositionsByKill(
   const duration = Number.isFinite(clipDurationSec) ? Number(clipDurationSec) : null;
   const out: Array<{ index: number; sec: number }> = [];
   kills.forEach((kill, index) => {
+    // Posição ESTIMADA (não medida): a janela do Short sairia deslocada
+    // e o título prometeria kills que o vídeo não mostra no horário
+    // dito. A kill continua na lista, mas sem posição.
+    if (kill.estimated === true) return;
     const at = killAtMs(kill.at);
     if (at == null) return;
     const sec = (at + offset - clipStartMs) / 1000;

@@ -77,12 +77,25 @@ export interface ClipAnchorsInput {
    */
   streamLatencyMs: number;
   /**
-   * Latência (ms) a aplicar no INÍCIO do clipe e nos timestamps das
-   * kills. Vem da medição por round (OCR do placar): a amostra que
-   * estava em vigor no instante do evento. Ausente = usa
-   * `streamLatencyMs`.
+   * Latência (ms) a aplicar na ABERTURA do clipe. Vem da medição por
+   * round (OCR do placar): a amostra que estava em vigor no instante do
+   * evento. Ausente = usa `streamLatencyMs`.
+   *
+   * É o valor que o CORTE usa — e pode ser LIMITADO pelo teto de
+   * `CLIP_START_LATENCY_MAX_MS` (abrir mais cedo é o lado barato do
+   * corte).
    */
   startLatencyMs?: number;
+  /**
+   * Latência (ms) da ESTIMATIVA real do canal — a que alinha os
+   * timestamps das kills (`offset = latência − atraso do placar`).
+   *
+   * Separada da de ABERTURA de propósito: o teto do início existe para
+   * o corte (abrir cedo nunca perde a 1ª kill), mas para os timestamps
+   * não existe lado barato — limitar o offset lá deslocaria a marca de
+   * tempo das kills na descrição. Ausente = usa `startLatencyMs`.
+   */
+  offsetLatencyMs?: number;
   /**
    * Latência (ms) a aplicar no FIM ESTIMADO (quando o OCR do vídeo não
    * achou a virada do placar). Ausente = usa `streamLatencyMs`.
@@ -226,13 +239,16 @@ export function computeClipAnchors(input: ClipAnchorsInput): ClipAnchors {
   // estimativa conservadora do fim (o fim exato vem do OCR do vídeo).
   const startLatencyMs = input.startLatencyMs ?? input.streamLatencyMs;
   const endLatencyMs = input.endLatencyMs ?? input.streamLatencyMs;
+  // A latência dos TIMESTAMPS é a ESTIMATIVA do canal: o teto do início
+  // existe para a abertura do corte, não para alinhar as kills na tela.
+  const offsetLatencyMs = input.offsetLatencyMs ?? startLatencyMs;
   const videoStartMs =
     input.videoStartOverrideMs ??
     (input.aceStartedAtMs != null ? input.aceStartedAtMs + startLatencyMs : undefined);
   const startContextSec = input.contextSec + (input.startMarginSec ?? 0);
   const estimatedClipStartMs =
     videoStartMs != null ? videoStartMs - startContextSec * 1000 : undefined;
-  const killVideoOffset = killVideoOffsetMs(startLatencyMs, input.scoreboardDelayMs);
+  const killVideoOffset = killVideoOffsetMs(offsetLatencyMs, input.scoreboardDelayMs);
   const estimatedEndMs =
     computeAceEndMs(
       input.aceDetectedAtMs,

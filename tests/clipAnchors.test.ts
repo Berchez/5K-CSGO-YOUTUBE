@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { computeAceEndMs, computeClipAnchors, killVideoOffsetMs } from '../src/clipper/clipAnchors.js';
+import { resolveStartLatency } from '../src/monitor/streamLatency.js';
 
 const T = 1_700_000_000_000;
 
@@ -33,6 +34,50 @@ describe('computeClipAnchors (placar → timeline do vídeo)', () => {
     const a = anchors({ aceStartedAtMs: undefined });
     expect(a.videoStartMs).toBeUndefined();
     expect(a.estimatedClipStartMs).toBeUndefined();
+  });
+
+  it('a latência do TETO muda só a ABERTURA (os timestamps seguem a estimativa)', () => {
+    // O teto existe para o CORTE (abrir cedo nunca perde a 1ª kill); para
+    // os timestamps não existe lado barato — limitar o offset lá
+    // deslocaria a marca de tempo das kills na descrição.
+    const a = anchors({ startLatencyMs: 25_000, offsetLatencyMs: 45_000 });
+    // Abertura: a do teto.
+    expect(a.videoStartMs).toBe(T + 25_000);
+    // Timestamps: a estimativa (45s − 5s do placar = 40s).
+    expect(a.killVideoOffsetMs).toBe(40_000);
+    expect(a.startLatencyMs).toBe(25_000);
+  });
+
+  it('sem offsetLatencyMs, os timestamps usam a latência de abertura', () => {
+    const a = anchors({ startLatencyMs: 25_000 });
+    expect(a.killVideoOffsetMs).toBe(20_000);
+  });
+
+  it('2399858 (golden): com 45s configurados, a 1ª kill fica DENTRO do clipe', () => {
+    // Caso real: gaules com 45s configurados para um offset real de ~26s.
+    // Sem o teto o corte abria ~20s DEPOIS da 1ª kill (as três primeiras
+    // ficavam fora do clipe — o defeito que motivou o teto).
+    const decision = resolveStartLatency({
+      estimatedMs: 45_000,
+      measured: false,
+      killfeedAnchored: false,
+      capMs: 25_000,
+      applyAdaptive: true,
+    });
+    expect(decision.capped).toBe(true);
+    const a = anchors({
+      streamLatencyMs: 45_000,
+      startLatencyMs: decision.openMs,
+      offsetLatencyMs: decision.estimatedMs,
+    });
+    // A 1ª kill aparece no vídeo ~26s depois do placar.
+    const primeiraKillNoVideoMs = T + 26_000;
+    expect(a.videoStartMs!).toBeLessThan(primeiraKillNoVideoMs);
+    expect(a.estimatedClipStartMs!).toBeLessThan(primeiraKillNoVideoMs);
+    // O corte abre pelo teto (25s), mas os timestamps seguem a estimativa
+    // (45s − 5s do placar): a marca de tempo não desloca.
+    expect(a.videoStartMs).toBe(T + 25_000);
+    expect(a.killVideoOffsetMs).toBe(40_000);
   });
 
   it('a margem do início abre o corte antes (erro de latência assimétrico)', () => {

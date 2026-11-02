@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   boolEnv,
+  cappedLatencyChannels,
   ConfigSchema,
   deprecatedEnvVars,
   divergentLatencyEnvs,
@@ -10,6 +11,69 @@ import {
   shortsCrossFieldErrors,
   validateConfigCrossFields,
 } from '../src/config.js';
+
+describe('cappedLatencyChannels (aviso do teto de abertura)', () => {
+  const base = {
+    capMs: 25_000,
+    globalMs: 25_000,
+    byStream: {} as Record<string, number>,
+    applyAdaptive: true,
+  };
+
+  it('não avisa nada quando tudo cabe no teto', () => {
+    expect(cappedLatencyChannels(base)).toEqual([]);
+  });
+
+  it('avisa o canal configurado acima do teto', () => {
+    expect(
+      cappedLatencyChannels({
+        ...base,
+        byStream: { gaules: 45_000 },
+      }),
+    ).toEqual([{ channel: 'gaules', configuredMs: 45_000 }]);
+  });
+
+  it('avisa o global acima do teto', () => {
+    expect(
+      cappedLatencyChannels({
+        ...base,
+        globalMs: 40_000,
+      }),
+    ).toEqual([{ channel: '(global)', configuredMs: 40_000 }]);
+  });
+
+  it('canal COM MEDIÇÃO não é avisado (o teto não age nele)', () => {
+    expect(
+      cappedLatencyChannels({
+        ...base,
+        byStream: { gaules: 45_000 },
+        measuredChannels: ['Gaules'],
+      }),
+    ).toEqual([]);
+  });
+
+  it('com o adaptativo desligado o teto não age (nada a avisar)', () => {
+    expect(
+      cappedLatencyChannels({
+        ...base,
+        applyAdaptive: false,
+        byStream: { gaules: 45_000 },
+        globalMs: 40_000,
+      }),
+    ).toEqual([]);
+  });
+
+  it('teto desligado (0) não avisa', () => {
+    expect(
+      cappedLatencyChannels({
+        ...base,
+        capMs: 0,
+        globalMs: 40_000,
+        byStream: { gaules: 45_000 },
+      }),
+    ).toEqual([]);
+  });
+});
 
 describe('boolEnv', () => {
   it('aceita 1/true/yes/on como ligado', () => {
@@ -105,6 +169,10 @@ describe('config dos clipes (latência e âncoras)', () => {
     expect(cfg.CLIP_SCORE_DELAY_MS).toBe(20_000);
     expect(cfg.CLIP_END_TAIL_SEC).toBe(8);
     expect(cfg.CLIP_STREAM_LATENCY_BY_STREAM).toEqual({});
+  });
+  it('teto da latência do início: 25s por default (0 desliga)', () => {
+    expect(ConfigSchema.parse({}).CLIP_START_LATENCY_MAX_MS).toBe(25_000);
+    expect(ConfigSchema.parse({ CLIP_START_LATENCY_MAX_MS: '0' }).CLIP_START_LATENCY_MAX_MS).toBe(0);
   });
   it('lê o mapa de latência por canal', () => {
     const cfg = ConfigSchema.parse({

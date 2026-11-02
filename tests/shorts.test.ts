@@ -180,6 +180,21 @@ describe('killPositionsSec', () => {
     expect(positioned.map((p) => p.index)).toEqual([1, 2]);
     expect(positioned[0].sec).toBeCloseTo(15, 1);
   });
+
+  it('kill ESTIMADA (posição não medida) não entra na janela do Short', () => {
+    // Abertura limitada pelo teto = a posição vem do palpite: montar a
+    // janela em cima dela cortaria o começo do ace e prometeria um
+    // horário que ninguém mediu.
+    const positioned = killPositionsByKill(
+      [
+        { at: 1793482031411, estimated: true },
+        { at: 1793482034452, estimated: true },
+        { at: 1793482037465 },
+      ],
+      { clipStartMs: 1793482037465, killVideoOffsetMs: 21053.67, clipDurationSec: 59.14 },
+    );
+    expect(positioned.map((p) => p.index)).toEqual([2]);
+  });
 });
 
 describe('killAtMs', () => {

@@ -143,41 +143,77 @@ function readLog(file: string): { samples: Sample[]; ocr: OcrOutcome[]; shifts: 
   return { samples, ocr, shifts };
 }
 
-function readState(file: string): { stream: string; latencyMs: number; at: number; reference?: string }[] {
-  if (!fs.existsSync(file)) return [];
+/** Amostra do estado persistido (latência). */
+interface StateSample {
+  stream: string;
+  latencyMs: number;
+  at: number;
+  reference?: string;
+}
+
+/** Amostra crua do arquivo de estado. */
+interface StateRawSample {
+  measuredAtMs?: number;
+  latencyMs?: number;
+  reference?: string;
+  startOnly?: boolean;
+}
+
+/**
+ * Lê as medições do estado persistido.
+ *
+ * São DOIS conjuntos: a latência COMPLETA (mede o regime do canal) e as
+ * amostras do INÍCIO (`startSamples`, medidas pelo killfeed). As do
+ * início são limite INFERIOR da latência: elas não entram na estatística
+ * (mediana/máx do canal), senão o relatório mostraria um número
+ * optimisticamente baixo como se fosse a latência real — mas aparecem
+ * na linha do canal, porque são a evidência do que o bot usou para
+ * abrir o clipe.
+ */
+function readState(file: string): { samples: StateSample[]; startSamples: StateSample[] } {
+  if (!fs.existsSync(file)) return { samples: [], startSamples: [] };
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as {
       streams?: Record<
         string,
         {
-          samples?: {
-            measuredAtMs?: number;
-            latencyMs?: number;
-            reference?: string;
-          }[];
+          samples?: StateRawSample[];
+          startSamples?: StateRawSample[];
         }
       >;
     };
-    const out: { stream: string; latencyMs: number; at: number; reference?: string }[] = [];
+    const out: StateSample[] = [];
+    const startOut: StateSample[] = [];
+    const toSample = (stream: string, sample: StateRawSample): StateSample | null => {
+      const latencyMs = Number(sample.latencyMs);
+      const at = Number(sample.measuredAtMs);
+      if (!Number.isFinite(latencyMs) || !Number.isFinite(at)) return null;
+      return {
+        stream: normalizeStream(stream),
+        latencyMs,
+        at,
+        reference:
+          sample.reference === 'timer-hltv' || sample.reference === 'estimada'
+            ? sample.reference
+            : undefined,
+      };
+    };
     for (const [stream, entry] of Object.entries(parsed.streams ?? {})) {
       for (const sample of entry.samples ?? []) {
-        const latencyMs = Number(sample.latencyMs);
-        const at = Number(sample.measuredAtMs);
-        if (!Number.isFinite(latencyMs) || !Number.isFinite(at)) continue;
-        out.push({
-          stream: normalizeStream(stream),
-          latencyMs,
-          at,
-          reference:
-            sample.reference === 'timer-hltv' || sample.reference === 'estimada'
-              ? sample.reference
-              : undefined,
-        });
+        // `startOnly` no anel completo é resíduo de schema antigo: a
+        // amostra do início não é latência do canal.
+        if (sample.startOnly === true) continue;
+        const normalized = toSample(stream, sample);
+        if (normalized) out.push(normalized);
+      }
+      for (const sample of entry.startSamples ?? []) {
+        const normalized = toSample(stream, sample);
+        if (normalized) startOut.push(normalized);
       }
     }
-    return out;
+    return { samples: out, startSamples: startOut };
   } catch {
-    return [];
+    return { samples: [], startSamples: [] };
   }
 }
 
@@ -185,10 +221,10 @@ function main(): void {
   const logFile = path.resolve(arg('log', 'logs/bot.log') ?? 'logs/bot.log');
   const stateFile = path.resolve(arg('state', 'data/stream-latency.json') ?? 'data/stream-latency.json');
   const { samples, ocr, shifts } = readLog(logFile);
-  const state = readState(stateFile);
+  const { samples: stateSamples, startSamples: stateStartSamples } = readState(stateFile);
 
-  const all = mergeMeasurements(samples, state);
-  if (all.length === 0) {
+  const all = mergeMeasurements(samples, stateSamples);
+  if (all.length === 0 && stateStartSamples.length === 0) {
     console.log(`sem medições: nem ${logFile} nem ${stateFile} têm dados de latência`);
     console.log('o bot só passa a medir quando o OCR acha a virada do placar no vídeo (CLIP_STREAM_SYNC=auto|log)');
     return;
@@ -199,6 +235,11 @@ function main(): void {
     const list = byStream.get(sample.stream) ?? [];
     list.push(sample);
     byStream.set(sample.stream, list);
+  }
+  // Canal que só tem amostras do INÍCIO (sem medição completa) precisa
+  // aparecer no relatório mesmo assim.
+  for (const sample of stateStartSamples) {
+    if (!byStream.has(sample.stream)) byStream.set(sample.stream, []);
   }
 
   console.log(`latência observada por canal (${all.length} medições)\n`);
@@ -217,11 +258,15 @@ function main(): void {
       reasons.set(outcome.reason, (reasons.get(outcome.reason) ?? 0) + 1);
     }
     const channelShifts = shifts.filter((shift) => shift.stream === stream);
-    console.log(
-      `${stream}: n=${values.length} min=${(values[0] / 1000).toFixed(1)}s ` +
-        `med=${(median(values) / 1000).toFixed(1)}s max=${(values[values.length - 1] / 1000).toFixed(1)}s ` +
-        `saltoMaior=${(biggestJump / 1000).toFixed(1)}s`,
-    );
+    if (values.length > 0) {
+      console.log(
+        `${stream}: n=${values.length} min=${(values[0] / 1000).toFixed(1)}s ` +
+          `med=${(median(values) / 1000).toFixed(1)}s max=${(values[values.length - 1] / 1000).toFixed(1)}s ` +
+          `saltoMaior=${(biggestJump / 1000).toFixed(1)}s`,
+      );
+    } else {
+      console.log(`${stream}: n=0 (só amostras do início)`);
+    }
     if (outcomes.length > 0) {
       const falhas = [...reasons].map(([motivo, n]) => `${motivo}=${n}`).join(' ');
       console.log(
@@ -239,6 +284,19 @@ function main(): void {
       console.log(
         `  referência do fim do round: ${comTimer}/${list.length} pelo timer real do HLTV` +
           `${comTimer < list.length ? ` (${list.length - comTimer} pela estimativa)` : ''}`,
+      );
+    }
+    /**
+     * Amostras do INÍCIO (killfeed): limite INFERIOR da latência real —
+     * não entram na estatística acima, mas mostram o que o bot usou
+     * para abrir o clipe quando não tinha medição do placar.
+     */
+    const inicio = stateStartSamples.filter((s) => s.stream === stream);
+    if (inicio.length > 0) {
+      const valores = inicio.map((s) => s.latencyMs).sort((a, b) => a - b);
+      console.log(
+        `  amostras do início (killfeed, limite inferior): n=${valores.length} ` +
+          `min=${(valores[0] / 1000).toFixed(1)}s max=${(valores[valores.length - 1] / 1000).toFixed(1)}s`,
       );
     }
   }

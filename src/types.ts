@@ -36,7 +36,12 @@ export interface KillEvent {
   at?: number;
   /**
    * A posição da kill foi ESTIMADA (não medida no vídeo): a descrição
-   * não pode afirmar um horário que ninguém mediu.
+   * não pode afirmar um horário que ninguém mediu — e o Short não pode
+   * montar a janela em cima dela.
+   *
+   * Ocorrências: o teto de abertura limitou a latência estimada (a
+   * posição vem do palpite, não de uma medição) ou a kill foi lida no
+   * placar sem âncora no vídeo.
    */
   estimated?: boolean;
   /** Arma do kill: ak47, awp, deagle, hegrenade, molotov, knife... (minúsculo; '' = desconhecida) */
@@ -135,6 +140,19 @@ export interface AceEvent {
     latencySource?: string | null;
     /** O round trocou de regime de latência (início incerto). */
     latencyChanged?: boolean;
+    /**
+     * O teto de CLIP_START_LATENCY_MAX_MS limitou a latência de ABERTURA
+     * (o corte abriu mais cedo que a estimativa). Os timestamps e a
+     * cobertura continuam com a estimativa — só a abertura mudou.
+     */
+    startLatencyCapped?: boolean;
+    /**
+     * A latência ESTIMADA do início (ms) — o valor que o teto limitou.
+     * Com o teto ativo, é a melhor estimativa disponível (pode estar
+     * inflada): por isso as kills saem marcadas como `estimated` e a
+     * descrição não afirma horários.
+     */
+    estimatedStartLatencyMs?: number | null;
     /** Crop do placar que produziu a leitura. */
     crop?: string | null;
   };

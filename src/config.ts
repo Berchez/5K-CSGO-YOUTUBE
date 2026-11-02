@@ -154,6 +154,24 @@ export const ConfigSchema = z.object({
    */
   CLIP_START_MARGIN_SEC: z.coerce.number().min(0).max(60).default(5),
   /**
+   * Teto da latência aplicada ao INÍCIO quando o canal NÃO tem medição
+   * nenhuma (nem do placar, nem do killfeed).
+   *
+   * A latência do `.env` vem de uma leitura do placar e erra para MAIS
+   * quando o placar atrasa a publicação (2399858/gaules: 45s configurados
+   * para ~26s de offset real → o corte abria ~20s DEPOIS da 1ª kill, as
+   * primeiras kills ficavam fora). O killfeed é a única medição dentro do
+   * vídeo; sem ele, abrir mais cedo (material do round anterior) é o
+   * lado barato e nunca perde a abertura.
+   *
+   * Com QUALQUER medição (placar ou killfeed) o teto não age: silenciar
+   * uma medição seria mudar o corte sem motivo. Ele mexe só na
+   * ABERTURA — os timestamps e a cobertura seguem a estimativa (para
+   * eles não existe lado barato).
+   * Default 25s. 0 = desligado.
+   */
+  CLIP_START_LATENCY_MAX_MS: z.coerce.number().min(0).max(120_000).default(25_000),
+  /**
    * Upscale (opcional) do clipe live: 0 = desligado (resolução nativa
    * da fonte), 1440/2160 = reescala (denoise + scale + sharpen) na
    * MESMA passada do encode. Serve para forçar VP9/AV1 no YouTube
@@ -222,7 +240,8 @@ export const ConfigSchema = z.object({
   /**
    * Cobertura estrita do ace: descarta o evento quando a 1ª kill NÃO
    * está no material — mas só com evidência forte: a posição EXATA da
-   * 1ª kill (lida pelo killfeed) fora do buffer, ou uma régua de
+   * 1ª kill (lida pelo killfeed E corroborada por outra kill — sem
+   * corroboração pode ser o killfeed de outro round), ou uma régua de
    * latência que prove ausência (teto de plausibilidade na checagem
    * inicial; offset medido na checagem final). "O OCR varreu e não leu
    * o nome" NÃO descarta — nomes truncados são comuns e esse descarte
@@ -502,6 +521,65 @@ export function validateConfigCrossFields(cfg: AppConfig): void {
   if (errors.length > 0) {
     throw new Error(errors.map((e) => e.message).join('; '));
   }
+}
+
+/**
+ * Canais cuja latência CONFIGURADA ficaria acima do teto de abertura
+ * (o corte abriria mais cedo que o configurado enquanto o canal não
+ * tiver medição).
+ */
+export interface CappedLatencyChannel {
+  /** Nome do canal ('(global)' = o valor padrão do config). */
+  channel: string;
+  /** Latência configurada (ms). */
+  configuredMs: number;
+}
+
+/**
+ * Aviso de teto de abertura: quais canais ENTREGAM o valor configurado
+ * acima do teto (ms) e, portanto, vão abrir pelo teto enquanto não
+ * tiverem medição. Puro/testável.
+ *
+ * Só avisa o que REALMENTE acontece:
+ * - com o adaptativo desligado (modo 'log' ou `CLIP_STREAM_SYNC_ADAPTIVE
+ *   =false`) o teto não age — não há o que avisar;
+ * - canal COM MEDIÇÃO (placar ou killfeed) não é limitado — o teto é
+ *   para o palpite, não para a medição.
+ *
+ * O valor explícito por canal (`CLIP_STREAM_LATENCY_BY_STREAM`) NÃO é
+ * isento: o teto existe para o caso em que esse valor é um palpite
+ * inflado (o 2399756 tem 45s configurados para uma latência real menor).
+ */
+export function cappedLatencyChannels(params: {
+  /** Teto da latência de abertura (ms). 0 = desligado. */
+  capMs: number;
+  /** Latência global configurada (ms). */
+  globalMs: number;
+  /** Latências por canal (ms). */
+  byStream: Record<string, number>;
+  /** Canais que já têm MEDIÇÃO (latência completa ou do início). */
+  measuredChannels?: Iterable<string>;
+  /** O modo adaptativo está sendo aplicado? */
+  applyAdaptive: boolean;
+}): CappedLatencyChannel[] {
+  if (!params.applyAdaptive || params.capMs <= 0) return [];
+  const measured = new Set(
+    [...(params.measuredChannels ?? [])].map((channel) => channel.trim().toLowerCase()),
+  );
+  const out: CappedLatencyChannel[] = [];
+  const globalChannel = '(global)';
+  // O valor global é um fato do CONFIG: ele avisa sempre que estiver
+  // acima do teto (vale para todo canal que não tem valor próprio).
+  if (params.globalMs > params.capMs) {
+    out.push({ channel: globalChannel, configuredMs: params.globalMs });
+  }
+  for (const [channel, ms] of Object.entries(params.byStream)) {
+    if (!Number.isFinite(ms) || ms <= params.capMs) continue;
+    // Canal com medição própria: o teto não age nele.
+    if (measured.has(channel.trim().toLowerCase())) continue;
+    out.push({ channel, configuredMs: ms });
+  }
+  return out;
 }
 
 export function getConfig(): AppConfig {

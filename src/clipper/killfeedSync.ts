@@ -11,8 +11,16 @@ const execFileAsync = promisify(execFile);
 
 /** Frequência de amostragem do killfeed (fps). */
 const SAMPLE_RATE = 1;
-/** Tolerância ANTES da 1ª kill estimada (ms): o killfeed aparece na hora. */
-const EARLY_TOLERANCE_MS = 15_000;
+/**
+ * Tolerância ANTES da 1ª kill estimada (ms): o killfeed aparece na hora.
+ *
+ * Alinhada com `|MIN_ALLOWED_OFFSET_MS|`: a observação de uma kill só
+ * é aceita a partir de `(at − atraso do placar) − 5s`, então varrer
+ * antes disso é ler material que será OBRIGATORIAMENTE descartado (o
+ * filtro de faixa vem antes da agregação). Menos um segmento de OCR
+ * inútil por varredura — e o canto caro é o trecho antes da kill.
+ */
+const EARLY_TOLERANCE_MS = 5_000;
 /** Tolerância DEPOIS da última kill estimada (ms). */
 const LATE_TOLERANCE_MS = 15_000;
 /** Duas medições do mesmo kill podem diferir até isto (ms). */
@@ -43,6 +51,12 @@ const NICKNAME_PROXIMITY_TOKENS = 10;
  * do clipe (o piso do fim usaria a posição errada).
  */
 const KILLFEED_POLL_SLACK_MS = 25_000;
+/**
+ * Quantas kills precisam casar para o cluster corroborar a âncora:
+ * no mínimo 2 (uma leitura só não é medição) e 60% das kills do ace.
+ */
+const MIN_CLUSTER_MATCHES = 2;
+const CLUSTER_MATCHES_RATIO = 0.6;
 
 type OcrWorker = Awaited<ReturnType<typeof import('tesseract.js').createWorker>>;
 
@@ -114,6 +128,17 @@ export interface KillfeedSyncResult {
     | 'no-killfeed';
   /** Crop do killfeed que produziu as leituras. */
   crop?: string | null;
+  /**
+   * Segmentos varridos pelo OCR (diagnóstico do custo: cada um é um
+   * ffmpeg + até N frames de tesseract por crop tentado).
+   */
+  segmentsScanned?: number;
+  /** Segmentos varridos SEM nenhum match (material antes da kill). */
+  segmentsWithoutMatch?: number;
+  /** Tempo total da varredura (ms). */
+  scanDurationMs?: number;
+  /** A varredura bateu o prazo (`scanDeadlineMs`) e devolveu parcial. */
+  deadlineExceeded?: boolean;
 }
 
 /** Opções da varredura do killfeed. */
@@ -122,16 +147,18 @@ export interface KillfeedScanOptions {
   /** Atraso do placar por kill (ms). */
   scoreboardDelayMs: number;
   /**
-   * Latência estimada (ms): converte o relógio do placar no relógio do
-   * vídeo para saber QUAL segmento varrer. É só uma dica — o resultado
-   * é medido, não derivado dela.
+   * Latência estimada (ms): referência do limite SUPERIOR da varredura.
+   * O início da janela não depende dela — parte da latência 0, senão a
+   * 1ª kill (que pode aparecer antes do estimado) nunca seria lida.
    */
   latencyHintMs: number;
   /**
-   * Latência MÁXIMA plausível (ms): o killfeed é acionado justamente
-   * quando o regime pode ter mudado, então a janela vai da latência do
-   * início até este valor. Sem ele, a janela usa só o hint (comportamento
-   * antigo) — e perderia o kill quando a latência tivesse subido.
+   * Latência MÁXIMA plausível (ms): o limite SUPERIOR da varredura. O
+   * killfeed é acionado justamente quando o regime pode ter mudado,
+   * então a janela precisa alcançar a latência real, que pode ser bem
+   * maior que a configurada (2399756: config 25s, real 45s). Sem ele, a
+   * janela usaria só o hint (comportamento antigo) — e perderia o kill
+   * quando a latência tivesse subido.
    */
   latencyMaxMs?: number;
   /** Duração do segmento (s). */
@@ -146,6 +173,15 @@ export interface KillfeedScanOptions {
   skipNewest?: boolean;
   /** Crops tentados, em ordem (o primeiro é o principal). */
   crops: string[];
+  /**
+   * Crop que JÁ leu o killfeed neste canal (o "sticky" do tracker).
+   *
+   * Os segmentos ANTES da janela esperada são varridos só com ele: antes
+   * da kill não há match por definição, e a cadeia completa de crops
+   * (até 4× ffmpeg + ~10 frames de tesseract por segmento) seria custo
+   * puro — o OCR é o gargalo do bot.
+   */
+  rememberedCrop?: string | null;
   shouldStop?: () => boolean;
   pollIntervalMs?: number;
 }
@@ -163,12 +199,21 @@ function median(values: number[]): number {
  * Janela da timeline do VÍDEO a varrer (ms), a partir da FAIXA de
  * latências plausíveis.
  *
- * A janela tem que cobrir as kills quando a latência MUDOU: o killfeed é
- * acionado pelo salto do PDT ou pela troca de regime, exatamente os
- * casos em que o hint antigo está errado. Usar só o hint perderia o
- * killfeed (e a única medição DENTRO do vídeo) justo quando ele é
- * necessário. As tolerâncias cobrem a amostragem de 1fps e o jitter do
- * killfeed. Puro/testável.
+ * O limite INFERIOR é independente do hint: a varredura começa no
+ * instante MAIS CEDO plausível da 1ª kill (latência 0 — o vídeo nunca
+ * chega antes do relógio do jogo), não na latência estimada. Com o
+ * início derivado do hint (2399858: 45s) a janela começava em at1+25s,
+ * exatamente onde o corte abre — a 1ª kill, que aparece no vídeo
+ * antes disso, NUNCA era lida e o killfeed devolvia
+ * 'insufficient-matches' para sempre. Abrir pelo lado cedo custa alguns
+ * segmentos de OCR; o falso positivo do round anterior é descartado
+ * pela FAIXA de offset (`MIN_ALLOWED_OFFSET_MS`) — e o descarte acontece
+ * ANTES da agregação, então ele não leva a leitura legítima junto.
+ *
+ * O limite SUPERIOR continua usando o máximo da faixa: a latência pode
+ * ter SUBIDO depois da medição anterior e cortar aí perderia a kill.
+ * As tolerâncias cobrem a amostragem de 1fps e o jitter do killfeed.
+ * Puro/testável.
  */
 export function killfeedScanWindowMs(params: {
   kills: KillEvent[];
@@ -182,19 +227,13 @@ export function killfeedScanWindowMs(params: {
     .filter((kill) => Number.isFinite(kill.at))
     .map((kill) => kill.at! - params.scoreboardDelayMs);
   if (times.length === 0) return null;
-  const minLatency = Math.max(
-    0,
-    Math.min(params.latencyHintMs, params.latencyMaxMs ?? params.latencyHintMs),
-  );
   const maxLatency = Math.max(
     params.latencyHintMs,
     params.latencyMaxMs ?? params.latencyHintMs,
   );
   return {
     startMs:
-      Math.min(...times) +
-      minLatency -
-      (params.earlyToleranceMs ?? EARLY_TOLERANCE_MS),
+      Math.min(...times) - (params.earlyToleranceMs ?? EARLY_TOLERANCE_MS),
     endMs:
       Math.max(...times) +
       maxLatency +
@@ -202,7 +241,54 @@ export function killfeedScanWindowMs(params: {
   };
 }
 
-/** Estimativa pura do offset/âncoras a partir das leituras do killfeed. */
+/**
+ * Início da janela ESPERADA (ms): onde a kill deve aparecer se a
+ * latência estimada estiver certa.
+ *
+ * Serve para o CUSTO do OCR: os segmentos ANTES desta posição são
+ * varridos só com o crop lembrado (o que já leu o killfeed no canal).
+ * A cadeia completa de crops (até 4× ffmpeg + ~10 frames de tesseract
+ * por segmento) só entra a partir da janela esperada — o trecho
+ * anterior é material sem match por definição (a kill ainda não
+ * aconteceu) e, com a latência inflada, são vários segmentos.
+ *
+ * Puro/testável.
+ */
+export function killfeedExpectedWindowStartMs(params: {
+  kills: KillEvent[];
+  scoreboardDelayMs: number;
+  latencyHintMs: number;
+  earlyToleranceMs?: number;
+}): number | null {
+  const times = params.kills
+    .filter((kill) => Number.isFinite(kill.at))
+    .map((kill) => kill.at! - params.scoreboardDelayMs);
+  if (times.length === 0) return null;
+  return (
+    Math.min(...times) +
+    params.latencyHintMs -
+    (params.earlyToleranceMs ?? EARLY_TOLERANCE_MS)
+  );
+}
+
+/**
+ * Ordem dos crops para o próximo segmento: o que já leu o killfeed
+ * (o "sticky") vai PRIMEIRO; o resto mantém a ordem original.
+ *
+ * Sem isso, cada segmento da janela testava a cadeia inteira de crops
+ * (até 4× ffmpeg + ~10 frames de tesseract) — o custo do OCR é o
+ * gargalo do bot. Puro/testável.
+ */
+export function orderCrops<T extends { raw: string }>(
+  candidates: T[],
+  used: string | null,
+): T[] {
+  if (used == null) return [...candidates];
+  const winner = candidates.filter((crop) => crop.raw === used);
+  const rest = candidates.filter((crop) => crop.raw !== used);
+  return [...winner, ...rest];
+}
+
 export interface StreamOffsetEstimate {
   offsetMs: number | null;
   matchedKills: number;
@@ -259,27 +345,41 @@ export function estimateStreamOffset(
 
   // A 1ª aparição de cada kill no killfeed = o instante do kill (+1s de
   // amostragem). Observações posteriores são a MESMA linha persistindo.
-  const firstSeenByKill = new Map<number, number>();
+  //
+  // O filtro de faixa vem ANTES da agregação: um falso positivo do OCR
+  // na banda negativa (abaixo de MIN_ALLOWED_OFFSET_MS) virava o
+  // "first seen" da kill e era descartado DEPOIS — levando junto a
+  // leitura legítima (a kill ficava sem observação nenhuma e o
+  // resultado virava 'insufficient-matches').
+  const firstSeenByKill = new Map<number, { streamAtMs: number; offsetMs: number }>();
   for (const observation of observations) {
+    const kill = kills[observation.killIndex];
+    if (!kill || !Number.isFinite(kill.at) || !Number.isFinite(observation.streamAtMs)) continue;
+    const offsetMs = observation.streamAtMs - (kill.at! - scoreboardDelayMs);
+    if (offsetMs < MIN_ALLOWED_OFFSET_MS || offsetMs > maxLagSec * 1000) continue;
     const current = firstSeenByKill.get(observation.killIndex);
-    if (current == null || observation.streamAtMs < current) {
-      firstSeenByKill.set(observation.killIndex, observation.streamAtMs);
+    if (current == null || observation.streamAtMs < current.streamAtMs) {
+      firstSeenByKill.set(observation.killIndex, {
+        streamAtMs: observation.streamAtMs,
+        offsetMs,
+      });
     }
   }
 
-  const candidates = [...firstSeenByKill]
-    .map(([killIndex, streamAtMs]) => {
-      const kill = kills[killIndex];
-      if (!kill || !Number.isFinite(kill.at) || !Number.isFinite(streamAtMs)) return null;
-      const offsetMs = streamAtMs - (kill.at! - scoreboardDelayMs);
-      if (offsetMs < MIN_ALLOWED_OFFSET_MS || offsetMs > maxLagSec * 1000) return null;
-      return { killIndex, offsetMs, streamAtMs };
-    })
-    .filter((candidate): candidate is { killIndex: number; offsetMs: number; streamAtMs: number } => candidate !== null);
+  const candidates = [...firstSeenByKill].map(([killIndex, first]) => ({
+    killIndex,
+    offsetMs: first.offsetMs,
+    streamAtMs: first.streamAtMs,
+  }));
 
+  /**
+   * Quantas kills precisam casar para o cluster valer: no mínimo 2 (sem
+   * corroboração não é uma medição) e 60% das kills do ace (num ace de
+   * 5 kills, 3 já provam o regime).
+   */
   const minimumMatches = Math.min(
     timestamped.length,
-    Math.max(2, Math.ceil(timestamped.length * 0.6)),
+    Math.max(MIN_CLUSTER_MATCHES, Math.ceil(timestamped.length * CLUSTER_MATCHES_RATIO)),
   );
   let best: Array<{ killIndex: number; offsetMs: number; streamAtMs: number }> = [];
   for (const candidate of candidates) {
@@ -425,7 +525,19 @@ export function estimateStreamOffset(
       firstKillMatched: false,
       lastKillVideoMs,
       clusterKills,
-      killVideoOffsetMs: Math.round(clusterOffsetMs) - scoreboardDelayMs,
+      /**
+       * Offset dos timestamps no ramo DERIVADO: o mesmo cluster, menos o
+       * atraso de aparecimento do killfeed.
+       *
+       * O `offsetMs` do cluster é medido a partir do instante em que a
+       * LINHA apareceu (ela entra 1s depois do kill) — a âncora derivada
+       * (`derivedAnchorMs`) desconta esse 1s, e o offset dos timestamps
+       * precisa descontar o MESMO: sem ele as marcas de tempo das kills
+       * ficavam 1s depois do kill no vídeo (e 1s fora da âncora do
+       * clipe, que o próprio bot gravou).
+       */
+      killVideoOffsetMs:
+        Math.round(clusterOffsetMs) - scoreboardDelayMs - KILLFEED_APPEAR_DELAY_MS,
     };
   }
 
@@ -688,8 +800,9 @@ async function scanSegment(
  * regime de latência), esta é a segunda medição: ela dá o instante do
  * kill DENTRO do vídeo, que não depende de nenhuma latência estimada.
  *
- * A janela varrida é calculada com a latência SUGERIDA (só para saber
- * qual segmento olhar) — o resultado é medido.
+ * A janela varrida NÃO parte da latência sugerida: ela começa no
+ * instante mais cedo plausível da 1ª kill (latência 0) e só usa o hint
+ * como referência do limite superior. O resultado é medido.
  */
 export async function scanKillfeedForLatency(
   options: KillfeedScanOptions,
@@ -750,6 +863,33 @@ export async function scanKillfeedForLatency(
   let worker: OcrWorker | null = null;
   let cropUsed: string | null = null;
   let windowCovered = false;
+  /**
+   * Diagnóstico do custo do OCR (por varredura): quantos segmentos
+   * entraram no tesseract, quantos não casaram nada e quanto tempo
+   * levou. Sem isso não dá para provar em produção se a janela larga
+   * está pesando no bot.
+   */
+  let segmentsScanned = 0;
+  let segmentsWithoutMatch = 0;
+  const scanStartedAtMs = Date.now();
+  /**
+   * Início da janela ESPERADA (a latência estimada confere): os
+   * segmentos antes dela são varridos SÓ com o crop lembrado — antes
+   * da kill não há match por definição, e a cadeia completa de crops
+   * (4× ffmpeg + ~10 frames de tesseract) seria custo puro.
+   */
+  const expectedStartMs = killfeedExpectedWindowStartMs({
+    kills,
+    scoreboardDelayMs,
+    latencyHintMs,
+  });
+  const rememberedRaw = options.rememberedCrop ?? null;
+  const rememberedCrop =
+    rememberedRaw != null
+      ? cropCandidates.find((crop) => crop.raw === rememberedRaw) ?? null
+      : null;
+  /** Crop único do trecho ANTES da janela esperada (o mais barato). */
+  const probeCrop = rememberedCrop ?? cropCandidates[0];
 
   try {
     const { default: sharp } = await import('sharp');
@@ -764,6 +904,10 @@ export async function scanKillfeedForLatency(
         ...base,
         crop: cropUsed,
         windowCovered,
+        segmentsScanned,
+        segmentsWithoutMatch,
+        scanDurationMs: Date.now() - scanStartedAtMs,
+        deadlineExceeded: Date.now() > scanDeadlineMs,
       };
     };
 
@@ -793,6 +937,17 @@ export async function scanKillfeedForLatency(
         const segmentEndMs = stat.mtimeMs;
         if (segmentEndMs < scanStartMs || segmentStartMs > scanEndMs) continue;
 
+        /**
+         * Custo do OCR por segmento:
+         * - ANTES da janela esperada: só o crop lembrado (o trecho não
+         *   tem kill por definição — a cadeia completa seria custo puro);
+         * - a partir da janela esperada: a cadeia completa, com o crop
+         *   que já leu ("sticky") PRIMEIRO.
+         */
+        const beforeExpected = expectedStartMs != null && segmentEndMs < expectedStartMs;
+        const segmentCrops = beforeExpected
+          ? [probeCrop]
+          : orderCrops(cropCandidates, cropUsed);
         const scanned = await scanSegment(
           file,
           durationSec,
@@ -802,9 +957,11 @@ export async function scanKillfeedForLatency(
           sharp,
           kills,
           segmentEndMs,
-          cropCandidates,
+          segmentCrops,
           aborted,
         );
+        segmentsScanned++;
+        if (scanned.observations.length === 0) segmentsWithoutMatch++;
         observations.push(...scanned.observations);
         if (scanned.crop) cropUsed = scanned.crop;
         const result = estimate();

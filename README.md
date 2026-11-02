@@ -218,7 +218,22 @@ The start of the clip pays the opposite error: if the real latency is *smaller* 
 configured one, the clip would begin **after** the first kill and lose it. The cut
 therefore opens `CLIP_CONTEXT_SEC + CLIP_START_MARGIN_SEC` before the first kill
 (`CLIP_START_MARGIN_SEC`, default 5s) — the cheap side of the error (a few extra seconds
-of the previous round) instead of the expensive one (a missing first kill).
+of the previous round) instead of the expensive one (a missing first kill). When the
+channel has **no measurement at all** (no scoreboard and no killfeed reading — the
+configured latency is then a guess), the opening latency is capped at
+`CLIP_START_LATENCY_MAX_MS` (default 25s): a guess can be inflated, and uncapped it
+would open the clip after the first kill (2399858: 45s configured for a ~26s offset — the
+first three kills were outside the clip). 0 disables the cap. A **measured** latency is
+never capped (the measurement is the best estimate available), and the cap only moves
+the **opening**: the timestamps and the coverage keep the estimate, because for them
+there is no cheap side — a shifted offset moves the kill marks in the description. The
+cap is inactive with `CLIP_STREAM_SYNC_ADAPTIVE=false` (and in the `log` shadow mode).
+
+When the cap fires, the bot is saying "this latency is a guess I don't trust": the kills
+are marked as **estimated** (the description stops asserting times nobody measured), the
+sidecar records the estimate (`estimatedStartLatencyMs`) next to the capped opening, and
+`publish-shorts` **skips** the clip instead of cutting a Short around positions that may
+be shifted — `--force` publishes it anyway (the decision is the owner's).
 
 The live clip is rendered at the source resolution by default. `CLIP_UPSCALE_HEIGHT`
 (0 = off, 1440/2160) re-scales it in the same encode pass (denoise + scale + sharpen):
@@ -243,9 +258,14 @@ Com isso, por round:
 - **início** do clipe = a latência em vigor na 1ª kill (a amostra medida **antes** do
   evento). A amostra do fim do round só pode **antecipar** a abertura: quando é menor que
   a anterior, vale ela; quando é maior, é ignorada — foi medida depois da 1ª kill e a
-  subida pode ter acontecido depois do kill. O caso "regime trocou" (|delta| >
+  subida pode ter acontecido depois do kill. A medição do killfeed (limite inferior)
+  **não substitui** uma medição do placar: ela só entra quando o canal não tem
+  medição completa — no mesmo round o killfeed é gravado por último, e usá-lo como base
+  trocaria a latência precisa pelo limite inferior. O caso "regime trocou" (|delta| >
   `CLIP_STREAM_SYNC_MAX_STEP_MS`, default 20s) fica no log e dispara o killfeed, que mede
-  o instante exato dentro do vídeo. Amostra anterior com mais de 15min é tratada como
+  o instante exato dentro do vídeo; a comparação do delta é sempre contra a última
+  medição **completa** (contra o limite inferior ela dispararia o OCR do killfeed à toa).
+  Amostra anterior com mais de 15min é tratada como
   "prior velho": o início usa `min(prior, configurado)` em vez de confiar cegamente no
   valor antigo (a stream pode ter mudado de regime entre as partidas).
 - **fim** do clipe = o **maior** valor entre a amostra do round, a janela recente e a
@@ -253,13 +273,37 @@ Com isso, por round:
   mais cedo custa a última kill.
 - a medição fica persistida em `data/stream-latency.json` (`CLIP_STREAM_SYNC_STATE_PATH`),
   então o primeiro round da partida seguinte já começa com a latência real da anterior.
-  O `reference` (`timer-hltv` ou `estimada`) também é persistido para o relatório.
+  O `reference` (`timer-hltv` ou `estimada`) também é persistido para o relatório. A
+  medição do **killfeed** também é persistida (`source: killfeed`), mas como **limite
+  inferior** (`startOnly`): o `at` do placar é a observação, que chega depois da kill,
+  então ela abre o clipe mais cedo (seguro) e fica fora do fim estimado (fecharia antes
+  do round acabar). As amostras do killfeed ficam num **anel próprio** (`startSamples`):
+  no anel único elas expulsavam as amostras do placar — que alimentam o fim estimado — e
+  a mediana do canal passava a misturar um limite inferior com medições de verdade. O
+  schema do arquivo é v3: um arquivo **v2 é aproveitado** (as amostras voltam; o
+  `startOnly` é separado no anel do início e a migração fica no log do startup) e um
+  arquivo **v1** perde as amostras (só os crops, independentes do schema, são resgatados)
+  porque o código antigo leria o limite inferior como latência completa e o usaria no fim
+  — cortando a última kill.
 
-O OCR do killfeed varre da **1ª kill + latência de início** até a **última kill +
-latência de fim**, com tolerância dos dois lados: procurar cedo demais não acha a kill (o
-vídeo ainda não chegou nela) e procurar tarde demais perde o frame. O vídeo não pode ser
-varrido além do `scanDeadlineMs`, senão um crop que não acha o killfeed trava a próxima
-rodada.
+O OCR do killfeed varre do instante **mais cedo plausível** da 1ª kill (latência 0 — o
+vídeo nunca chega antes do relógio do jogo) até a **última kill + latência de fim**. O
+início da varredura NÃO parte da latência estimada: com ela, uma latência configurada
+alta deixava a 1ª kill fora da janela (2399858: janela começando em at1+25s, exatamente
+onde o corte abre) e o killfeed nunca conseguia medir. A tolerância antes da 1ª kill é de
+5s (`=|MIN_ALLOWED_OFFSET_MS|`): antes disso a leitura seria descartada pelo filtro de
+faixa, e varrer ali é custo de OCR sem chance de match. O `MIN_ALLOWED_OFFSET_MS` descarta
+o falso positivo do round anterior — e o descarte acontece ANTES da agregação, senão o
+falso positivo virava a "primeira aparição" da kill e levava a leitura legítima junto
+(o resultado era `insufficient-matches`). O vídeo não pode ser varrido além do
+`scanDeadlineMs`, senão um crop que não acha o killfeed trava a próxima rodada.
+
+O **custo** do OCR é o gargalo do bot (cada segmento é um ffmpeg + até 4 crops × ~10
+frames de tesseract). Por isso os segmentos **antes** da janela esperada (a kill + a
+latência estimada) são varridos **só com o crop que já leu o killfeed no canal** — antes
+da kill não há match por definição; a partir dali entra a cadeia completa, com o crop
+que funcionou primeiro. O log da calibração mostra o custo da varredura
+(`segmentosVarridos`, `segmentosSemMatch`, `msVarredura`, `deadlineEstourado`).
 
 O casamento do killfeed exige **killer + vítima** (é o que prova que a kill é a do
 jogador). Quando o placar do HLTV não traz as vítimas, o bot as sintetiza a partir das
@@ -282,6 +326,7 @@ medição; a aplicação só acontece com `CLIP_STREAM_SYNC=auto`.
 | variável | padrão | efeito |
 | --- | --- | --- |
 | `CLIP_STREAM_SYNC_ADAPTIVE` | `true` | aplica a latência medida nas âncoras (só com `CLIP_STREAM_SYNC=auto`) |
+| `CLIP_START_LATENCY_MAX_MS` | `25000` | teto da latência de ABERTURA quando o canal não tem medição (0 = desligado) |
 | `CLIP_STREAM_SYNC_MAX_STEP_MS` | `20000` | acima disso, o round "trocou de regime" |
 | `CLIP_STREAM_SYNC_STATE_PATH` | `./data/stream-latency.json` | estado persistido por canal |
 | `CLIP_KILLFEED_SYNC` | `fallback` | `off` \| `fallback` (só quando o placar falha) \| `always` |
@@ -336,6 +381,10 @@ O script (`scripts/publish-shorts.ts`):
 
 O Short só fala das kills que CABEM na janela: se a janela trunca a
 jogada, o título e a descrição contam só as kills do vídeo.
+
+Um clipe cuja **abertura foi limitada pelo teto de latência** é **pulado**: as
+posições das kills vêm da estimativa (e podem estar deslocadas), e a janela do
+Short cortaria o começo do ace. `--force` publica mesmo assim.
 
 A legenda fica por conta do YouTube (auto-caption PT-BR): subir uma faixa
 própria exige `captions.insert`, que pede o scope `youtube.force-ssl` (o

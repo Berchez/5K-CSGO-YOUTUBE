@@ -5,6 +5,7 @@ import {
   observedLatencyMs,
   parseLatencyMap,
   resolveAdaptiveLatency,
+  resolveStartLatency,
   resolveStreamLatencyMs,
   shouldApplyAdaptive,
   StreamLatencyTracker,
@@ -208,22 +209,115 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
     expect(restored.channels()).toEqual(['gaules']);
   });
 
-  it('ignora estado corrompido (JSON de outro formato)', () => {
-    const restored = StreamLatencyTracker.fromJSON({ streams: 'nope' });
-    expect(restored.channels()).toEqual([]);
-    expect(restored.median('Gaules')).toBeNull();
-  });
-
-  it('rejeita versão de schema desconhecida (estado vazio)', () => {
-    const restored = StreamLatencyTracker.fromJSON({
-      version: 99,
-      streams: { gaules: { samples: [{ measuredAtMs: 1_000, latencyMs: 30_000, source: 'scoreboard', quality: 'confident' }] } },
+  it('startOnly (killfeed) sobrevive à persistência', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 31_500, {
+      measuredAtMs: 1_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
     });
-    expect(restored.channels()).toEqual([]);
+    const restored = StreamLatencyTracker.fromJSON(JSON.parse(JSON.stringify(tracker.toJSON())));
+    // A amostra do INÍCIO fica no anel próprio: `latest` (latência
+    // completa) não a enxerga — ela é limite inferior, não medição.
+    expect(restored.latest('Gaules')).toBeNull();
+    expect(restored.startSamplesCount('Gaules')).toBe(1);
+    expect(restored.allSamples('Gaules')[0]).toMatchObject({
+      latencyMs: 31_500,
+      source: 'killfeed',
+      startOnly: true,
+    });
+    // O canal aparece no diagnóstico mesmo só com amostra do início.
+    expect(restored.channels()).toEqual(['gaules']);
   });
 
-  it('amostras v1 não sobrevivem (after-only envenenado), mas crops sim', () => {
-    // v2: after-only deixou de ser latência — as AMOSTRAS do arquivo v1
+  it('amostras startOnly ficam num anel SEPARADO (não expulsam as do placar)', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 45_000, {
+      measuredAtMs: 1_000,
+      source: 'scoreboard',
+      quality: 'confident',
+      reference: 'timer-hltv',
+    });
+    // 6 aces com killfeed: no anel único as amostras do placar
+    // (que alimentam o FIM estimado) saíriam fora.
+    for (let i = 0; i < 6; i++) {
+      tracker.record('Gaules', 20_000, {
+        measuredAtMs: 2_000 + i,
+        source: 'killfeed',
+        quality: 'confident',
+        startOnly: true,
+      });
+    }
+    expect(tracker.samplesCount('Gaules')).toBe(1);
+    expect(tracker.startSamplesCount('Gaules')).toBe(5);
+    // A mediana é a da latência COMPLETA (o limite inferior não entra).
+    expect(tracker.median('Gaules')).toBe(45_000);
+    expect(tracker.recentMax('Gaules', 3, 15 * 60_000, 10_000)).toBe(45_000);
+    // A união (histórico do canal) tem as duas.
+    expect(tracker.allSamples('Gaules')).toHaveLength(6);
+  });
+
+  it('amostra startOnly NUNCA entra no anel da latência completa', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 20_000, {
+      measuredAtMs: 1_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    });
+    expect(tracker.samplesCount('Gaules')).toBe(0);
+    expect(tracker.median('Gaules')).toBeNull();
+    expect(tracker.startSamplesCount('Gaules')).toBe(1);
+  });
+
+  it('canal só com amostra do INÍCIO aparece no diagnóstico', () => {
+    const tracker = new StreamLatencyTracker();
+    tracker.record('Gaules', 20_000, {
+      measuredAtMs: 1_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    });
+    // O canal tem medição (do início): sumir do log de startup fazia o
+    // dono achar que o canal nunca foi medido.
+    expect(tracker.channels()).toEqual(['gaules']);
+    expect(tracker.samplesCount('Gaules')).toBe(0);
+    expect(tracker.startSamplesCount('Gaules')).toBe(1);
+  });
+
+  it('estado v2 aproveita as amostras (o startOnly vai para o anel do início)', () => {
+    // O schema v2 é o mesmo: a amostra marcada `startOnly` é separada
+    // pelo roteamento. Descartar o arquivo inteiro jogava fora a
+    // medição do canal por causa de uma amostra marcada.
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 2,
+      streams: {
+        gaules: {
+          samples: [
+            { measuredAtMs: 1_000, latencyMs: 20_000, source: 'killfeed', quality: 'confident', startOnly: true },
+            { measuredAtMs: 2_000, latencyMs: 33_000, source: 'scoreboard', quality: 'confident', reference: 'timer-hltv' },
+          ],
+          crop: '0.02:0.02:0.30:0.14',
+          killfeedCrop: '0.70:0.05:0.30:0.25',
+        },
+      },
+    });
+    // A latência completa sobrevive...
+    expect(restored.median('Gaules')).toBe(33_000);
+    expect(restored.samplesCount('Gaules')).toBe(1);
+    // ...e a do início vai para o anel próprio (nunca no da completa).
+    expect(restored.startSamplesCount('Gaules')).toBe(1);
+    expect(restored.latest('Gaules')?.latencyMs).toBe(33_000);
+    expect(restored.crop('Gaules')).toBe('0.02:0.02:0.30:0.14');
+    expect(restored.killfeedCrop('Gaules')).toBe('0.70:0.05:0.30:0.25');
+    // O log da migração precisa saber de onde veio o arquivo.
+    expect(restored.restoredFromVersion).toBe(2);
+    expect(restored.restoredSamplesCount).toBe(2);
+  });
+
+  it('estado v1 não aproveita as amostras (after-only envenenado), mas resgata os crops', () => {
+    // v1: after-only deixou de ser latência — as AMOSTRAS do arquivo v1
     // saem; os crops memorizados são independentes do schema e valem
     // (inclusive o do killfeed).
     const restored = StreamLatencyTracker.fromJSON({
@@ -241,9 +335,42 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
     expect(restored.killfeedCrop('Gaules')).toBe('0.70:0.05:0.30:0.25');
   });
 
+  it('estado v3: as amostras do início voltam no anel próprio', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 3,
+      streams: {
+        gaules: {
+          samples: [
+            { measuredAtMs: 1_000, latencyMs: 45_000, source: 'scoreboard', quality: 'confident', reference: 'timer-hltv' },
+          ],
+          startSamples: [
+            { measuredAtMs: 2_000, latencyMs: 20_000, source: 'killfeed', quality: 'confident', startOnly: true },
+          ],
+        },
+      },
+    });
+    expect(restored.median('Gaules')).toBe(45_000);
+    expect(restored.startSamplesCount('Gaules')).toBe(1);
+    expect(restored.allSamples('Gaules').map((s) => s.latencyMs)).toEqual([45_000, 20_000]);
+  });
+
+  it('ignora estado corrompido (JSON de outro formato)', () => {
+    const restored = StreamLatencyTracker.fromJSON({ streams: 'nope' });
+    expect(restored.channels()).toEqual([]);
+    expect(restored.median('Gaules')).toBeNull();
+  });
+
+  it('rejeita versão de schema desconhecida (estado vazio)', () => {
+    const restored = StreamLatencyTracker.fromJSON({
+      version: 99,
+      streams: { gaules: { samples: [{ measuredAtMs: 1_000, latencyMs: 30_000, source: 'scoreboard', quality: 'confident' }] } },
+    });
+    expect(restored.channels()).toEqual([]);
+  });
+
   it('só amostras confident sobrevivem à restauração (after-only não é latência)', () => {
     const restored = StreamLatencyTracker.fromJSON({
-      version: 2,
+      version: 3,
       streams: {
         gaules: {
           samples: [
@@ -258,7 +385,7 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
 
   it('rejeita origem/qualidade desconhecidas em vez de normalizar', () => {
     const restored = StreamLatencyTracker.fromJSON({
-      version: 2,
+      version: 3,
       streams: {
         gaules: {
           samples: [
@@ -284,7 +411,7 @@ describe('StreamLatencyTracker (amostras com timestamp)', () => {
       quality: 'confident',
     }));
     const restored = StreamLatencyTracker.fromJSON({
-      version: 2,
+      version: 3,
       streams: { gaules: { samples } },
     });
     const kept = restored.allSamples('Gaules');
@@ -538,6 +665,141 @@ describe('resolveAdaptiveLatency', () => {
     expect(decision.endLatencyMs).toBe(40_000);
   });
 
+  it('amostra startOnly (killfeed) alimenta o INÍCIO — é limite inferior seguro', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 1_000,
+      latencyMs: 31_500,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 45_000,
+      priorSamples: [killfeed],
+      recentSamples: [killfeed],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.startLatencyMs).toBe(31_500);
+    expect(decision.startSource).toBe('prior');
+  });
+
+  it('amostra startOnly NÃO entra no fim estimado (fecharia antes do round acabar)', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 1_000,
+      latencyMs: 31_500,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 45_000,
+      priorSamples: [killfeed],
+      recentSamples: [killfeed],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    expect(decision.endLatencyMs).toBe(45_000);
+    expect(decision.endSample).toBeNull();
+  });
+
+  it('startOnly com amostra do placar: o INÍCIO usa a medição precisa, o fim também', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: 20_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const scoreboard = sample(1_000, 60_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 45_000,
+      priorSamples: [scoreboard, killfeed],
+      recentSamples: [scoreboard, killfeed],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    // O killfeed é limite INFERIOR: ele não substitui a medição do
+    // placar (no mesmo round o killfeed é gravado por último).
+    expect(decision.startLatencyMs).toBe(60_000);
+    expect(decision.startSource).toBe('prior');
+    expect(decision.endLatencyMs).toBe(60_000);
+  });
+
+  it('o "regime trocou" compara com a última medição completa (não com o limite inferior)', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 2_000,
+      latencyMs: 20_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const scoreboard = sample(1_000, 60_000);
+    const current = sample(3_000, 62_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 45_000,
+      priorSamples: [scoreboard, killfeed],
+      recentSamples: [scoreboard, killfeed],
+      current,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+    });
+    // Contra o limite inferior (20s) o delta seria 42s → "regime trocou"
+    // e outro OCR caro do killfeed. Contra a medição real: 2s.
+    expect(decision.deltaMs).toBe(2_000);
+    expect(decision.changed).toBe(false);
+  });
+
+  it('amostra do killfeed VELHA não substitui a medição completa recente', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 5_000,
+      latencyMs: 20_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const scoreboard = sample(55_000, 45_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [killfeed, scoreboard],
+      recentSamples: [killfeed, scoreboard],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+      maxPriorAgeMs: 30_000,
+    });
+    // A medição do placar (6s) é mais nova que a do killfeed (56s).
+    expect(decision.startLatencyMs).toBe(45_000);
+    expect(decision.startSource).toBe('prior');
+  });
+
+  it('killfeed RECENTE entra quando a medição completa está VELHA', () => {
+    const killfeed: LatencySample = {
+      measuredAtMs: 55_000,
+      latencyMs: 20_000,
+      source: 'killfeed',
+      quality: 'confident',
+      startOnly: true,
+    };
+    const scoreboard = sample(5_000, 80_000);
+    const decision = resolveAdaptiveLatency({
+      configuredMs: 25_000,
+      priorSamples: [scoreboard, killfeed],
+      recentSamples: [scoreboard, killfeed],
+      current: null,
+      maxStepMs: 20_000,
+      eventAtMs: 61_000,
+      maxPriorAgeMs: 30_000,
+    });
+    // A do placar está velha (56s): uma medição do killfeed de 6s vale
+    // mais (o regime pode ter mudado) — e abrir mais cedo é seguro.
+    expect(decision.startLatencyMs).toBe(20_000);
+    expect(decision.startSource).toBe('prior');
+  });
+
   it('informa a idade da amostra anterior (amostra antiga = confiança baixa)', () => {
     const prior = [sample(1_000, 40_000)];
     const decision = resolveAdaptiveLatency({
@@ -656,5 +918,63 @@ describe('shouldApplyAdaptive (modos do sync)', () => {
     expect(shouldApplyAdaptive('log', true)).toBe(false);
     expect(shouldApplyAdaptive('off', true)).toBe(false);
     expect(shouldApplyAdaptive('auto', false)).toBe(false);
+  });
+});
+
+describe('resolveStartLatency (teto de abertura)', () => {
+  const base = {
+    estimatedMs: 45_000,
+    measured: false,
+    killfeedAnchored: false,
+    capMs: 25_000,
+    applyAdaptive: true,
+  };
+
+  it('sem medição: o teto limita a ABERTURA (e não a estimativa)', () => {
+    const decision = resolveStartLatency(base);
+    expect(decision.openMs).toBe(25_000);
+    expect(decision.estimatedMs).toBe(45_000);
+    expect(decision.capped).toBe(true);
+    expect(decision.reason).toBe('capped');
+  });
+
+  it('estimada igual ao teto: não é limitada (não há o que limitar)', () => {
+    const decision = resolveStartLatency({ ...base, estimatedMs: 25_000 });
+    expect(decision.openMs).toBe(25_000);
+    expect(decision.capped).toBe(false);
+  });
+
+  it('estimada abaixo do teto: o corte usa o valor inteiro', () => {
+    const decision = resolveStartLatency({ ...base, estimatedMs: 12_000 });
+    expect(decision.openMs).toBe(12_000);
+    expect(decision.capped).toBe(false);
+    expect(decision.reason).toBe('config');
+  });
+
+  it('teto 0 desliga a limitação', () => {
+    const decision = resolveStartLatency({ ...base, capMs: 0 });
+    expect(decision.openMs).toBe(45_000);
+    expect(decision.capped).toBe(false);
+  });
+
+  it('latência MEDIDA não é limitada (silenciar medição mudaria o corte)', () => {
+    const decision = resolveStartLatency({ ...base, measured: true });
+    expect(decision.openMs).toBe(45_000);
+    expect(decision.capped).toBe(false);
+    expect(decision.reason).toBe('measured');
+  });
+
+  it('killfeed ancorado: o teto não se aplica (a âncora é medição)', () => {
+    const decision = resolveStartLatency({ ...base, killfeedAnchored: true });
+    expect(decision.openMs).toBe(45_000);
+    expect(decision.capped).toBe(false);
+    expect(decision.reason).toBe('killfeed');
+  });
+
+  it('adaptativo desligado: o teto é inativo (o configurado vale como está)', () => {
+    const decision = resolveStartLatency({ ...base, applyAdaptive: false });
+    expect(decision.openMs).toBe(45_000);
+    expect(decision.capped).toBe(false);
+    expect(decision.reason).toBe('adaptive-off');
   });
 });
