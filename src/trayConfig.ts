@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { boolEnv, ConfigSchema, parseBoolEnv } from './config.js';
+import { boolEnv, ConfigSchema, parseBoolEnv, shortsCrossFieldErrors } from './config.js';
 import type { AppConfig } from './config.js';
 
 export type ConfigGroup = 'capture' | 'stream' | 'clips' | 'youtube' | 'system';
@@ -297,6 +297,81 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     unit: 'GB',
   },
   {
+    key: 'SHORTS_ENABLED',
+    group: 'clips',
+    label: 'Gerar Shorts (9:16)',
+    help: 'O script publish:shorts só PUBLICA com esta chave ligada; o dry-run (cálculo + render) funciona sempre.',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_MAX_SEC',
+    group: 'clips',
+    label: 'Duração máx. do Short',
+    help: 'Duração máxima do Short (o YouTube aceita até 3min; 60s é o corte).',
+    type: 'number',
+    min: 10,
+    max: 180,
+    step: 1,
+    unit: 's',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_MIN_KILLS',
+    group: 'clips',
+    label: 'Mín. de kills no Short',
+    help: 'O bot também grava 3K/4K: no feed Shorts um 4K é tão bom quanto um ace.',
+    type: 'number',
+    min: 2,
+    max: 5,
+    step: 1,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_MIN_SEC',
+    group: 'clips',
+    label: 'Duração mín. do Short',
+    help: 'Abaixo disso o Short é rápido demais e perde retenção.',
+    type: 'number',
+    min: 5,
+    max: 180,
+    step: 1,
+    unit: 's',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CROP_X',
+    group: 'clips',
+    label: 'Crop do Short (horizontal)',
+    help: '0 = esquerda, 0.5 = centro, 1 = direita. O crop 9:16 tira ~2/3 da largura: se a ação ou o placar saírem do quadro, mova aqui.',
+    type: 'number',
+    min: 0,
+    max: 1,
+    step: 0.05,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_PRIVACY',
+    group: 'clips',
+    label: 'Visibilidade do Short',
+    help: 'Unlisted testa sem risco de claim no canal; public publica de cara.',
+    type: 'select',
+    options: [
+      { value: 'unlisted', label: 'Unlisted (teste)' },
+      { value: 'private', label: 'Privado' },
+      { value: 'public', label: 'Público' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_HASHTAG',
+    group: 'clips',
+    label: 'Hashtag do Short',
+    help: 'Tag que entra no fim da descrição do Short (o painel grava entre aspas — o # solto seria lido como comentário).',
+    type: 'text',
+    advanced: true,
+  },
+  {
     key: 'THUMB_MODE',
     group: 'clips',
     label: 'Thumbnail',
@@ -578,7 +653,10 @@ export function panelConfigValues(values: Record<string, string>): Record<string
   return out;
 }
 
-export function validateConfigPatch(patch: Record<string, unknown>): ConfigPatchResult {
+export function validateConfigPatch(
+  patch: Record<string, unknown>,
+  current: Record<string, string> = {},
+): ConfigPatchResult {
   const errors: Array<{ key: string; message: string }> = [];
   const values: Record<string, string> = {};
   const fieldByKey = new Map(EDITABLE_FIELDS.map((field) => [String(field.key), field]));
@@ -645,5 +723,25 @@ export function validateConfigPatch(patch: Record<string, unknown>): ConfigPatch
   if (Object.keys(values).length === 0 && errors.length === 0) {
     errors.push({ key: '_', message: 'Nenhuma alteração informada.' });
   }
+  // Regras CRUZADAS (dois campos ao mesmo tempo): salvar só o MAX dos
+  // Shorts sem o MIN deixaria um .env que o script de Shorts recusa —
+  // e o painel é justamente o lugar de pegar isso antes de gravar.
+  const effective = (key: 'SHORTS_MIN_SEC' | 'SHORTS_MAX_SEC' | 'SHORTS_WIDTH' | 'SHORTS_HEIGHT'): number => {
+    const raw = values[key] ?? current[key];
+    if (raw != null && String(raw).trim() !== '') {
+      const n = Number(String(raw).trim());
+      if (Number.isFinite(n)) return n;
+    }
+    const parsed = ConfigSchema.shape[key].safeParse(undefined);
+    return parsed.success ? Number(parsed.data) : 0;
+  };
+  errors.push(
+    ...shortsCrossFieldErrors({
+      minSec: effective('SHORTS_MIN_SEC'),
+      maxSec: effective('SHORTS_MAX_SEC'),
+      width: effective('SHORTS_WIDTH'),
+      height: effective('SHORTS_HEIGHT'),
+    }),
+  );
   return errors.length > 0 ? { ok: false, errors } : { ok: true, values };
 }

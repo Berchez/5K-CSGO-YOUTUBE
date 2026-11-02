@@ -34,6 +34,11 @@ export interface KillEvent {
   map: string;
   /** Wall-clock (epoch ms) da detecção — ancora o início do clipe. */
   at?: number;
+  /**
+   * A posição da kill foi ESTIMADA (não medida no vídeo): a descrição
+   * não pode afirmar um horário que ninguém mediu.
+   */
+  estimated?: boolean;
   /** Arma do kill: ak47, awp, deagle, hegrenade, molotov, knife... (minúsculo; '' = desconhecida) */
   weapon?: string;
   headshot?: boolean;

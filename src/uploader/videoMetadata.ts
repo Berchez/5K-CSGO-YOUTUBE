@@ -1,9 +1,16 @@
 import type { AceEvent } from '../types.js';
 import { killLabel, prettyWeapon } from '../detector/aceDetector.js';
+import { killAtMs } from '../clipper/shorts.js';
 import { getLogger } from '../logger.js';
 
 export type MetadataMode = 'ai' | 'template' | 'legacy';
 export type MetadataPrivacy = 'private' | 'unlisted' | 'public';
+/**
+ * `shorts` = vídeo vertical (9:16) do feed Shorts: título curto, descrição
+ * enxuta, hashtag `#Shorts` e a lista de eliminações fora (ninguém lê
+ * timestamp de descrição num Short).
+ */
+export type MetadataFormat = 'standard' | 'shorts';
 
 export const TITLE_MAX = 100;
 /**
@@ -17,6 +24,16 @@ export const TAGS_MAX = 30;
 export const TAGS_CHARS_MAX = 500;
 /** Limite por tag (o próprio painel do YouTube usa 30). */
 export const TAG_CHARS_MAX = 30;
+/**
+ * Shorts: o título aparece cortado no feed (uns 60-70 caracteres cabem
+ * antes da reticência) e a descrição é curta.
+ *
+ * O teto de 1000 BYTES é ESCOLHA NOSSA (o YouTube aceita 5000 como no
+ * vídeo longo): no feed vertical a descrição aparece dobrada e um
+ * parágrafo enorme ninguém lê.
+ */
+export const SHORTS_TITLE_MAX = 70;
+export const SHORTS_DESCRIPTION_MAX_BYTES = 1000;
 
 const ALLOWED_EMOJI = ['🔥', '💥', '⚡', '🎯', '💀', '🚨', '❗'];
 const EMOJI_RE =
@@ -102,6 +119,8 @@ export interface MetadataContext {
    * da descrição com o que está na tela. Ausente = 0 (sem deslocamento).
    */
   killTimeOffsetMs?: number;
+  /** Formato do vídeo (o Shorts muda o tom e o tamanho do texto). */
+  format?: MetadataFormat;
 }
 
 export interface MetadataValidation {
@@ -133,6 +152,10 @@ export interface MetadataOptions {
   cta?: string;
   privacy?: MetadataPrivacy;
   defaultTags?: string;
+  /** Formato do vídeo (shorts = vertical, título curto, #Shorts). */
+  format?: MetadataFormat;
+  /** Hashtag de classificação do Shorts (default #Shorts). */
+  shortsHashtag?: string;
   /** Início do clipe (epoch ms): âncora dos timestamps das eliminações. */
   clipStartMs?: number;
   /** Duração real do clipe (s) — vira a linha "duração" da descrição. */
@@ -183,6 +206,7 @@ export function buildMetadataContext(
   clipStartMs?: number,
   clipDurationSec?: number,
   killTimeOffsetMs?: number,
+  format: MetadataFormat = 'standard',
 ): MetadataContext {
   const summary = ace.summary;
   const kills = summary?.kills?.length ?? ace.kills.length;
@@ -198,16 +222,24 @@ export function buildMetadataContext(
     // (antes do início ou depois do fim) o horário seria mentira
     // ("0:00 matou X" para uma kill que está depois do clipe): nesses
     // casos a linha sai SEM timestamp (a kill continua na lista).
+    // Kill ESTIMADA (posição não medida) também sai sem timestamp.
+    // O `at` pode ser epoch ms (sidecar do bot) ou ISO (sidecar do VOD):
+    // somar string com número daria NaN ("NaN:NaN matou X").
+    const atMs = killAtMs(k.at);
     const rawSec =
-      clipStartMs != null && k.at != null ? (k.at + killOffsetMs - clipStartMs) / 1000 : undefined;
+      clipStartMs != null && atMs != null && !k.estimated
+        ? (atMs + killOffsetMs - clipStartMs) / 1000
+        : undefined;
     const timeSec =
       rawSec == null
         ? undefined
-        : rawSec < 0
+        : !Number.isFinite(rawSec)
           ? undefined
-          : durationSec != null && rawSec > durationSec + 1
+          : rawSec < 0
             ? undefined
-            : rawSec;
+            : durationSec != null && rawSec > durationSec + 1
+              ? undefined
+              : rawSec;
     return {
       victim: k.victim || '?',
       weapon: prettyWeapon(k.weapon ?? ''),
@@ -290,6 +322,7 @@ export function buildMetadataContext(
     clipStartMs,
     clipDurationSec: clipDurationSec ?? ace.clipDurationSec,
     killTimeOffsetMs: killOffsetMs,
+    format,
   };
 }
 
@@ -618,6 +651,92 @@ export function buildTemplateTitle(ctx: MetadataContext): string {
   return sanitizeTitle(`${ctx.label}! ${ctx.player} — ${ctx.map} R${ctx.round} ${emoji}`);
 }
 
+/**
+ * Título do Short: curto (≤70 chars) e com o gancho na frente.
+ *
+ * O feed do Shorts mostra o título cortado (~60 chars), então o que
+ * decide o clique é o começo: label + jogador + mapa. A âncora obrigatória
+ * (evento OU time) entra no final se couber — sem ela o título cai na
+ * validação, então o evento/time mais curto vence.
+ *
+ * O título devolvido SEMPRE é válido: jogador + âncora e ≤70 chars. Se
+ * nada couber, a base encolhe (sem round, sem mapa) e, no limite, sobra
+ * o jogador + as duas primeiras palavras do evento.
+ */
+export function buildShortTitle(ctx: MetadataContext): string {
+  const label = ctx.label || `${ctx.kills} kills`;
+  const player = ctx.player;
+  const anchors = [ctx.event, ctx.team, ctx.team1, ctx.team2].filter(
+    (a): a is string => !!a && a.trim().length > 0,
+  );
+  const bases = [
+    `${label}! ${player} — ${ctx.map} R${ctx.round}`,
+    `${label}! ${player} — ${ctx.map}`,
+    `${label}! ${player}`,
+  ];
+  for (const base of bases) {
+    for (const anchor of anchors) {
+      const candidate = sanitizeTitle(`${base} | ${anchor}`);
+      if (candidate.length <= SHORTS_TITLE_MAX && validateTitle(candidate, ctx).ok) {
+        return candidate;
+      }
+    }
+    const bare = sanitizeTitle(base);
+    if (bare.length <= SHORTS_TITLE_MAX && validateTitle(bare, ctx).ok) return bare;
+  }
+  // Último recurso: o mínimo que ainda cita o jogador e a âncora.
+  const eventWords = ctx.event.split(/\s+/).filter(Boolean);
+  const shortEvent = eventWords.slice(0, 2).join(' ');
+  const fallbacks = [
+    sanitizeTitle(`${player} — ${shortEvent}`),
+    sanitizeTitle(`${player} ${shortEvent}`),
+    sanitizeTitle(`${player} ${label}`),
+    sanitizeTitle(player),
+  ];
+  for (const candidate of fallbacks) {
+    if (
+      candidate &&
+      candidate.length <= SHORTS_TITLE_MAX &&
+      validateTitle(candidate, ctx).ok
+    ) {
+      return candidate;
+    }
+  }
+  return sanitizeTitle(`${player} ${label}`).slice(0, SHORTS_TITLE_MAX);
+}
+
+/**
+ * Palavras que NÃO podem ficar no fim de um título cortado: o título
+ * "...no PGL" parece erro de digitação.
+ */
+const DANGLING_LAST_WORD =
+  /^(?:no|na|nos|nas|de|do|da|dos|das|em|com|contra|vs|e|ou|para|pelo|pela|—|-)$/i;
+
+/** O título cortado termina com uma palavra pendurada? */
+function hasDanglingEnd(candidate: string): boolean {
+  const last = candidate.split(/\s+/).pop() ?? '';
+  return DANGLING_LAST_WORD.test(last);
+}
+
+/**
+ * Encurta um título (IA) para o limite do Short, sem quebrar a regra do
+ * jogador + evento/time: corta na última palavra e revalida. Se o corte
+ * tira a âncora (ou deixa uma palavra pendurada no fim), devolve null
+ * (o chamador usa o título determinístico).
+ */
+export function shortenTitleForShorts(
+  title: string,
+  ctx: MetadataContext,
+): string | null {
+  if (title.length <= SHORTS_TITLE_MAX) return title;
+  const cut = title.slice(0, SHORTS_TITLE_MAX);
+  const lastSpace = cut.lastIndexOf(' ');
+  const candidate = sanitizeTitle(lastSpace > 20 ? cut.slice(0, lastSpace) : cut);
+  if (!candidate) return null;
+  if (hasDanglingEnd(candidate)) return null;
+  return validateTitle(candidate, ctx).ok ? candidate : null;
+}
+
 const OPENINGS: Array<(ctx: MetadataContext) => string> = [
   (c) =>
     `${c.label} de ${c.player}${c.team ? ` (${c.team})` : ''} no round ${c.round} (${c.map}) — ${c.event}`,
@@ -715,39 +834,96 @@ export function composeDescription(
   ctx: MetadataContext,
   opts: MetadataOptions = {},
 ): string {
+  const isShorts = opts.format === 'shorts';
   const blocks = [opening.trim()];
   const runLine = buildRunLine(ctx, opening);
   if (runLine) blocks.push(runLine);
-  const kills = buildKillList(ctx);
-  if (kills) blocks.push(kills);
+  // No Short a lista de eliminações com timestamp não é lida (e come o
+  // orçamento de 1000 bytes da descrição): fica só no vídeo longo.
+  if (!isShorts) {
+    const kills = buildKillList(ctx);
+    if (kills) blocks.push(kills);
+  }
   const stats = buildStatsLine(ctx);
   if (stats) blocks.push(stats);
-  blocks.push(buildHashtags(ctx, opts.brand));
+  // No Short a hashtag de classificação é FIXADA no fim: ela é a última
+  // coisa a ser cortada quando o corpo passa do limite de 1000 bytes.
+  const pinned = isShorts ? [shortsTag(opts.shortsHashtag)] : [];
+  const tagsBlock = buildHashtags(ctx, opts.brand, {
+    shorts: isShorts,
+    shortsHashtag: opts.shortsHashtag,
+  });
+  const restTags =
+    pinned.length > 0 && tagsBlock.startsWith(pinned[0])
+      ? tagsBlock.slice(pinned[0].length).trim()
+      : tagsBlock;
+  blocks.push(restTags);
   const body = sanitizeDescription(blocks.filter(Boolean).join('\n\n'));
   // O rodapé (com o CTA) entra DEPOIS do sanitize: ele é config do dono
   // e pode ter URL — o sanitize remove URL (e a guarda é do texto da IA,
   // não do CTA). O YouTube aceita link na descrição.
   const footer = buildFooter(ctx, opts);
-  return joinDescription(body, footer);
+  return joinDescription(
+    body,
+    footer,
+    isShorts ? SHORTS_DESCRIPTION_MAX_BYTES : DESCRIPTION_MAX_BYTES,
+    pinned,
+  );
+}
+
+/** Hashtag de classificação do Short, normalizada (`#Shorts`). */
+function shortsTag(shortsHashtag?: string): string {
+  const raw = (shortsHashtag ?? '#Shorts').trim() || '#Shorts';
+  return raw.startsWith('#') ? raw : `#${raw}`;
 }
 
 /**
- * Corpo + rodapé dentro do limite de bytes do YouTube. O rodapé tem
- * prioridade: se faltar espaço, o corpo é que cede.
+ * Corpo + rodapé + hashtags fixadas dentro do limite de bytes do YouTube.
+ *
+ * Prioridade: o rodapé (CTA do dono) e a hashtag fixada NUNCA são
+ * cortados — quem cede é o corpo. Sem isso, uma descrição longa com o
+ * CTA no fim perdia a tag `#Shorts` (que é o que marca o vídeo como
+ * Short no canal) só porque o corpo estourou o limite.
  */
-function joinDescription(body: string, footer: string): string {
-  if (!footer) return body;
-  const footerBytes = utf8Length(footer);
-  if (footerBytes >= DESCRIPTION_MAX_BYTES) {
-    return truncateUtf8(footer, DESCRIPTION_MAX_BYTES);
+export function joinDescription(
+  body: string,
+  footer: string,
+  maxBytes: number = DESCRIPTION_MAX_BYTES,
+  pinned: string[] = [],
+): string {
+  const pinnedText = pinned.filter(Boolean).join('\n\n');
+  const pinnedCost = pinnedText ? utf8Length(pinnedText) : 0;
+  if (pinnedCost >= maxBytes) return truncateUtf8(pinnedText, maxBytes);
+
+  const fixedParts = [footer.trim(), pinnedText].filter(Boolean);
+  let fixedCost = fixedParts.reduce((sum, p) => sum + utf8Length(p), 0);
+  fixedCost += Math.max(0, fixedParts.length - 1) * 2; // "\n\n"
+  if (fixedCost >= maxBytes) {
+    // Não cabe o rodapé inteiro: a hashtag fixa é a última a cair.
+    const room = maxBytes - pinnedCost - 2;
+    const head = room > 0 ? truncateUtf8(footer, room) : '';
+    return [head, pinnedText].filter(Boolean).join('\n\n');
   }
-  const room = DESCRIPTION_MAX_BYTES - footerBytes - 2; // "\n\n"
+
+  const room = maxBytes - fixedCost - (fixedParts.length > 0 ? 2 : 0);
   const head = room > 0 ? truncateUtf8(body, room) : '';
-  return head ? `${head}\n\n${footer}` : footer;
+  return [head, ...fixedParts].filter(Boolean).join('\n\n');
 }
 
-export function buildHashtags(ctx: MetadataContext, brand?: string): string {
-  const tags: string[] = ['#cs2', '#counterstrike'];
+export function buildHashtags(
+  ctx: MetadataContext,
+  brand?: string,
+  opts: { shorts?: boolean; shortsHashtag?: string } = {},
+): string {
+  const tags: string[] = [];
+  // A hashtag do Short vem PRIMEIRO e nunca é cortada pelo teto de 10: é
+  // a convenção do canal para o feed vertical (a classificação do Shorts
+  // no YouTube vem do formato VERTICAL do vídeo, não da tag).
+  if (opts.shorts) {
+    const shortsTag = (opts.shortsHashtag ?? '#Shorts').trim() || '#Shorts';
+    tags.push(shortsTag.startsWith('#') ? shortsTag : `#${shortsTag}`);
+  }
+  tags.push('#cs2', '#counterstrike');
   const mapTag = slugify(ctx.map);
   if (mapTag) tags.push(`#${mapTag}`);
   const labelTag = slugify(ctx.kills >= 5 ? 'ace' : `${ctx.kills}k`);
@@ -778,12 +954,20 @@ export function buildHashtags(ctx: MetadataContext, brand?: string): string {
 
 export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): string {
   const privacy = opts.privacy ?? 'private';
-  const base =
-    privacy === 'private'
-      ? 'Corte automático para revisão. Publicado como privado.'
-      : privacy === 'unlisted'
-        ? 'Corte automático. Vídeo não listado: aparece só para quem tem o link.'
-        : `Corte automático de ${ctx.player}. Assine o canal para não perder nenhum highlight.`;
+  const isShorts = opts.format === 'shorts';
+  // O rodapé diz O QUE é o vídeo (vertical ou não), ONDE (mapa) e COMO
+  // ele está publicado.
+  const what = isShorts ? 'Corte vertical' : 'Corte';
+  const where = ctx.map ? ` no ${ctx.map}` : '';
+  const who = ctx.player ? ` de ${ctx.player}` : '';
+  let base: string;
+  if (privacy === 'private') {
+    base = `${what} automático${where}. Publicado como privado.`;
+  } else if (privacy === 'unlisted') {
+    base = `${what} automático${where}. Vídeo não listado: aparece só para quem tem o link.`;
+  } else {
+    base = `${what} automático${who}${where}. Assine o canal para não perder nenhum highlight.`;
+  }
   const cta = (opts.cta ?? '').trim();
   const footer = cta ? `${base}\n${cta}` : base;
   // O rodapé entra DEPOIS do sanitize do corpo (o CTA pode ter URL, e
@@ -816,7 +1000,11 @@ function contradictsKillCount(tag: string, kills: number): boolean {
   return Number(match[1]) > kills;
 }
 
-export function buildTags(ctx: MetadataContext, defaults: string[]): string[] {
+export function buildTags(
+  ctx: MetadataContext,
+  defaults: string[],
+  opts: { shorts?: boolean } = {},
+): string[] {
   const base = defaults
     .map((t) => t.trim())
     .filter((t) => t && !contradictsKillCount(t, ctx.kills));
@@ -826,6 +1014,9 @@ export function buildTags(ctx: MetadataContext, defaults: string[]): string[] {
     ctx.event,
     ctx.team,
     ctx.kills >= 5 ? 'ace' : `${ctx.kills}k`,
+    // A hashtag do Short fica na descrição; a tag 'shorts' ajuda a
+    // busca/ordenação do canal.
+    opts.shorts ? 'shorts' : '',
   ].filter(Boolean);
   const unique: string[] = [];
   const seen = new Set<string>();
@@ -886,10 +1077,11 @@ export function buildTemplateMetadata(
     .split(',')
     .map((t) => t.trim())
     .filter(Boolean);
+  const isShorts = opts.format === 'shorts';
   return {
-    title: buildTemplateTitle(ctx),
+    title: isShorts ? buildShortTitle(ctx) : buildTemplateTitle(ctx),
     description: buildTemplateDescription(ctx, opts),
-    tags: buildTags(ctx, defaults),
+    tags: buildTags(ctx, defaults, { shorts: isShorts }),
     source: 'template',
   };
 }
@@ -911,11 +1103,13 @@ export async function buildVideoMetadata(
   ace: AceEvent,
   opts: MetadataOptions = {},
 ): Promise<VideoMetadata> {
+  const isShorts = opts.format === 'shorts';
   const ctx = buildMetadataContext(
     ace,
     opts.clipStartMs,
     opts.clipDurationSec,
     opts.killTimeOffsetMs,
+    opts.format,
   );
   const template = buildTemplateMetadata(ctx, opts);
   if (opts.mode !== 'ai' || !opts.ai) return template;
@@ -932,17 +1126,25 @@ export async function buildVideoMetadata(
   for (const raw of draft.titles ?? []) {
     const candidate = sanitizeTitle(raw);
     if (!candidate) continue;
-    const check = validateTitle(candidate, ctx);
-    if (!check.ok) {
-      if (!titleReason) titleReason = check.reason ?? 'inválido';
-      log.warn({ motivo: check.reason, titulo: candidate.slice(0, 120) }, 'título da IA rejeitado');
+    // No Short o título longo é cortado no feed: o que sobra não é o
+    // que o autor escreveu. Encurta (mantendo jogador + evento/time) ou
+    // descarta o título da IA.
+    const shortCandidate = isShorts ? shortenTitleForShorts(candidate, ctx) : candidate;
+    if (shortCandidate == null) {
+      if (!titleReason) titleReason = 'título longo demais para o Short';
       continue;
     }
-    if (isUsedTitle(candidate)) {
+    const check = validateTitle(shortCandidate, ctx);
+    if (!check.ok) {
+      if (!titleReason) titleReason = check.reason ?? 'inválido';
+      log.warn({ motivo: check.reason, titulo: shortCandidate.slice(0, 120) }, 'título da IA rejeitado');
+      continue;
+    }
+    if (isUsedTitle(shortCandidate)) {
       if (!titleReason) titleReason = 'título repetido';
       continue;
     }
-    title = candidate;
+    title = shortCandidate;
     break;
   }
   let description = '';
@@ -986,6 +1188,7 @@ export async function buildVideoMetadata(
         .split(',')
         .map((t) => t.trim())
         .filter(Boolean),
+      { shorts: isShorts },
     ),
     source: 'ai',
     provider: draft.provider,

@@ -73,6 +73,30 @@ export function buildMetadataPrompt(ctx: MetadataContext): string {
   // Só entra o confronto quando o lado do jogador é conhecido: sem isso a
   // IA inventa um rival ("contra a X") e o título inteiro é descartado.
   if (ctx.rival) facts.rival = ctx.rival;
+  // As regras são numeradas DEPOIS: a numeração manual quebrava quando
+  // uma regra do Short e a do vídeo longo trocavam de lugar.
+  const rules: string[] = [
+    `O jogador fez exatamente ${ctx.kills} kills. Nunca cite outro número de kills e nunca use a palavra "ace" se ${ctx.kills} < 5.`,
+    'É proibido inventar: clutch, 1vX, resultado do round (vitória/derrota/GG), placar, jogador, arma, mapa ou evento que não estejam no JSON.',
+    ctx.rival
+      ? 'O rival do jogador está em "rival": pode citá-lo.'
+      : 'Não cite nenhum time (nem "contra X"): não sabemos de que lado o jogador estava. O confronto e a linha de contexto entram depois, no corpo da descrição.',
+    `O título precisa conter o nome do jogador (${ctx.player}) e o evento (${ctx.event}) ou o time.`,
+    // As regras de título e de abertura são DIFERENTES no Short: listar as
+    // duas (100 chars + dois blocos, e 70 chars + uma linha) fazia a IA
+    // escolher uma e violar a outra.
+    ...(ctx.format === 'shorts'
+      ? [
+          'Este é um SHORT (vídeo vertical de 9:16): o título precisa ser CURTO — no máximo 70 caracteres — e começar pelo impacto (label + jogador + mapa). No máximo 1 emoji (use só um destes: 🔥 💥 ⚡ 🎯 💀 🚨 ❗), sem aspas, sem URL, sem hashtag e sem quebra de linha.',
+          'Escreva a ABERTURA da descrição em UMA linha de impacto: nome do jogador, número de kills e mapa. Sem parágrafo, sem emoji, sem hashtag e sem URL.',
+        ]
+      : [
+          'Título: no máximo 100 caracteres, no máximo 1 emoji (use só um destes: 🔥 💥 ⚡ 🎯 💀 🚨 ❗), sem aspas, sem URL, sem hashtag e sem quebra de linha.',
+          'Escreva a ABERTURA da descrição em dois blocos: (a) uma linha de impacto com o nome do jogador, o número de kills e o mapa; (b) um parágrafo curto de 1 a 2 frases, direto e na 2ª pessoa ("assiste donk..."), sem clichê vazio.',
+        ]),
+    'NÃO liste as eliminações uma a uma, NÃO cite o placar, NÃO use emoji, hashtag ou URL: a lista com timestamps, as estatísticas e as hashtags entram depois.',
+    'Devolva 3 opções de título, da mais chamativa para a mais limpa.',
+  ];
   return [
     'Você escreve metadados de YouTube para um canal de highlights de CS2 (Counter-Strike 2).',
     'Tom: esports brasileiro, criativo e direto, mas 100% factual.',
@@ -81,19 +105,12 @@ export function buildMetadataPrompt(ctx: MetadataContext): string {
     JSON.stringify(facts, null, 2),
     '',
     'REGRAS OBRIGATÓRIAS:',
-    `1. O jogador fez exatamente ${ctx.kills} kills. Nunca cite outro número de kills e nunca use a palavra "ace" se ${ctx.kills} < 5.`,
-    '2. É proibido inventar: clutch, 1vX, resultado do round (vitória/derrota/GG), placar, jogador, arma, mapa ou evento que não estejam no JSON.',
-    ctx.rival
-      ? '3. O rival do jogador está em "rival": pode citá-lo.'
-      : '3. Não cite nenhum time (nem "contra X"): não sabemos de que lado o jogador estava. O confronto e a linha de contexto entram depois, no corpo da descrição.',
-    `4. O título precisa conter o nome do jogador (${ctx.player}) e o evento (${ctx.event}) ou o time.`,
-    '5. Título: no máximo 100 caracteres, no máximo 1 emoji (use só um destes: 🔥 💥 ⚡ 🎯 💀 🚨 ❗), sem aspas, sem URL, sem hashtag e sem quebra de linha.',
-    '6. Escreva a ABERTURA da descrição em dois blocos: (a) uma linha de impacto com o nome do jogador, o número de kills e o mapa; (b) um parágrafo curto de 1 a 2 frases, direto e na 2ª pessoa ("assiste donk..."), sem clichê vazio.',
-    '7. NÃO liste as eliminações uma a uma, NÃO cite o placar, NÃO use emoji, hashtag ou URL: a lista com timestamps, as estatísticas e as hashtags entram depois.',
-    '8. Devolva 3 opções de título, da mais chamativa para a mais limpa.',
+    ...rules.map((rule, i) => `${i + 1}. ${rule}`),
     '',
     'Responda APENAS com JSON válido, neste formato:',
-    '{"titles": ["titulo 1", "titulo 2", "titulo 3"], "opening": "linha de impacto\\n\\nparágrafo curto"}',
+    ctx.format === 'shorts'
+      ? '{"titles": ["titulo 1", "titulo 2", "titulo 3"], "opening": "linha de impacto"}'
+      : '{"titles": ["titulo 1", "titulo 2", "titulo 3"], "opening": "linha de impacto\\n\\nparágrafo curto"}',
   ].join('\n');
 }
 

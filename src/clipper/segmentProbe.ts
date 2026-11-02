@@ -169,6 +169,25 @@ export function startDeltaSec(videoPts: number[], audioPts: number[]): number {
 }
 
 /**
+ * ffmpeg p/ inspeção/render: vendored em .tools/ (extraído do
+ * ffmpeg.zip) ou PATH.
+ *
+ * Fica aqui (e não no clipBuilder) porque o módulo só depende de
+ * builtin do node: o clipper, o script de Shorts e o clipBuilder
+ * compartilham a MESMA resolução de binário.
+ */
+export function resolveFfmpegBin(): string {
+  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  try {
+    const vendored = path.join(path.resolve('.tools'), exe);
+    if (fs.existsSync(vendored)) return vendored;
+  } catch {
+    // segue p/ PATH
+  }
+  return 'ffmpeg';
+}
+
+/**
  * ffprobe p/ inspeção de pacotes: vendored em .tools/ (extraído do
  * ffmpeg.zip) ou PATH. Null se ausente — chamadores pulam a inspeção.
  */

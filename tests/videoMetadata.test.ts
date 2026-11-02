@@ -3,6 +3,7 @@ import type { AceEvent, KillEvent } from '../src/types.js';
 import {
   buildHashtags,
   buildMetadataContext,
+  buildShortTitle,
   buildTags,
   buildTemplateDescription,
   buildTemplateTitle,
@@ -10,10 +11,14 @@ import {
   buildVideoMetadataSafe,
   composeDescription,
   DESCRIPTION_MAX_BYTES,
+  joinDescription,
   resetTemplateRotation,
   resetUsedTitles,
   sanitizeDescription,
   sanitizeTitle,
+  SHORTS_DESCRIPTION_MAX_BYTES,
+  SHORTS_TITLE_MAX,
+  shortenTitleForShorts,
   truncateUtf8,
   utf8Length,
   validateDescription,
@@ -157,9 +162,13 @@ describe('descrição determinística', () => {
     expect(desc).toContain('matou vitor0');
     expect(desc).toContain('5 kills');
     expect(desc).toContain('#mirage');
-    expect(desc.trim().endsWith('Corte automático. Vídeo não listado: aparece só para quem tem o link.')).toBe(
-      true,
-    );
+    expect(
+      desc
+        .trim()
+        .endsWith(
+          'Corte automático no Mirage. Vídeo não listado: aparece só para quem tem o link.',
+        ),
+    ).toBe(true);
   });
 
   it('marca o tempo de cada eliminação quando o clipe tem âncora', () => {
@@ -621,5 +630,160 @@ describe('tags', () => {
     expect(tags).toContain('cs2');
     expect(tags).toContain('highlights');
     expect(tags).toContain('4k');
+  });
+
+  it('no Shorts entra a tag "shorts"', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const tags = buildTags(ctx, ['cs2'], { shorts: true });
+    expect(tags).toContain('shorts');
+  });
+});
+
+describe('formato Shorts (vertical 9:16)', () => {
+  it('o título curto cabe em 70 chars e cita jogador + evento', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const title = buildShortTitle(ctx);
+    expect(title.length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    expect(validateTitle(title, ctx).ok).toBe(true);
+  });
+
+  it('o título curto usa o evento quando ele cabe em 70 chars', () => {
+    const ctx = buildMetadataContext(
+      makeAce({ event: 'ESL Pro League Season 21 - Group Stage' }),
+    );
+    const title = buildShortTitle(ctx);
+    expect(title.length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    expect(title).toContain('donk');
+    // O evento cabe (~67 chars): ele é a âncora escolhida.
+    expect(title).toContain('ESL Pro League');
+    expect(validateTitle(title, ctx).ok).toBe(true);
+  });
+
+  it('quando o evento não cabe, o título cai na âncora do time', () => {
+    const ctx = buildMetadataContext(
+      makeAce({
+        event: 'Torneio com um nome de evento absurdamente comprido que jamais cabe em 70 caracteres',
+        summary: {
+          round: 12,
+          map: 'Mirage',
+          player: 'donk',
+          team: 'Spirit',
+          opponents: 'MOUZ',
+          kills: makeKills(5),
+          victims: makeKills(5).map((k) => k.victim),
+          weapons: makeKills(5).map(() => 'ak47'),
+          headshots: 2,
+          assists: [],
+          flashAssists: [],
+          grenades: [],
+          mainWeapon: 'AK-47',
+        },
+      }),
+    );
+    const title = buildShortTitle(ctx);
+    expect(title.length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    expect(title).toContain('donk');
+    expect(title).not.toContain('Torneio com um nome');
+    // A âncora do time entra no lugar do evento.
+    expect(title).toMatch(/Spirit|MOUZ/);
+    expect(validateTitle(title, ctx).ok).toBe(true);
+  });
+
+  it('o título curto continua válido com nome e evento gigante', () => {
+    const ctx = buildMetadataContext(
+      makeAce({
+        player: 'nome-de-jogador-muito-comprido-de-verdade',
+        event: 'Torneio com um nome comprido demais para caber em um titulo curto',
+      }),
+    );
+    const title = buildShortTitle(ctx);
+    expect(title.length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    expect(validateTitle(title, ctx).ok).toBe(true);
+  });
+
+  it('o título da IA é encurtado para o limite do Short', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const long = 'donk faz 5 kills no Mirage com uma mira absurda no PGL Masters Bucharest 💥';
+    const short = shortenTitleForShorts(long, ctx);
+    expect(short).not.toBeNull();
+    expect((short ?? '').length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    expect(validateTitle(short ?? '', ctx).ok).toBe(true);
+  });
+
+  it('a descrição do Short tem #Shorts e cabe em 1000 bytes', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const description = composeDescription('donk dominou o round com 5 eliminações.', ctx, {
+      format: 'shorts',
+      privacy: 'public',
+      brand: '5K',
+    });
+    expect(description).toContain('#Shorts');
+    expect(utf8Length(description)).toBeLessThanOrEqual(SHORTS_DESCRIPTION_MAX_BYTES);
+    // No Short a lista de eliminações com timestamp não entra.
+    expect(description).not.toContain('matou vitor');
+  });
+
+  it('#Shorts e o rodapé sobrevivem a um corpo enorme', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const description = composeDescription('palavra '.repeat(400), ctx, {
+      format: 'shorts',
+      privacy: 'unlisted',
+      brand: '5K',
+      cta: 'Assine o canal: youtube.com/@5kcsgo',
+    });
+    expect(utf8Length(description)).toBeLessThanOrEqual(SHORTS_DESCRIPTION_MAX_BYTES);
+    expect(description).toContain('#Shorts');
+    expect(description).toContain('Assine o canal');
+  });
+
+  it('joinDescription: a hashtag fixada nunca é cortada pelo corpo enorme', () => {
+    const out = joinDescription('palavra '.repeat(400), 'rodapé do dono', 1000, ['#Shorts']);
+    expect(utf8Length(out)).toBeLessThanOrEqual(1000);
+    expect(out).toContain('#Shorts');
+    expect(out).toContain('rodapé do dono');
+    // A hashtag fica no FIM (é a prioridade depois do rodapé).
+    expect(out.trim().endsWith('#Shorts')).toBe(true);
+  });
+
+  it('joinDescription: quando não cabe o rodapé inteiro, a hashtag sobrevive', () => {
+    const out = joinDescription('corpo', 'x'.repeat(1200), 1000, ['#Shorts']);
+    expect(utf8Length(out)).toBeLessThanOrEqual(1000);
+    expect(out).toContain('#Shorts');
+  });
+
+  it('joinDescription: sem hashtag fixada, o rodapé continua prioritário', () => {
+    const out = joinDescription('palavra '.repeat(400), 'rodapé do dono', 1000);
+    expect(utf8Length(out)).toBeLessThanOrEqual(1000);
+    expect(out).toContain('rodapé do dono');
+  });
+
+  it('o vídeo longo continua com a lista de eliminações', () => {
+    const ctx = buildMetadataContext(makeAce());
+    const description = composeDescription('donk dominou o round com 5 eliminações.', ctx, {
+      format: 'standard',
+      privacy: 'public',
+    });
+    expect(description).toContain('matou vitor');
+    expect(description).not.toContain('#Shorts');
+  });
+
+  it('o título da IA longo não vira título de Short (cai no determinístico)', async () => {
+    resetUsedTitles();
+    const ctx = buildMetadataContext(makeAce());
+    const metadata = await buildVideoMetadata(makeAce(), {
+      mode: 'ai',
+      format: 'shorts',
+      ai: async () => ({
+        titles: [
+          'donk faz um ACE inacreditavel no Mirage contra o MOUZ no PGL Masters Bucharest 💥',
+        ],
+        opening: 'donk pegou 5 eliminações seguidas no Mirage.',
+      }),
+    });
+    expect(metadata.title.length).toBeLessThanOrEqual(SHORTS_TITLE_MAX);
+    // O título tem que ser VÁLIDO (citando jogador + âncora), não só curto.
+    expect(validateTitle(metadata.title, ctx).ok).toBe(true);
+    expect(metadata.title).toContain('donk');
+    expect(metadata.description).toContain('#Shorts');
   });
 });

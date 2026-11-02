@@ -223,25 +223,9 @@ async function isSegmentReadable(file: string): Promise<boolean> {
   return /Duration:\s*\d+:\d+/.test(out) && /Stream #0/.test(out);
 }
 
-/**
- * ffmpeg p/ inspeção/concat temporário: vendored em .tools/ ou PATH.
- * (O render usa 'ffmpeg' pelo nome pois main.ts prepend .tools no PATH;
- * aqui o caminho explícito evita depender disso em probes/testes.)
- */
-export function resolveFfmpegBin(): string {
-  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-  try {
-    const vendored = path.join(path.resolve('.tools'), exe);
-    if (fs.existsSync(vendored)) return vendored;
-  } catch {
-    // segue p/ PATH
-  }
-  return 'ffmpeg';
-}
-
 export type { ConcatSpan, SegmentAvIssue } from './segmentProbe.js';
-export { classifySegmentAv, inspectSegmentAv, probeConcatSpan, probeSegmentPackets, resolveFfprobeBin } from './segmentProbe.js';
-import { inspectSegmentAv, probeConcatSpan, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
+export { classifySegmentAv, inspectSegmentAv, probeConcatSpan, probeSegmentPackets, resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
+import { inspectSegmentAv, probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
 
 /**
  * Inspeciona A/V de cada segmento SEM decodificar (só cabeçalhos de pacote,

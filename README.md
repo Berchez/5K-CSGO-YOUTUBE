@@ -14,7 +14,7 @@ HLTV /matches (Playwright, 45s base; ocioso espera até 30min conforme a próxim
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal only, no Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records even at 0–1★ with its own threshold (see below).
+Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal clips + optional Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records even at 0–1★ with its own threshold (see below).
 
 ## Prerequisites (Windows)
 
@@ -295,6 +295,79 @@ O relatório por canal sai de `npx tsx scripts/sync-report.ts` (lê o log + o es
 persistido): n de medições, min/med/máx, maior salto, taxa de acerto do OCR e os saltos
 do relógio de origem.
 
+## Shorts (vertical 9:16)
+
+O YouTube só mostra vídeo **vertical** no feed Shorts — o material do bot é
+16:9 (transmissão da HLTV), então o 9:16 é produzido no *render* (crop
+central + scale), nunca na captura (o recorder continua `-c copy` 16:9).
+
+```powershell
+# 1. calcula e renderiza os verticais, sem publicar (default)
+npm run publish:shorts -- --dry-run
+
+# 2. só um clipe (a pasta de data/clips/<pasta>)
+npm run publish:shorts -- --dry-run --clip data/clips/2399958_Inferno_r12_doc
+
+# 3. sem gastar IA de metadados (usa o gerador local)
+npm run publish:shorts -- --dry-run --no-ai
+
+# 4. publica (unlisted por padrão — teste sem risco de claim no canal)
+#    exige SHORTS_ENABLED=true no .env (ou no painel)
+npm run publish:shorts -- --publish --clip data/clips/2399958_Inferno_r12_doc
+```
+
+O script (`scripts/publish-shorts.ts`):
+
+1. lê os sidecars em `data/clips/` (precisa de `clipStartMs` e de
+   `killVideoOffsetMs` — sem o offset as posições das kills ficam
+   deslocadas e o clipe é pulado);
+2. calcula a **janela do Short** (30–60s): da 1ª à última kill. Quando a
+   jogada não cabe, ele prioriza o **clímax** (a última kill) e reporta as
+   kills que ficaram de fora;
+3. renderiza o vertical (`crop=ih*9/16` → `scale=1080:1920`) em
+   `data/shorts/<pasta>/` (render atômico: só vira `.mp4` final quando
+   termina inteiro);
+4. gera os metadados no formato Shorts (título ≤70 chars, `#Shorts` no
+   fim da descrição, sem a lista de eliminações) e sobe pelo mesmo
+   pipeline do bot (`videos.insert`);
+5. grava o Short no SQLite (`clips.is_shorts = 1`, chaveado pelo ace) e
+   um relatório em `data/shorts/report.json` (com o histórico das
+   rodadas).
+
+O Short só fala das kills que CABEM na janela: se a janela trunca a
+jogada, o título e a descrição contam só as kills do vídeo.
+
+A legenda fica por conta do YouTube (auto-caption PT-BR): subir uma faixa
+própria exige `captions.insert`, que pede o scope `youtube.force-ssl` (o
+token atual tem só `youtube.upload`).
+
+| variável | padrão | efeito |
+| --- | --- | --- |
+| `SHORTS_ENABLED` | `false` | só publicar exige esta chave ligada |
+| `SHORTS_MAX_SEC` | `60` | duração máxima do Short |
+| `SHORTS_MIN_SEC` | `30` | duração mínima |
+| `SHORTS_HEAD_SEC` / `SHORTS_TAIL_SEC` | `4` / `4` | folga antes da 1ª kill e depois da última |
+| `SHORTS_WIDTH` / `SHORTS_HEIGHT` | `1080` / `1920` | saída do vertical |
+| `SHORTS_CROP_X` | `0.5` | posição horizontal do crop (0 = esquerda, 1 = direita) |
+| `SHORTS_MIN_KILLS` | `3` | mínimo de kills (o bot também grava 3K/4K) |
+| `SHORTS_PRIVACY` | `unlisted` | visibilidade do Short |
+| `SHORTS_HASHTAG` | `#Shorts` | hashtag de classificação (no `.env`, entre aspas) |
+| `SHORTS_DIR` | `./data/shorts` | onde os verticais, os markers e o relatório são gravados |
+
+`SHORTS_MIN_SEC` tem que ser **menor ou igual** a `SHORTS_MAX_SEC`, e
+`SHORTS_WIDTH` menor que `SHORTS_HEIGHT`. O painel recusa a gravação
+inconsistente; o script recusa na hora de rodar (o bot live não depende
+dessas chaves — uma config de Shorts quebrada não impede o bot de subir).
+
+A cota do YouTube é do **projeto de API** (10 000 units/dia, 1600 por
+`videos.insert`) e é dividida com o bot: o script conta os vídeos já
+enviados no dia e recusa o lote quando a cota estourar.
+
+O crop 9:16 tira ~2/3 da largura do 16:9: o placar (topo) e a facecam
+(rodapé) continuam no quadro, mas o **killfeed** (canto direito) sai. Se
+a ação ficar de fora, mexa em `SHORTS_CROP_X` (0.3–0.7) — não precisa
+mudar código.
+
 ## Structure
 
 ```text
@@ -312,12 +385,18 @@ src/clipper/scoreboardSync.ts (OCR da virada de round no vídeo; crop por canal)
 src/clipper/killfeedSync.ts (OCR do killfeed: instante exato da 1ª kill)
 src/clipper/clipAnchors.ts (puro: âncoras de início/fim do clipe)
 src/clipper/clipBuilder.ts (concat + sidecar json)
+src/clipper/shorts.ts (janela 30-60s + render vertical 9:16 atômico)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/uploader/youtubeUploader.ts (private)
+src/uploader/videoMetadata.ts (título/descrição: IA com guarda anti-alucinação + gerador determinístico)
+src/uploader/metadataAi.ts (prompt + parse da resposta da IA)
 src/main.ts (supervisor asyncio-like)
 scripts/auth-youtube.ts
 scripts/sync-report.ts (latência por canal: log + estado persistido)
+scripts/publish-shorts.ts (Shorts verticais: render, metadados, upload, dedupe)
+scripts/clip-from-vod.ts (one-off: clipe a partir do VOD do YouTube, com OCR)
+scripts/upload-vod-clips.ts (one-off: envia os clipes do VOD pelo pipeline do bot)
 tests/
 ```
 
@@ -470,8 +549,12 @@ Round 10 | Mirage | Spirit vs MOUZ | Placar 3-6
 
 #cs2 #counterstrike #mirage #ace #donk #spirit #mouz #pgl
 
-Corte automático. Vídeo não listado: aparece só para quem tem o link.
+Corte automático no Mirage. Vídeo não listado: aparece só para quem tem o link.
 ```
+
+(The footer names the map and says how the video was published — the exact
+wording follows `YT_PRIVACY`: private → "Publicado como privado", unlisted →
+"Vídeo não listado", public → the CTA.)
 
 The opening (first two blocks) is what the AI writes — a punchy line plus a
 short paragraph in 2nd person. The rest is deterministic, so the facts, the

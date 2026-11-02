@@ -49,6 +49,27 @@ function boolEnvField(key: string, defaultValue: boolean) {
     .transform((v) => boolEnv(v, defaultValue));
 }
 
+/**
+ * Hashtag de classificação do Shorts.
+ *
+ * O dotenv trata `#` como início de comentário: `SHORTS_HASHTAG=#Shorts`
+ * (sem aspas) chega VAZIO. O painel, que lê o .env na mão, mostra
+ * "#Shorts" — as duas pontas discordavam. Aqui o valor é normalizado:
+ * aspas tiradas, vazio cai no default e o `#` é garantido.
+ */
+export function normalizeShortsHashtag(value: string | undefined): string {
+  let v = (value ?? '').trim();
+  if (v.length >= 2) {
+    const first = v[0];
+    const last = v[v.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      v = v.slice(1, -1).trim();
+    }
+  }
+  if (!v) return '#Shorts';
+  return v.startsWith('#') ? v : `#${v}`;
+}
+
 export const ConfigSchema = z.object({
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
   /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
@@ -317,6 +338,53 @@ export const ConfigSchema = z.object({
    */
   CLIP_END_PLAUSIBILITY_SEC: z.coerce.number().min(0).max(300).default(60),
   CLIPS_DIR: z.string().default('./data/clips'),
+  /** Onde os Shorts verticais (mp4 + marker + report) são gravados. */
+  SHORTS_DIR: z.string().default('./data/shorts'),
+  /**
+   * Shorts verticais (9:16) para o feed Shorts do YouTube.
+   *
+   * O material é 16:9 (transmissão da HLTV) e o Shorts só aparece no
+   * feed VERTICAL — então o 9:16 é produzido no render (crop central +
+   * scale), nunca na captura.
+   */
+  /** Liga a geração dos Shorts (o script `publish:shorts`). */
+  SHORTS_ENABLED: boolEnvField('SHORTS_ENABLED', false),
+  /**
+   * Mínimo de kills para virar Short. O bot grava também 3K/4K (não só
+   * ace) e no feed Shorts um 4K é tão bom quanto um ace.
+   */
+  SHORTS_MIN_KILLS: z.coerce.number().min(2).max(5).default(3),
+  /** Duração máxima do Short (o YouTube aceita até 3min; 60s é o corte). */
+  SHORTS_MAX_SEC: z.coerce.number().min(10).max(180).default(60),
+  /** Duração mínima (abaixo disso o Short é rápido demais e perde retenção). */
+  SHORTS_MIN_SEC: z.coerce.number().min(5).max(180).default(30),
+  /** Folga antes da 1ª kill (o gancho do Short). */
+  SHORTS_HEAD_SEC: z.coerce.number().min(0).max(20).default(4),
+  /** Folga depois da última kill. */
+  SHORTS_TAIL_SEC: z.coerce.number().min(0).max(30).default(4),
+  /** Largura de saída (1080 = Full HD vertical). */
+  SHORTS_WIDTH: z.coerce.number().min(360).max(2160).default(1080),
+  /** Altura de saída (1920 = 9:16). */
+  SHORTS_HEIGHT: z.coerce.number().min(640).max(3840).default(1920),
+  /**
+   * Posição horizontal do crop (0 = esquerda, 0.5 = centro, 1 = direita).
+   * O crop 9:16 de um 16:9 tira ~2/3 da largura: o HUD (placar no topo,
+   * killfeed na direita) pode ficar de fora — este é o ajuste para
+   * puxar a janela sem mexer no código.
+   */
+  SHORTS_CROP_X: z.coerce.number().min(0).max(1).default(0.5),
+  /** Visibilidade do Short no upload (unlisted = testa sem risco de claim). */
+  SHORTS_PRIVACY: z.enum(['private', 'unlisted', 'public']).default('unlisted'),
+  /**
+   * Hashtag de classificação do Shorts.
+   *
+   * (A classificação do Shorts no feed é pelo formato VERTICAL do vídeo; a
+   * hashtag é a convenção que o canal usa e o que a busca enxerga.)
+   */
+  SHORTS_HASHTAG: z
+    .string()
+    .default('#Shorts')
+    .transform((v) => normalizeShortsHashtag(v)),
   /**
    * Espaço livre mínimo em disco (GB) para operar: abaixo disto o render
    * do clipe é ABORTADO com erro claro (em vez de entregar mp4 sem moov)
@@ -382,10 +450,67 @@ export type AppConfig = z.infer<typeof ConfigSchema>;
 
 let cached: AppConfig | null = null;
 
+/** Erro de validação CRUZADA (depende de dois campos ao mesmo tempo). */
+export interface ConfigCrossFieldError {
+  key: string;
+  message: string;
+}
+
+/**
+ * Regras que dependem de DOIS campos.
+ *
+ * O schema é um objeto simples de propósito (o painel usa
+ * `ConfigSchema.shape[key]` para editar campo a campo): validação
+ * cruzada não cabe em `.refine()` (viraria ZodEffects e quebraria o
+ * painel). Ela acontece aqui, depois do parse.
+ *
+ * Quem CHAMA decide o que fazer com o erro: o script de Shorts aborta
+ * (a config é dele), o painel recusa a gravação. O `getConfig()` NÃO
+ * chama — a feature dos Shorts é opcional e desligada por padrão, e um
+ * `.env` com valor inconsistente não pode impedir o bot de subir.
+ */
+export function shortsCrossFieldErrors(values: {
+  minSec: number;
+  maxSec: number;
+  width: number;
+  height: number;
+}): ConfigCrossFieldError[] {
+  const errors: ConfigCrossFieldError[] = [];
+  if (values.minSec > values.maxSec) {
+    errors.push({
+      key: 'SHORTS_MIN_SEC',
+      message: `SHORTS_MIN_SEC (${values.minSec}) não pode ser maior que SHORTS_MAX_SEC (${values.maxSec})`,
+    });
+  }
+  if (values.width >= values.height) {
+    errors.push({
+      key: 'SHORTS_WIDTH',
+      message: `SHORTS_WIDTH (${values.width}) tem que ser menor que SHORTS_HEIGHT (${values.height}) — o Short é vertical`,
+    });
+  }
+  return errors;
+}
+
+/** Valida as regras cruzadas e LANÇA na primeira inconsistência. */
+export function validateConfigCrossFields(cfg: AppConfig): void {
+  const errors = shortsCrossFieldErrors({
+    minSec: cfg.SHORTS_MIN_SEC,
+    maxSec: cfg.SHORTS_MAX_SEC,
+    width: cfg.SHORTS_WIDTH,
+    height: cfg.SHORTS_HEIGHT,
+  });
+  if (errors.length > 0) {
+    throw new Error(errors.map((e) => e.message).join('; '));
+  }
+}
+
 export function getConfig(): AppConfig {
   if (cached) return cached;
-  cached = ConfigSchema.parse(process.env);
-  return cached;
+  // Sem `validateConfigCrossFields`: a config dos Shorts é opcional e o
+  // bot live não pode depender dela (ver shortsCrossFieldErrors).
+  const parsed = ConfigSchema.parse(process.env);
+  cached = parsed;
+  return parsed;
 }
 
 /**

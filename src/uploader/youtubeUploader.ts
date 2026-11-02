@@ -55,6 +55,25 @@ export interface UploadOptions {
   thumbnailPath?: string;
   /** Metadados já gerados (IA ou template). Ausente = caminho legado. */
   metadata?: VideoMetadata;
+  /**
+   * Vídeo vertical (9:16) do feed Shorts: garante a hashtag de
+   * classificação na descrição (é a convenção do canal) e ajusta o log.
+   */
+  isShorts?: boolean;
+  /** Hashtag usada no Shorts (default #Shorts). */
+  shortsHashtag?: string;
+  /**
+   * Conteúdo infantil? O padrão é `false` (o YouTube não pode inferir:
+   * marcar errado tira comentários e dá menos alcance).
+   */
+  madeForKids?: boolean;
+  /**
+   * Publicação agendada (ISO 8601). Ausente = publica agora.
+   *
+   * A API só aceita agendamento com `privacyStatus = private` (com
+   * public/unlisted o `publishAt` é recusado).
+   */
+  publishAt?: string;
 }
 
 export interface ThumbnailAuthOptions {
@@ -113,28 +132,62 @@ export async function uploadClip(
   const title = opts.metadata
     ? opts.metadata.title
     : buildTitle(ace).slice(0, 100);
-  const description = opts.metadata
+  let description = opts.metadata
     ? opts.metadata.description
     : buildDescription(ace, opts.defaultTags);
   const tags = opts.metadata
     ? opts.metadata.tags
     : [...new Set([...opts.defaultTags.split(',').map((t) => t.trim()).filter(Boolean), ace.player, ace.map, ace.event])].slice(0, 30);
 
+  // A hashtag do Short entra na descrição se não estiver lá (o YouTube
+  // classifica o Short pelo formato VERTICAL; a tag é a convenção do
+  // canal e o que a busca enxerga).
+  if (opts.isShorts) {
+    const hashtag = (opts.shortsHashtag ?? '#Shorts').trim() || '#Shorts';
+    const tag = hashtag.startsWith('#') ? hashtag : `#${hashtag}`;
+    if (!description.includes(tag)) {
+      description = `${description}\n\n${tag}`;
+    }
+  }
+
+  if (opts.publishAt && opts.privacy !== 'private') {
+    throw new Error(
+      `publicação agendada exige privacyStatus=private (recebido: ${opts.privacy})`,
+    );
+  }
+
   log.info(
-    { title, privacy: opts.privacy, source: opts.metadata?.source ?? 'legacy' },
+    {
+      title,
+      privacy: opts.privacy,
+      source: opts.metadata?.source ?? 'legacy',
+      shorts: Boolean(opts.isShorts),
+    },
     'enviando para o YouTube',
   );
+  const status: {
+    privacyStatus: 'private' | 'unlisted' | 'public';
+    selfDeclaredMadeForKids: boolean;
+    publishAt?: string;
+  } = {
+    privacyStatus: opts.privacy,
+    selfDeclaredMadeForKids: opts.madeForKids ?? false,
+  };
+  if (opts.publishAt) status.publishAt = opts.publishAt;
   const res = await youtube.videos.insert({
     part: ['snippet', 'status'],
     requestBody: {
       snippet: { title, description, tags, categoryId: opts.categoryId },
-      status: { privacyStatus: opts.privacy, selfDeclaredMadeForKids: false },
+      status,
     },
     media: { body: fs.createReadStream(filePath) },
   });
   const videoId = res.data.id ?? '';
   if (!videoId) throw new Error('YouTube não retornou videoId');
-  log.info({ videoId }, 'upload concluído (privado, aguardando revisão)');
+  log.info(
+    { videoId, privacy: opts.privacy, shorts: Boolean(opts.isShorts) },
+    'upload concluído (aguardando revisão no Studio)',
+  );
 
   if (opts.thumbnailPath && fs.existsSync(opts.thumbnailPath)) {
     await applyThumbnail(videoId, opts.thumbnailPath, {

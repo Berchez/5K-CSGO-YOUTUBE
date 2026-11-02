@@ -5,7 +5,10 @@ import {
   deprecatedEnvVars,
   divergentLatencyEnvs,
   invalidBoolEnvs,
+  normalizeShortsHashtag,
   parseBoolEnv,
+  shortsCrossFieldErrors,
+  validateConfigCrossFields,
 } from '../src/config.js';
 
 describe('boolEnv', () => {
@@ -149,5 +152,53 @@ describe('formato de captura', () => {
 
   it('seletor vazio volta para o padrão (não derruba o bot)', () => {
     expect(ConfigSchema.parse({ CAPTURE_FORMAT: '  ' }).CAPTURE_FORMAT).toBe('best');
+  });
+});
+
+describe('hashtag dos Shorts', () => {
+  it('normaliza: sem aspas, com aspas, sem # e vazio', () => {
+    expect(normalizeShortsHashtag('#Shorts')).toBe('#Shorts');
+    expect(normalizeShortsHashtag('"#Shorts"')).toBe('#Shorts');
+    expect(normalizeShortsHashtag("'#Shorts'")).toBe('#Shorts');
+    expect(normalizeShortsHashtag('Shorts')).toBe('#Shorts');
+    expect(normalizeShortsHashtag('')).toBe('#Shorts');
+    expect(normalizeShortsHashtag(undefined)).toBe('#Shorts');
+  });
+
+  it('o schema aplica a normalização (o # solto no .env chega vazio)', () => {
+    expect(ConfigSchema.parse({ SHORTS_HASHTAG: '"#Shorts"' }).SHORTS_HASHTAG).toBe('#Shorts');
+    expect(ConfigSchema.parse({}).SHORTS_HASHTAG).toBe('#Shorts');
+  });
+});
+
+describe('regras cruzadas dos Shorts', () => {
+  it('MIN > MAX é erro', () => {
+    const errors = shortsCrossFieldErrors({ minSec: 45, maxSec: 30, width: 1080, height: 1920 });
+    expect(errors.length).toBe(1);
+    expect(errors[0].key).toBe('SHORTS_MIN_SEC');
+  });
+
+  it('largura >= altura é erro (o Short é vertical)', () => {
+    const errors = shortsCrossFieldErrors({ minSec: 30, maxSec: 60, width: 1920, height: 1080 });
+    expect(errors.length).toBe(1);
+    expect(errors[0].key).toBe('SHORTS_WIDTH');
+  });
+
+  it('config consistente não gera erro', () => {
+    expect(shortsCrossFieldErrors({ minSec: 30, maxSec: 60, width: 1080, height: 1920 })).toEqual([]);
+    expect(shortsCrossFieldErrors({ minSec: 60, maxSec: 60, width: 1080, height: 1920 })).toEqual([]);
+  });
+
+  it('validateConfigCrossFields lança na inconsistência', () => {
+    const cfg = ConfigSchema.parse({ SHORTS_MIN_SEC: '45', SHORTS_MAX_SEC: '30' });
+    expect(() => validateConfigCrossFields(cfg)).toThrow(/SHORTS_MIN_SEC/);
+  });
+
+  it('o getConfig NÃO valida as regras cruzadas (o bot live não depende delas)', () => {
+    // A config quebrada dos Shorts não pode impedir o bot de subir: quem
+    // recusa é o script de Shorts e o painel.
+    const cfg = ConfigSchema.parse({ SHORTS_MIN_SEC: '45', SHORTS_MAX_SEC: '30' });
+    expect(cfg.SHORTS_MIN_SEC).toBe(45);
+    expect(cfg.SHORTS_MAX_SEC).toBe(30);
   });
 });

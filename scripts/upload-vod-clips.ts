@@ -2,7 +2,7 @@
  * Envia os clipes gerados do VOD (data/clips-vod) pelo MESMO pipeline do
  * bot: metadados IA (com guarda anti-alucinação), thumbnail IA
  * (chatgpt/grok/gemini-web, fallback composto), registro no banco e
- * upload unlisted.
+ * upload com a visibilidade configurada em `YT_PRIVACY`.
  *
  * Os clipes já nascem com sidecar (kills + âncoras de killfeed/placar);
  * aqui só falta o que o bot faria no ao vivo: refs, thumb de IA,
@@ -32,9 +32,30 @@ interface VodSidecar {
   player: string;
   team1: string;
   team2: string;
+  /** Time do JOGADOR (vem da demo) — evita assumir team2 e errar o rival. */
+  playerTeam?: string;
+  /** Time RIVAL (vem da demo). */
+  opponentTeam?: string;
   event: string;
-  kills: Array<{ killer: string; victim: string; weapon: string; headshot: boolean; atVodSec: number }>;
+  kills: Array<{
+    killer: string;
+    victim: string;
+    weapon: string;
+    headshot: boolean;
+    atVodSec: number;
+    /** `at` no relógio do HLTV (epoch ms ou ISO) — quando existe. */
+    at?: string | number;
+    /** A posição no VOD foi ESTIMADA (o OCR não achou a linha). */
+    appearEstimated?: boolean;
+  }>;
   roundWinner?: string;
+  /** Início do VOD (epoch ms) — o `vod.vodStartIso` tem o mesmo valor. */
+  vod?: { vodStartIso?: string; videoId?: string };
+  /**
+   * Offset (ms) entre o relógio do HLTV (`kills[].at`) e o relógio do
+   * VÍDEO. `at + offset` = o instante da kill no vídeo.
+   */
+  killVideoOffsetMs?: number;
   clipStartMs: number;
   clipDurationSec: number;
   clipFile: string;
@@ -43,22 +64,50 @@ interface VodSidecar {
   thumbnailAi?: boolean;
 }
 
-function buildAce(side: VodSidecar): AceEvent {
-  const kills: KillEvent[] = side.kills.map((k) => ({
-    killer: k.killer ?? '',
-    victim: k.victim ?? '',
-    round: side.round,
-    map: side.map,
-    // `at` na timeline do VOD: com killTimeOffsetMs = 0, os timestamps da
-    // descrição saem da posição real no vídeo (o killfeed já mediu).
-    at: Math.round(VOD_START_MS + k.atVodSec * 1000),
-    weapon: k.weapon ?? '',
-    headshot: Boolean(k.headshot),
-  }));
+/** Epoch ms do início do VOD (o sidecar tem o valor; o fallback é o fixo). */
+function vodStartMs(side: VodSidecar): number {
+  const fromSide = side.vod?.vodStartIso ? Date.parse(side.vod.vodStartIso) : NaN;
+  return Number.isFinite(fromSide) ? fromSide : VOD_START_MS;
+}
+
+function buildAce(side: VodSidecar): { ace: AceEvent; killTimeOffsetMs: number } {
+  const startMs = vodStartMs(side);
+  // O sidecar novo traz `at` no relógio do HLTV + `killVideoOffsetMs`
+  // (o offset converte para o relógio do vídeo). O antigo não tem: aí a
+  // posição vem do `atVodSec`, que já é a timeline do VOD.
+  const offsetMs = Number.isFinite(side.killVideoOffsetMs) ? Number(side.killVideoOffsetMs) : null;
+  const kills: KillEvent[] = side.kills.map((k) => {
+    const atHltv = typeof k.at === 'number' ? k.at : Date.parse(String(k.at ?? ''));
+    return {
+      killer: k.killer ?? '',
+      victim: k.victim ?? '',
+      round: side.round,
+      map: side.map,
+      // `at` na timeline do VOD: com killTimeOffsetMs = 0, os timestamps da
+      // descrição saem da posição real no vídeo (o killfeed já mediu).
+      at:
+        offsetMs != null && Number.isFinite(atHltv)
+          ? atHltv
+          : Math.round(startMs + k.atVodSec * 1000),
+      weapon: k.weapon ?? '',
+      headshot: Boolean(k.headshot),
+      // Kill com posição ESTIMADA não entra com timestamp: a descrição
+      // não pode afirmar um horário que ninguém mediu.
+      estimated: Boolean(k.appearEstimated),
+    };
+  });
   const weaponCounts = new Map<string, number>();
   for (const k of kills) weaponCounts.set(k.weapon ?? '', (weaponCounts.get(k.weapon ?? '') ?? 0) + 1);
   const mainWeapon = [...weaponCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
-  return {
+  // Time do jogador: o sidecar traz o lado real (da demo). O fallback
+  // antigo (team2) publicava "contra X" do lado errado quando a info
+  // faltava.
+  const playerTeam = side.playerTeam || side.team2 || '';
+  const opponentTeam =
+    side.opponentTeam ||
+    (playerTeam && playerTeam === side.team1 ? side.team2 : side.team1) ||
+    '';
+  const ace: AceEvent = {
     matchId: side.matchId,
     map: side.map,
     round: side.round,
@@ -72,8 +121,8 @@ function buildAce(side: VodSidecar): AceEvent {
       round: side.round,
       map: side.map,
       player: side.player,
-      team: side.team2,
-      opponents: `${side.team1} vs ${side.team2}`,
+      team: playerTeam,
+      opponents: opponentTeam,
       kills,
       victims: kills.map((k) => k.victim),
       weapons: kills.map((k) => k.weapon ?? ''),
@@ -83,6 +132,12 @@ function buildAce(side: VodSidecar): AceEvent {
       grenades: [],
       mainWeapon,
     },
+  };
+  return {
+    ace,
+    // Com `at` no relógio do HLTV, o offset do sidecar reconverte para o
+    // vídeo; sem `at`, o `at` já está na timeline do VOD (offset 0).
+    killTimeOffsetMs: offsetMs != null && side.kills.some((k) => k.at != null) ? offsetMs : 0,
   };
 }
 
@@ -121,7 +176,7 @@ async function main(): Promise<void> {
       continue;
     }
     console.log(`\n== ${name} ==`);
-    const ace = buildAce(side);
+    const { ace, killTimeOffsetMs } = buildAce(side);
 
     // Referências (foto do player, logos, mapa) — cache em data/clips/refs.
     let refs: ReferenceImages = {};
@@ -140,7 +195,7 @@ async function main(): Promise<void> {
     }
 
     // Thumbnail IA (chatgpt → grok → gemini-web; fallback composto).
-    const clipStartSec = (side.clipStartMs - VOD_START_MS) / 1000;
+    const clipStartSec = (side.clipStartMs - vodStartMs(side)) / 1000;
     const lastKillSec = Math.max(...side.kills.map((k) => k.atVodSec));
     const thumbAtSec = Math.max(1, Math.min(lastKillSec - clipStartSec - 1, side.clipDurationSec - 1));
     let thumbPath: string | null = null;
@@ -186,7 +241,7 @@ async function main(): Promise<void> {
       defaultTags: cfg.YT_DEFAULT_TAGS,
       clipStartMs: side.clipStartMs,
       clipDurationSec: side.clipDurationSec,
-      killTimeOffsetMs: 0,
+      killTimeOffsetMs,
     });
     console.log(`  metadados: ${metadata ? `${metadata.source} — "${metadata.title}"` : 'LEGADO (template)'}`);
 
@@ -203,16 +258,27 @@ async function main(): Promise<void> {
     console.log(`  ✓ https://youtu.be/${videoId} (${cfg.YT_PRIVACY})`);
 
     // Registro no banco (mesmo ace_event do bot) + sidecar atualizado.
-    const db = getDb(cfg.DB_PATH);
-    const row = db
-      .prepare('SELECT id FROM ace_events WHERE match_id=? AND map=? AND round=? AND player=?')
-      .get(ace.matchId, ace.map, ace.round, ace.player) as { id: number } | undefined;
-    if (row) insertClip(cfg.DB_PATH, row.id, mp4, cfg.YT_PRIVACY, videoId);
-    else console.warn('  ace_event não encontrado no banco — clipe não registrado');
+    // O sidecar é gravado ANTES do insert: se o banco falhar, o
+    // youtubeId já está no disco e o script não reenvia o vídeo.
     side.youtubeId = videoId;
     if (thumbPath) side.thumbnailFile = path.basename(thumbPath);
     side.thumbnailAi = thumbPath != null;
     fs.writeFileSync(sidecarPath, JSON.stringify(side, null, 2) + '\n');
+
+    const db = getDb(cfg.DB_PATH);
+    const row = db
+      .prepare('SELECT id FROM ace_events WHERE match_id=? AND map=? AND round=? AND player=?')
+      .get(ace.matchId, ace.map, ace.round, ace.player) as { id: number } | undefined;
+    // `format: 'vod'` é obrigatório: sem ele, o clipe do VOD cairia na
+    // MESMA linha do clipe do bot (mesmo ace, formato vazio) e
+    // sobrescreveria o `youtube_video_id` do vídeo já publicado.
+    if (row) {
+      insertClip(cfg.DB_PATH, row.id, mp4, cfg.YT_PRIVACY, videoId, {
+        format: 'vod',
+        title: metadata?.title ?? null,
+        publishedAt: new Date().toISOString(),
+      });
+    } else console.warn('  ace_event não encontrado no banco — clipe não registrado');
   }
 }
 

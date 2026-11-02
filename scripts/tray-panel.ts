@@ -529,7 +529,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sendJson(res, 400, { ok: false, error: 'Envie { values: { CHAVE: "valor" } }.' });
       return;
     }
-    const validation = validateConfigPatch(body.values);
+    // Os valores ATUAIS do .env entram na validação: as regras cruzadas
+    // (ex.: MIN/MAX dos Shorts) dependem do par, não do campo sozinho.
+    const currentEnv = readEnvFile(ENV_FILE);
+    const validation = validateConfigPatch(body.values, currentEnv.values);
     if (!validation.ok) {
       sendJson(res, 400, { ok: false, error: 'Configuração inválida.', errors: validation.errors });
       return;
