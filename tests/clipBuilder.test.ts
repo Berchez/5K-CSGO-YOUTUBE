@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -6,14 +6,6 @@ import path from 'node:path';
 import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, makeClipThumbnail, newestSegmentEndMs, parseFreezeIntervals, patchSidecarThumbnail, pickSegments, REPLAY_AWARE_MIN_OVERLAP_MS, resolveConcatTimeline, resolveReplayAwareEndMs, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
 import { probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin } from '../src/clipper/segmentProbe.js';
 import { computeAceEndMs } from '../src/clipper/clipAnchors.js';
-
-// ffmpeg pelo nome (isSegmentReadable/render): .tools no PATH — restaurado no fim.
-const originalPath = process.env.PATH;
-process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${originalPath ?? ''}`;
-afterAll(() => {
-  if (originalPath === undefined) delete process.env.PATH;
-  else process.env.PATH = originalPath;
-});
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
 // executável os e2es pulam (CI Linux sem os bins não falha).
@@ -442,7 +434,6 @@ describe('detectTruncatedStart (âncora mais velha que o buffer)', () => {
 });
 
 describe('computeTrimStartSec', () => {
-  const SEG_MS = 10_000;
   it('sem âncora não trimma', () => {
     expect(computeTrimStartSec(110_000, 10, undefined, 10)).toBe(0);
   });

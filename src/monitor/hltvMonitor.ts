@@ -106,6 +106,14 @@ export async function getBrowser(): Promise<BrowserContext> {
       // (Logins manuais usam outro perfil/launcher, sem isso.)
       ignoreDefaultArgs: ['--disable-popup-blocking'],
     });
+    // Shim do __name: sob tsx (npm run dev, scripts npx tsx) o esbuild
+    // injeta __name(...) nas funcoes nomeadas - e o codigo de um
+    // page.evaluate vai para a pagina, onde __name nao existe
+    // (ReferenceError). A shim e a funcao identidade: o nome some, o
+    // comportamento nao. Em producao (tsc) nunca e chamada.
+    await b.addInitScript({
+      content: 'globalThis.__name = globalThis.__name || ((f) => f);',
+    });
     // Contexto morreu (crash/kill): zera para o próximo getBrowser lançar
     // de novo — sem isso todas as chamadas falhariam para sempre.
     b.on('close', () => {
@@ -141,7 +149,7 @@ export async function closeBrowser(): Promise<void> {
  * Aguarda o Cloudflare liberar a página.
  * Checa TÍTULO (EN e PT-BR: "Just a moment..." / "Um momento…") E conteúdo
  * real (página de desafio tem ~300 chars) — título sozinho já passou
- * bloqueadoogs como liberado.
+ * bloqueado como liberado.
  * Sem isso, a extração roda sobre a página de desafio e retorna vazio —
  * parecendo "sem streams", "sem lives" ou zerando o placar do tracker.
  * Se o desafio escalar para checkbox ("não sou robô"), tenta 1 clique

@@ -2317,7 +2317,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
         log.info({ matchId: id }, 'recorder morto, vai recriar com streams frescas');
       }
     }
-    // Recorders mortos (stream caiu/URL expirou) são descartados p/ recriar.
+    // Cria o recorder do round (se ainda não houver um p/ esta partida).
     if (!activeRecorders.has(m.matchId) && activeRecorders.size < cfg.MAX_RECORDINGS) {
       let attemptedStream: StreamInfo | null = null;
       try {
@@ -2607,8 +2607,8 @@ async function main(): Promise<void> {
   }
   ensureTray();
   const cfg = getConfig();
-  // Bins vendored (.tools/ffmpeg do repo) no PATH — o clipper chama
-  // 'ffmpeg' pelo nome (concat, thumb, upscale). Igual ao test-vod.
+  // Bins vendored (.tools/) no PATH: o clipper resolve o ffmpeg pelo caminho,
+  // mas o yt-dlp (binário externo) procura o ffmpeg pelo PATH. Igual ao test-vod.
   process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
   await ensureDirs(cfg);
   initTrayStatus(cfg);
@@ -2631,7 +2631,7 @@ async function main(): Promise<void> {
   } else {
     /**
      * Migração de schema: o arquivo veio de outra versão e foi
-     * aproveitado (amostas + crops). Sem este log, uma migração
+     * aproveitado (amostras + crops). Sem este log, uma migração
      * silenciosa parece "o canal perdeu a medição".
      */
     if (latencyState.migration) {
@@ -2753,7 +2753,7 @@ async function main(): Promise<void> {
         vars: latencyEnvs,
         offsetPlacarVideoMs: cfg.CLIP_STREAM_LATENCY_MS - cfg.SCOREBOARD_DELAY_MS,
       },
-      'latência/atraso do placar com valor diferente do default no .env — o corte usa só a diferença (CLIP_STREAM_LATENCY_MS - SCOREBOARD_DELAY_MS)',
+      'latência/atraso do placar com valor diferente do default no ambiente — o corte usa só a diferença (CLIP_STREAM_LATENCY_MS - SCOREBOARD_DELAY_MS)',
     );
   }
   /**

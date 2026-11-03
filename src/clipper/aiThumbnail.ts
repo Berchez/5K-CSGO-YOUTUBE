@@ -131,9 +131,7 @@ export const ACCENT = 'neon lime green (#B6FF00)';
  * Recebe TUDO que o evento tem: player, times, mapa, armas (principal +
  * sequência), vítimas, headshots, assists, flash-assists, granadas e placar.
  * O JSON do round vai embutido para a IA contextualizar.
- */
-/**
- * Prompt de thumbnail PT-BR no layout de 3 zonas do canal.
+ *
  * portraitSafe=true (providers que recusam semelhança de pessoa real, ex. Gemini):
  * o retrato vira figura estilizada com rosto na sombra — mantém o layout,
  * troca só a linha do retrato, e o restante do layout (killfeed/textos) intacto.

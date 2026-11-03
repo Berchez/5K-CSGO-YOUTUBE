@@ -129,7 +129,7 @@ async function main(): Promise<void> {
 
   const cfg = getConfig();
   const log = getLogger();
-  // Garante que 'ffmpeg' resolve (clipper chama pelo nome) e yt-dlp acha o ffmpeg
+  // .tools no PATH: o yt-dlp (binário externo) procura o ffmpeg pelo PATH.
   process.env.PATH = `${path.join(ROOT, '.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
 
   if (!fs.existsSync(YTDLP)) throw new Error(`yt-dlp não encontrado em ${YTDLP}`);

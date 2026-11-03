@@ -10,10 +10,11 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
 ## Comandos (rode da raiz do repo)
 
 - Antes de terminar: `npm run lint` (`tsc --noEmit`), `npm test` (vitest) e
-  `npm run build`. Os três têm que passar.
+  `npm run build` (`tsc -p tsconfig.build.json` → `dist/`). Os três têm que
+  passar.
 - Um teste: `npm test -- tests/arquivo.test.ts`.
-- O `lint` typechecka `src/`, `scripts/` e `tests/` (`tsconfig.tests.json`); o
-  vitest não checa tipos, então rode `npm run lint` antes de fechar a tarefa.
+- O `lint` typechecka `src/`, `scripts/` e `tests/` — o vitest não checa tipos,
+  então é ele que pega o erro de tipo no teste.
 - Produção: pm2 `5k-bot` → `dist/src/main.js` (cwd fixo no
   `ecosystem.config.cjs`); depois de `npm run build`, `pm2 restart 5k-bot`.
 - One-off: `npx tsx scripts/x.ts --flag` (no Windows `npm run x -- --flag` às
@@ -29,8 +30,10 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
 - ESM/NodeNext: import relativo leva `.js` (`import './env.js'`).
 - Config é uma fonte só: schema Zod/defaults em `src/config.ts`; o painel
   (`src/trayConfig.ts`) e os validadores leem dela — não duplique regra.
-- Playwright `page.evaluate` roda na página: sem helper local nem arrow
-  nomeada (o `tsx` injeta `__name`, ausente no contexto do navegador).
+- Playwright `page.evaluate` roda na página: o `tsx` injeta `__name` nas
+  funções nomeadas e a página não tem esse helper (o `getBrowser` injeta um
+  shim identidade). Arrow anônima como argumento (`.filter((e) => …)`) é
+  seguro; binding nomeado dentro do callback não é.
 - **Nunca commitar/pushar** sem pedido explícito. `.env`, `token.json`,
   `client_secrets.json` e perfis de login não são versionados.
 - **Não mexer em `data/`, `logs/`** (artefatos de produção) sem pedido.
@@ -57,8 +60,9 @@ npm run diag:clip -- --match <matchId> --ocr
 ## Ambiente
 
 - `ffmpeg`, `ffprobe` e `yt-dlp` ficam em `.tools/` (gitignored; o boot avisa
-  se faltam). Resolva com `resolveFfmpegBin`/`resolveFfprobeBin` — não chame
-  `ffmpeg` direto.
+  se faltam). O código resolve o binário com `resolveFfmpegBin`/
+  `resolveFfprobeBin` (`src/clipper/segmentProbe.ts`) — não chame `ffmpeg`
+  pelo nome.
 - Caminhos de runtime são relativos ao CWD (`./data`, `./logs`, `.tools`):
   rode tudo da raiz do repo. O `.env` é lido da raiz com `override: true`
   (`src/env.ts`): variável no shell **perde** para o `.env`.

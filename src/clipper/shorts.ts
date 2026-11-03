@@ -348,12 +348,6 @@ export function shortVideoFilter(opts: ShortRenderOptions): string {
   ].join(',');
 }
 
-/**
- * ffmpeg p/ inspeção/render: vendored em .tools/ ou PATH (mesma regra do
- * clipper — a resolução vive no `segmentProbe`, compartilhada).
- */
-export { resolveFfmpegBin };
-
 async function probeDurationSec(file: string): Promise<number | null> {
   const ffprobe = resolveFfprobeBin();
   if (!ffprobe) return null;
@@ -448,6 +442,10 @@ export async function renderShortClip(
   const durSec = Math.max(1, opts.durSec);
   const filter = shortVideoFilter(opts);
   const withAudio = await hasAudioStream(inPath);
+  // A pasta de destino tem que existir ANTES do ffmpeg: o mkdir do caller
+  // vinha depois do render e o ffmpeg abortava com "Error opening output
+  // file" (o Short nunca era gerado para um clipe novo).
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
 
   // Render ATÓMICO: o ffmpeg escreve num `.tmp` e o arquivo final só
   // aparece pronto. Um render interrompido (timeout, disco cheio) deixava

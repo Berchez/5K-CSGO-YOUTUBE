@@ -11,15 +11,13 @@ import type { KillEvent } from '../src/types.js';
 
 function kill(at: number, killer: string, victim: string): KillEvent {
   return {
-    matchId: 'm1',
     killer,
     victim,
     weapon: 'AK47',
     at,
     round: 1,
     map: 'Mirage',
-    team: 'A',
-  } as KillEvent;
+  };
 }
 
 describe('killfeedScanWindowMs', () => {

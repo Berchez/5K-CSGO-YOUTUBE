@@ -229,7 +229,7 @@ export interface PickOptions {
  * então o veredito vem do stderr (tem Duration + Stream #0? tem erro fatal?).
  */
 async function isSegmentReadable(file: string): Promise<boolean> {
-  const out = await execFileAsync('ffmpeg', ['-hide_banner', '-i', file], { timeout: 15000, windowsHide: true })
+  const out = await execFileAsync(resolveFfmpegBin(), ['-hide_banner', '-i', file], { timeout: 15000, windowsHide: true })
     .then((r) => String(r.stderr ?? ''))
     .catch((e: unknown) => String((e as { stderr?: unknown }).stderr ?? e));
   if (/moov atom not found|Invalid data found|No such file|does not contain any stream/i.test(out)) {
@@ -238,7 +238,6 @@ async function isSegmentReadable(file: string): Promise<boolean> {
   return /Duration:\s*\d+:\d+/.test(out) && /Stream #0/.test(out);
 }
 
-export type { ConcatSpan, SegmentAvIssue } from './segmentProbe.js';
 import { inspectSegmentAv, probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
 
 /**
@@ -394,7 +393,7 @@ export async function upscaleClip(inPath: string, height: number, trimStartSec =
     '+faststart',
     tmp,
   );
-  await execTracked('ffmpeg', args);
+  await execTracked(resolveFfmpegBin(), args);
   fs.renameSync(tmp, inPath);
   const mb = (fs.statSync(inPath).size / 1024 / 1024).toFixed(1);
   log.info({ height, mb, trimStartSec }, 'upscale aplicado (força VP9/AV1 no YouTube)');
@@ -1150,7 +1149,7 @@ export async function buildClip(
       '+faststart',
       outPath,
     );
-    await execTracked('ffmpeg', args, (line) => {
+    await execTracked(resolveFfmpegBin(), args, (line) => {
       if (line.includes('freezedetect')) freezeLog += `${line}\n`;
     });
     freezeIntervals = parseFreezeIntervals(freezeLog);

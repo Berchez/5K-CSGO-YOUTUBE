@@ -6,6 +6,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import type { AceEvent } from '../types.js';
 import { killLabel } from '../detector/aceDetector.js';
+import { resolveFfmpegBin } from './segmentProbe.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -65,7 +66,7 @@ export async function extractFrame(videoPath: string, atSec: number): Promise<st
     os.tmpdir(),
     `5k-frame-${Date.now()}-${Math.floor(Math.random() * 1e6)}.jpg`,
   );
-  await execFileAsync('ffmpeg', [
+  await execFileAsync(resolveFfmpegBin(), [
     '-hide_banner',
     '-loglevel',
     'error',

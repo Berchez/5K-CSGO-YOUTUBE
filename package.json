@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "node dist/src/main.js",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "auth:youtube": "tsx scripts/auth-youtube.ts",
     "gemini:login": "tsx scripts/gemini-login.ts",
     "chatgpt:login": "tsx scripts/chatgpt-login.ts",
@@ -24,7 +24,7 @@
     "diag:clip": "tsx scripts/diag-clip-window.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit && tsc -p tsconfig.tests.json",
+    "lint": "tsc --noEmit",
     "playwright:install": "npx playwright install chromium"
   },
   "dependencies": {
