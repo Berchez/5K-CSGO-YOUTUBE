@@ -3,8 +3,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveFfmpegBin } from './clipBuilder.js';
-import { resolveFfprobeBin } from './segmentProbe.js';
+import { resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
 
 const execFileAsync = promisify(execFile);
 const SAMPLE_FPS = 1;
@@ -124,24 +123,47 @@ export function isValidCrop(value: string): boolean {
  * é ignorado (o canal cai no crop global).
  */
 export function parseCropMap(raw: string | undefined): Record<string, string> {
+  return parseCropMapDetailed(raw).map;
+}
+
+/**
+ * O mesmo mapa de crop por canal, MAS com a lista dos crops INVÁLIDOS.
+ *
+ * Um crop inválido é um erro de configuração silencioso: o canal cai
+ * no crop global e a guarda que dependia daquele crop (a do banner de
+ * replay) simplesmente nunca age — sem ninguém perceber. Quem chama
+ * esta função pode avisar.
+ */
+export function parseCropMapDetailed(raw: string | undefined): {
+  map: Record<string, string>;
+  invalid: string[];
+} {
   const text = (raw ?? '').trim();
-  if (!text) return {};
+  const invalid: string[] = [];
+  if (!text) return { map: {}, invalid };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return {};
+    invalid.push(`JSON inválido: ${text}`);
+    return { map: {}, invalid };
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  const out: Record<string, string> = {};
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    invalid.push(`mapa de crop inválido (não é um objeto JSON): ${text}`);
+    return { map: {}, invalid };
+  }
+  const map: Record<string, string> = {};
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     const name = key.trim().toLowerCase();
     if (!name || typeof value !== 'string') continue;
     const crop = value.trim();
-    if (!isValidCrop(crop)) continue;
-    out[name] = crop;
+    if (!isValidCrop(crop)) {
+      invalid.push(`${name}: ${crop}`);
+      continue;
+    }
+    map[name] = crop;
   }
-  return out;
+  return { map, invalid };
 }
 
 /**

@@ -58,11 +58,13 @@ import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
-import { buildClip, detectTruncatedStart, makeClipThumbnail, newestSegmentEndMs, oldestSegmentStartMs, patchSidecarThumbnail, pickSegments } from './clipper/clipBuilder.js';
+import { buildClip, detectTruncatedStart, makeClipThumbnail, newestSegmentEndMs, oldestSegmentStartMs, patchSidecarAudit, patchSidecarThumbnail, pickSegments } from './clipper/clipBuilder.js';
 import { SegmentFreezer } from './clipper/segmentFreezer.js';
-import { computeClipAnchors, type ScoreboardEndReason } from './clipper/clipAnchors.js';
+import { computeClipAnchors, resolveClipStartAnchor, type ScoreboardEndReason } from './clipper/clipAnchors.js';
 import { cropCandidatesForStream, scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
-import { scanKillfeedForLatency, type KillfeedSyncResult } from './clipper/killfeedSync.js';
+import { scanKillfeedForLatency, resolveReplayCrop, type KillfeedSyncResult } from './clipper/killfeedSync.js';
+import { auditClipWindow, suspectKillsSpread, trustedRoundEndVideoMs } from './clipper/clipWindowAudit.js';
+import { ocrClipWindow } from './clipper/clipWindowOcr.js';
 import { uploadClip, applyThumbnail } from './uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
@@ -584,6 +586,55 @@ function scoreboardEndReasonOf(reason: string): ScoreboardEndReason | null {
     : null;
 }
 
+/**
+ * Mede se o clipe renderizado ABRE DENTRO de um replay.
+ *
+ * É a única evidência INDEPENDENTE da janela: nenhuma conta de
+ * latência prova que o primeiro segundo do clipe é o round ao vivo (o
+ * 2399858_Mirage_r15_makazze foi publicado com o clipe abrindo no
+ * replay do round).
+ *
+ * O banner "REPLAY" do HLTV é lido nos primeiros segundos do MP4. Só
+ * conta como evidência se aparecer em DOIS frames seguidos — leitura
+ * suja de OCR (um "REPLAY" perdido num canto) não descarta um clipe.
+ */
+async function measureClipReplayBanner(
+  clip: { filePath: string },
+  cfg: ReturnType<typeof getConfig>,
+  streamName?: string,
+): Promise<{ opensInsideReplay: boolean | null; detail: string | null }> {
+  const { crop, warnings } = resolveReplayCrop({
+    globalCrop: cfg.CLIP_KILLFEED_REPLAY_CROP,
+    byStreamRaw: cfg.CLIP_KILLFEED_REPLAY_CROP_BY_STREAM,
+    streamName,
+  });
+  const log = getLogger();
+  for (const warning of warnings) log.warn({ clip: clip.filePath }, warning);
+  if (crop == null) return { opensInsideReplay: null, detail: null };
+  try {
+    const ocr = await ocrClipWindow({
+      file: clip.filePath,
+      killfeedCrop: null,
+      replayCrop: crop,
+      kills: [],
+      fromSec: 0,
+      toSec: 10,
+      sampleFps: 1,
+    });
+    if (ocr.error != null) {
+      log.warn({ clip: clip.filePath, erro: ocr.error }, 'não foi possível ler o banner de replay');
+      return { opensInsideReplay: null, detail: ocr.error };
+    }
+    const seconds = ocr.replayAtSec.map((sec) => Number(sec.toFixed(1)));
+    const consecutive = seconds.some((sec, index) => index > 0 && sec - seconds[index - 1] <= 1.5);
+    const detail = seconds.length > 0 ? `REPLAY em ${seconds.join(', ')}s` : null;
+    return { opensInsideReplay: consecutive, detail };
+  } catch (e) {
+    log.warn({ clip: clip.filePath, err: String(e).slice(0, 120) }, 'falha ao ler o banner de replay');
+    return { opensInsideReplay: null, detail: null };
+  }
+}
+
 async function handleAce(
   ace: AceEvent,
   matchId: string,
@@ -705,6 +756,67 @@ async function handleAce(
       detectedAt: ace.detectedAt,
     });
     return;
+  }
+  /**
+   * Lista de kills SUSPEITA: rounds misturados ou intervalo absurdo
+   * entre kills consecutivas.
+   *
+   * O `at` do placar do HLTV é o instante do POLL (atrasa 5..16s por
+   * kill) e a lista pode VIR DE ROUNDS DIFERENTES: o
+   * 2399858_Ancient_r6 tinha 3 kills de um round (12:02:39) e 2 de
+   * outro (12:04:36) — um intervalo de 114s entre kills consecutivas.
+   * O clipe daí atravessa a partida inteira e não mostra o ace.
+   *
+   * O corte é barato de refazer; um clipe errado no YouTube não. Antes
+   * de gastar OCR e renderização, o evento suspecto é descartado e
+   * registrado — mas SÓ com evidência forte (round distinto ou gap
+   * enorme): um round lento (post-plant/retake) passa de 60s entre a
+   * 1ª e a 5ª kill sem ser um bug.
+   */
+  const spreadCheck = suspectKillsSpread(ace.kills, {
+    spreadMaxMs: cfg.CLIP_KILLS_SPREAD_MAX_SEC * 1000,
+    gapMaxMs: cfg.CLIP_KILLS_GAP_MAX_SEC * 1000,
+  });
+  const killsSpreadMs = spreadCheck.spreadMs;
+  if (spreadCheck.suspect) {
+    const motivo = spreadCheck.reason ?? 'kills de rounds diferentes';
+    log.warn(
+      {
+        matchId,
+        player: ace.player,
+        map: ace.map,
+        round: ace.round,
+        kills: ace.kills.length,
+        dispersaoMs: Math.round(spreadCheck.spreadMs ?? 0),
+        maiorIntervaloMs: Math.round(spreadCheck.maxGapMs ?? 0),
+      },
+      `${motivo} — evento descartado antes do corte`,
+    );
+    recordDiscardedEvent(cfg.DB_PATH, {
+      matchId: ace.matchId,
+      map: ace.map,
+      round: ace.round,
+      player: ace.player,
+      reason: motivo,
+      detectedAt: ace.detectedAt,
+    });
+    return;
+  }
+  if (spreadCheck.warning) {
+    // Faixa de atenção: acima do limite "gosto" de um ace legítimo
+    // (round lento), abaixo da evidência de mistura. Não descarta — só
+    // registra, para o diagnóstico.
+    log.warn(
+      {
+        matchId,
+        player: ace.player,
+        map: ace.map,
+        round: ace.round,
+        dispersaoMs: Math.round(spreadCheck.spreadMs ?? 0),
+        maiorIntervaloMs: Math.round(spreadCheck.maxGapMs ?? 0),
+      },
+      'dispersão das kills acima do normal — seguindo (sem descarte)',
+    );
   }
   const aceId = insertAce(cfg.DB_PATH, ace);
   addPendingClip(matchId);
@@ -948,6 +1060,18 @@ async function handleAce(
         // `freezer` é `let` do escopo externo: o const preserva o
         // estreitamento dentro do closure de listSegments.
         const freezerScan = freezer;
+        /**
+         * O crop do banner de replay deste canal (o banner muda de lugar
+         * conforme o organizador do HLTV). Um crop inválido é avisado:
+         * com o crop errado a guarda de replay simplesmente nunca age.
+         */
+        const replayCrop = resolveReplayCrop({
+          globalCrop: cfg.CLIP_KILLFEED_REPLAY_CROP,
+          byStreamRaw: cfg.CLIP_KILLFEED_REPLAY_CROP_BY_STREAM,
+          streamName,
+        });
+        for (const warning of replayCrop.warnings) log.warn({ matchId, streamName }, warning);
+        const replayCropForChannel = replayCrop.crop;
         const killfeedCrops = cropCandidatesForStream({
           globalCrop: cfg.CLIP_KILLFEED_CROP,
           byStream: cfg.CLIP_KILLFEED_CROP_BY_STREAM,
@@ -990,6 +1114,17 @@ async function handleAce(
            * custo puro de OCR).
            */
           rememberedCrop: latencyTracker.killfeedCrop(streamName),
+          /**
+           * Guarda de replay: o banner "REPLAY" do HLTV aparece no canto
+           * superior esquerdo. As linhas lidas COM o aviso na tela são
+           * a reexibição do round — usá-las como âncora abre o clipe
+           * depois do round e perde o ace ao vivo (2399858_Mirage_r15).
+           *
+           * O crop é por CANAL (o banner muda de lugar conforme o
+           * organizador do HLTV): com o crop errado a guarda nunca age
+           * — e o crop inválido sai como aviso, não em silêncio.
+           */
+          replayCrop: replayCropForChannel,
           shouldStop: () => stopping,
         });
         // Em shadow ('log') a medição é registrada no LOG, mas o
@@ -1017,6 +1152,24 @@ async function handleAce(
               killfeed.lastKillVideoMs != null ? new Date(killfeed.lastKillVideoMs).toISOString() : null,
             desvioMedianoMs: killfeed.medianDeviationMs,
             crop: killfeed.crop,
+            /**
+             * EVIDÊNCIA da varredura: cada leitura que virou candidato
+             * (a 1ª aparição da linha de cada kill, com o offset
+             * correspondente) e as descartadas, com o motivo. Sem isto
+             * não dá para distinguir "leu o round ao vivo" de "leu o
+             * replay" depois do fato — o caso 2399858_Mirage_r15 só ficou
+             * claro com a lista.
+             */
+            candidatos: (killfeed.candidates ?? []).map((candidate) => ({
+              kill: candidate.killIndex + 1,
+              video: new Date(candidate.streamAtMs).toISOString(),
+              offsetMs: Math.round(candidate.offsetMs),
+            })),
+            descartadas: (killfeed.rejected ?? []).map((entry) => ({
+              kill: entry.killIndex + 1,
+              video: new Date(entry.streamAtMs).toISOString(),
+              motivo: entry.reason,
+            })),
             /**
              * Custo do OCR: sem estes números não dá para provar em
              * produção se a varredura está pesando (cada segmento é um
@@ -1095,10 +1248,34 @@ async function handleAce(
      * usa o configurado como é — o teto é inativo (nenhum modo que
      * aplica a âncora medida usa o valor limitado).
      */
+    /**
+     * Âncora do killfeed CONFIRMADA?
+     *
+     * Só o motivo 'confident' (cluster corroborado: ≥2 kills lidas com
+     * o mesmo offset, dentro da tolerância) é medição de verdade. Em
+     * 'first-kill-only' a leitura é ÚNICA e pode ser a REEXIBIÇÃO da
+     * kill no replay — o replay repete as linhas do killfeed do round,
+     * e uma âncora lida nele abre o clipe depois do round (o defeito do
+     * 2399858_Mirage_r15_makazze). A guarda de replay (o banner
+     * "REPLAY") já descarta as leituras feitas na reexibição; aqui o
+     * motivo decide se a âncora pode dispensar o teto de latência.
+     */
+    const killfeedTrusted =
+      killfeedResult != null &&
+      killfeedResult.reason === 'confident' &&
+      killfeedResult.firstKillMatched === true;
     const startDecision = resolveStartLatency({
       estimatedMs: startLatencyMs,
       measured: applyAdaptive ? adaptive.startSource !== 'config' : false,
-      killfeedAnchored: killfeedStartMs != null,
+      /**
+       * O teto só é dispensado quando a âncora do killfeed é
+       * CONFIRMADA (cluster corroborado). Uma leitura única
+       * ('first-kill-only') pode ser a REEXIBIÇÃO da kill no replay — e
+       * uma âncora de replay abre o clipe depois do round
+       * (2399858_Mirage_r15_makazze). Sem a confiança, o teto vale e a
+       * abertura fica pelo placar, que é mais cedo.
+       */
+      killfeedAnchored: killfeedTrusted,
       capMs: cfg.CLIP_START_LATENCY_MAX_MS,
       applyAdaptive,
     });
@@ -1118,26 +1295,40 @@ async function handleAce(
       );
     }
     /**
-     * Âncora final do início: o instante da 1ª kill no vídeo quando o
-     * killfeed respondeu, senão a âncora do placar convertida com a
-     * latência adaptativa.
+     * Âncora final do início: o MENOR entre a âncora do killfeed e a do
+     * placar convertida com a latência aplicada.
      *
-     * A leitura DIRETA da linha da 1ª kill é medição (o killfeed só
-     * mostra a linha quando o kill aconteceu). A âncora DERIVADA (offset
-     * do cluster aplicado ao `at` da 1ª kill) carrega o atraso do poll
-     * daquela leitura (5-16s medidos no relatório): como ela pode abrir
-     * DEPOIS da 1ª kill, vale o MENOR entre ela e a âncora do placar —
-     * abrir mais cedo nunca perde a abertura.
+     * Regra: abrir CEDO nunca perde a abertura; abrir tarde perde a 1ª
+     * kill. Por isso o mínimo vence sempre — mesmo quando o killfeed
+     * leu a linha (a medição direta), porque a âncora do placar pode
+     * ser mais cedo (a latência estimada é grande) e nesse caso o
+     * clipe abre antes, sem perder nada.
+     *
+     * A âncora do killfeed só ENTRA quando é CONFIRMADA (cluster
+     * corroborado, motivo 'confident'). Uma leitura única
+     * ('first-kill-only') pode ser a REEXIBIÇÃO da kill no replay: o
+     * replay repete as linhas do killfeed do round e a âncora lida nele
+     * abre o clipe DEPOIS do round — foi exatamente o defeito do
+     * 2399858_Mirage_r15_makazze (o clipe começou no replay e o 5K ao
+     * vivo ficou de fora). Sem a confirmação, o menor entre as duas
+     * âncoras vence e o placar, com o teto, abre o clipe no round ao
+     * vivo.
      */
     const scoreboardVideoStartMs =
       aceStartMs != null ? aceStartMs + appliedStartLatencyMs : undefined;
-    const killfeedStartExact = killfeedResult?.firstKillMatched === true;
-    videoStartMs =
-      killfeedStartMs != null
-        ? killfeedStartExact || scoreboardVideoStartMs == null
-          ? killfeedStartMs
-          : Math.min(killfeedStartMs, scoreboardVideoStartMs)
-        : scoreboardVideoStartMs;
+    const startAnchor = resolveClipStartAnchor({
+      killfeedStartMs,
+      scoreboardVideoStartMs,
+    });
+    videoStartMs = startAnchor.videoStartMs;
+    /**
+     * A fonte da âncora reflete a CONFIANÇA: uma leitura única do
+     * killfeed ('first-kill-only') não é posição confiável (pode ser a
+     * reexibição), então a âncora é atribuída ao placar — que é quem
+     * posicionou o corte de verdade.
+     */
+    const anchorSource =
+      startAnchor.source === 'killfeed' && !killfeedTrusted ? 'placar' : startAnchor.source;
     streamSync.startLatencyMs = appliedStartLatencyMs;
     streamSync.endLatencyMs = endLatencyMs;
     streamSync.startLatencyCapped = startLatencyCapped;
@@ -1165,8 +1356,29 @@ async function handleAce(
      * amostra. O killfeed, quando aplicado, continua sendo a fonte exata.
      */
     const appliedStartSource = applyAdaptive ? adaptive.startSource : 'config';
-    streamSync.latencySource =
-      killfeedStartMs != null ? 'killfeed' : appliedStartSource;
+    /**
+     * A fonte da LATÊNCIA é a que foi aplicada. A âncora do killfeed só
+     * substitui o placar quando é CONFIRMADA — uma leitura única
+     * ('first-kill-only') não é fonte confiável de posição.
+     */
+    streamSync.latencySource = killfeedTrusted ? 'killfeed' : appliedStartSource;
+    /**
+     * De onde veio a ÂNCORA que abriu o clipe (diagnóstico da janela):
+     * 'placar', 'killfeed' ou 'killfeed+placar' (o menor dos dois).
+     */
+    streamSync.anchorSource = anchorSource;
+    /**
+     * Evidência do killfeed no sidecar: a âncora lida, o motivo e as
+     * leituras descartadas por serem REPLAY. Sem isso, o diagnóstico
+     * posterior não sabe se a janela foi aberta pelo round ao vivo ou
+     * pela reexibição.
+     */
+    streamSync.killfeedFirstKillVideoMs = killfeedResult?.firstKillVideoMs ?? null;
+    streamSync.killfeedReason = killfeedResult?.reason ?? null;
+    streamSync.killfeedCrop = killfeedResult?.crop ?? null;
+    streamSync.killfeedReplayReads = (killfeedResult?.rejected ?? []).filter(
+      (entry) => entry.reason === 'replay',
+    ).length;
     streamSync.latencyChanged = adaptive.changed;
     ace.streamSync = streamSync;
     // Contexto adaptativo (mesma conta do corte): âncora de início incerta =
@@ -1679,6 +1891,10 @@ async function handleAce(
           // última kill (medida ou estimada) e a virada genuína do
           // placar ficam dentro do clipe (r8: o corte removia as 3 kills).
           minEndMs: anchors.endFloorMs,
+          killsSpreadMs: killsSpreadMs ?? null,
+          // Início do material mais antigo: é o que separa "o clipe
+          // abre tarde" de "o round ao vivo não estava no buffer".
+          bufferOldestMs: oldestSegmentStartMs(segments, cfg.SEGMENT_TIME_SEC),
         });
       } catch (e) {
         log.error({ err: String(e), matchId }, 'falha ao montar o clipe');
@@ -1688,7 +1904,134 @@ async function handleAce(
       }
     };
 
-    const clip = await buildClipFromBuffer();
+    const clipBuilt = await buildClipFromBuffer();
+    /**
+     * GUARDRAIL DA JANELA: depois de renderizar, o clipe é conferido
+     * contra as invariantes antes de ir para o YouTube.
+     *
+     * Publicar um clipe que não é o ace é o pior desfecho possível
+     * (não há como "consertar" depois): o 2399858_Mirage_r15_makazze foi
+     * publicado com o clipe começando no REPLAY, sem o 5K ao vivo.
+     *
+     * A auditoria é CONSERVADORA: só descarta com evidência forte (a
+     * lista de kills é de rounds diferentes, ou o clipe abre depois do
+     * fim do round MEDIDO no vídeo com o material ao vivo disponível).
+     * Quando o round ao vivo não estava no material (o replay era o
+     * único material), o clipe é publicado MARCADO — é o último recurso,
+     * não o padrão.
+     */
+    let clip = clipBuilt;
+    /**
+     * O clipe só tem o REPLAY do round (o material ao vivo não estava no
+     * buffer): é publicado MARCADO — o marcador vai para a descrição,
+     * senão "publicado marcado" é só uma promessa no log.
+     */
+    let replayOnly = false;
+    if (clipBuilt != null && cfg.CLIP_VALIDATE !== 'off') {
+      /**
+       * FIM DE ROUND CONFIÁVEL: só o motivo `confident` (placar com o
+       * ANTES e o DEPOIS legíveis no vídeo) é medida de verdade.
+       *
+       * `after-only` (o placar ANTES não estava legível) e
+       * `gap-inferred` (o fim foi inferido do overlay ilegível) não
+       * serviriam: o segundo é um limite INFERIOR, e usá-lo como "fim
+       * do round" acusaria clipes bons de abrirem "depois do round".
+       * Um fim rejeitado pelos anchors também não serve.
+       */
+      const roundEndVideoMs = trustedRoundEndVideoMs({
+        reason: streamSync.reason,
+        roundEndAt: streamSync.roundEndAt,
+        ocrEndRejected: anchors.ocrEndRejected,
+      });
+      /**
+       * MEDIÇÃO INDEPENDENTE: o clipe abre DENTRO de um replay?
+       *
+       * Nenhuma conta de latência prova isso — é o único jeito de
+       * provar que o primeiro segundo do clipe é o round ao vivo (o
+       * 2399858_Mirage_r15_makazze foi publicado com o clipe abrindo
+       * no replay). O banner "REPLAY" é lido nos primeiros segundos do
+       * MP4 renderizado; só conta como evidência se aparecer em DOIS
+       * frames seguidos (proteção contra leitura suja).
+       */
+      const replayCheck = await measureClipReplayBanner(clipBuilt, cfg, streamName);
+      const verdict = auditClipWindow({
+        kills: ace.kills,
+        clipStartMs: clipBuilt.clipStartMs ?? null,
+        clipDurationSec: clipBuilt.clipDurationSec ?? null,
+        startLatencyMs: appliedStartLatencyMs,
+        estimatedStartLatencyMs: startLatencyMs,
+        endLatencyMs,
+        latencySource: streamSync.latencySource ?? null,
+        scoreboardDelayMs: cfg.SCOREBOARD_DELAY_MS,
+        killfeedFirstKillVideoMs: killfeedResult?.firstKillVideoMs ?? null,
+        killfeedReason: killfeedResult?.reason ?? null,
+        roundEndVideoMs,
+        bufferOldestMs: oldestSegmentStartMs(segments, cfg.SEGMENT_TIME_SEC),
+        killsSpreadMaxMs: cfg.CLIP_KILLS_SPREAD_MAX_SEC * 1000,
+        killsGapMaxMs: cfg.CLIP_KILLS_GAP_MAX_SEC * 1000,
+        opensInsideReplay: replayCheck.opensInsideReplay,
+      });
+      patchSidecarAudit(clipBuilt.sidecarPath, {
+        action: verdict.action,
+        violations: verdict.violations,
+        coversFirstKill: verdict.coversFirstKill,
+        coversLastKill: verdict.coversLastKill,
+        startsAfterRoundEnd: verdict.startsAfterRoundEnd,
+        liveMaterialAvailable: verdict.liveMaterialAvailable,
+        reason:
+          verdict.violations.length > 0
+            ? `janela fora das invariantes: ${verdict.violations.join(', ')}`
+            : 'janela dentro das invariantes',
+      });
+      if (verdict.action === 'discard') {
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            map: ace.map,
+            round: ace.round,
+            violacoes: verdict.violations,
+            clip: clipBuilt.filePath,
+            modo: cfg.CLIP_VALIDATE,
+          },
+          'janela do clipe fora das invariantes — clipe NÃO publicado (mantido local para retry)',
+        );
+        if (cfg.CLIP_VALIDATE === 'on') {
+          // `discardAce` remove o evento do banco E registra o descarte
+          // (discarded_events) — não chamar `recordDiscardedEvent` aqui,
+          // senão o descarte aparece duas vezes.
+          discardAce(cfg.DB_PATH, aceId, {
+            matchId: ace.matchId,
+            map: ace.map,
+            round: ace.round,
+            player: ace.player,
+            reason: `janela do clipe fora das invariantes: ${verdict.violations.join(', ')}`,
+            detectedAt: ace.detectedAt,
+          });
+          clip = null;
+        } else {
+          // Modo shadow: a violação é OBSERVADA (log + sidecar), mas o
+          // clipe segue para o YouTube — é o modo de vigiar a regra nova
+          // antes de ela custar um clipe.
+          log.warn(
+            { matchId, player: ace.player, clip: clipBuilt.filePath },
+            'modo shadow: janela fora das invariantes registrada, clipe publicado assim mesmo',
+          );
+        }
+      } else if (verdict.action === 'replay-only') {
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            map: ace.map,
+            round: ace.round,
+            violacoes: verdict.violations,
+          },
+          'clipe só tem o REPLAY do round (material ao vivo fora do buffer) — publicado marcado',
+        );
+        replayOnly = true;
+      }
+    }
     // As cópias congeladas (centenas de MB) já cumpriram o papel: o clipe
     // está renderizado. Apagar AGORA libera o disco antes do upload e da
     // thumb de IA (que pode levar minutos) em vez de só no `finally`.
@@ -1739,6 +2082,9 @@ async function handleAce(
                   // do placar) depois. É esse offset que alinha os
                   // timestamps da descrição com a tela.
                   killTimeOffsetMs: killVideoOffsetMs,
+                  // Clipe só com o replay do round: a descrição avisa
+                  // (o marcador precisa existir para o espectador).
+                  replayOnly,
                 });
           videoId = await uploadClip(ace, clip.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
@@ -1747,6 +2093,7 @@ async function handleAce(
             categoryId: cfg.YT_CATEGORY_ID,
             defaultTags: cfg.YT_DEFAULT_TAGS,
             metadata,
+            replayOnly,
           });
         } catch (e) {
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');

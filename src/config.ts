@@ -284,6 +284,63 @@ export const ConfigSchema = z.object({
     .default('0.02:0.05:0.30:0.25,0.35:0.05:0.30:0.25,0.55:0.05:0.30:0.25')
     .transform((v) => parseCropList(v)),
   /**
+   * Crop do aviso de REPLAY (o banner "REPLAY" do HLTV, no canto
+   * superior esquerdo).
+   *
+   * É o que separa a LINHA AO VIVO do killfeed da LINHA DO REPLAY: o
+   * replay reexibe as mesmas kills mais tarde e, lida como âncora,
+   * abre o clipe DEPOIS do round (o caso 2399858_Mirage_r15_makazze — o
+   * clipe começou no replay e perdeu o 5K ao vivo). Vazio desliga a
+   * guarda.
+   */
+  CLIP_KILLFEED_REPLAY_CROP: z.string().default('0.00:0.00:0.35:0.10'),
+  /**
+   * Crop do banner de replay por CANAL: JSON {"gaules": "0.00:0.00:0.30:0.08"}.
+   * O banner muda de lugar conforme o organizador do HLTV; com o crop
+   * errado a guarda de replay nunca age (e ninguém percebe) — por isso
+   * o crop inválido é avisado no log.
+   */
+  CLIP_KILLFEED_REPLAY_CROP_BY_STREAM: z.string().default(''),
+  /**
+   * Validação da JANELA depois de renderizar o clipe.
+   *
+   * - `off`: não valida;
+   * - `shadow`: valida, LOGA e grava no sidecar, mas nunca descarta
+   *   (modo de observação — é o que a repo usa para comportamento de
+   *   corte novo: `REPLAY_AWARE=shadow`, `CLIP_STREAM_SYNC=log`);
+   * - `on`: valida e descarta o clipe cuja janela está fora das
+   *   invariantes (o descarte é DESTRUTIVO: o ace sai do banco).
+   *
+   * O descarte só acontece com evidência forte (o fim do round
+   * MEDIDO com confiança no vídeo e o material ao vivo disponível).
+   *
+   * `auto` e `always` são ACEITOS como apelidos de `on`: o `auto` de
+   * antes se comportava como `always` (o "só quando há evidência" era
+   * a própria auditoria) — quem tinha `auto` no .env continua com o
+   * mesmo comportamento.
+   */
+  CLIP_VALIDATE: z
+    .enum(['off', 'shadow', 'on', 'auto', 'always'])
+    .default('on')
+    .transform((value) => (value === 'auto' || value === 'always' ? 'on' : value)),
+  /**
+   * Dispersão MÁXIMA (s) entre a 1ª e a última kill do ace. Acima
+   * disso a lista de kills provavelmente mistura rounds.
+   *
+   * O `at` do HLTV é o instante do POLL (atrasa 5..16s por kill) e um
+   * round lento (post-plant/retake) pode passar de 60s entre a 1ª e a
+   * 5ª kill — por isso o limite é folgado e a decisão principal é o
+   * GAP entre kills consecutivas (ver CLIP_KILLS_GAP_MAX_SEC).
+   */
+  CLIP_KILLS_SPREAD_MAX_SEC: z.coerce.number().min(30).max(600).default(120),
+  /**
+   * GAP máximo (s) entre duas kills CONSECUTIVAS do ace. Acima disso
+   * a lista juntou rounds diferentes (o caso 2399858_Ancient_r6: 3s e
+   * depois 114s). Dentro de um round o intervalo entre kills é de
+   * poucos segundos a ~1min.
+   */
+  CLIP_KILLS_GAP_MAX_SEC: z.coerce.number().min(10).max(600).default(90),
+  /**
    * TEMPO extra de espera quando a transição do placar não é encontrada
    * (o material precisa chegar). NÃO afeta o corte: o fim do clipe sai
    * de CLIP_END_TAIL_SEC. Default 35s.

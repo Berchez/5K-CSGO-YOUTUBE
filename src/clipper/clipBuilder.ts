@@ -197,6 +197,21 @@ export interface ClipOptions {
   ocrEndRejected?: boolean;
   /** Motivo da virada do placar (confident/after-only/gap-inferred). */
   scoreboardEndReason?: string | null;
+  /**
+   * Dispersão entre a 1ª e a última kill do ace (ms).
+   *
+   * A âncora do killfeed (o instante lido, o motivo, o crop, as
+   * leituras de replay) NÃO vem por aqui: ela já vive em
+   * `ace.streamSync`, que o sidecar carrega junto — duplicar aqui
+   * deixaria dois campos com o mesmo nome e valores diferentes.
+   */
+  killsSpreadMs?: number | null;
+  /**
+   * Início do material mais antigo disponível no buffer (epoch ms):
+   * se for DEPOIS do round, o clipe só pode mostrar o replay. É o que
+   * distingue "o clipe abre tarde" de "o material ao vivo não existia".
+   */
+  bufferOldestMs?: number | null;
 }
 
 export interface PickOptions {
@@ -1232,6 +1247,14 @@ export async function buildClip(
         endPinnedBy: opts.endPinnedBy ?? null,
         ocrEndRejected: opts.ocrEndRejected ?? null,
         scoreboardEndReason: opts.scoreboardEndReason ?? null,
+        killsSpreadMs: opts.killsSpreadMs ?? null,
+        /**
+         * Início do material mais antigo disponível no buffer (epoch ms):
+         * se for DEPOIS do round, o clipe só pode mostrar o replay. É o
+         * que distingue "o clipe abre tarde" de "o material ao vivo não
+         * existia".
+         */
+        bufferOldestMs: opts.bufferOldestMs ?? null,
       }),
       null,
       2,
@@ -1335,6 +1358,36 @@ export function patchSidecarThumbnail(sidecarPath: string, thumbnailPath: string
     getLogger().warn(
       { err: String(e).slice(0, 200) },
       'falha ao anotar a thumbnail no sidecar',
+    );
+  }
+}
+
+/**
+ * Anota a AUDITORIA DA JANELA no sidecar (depois do render).
+ *
+ * O sidecar é o registro que sobrevive ao restart: é ele que permite
+ * dizer, meses depois, por que a janela do clipe ficou como ficou.
+ */
+export function patchSidecarAudit(
+  sidecarPath: string,
+  audit: {
+    action?: string;
+    violations?: string[];
+    reason?: string;
+    coversFirstKill?: boolean | null;
+    coversLastKill?: boolean | null;
+    startsAfterRoundEnd?: boolean | null;
+    liveMaterialAvailable?: boolean | null;
+  },
+): void {
+  try {
+    const doc = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
+    doc.clipWindowAudit = audit;
+    fs.writeFileSync(sidecarPath, JSON.stringify(doc, null, 2));
+  } catch (e) {
+    getLogger().warn(
+      { err: String(e).slice(0, 200) },
+      'falha ao anotar a auditoria da janela no sidecar',
     );
   }
 }

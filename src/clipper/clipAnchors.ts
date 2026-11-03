@@ -221,6 +221,62 @@ export interface ClipAnchors {
 export const MIN_CLIP_DURATION_SEC = 10;
 
 /**
+ * De onde veio a âncora que abriu o clipe.
+ *
+ * 'placar' = a âncora do placar (latência aplicada); 'killfeed' = a
+ * leitura direta da linha no killfeed (medição confirmada);
+ * 'killfeed+placar' = as duas coincidem.
+ */
+export type ClipStartAnchorSource = 'placar' | 'killfeed' | 'killfeed+placar';
+
+/** Entrada da decisão da âncora de início. */
+export interface ClipStartAnchorInput {
+  /** Âncora do killfeed: instante no vídeo da 1ª kill (ms). */
+  killfeedStartMs?: number | null;
+  /** Âncora do placar: início do round + latência aplicada (ms). */
+  scoreboardVideoStartMs?: number | null;
+}
+
+/**
+ * Decide a âncora de INÍCIO do clipe (puro/testável).
+ *
+ * Regra: o MENOR entre a âncora do killfeed e a do placar.
+ *
+ * Abrir CEDO é o lado barato do corte (um segundo a mais de contexto
+ * não perde nada); abrir Tarde perde a 1ª kill — o defeito que mais
+ * voltou. Por isso o mínimo vence sempre, mesmo com a leitura direta
+ * do killfeed: se o placar (com o teto de latência) for mais cedo, ele
+ * abre antes e nada se perde.
+ *
+ * A CONFIANÇA da âncora do killfeed não é decidida aqui: ela é usada
+ * em outro ponto (o teto de latência só é dispensado com âncora
+ * confirmada — `resolveStartLatency`). Aqui ela não muda nada, e uma
+ * âncora não confiável só pode tornar a abertura MAIS CEDO, que é o
+ * lado seguro.
+ */
+export function resolveClipStartAnchor(input: ClipStartAnchorInput): {
+  videoStartMs: number | undefined;
+  source: ClipStartAnchorSource;
+} {
+  const killfeed = input.killfeedStartMs ?? null;
+  const scoreboard = input.scoreboardVideoStartMs ?? null;
+  if (killfeed == null) {
+    return { videoStartMs: scoreboard ?? undefined, source: 'placar' };
+  }
+  if (scoreboard == null) {
+    return { videoStartMs: killfeed, source: 'killfeed' };
+  }
+  const chosen = Math.min(killfeed, scoreboard);
+  const source: ClipStartAnchorSource =
+    chosen === killfeed && chosen === scoreboard
+      ? 'killfeed+placar'
+      : chosen === killfeed
+        ? 'killfeed'
+        : 'placar';
+  return { videoStartMs: chosen, source };
+}
+
+/**
  * Calcula as âncoras do clipe.
  *
  * O fim tem dois caminhos:

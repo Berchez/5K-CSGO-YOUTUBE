@@ -431,4 +431,32 @@ describe('estimateStreamOffset', () => {
     expect(result.firstKillVideoMs).toBe(124_000);
     expect(result.firstKillMatched).toBe(true);
   });
+
+  it('leitura de REPLAY é rejeitada e NÃO vira âncora', () => {
+    // A linha lida com o banner "REPLAY" na tela é a REXIBIÇÃO da kill
+    // (o replay repete o killfeed do round): usá-la como âncora abre o
+    // clipe depois do round e perde o ace ao vivo (2399858_Mirage_r15).
+    const kills = [
+      kill(100_000, 'a', 'b'),
+      kill(130_000, 'c', 'd'),
+      kill(160_000, 'e', 'f'),
+    ];
+    const observations: KillfeedObservation[] = [
+      // A 1ª kill só apareceu na REXIBIÇÃO (bem depois do round).
+      { killIndex: 0, streamAtMs: 200_000, replay: true },
+      { killIndex: 1, streamAtMs: 155_000 },
+      { killIndex: 2, streamAtMs: 185_000 },
+    ];
+    const result = estimateStreamOffset(kills, observations, 5_000, 180);
+    expect(result.reason).toBe('confident');
+    // Só as 2 leituras ao vivo entram no cluster.
+    expect(result.matchedKills).toBe(2);
+    expect(result.firstKillMatched).toBe(false);
+    // A âncora vem do offset do cluster (125s), não da leitura de replay.
+    expect(result.firstKillVideoMs).toBe(124_000);
+    const rejected = (result.rejected ?? []).filter((entry) => entry.reason === 'replay');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.killIndex).toBe(0);
+    expect(rejected[0]?.streamAtMs).toBe(200_000);
+  });
 });

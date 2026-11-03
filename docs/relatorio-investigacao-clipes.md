@@ -1,5 +1,11 @@
 # Relatório de investigação — defeitos nos clipes
 
+> **Este arquivo é a arqueologia** (a investigação somente leitura até
+> 30/10/2026, com o estado das correções na seção 8). O **runbook
+> vigente** da janela de corte é `docs/janela-do-clipe.md` — ele tem o
+> contrato das invariantes, o procedimento de diagnóstico e a tabela do
+> que já foi tentado. Ao investigar a janela, comece pelo runbook.
+
 **Escopo original:** investigação somente leitura; nenhuma alteração foi feita durante essa fase. O estado das correções autorizadas posteriormente está na seção 8.
 
 ## 1. Resumo do pipeline atual

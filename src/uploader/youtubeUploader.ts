@@ -56,6 +56,13 @@ export interface UploadOptions {
   /** Metadados já gerados (IA ou template). Ausente = caminho legado. */
   metadata?: VideoMetadata;
   /**
+   * O clipe só tem o REPLAY do round (o material ao vivo não estava no
+   * buffer). No caminho legado (sem `metadata`) o marcador entra na
+   * descrição — "publicado marcado" não pode ser só uma promessa no
+   * log.
+   */
+  replayOnly?: boolean;
+  /**
    * Vídeo vertical (9:16) do feed Shorts: garante a hashtag de
    * classificação na descrição (é a convenção do canal) e ajusta o log.
    */
@@ -135,6 +142,9 @@ export async function uploadClip(
   let description = opts.metadata
     ? opts.metadata.description
     : buildDescription(ace, opts.defaultTags);
+  if (opts.replayOnly === true && !description.includes('replay do round')) {
+    description = `(replay do round — o material ao vivo não estava no buffer)\n\n${description}`;
+  }
   const tags = opts.metadata
     ? opts.metadata.tags
     : [...new Set([...opts.defaultTags.split(',').map((t) => t.trim()).filter(Boolean), ace.player, ace.map, ace.event])].slice(0, 30);

@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { KillEvent } from '../types.js';
-import { resolveFfprobeBin } from './segmentProbe.js';
-import { resolveFfmpegBin } from './clipBuilder.js';
+import { resolveFfprobeBin, resolveFfmpegBin } from './segmentProbe.js';
+import { configuredCropForStream, parseCropMapDetailed } from './scoreboardSync.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +64,68 @@ type OcrWorker = Awaited<ReturnType<typeof import('tesseract.js').createWorker>>
 export interface KillfeedObservation {
   killIndex: number;
   streamAtMs: number;
+  /**
+   * A linha foi lida em um frame com o aviso de REPLAY — ou seja, é a
+   * REEXIBIÇÃO da kill, não o momento ao vivo. Uma âncora lida no
+   * replay abre o clipe depois do round (o caso 2399858_Mirage_r15).
+   */
+  replay?: boolean;
+}
+
+/**
+ * Uma leitura do killfeed que virou CANDIDATO (passou no filtro de
+ * faixa): o instante no vídeo da 1ª aparição da linha e o offset
+ * correspondente.
+ *
+ * Exposto no log porque é a ÚNICA evidência que separa "a linha do
+ * round ao vivo" de "a linha do REPLAY": o replay reaparece o mesmo
+ * killfeed mais tarde, com um offset maior. Sem ver os candidatos, um
+ * `first-kill-only` que casou o replay é indistinguível de uma leitura
+ * boa (o caso 2399858_Mirage_r15).
+ */
+export interface KillfeedCandidate {
+  /** Índice da kill do ace (0 = 1ª kill). */
+  killIndex: number;
+  /** Instante no vídeo da 1ª aparição da linha (ms). */
+  streamAtMs: number;
+  /** `videoTime − (kill.at − atraso do placar)` (ms). */
+  offsetMs: number;
+}
+
+/** Uma leitura DESCARTADA pelo filtro de faixa, com o motivo. */
+export interface KillfeedRejected {
+  killIndex: number;
+  streamAtMs: number;
+  offsetMs: number;
+  reason: 'offset-negativo' | 'offset-alto' | 'sem-timestamp' | 'replay';
+  /** Quantas vezes o mesmo (kill, motivo) apareceu (agregado no log). */
+  count?: number;
+}
+
+/**
+ * Agrega os descartados por (kill, motivo).
+ *
+ * A mesma leitura errada aparece em vários frames seguidos (a linha do
+ * killfeed fica na tela por segundos): sem agregar, o log da calibração
+ * vira uma lista de centenas de linhas e o que importa (o motivo) se
+ * perde no volume. A primeira ocorrência de cada par fica, com a
+ * contagem de quantas foram.
+ */
+function aggregateRejected(rejected: KillfeedRejected[]): KillfeedRejected[] {
+  const out: KillfeedRejected[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const entry of rejected) {
+    const key = `${entry.killIndex}:${entry.reason}`;
+    const at = indexByKey.get(key);
+    if (at == null) {
+      indexByKey.set(key, out.length);
+      out.push({ ...entry, count: 1 });
+      continue;
+    }
+    const existing = out[at];
+    existing.count = (existing.count ?? 1) + 1;
+  }
+  return out;
 }
 
 /** Resultado da calibração pelo killfeed. */
@@ -129,6 +191,13 @@ export interface KillfeedSyncResult {
   /** Crop do killfeed que produziu as leituras. */
   crop?: string | null;
   /**
+   * Leituras que viraram candidato (passaram no filtro de faixa). É o
+   * histórico do que o OCR viu — inclusive as ocorrências do REPLAY.
+   */
+  candidates?: KillfeedCandidate[];
+  /** Leituras descartadas pelo filtro de faixa, com o motivo. */
+  rejected?: KillfeedRejected[];
+  /**
    * Segmentos varridos pelo OCR (diagnóstico do custo: cada um é um
    * ffmpeg + até N frames de tesseract por crop tentado).
    */
@@ -182,6 +251,14 @@ export interface KillfeedScanOptions {
    * puro — o OCR é o gargalo do bot.
    */
   rememberedCrop?: string | null;
+  /**
+   * Crop do aviso de REPLAY (o banner "REPLAY" do HLTV).
+   *
+   * Com ele, as leituras feitas durante a REEXIBIÇÃO do round são
+   * marcadas e não viram âncora: o replay repete as mesmas linhas do
+   * killfeed e a âncora lida nele abre o clipe depois do round.
+   */
+  replayCrop?: string | null;
   shouldStop?: () => boolean;
   pollIntervalMs?: number;
 }
@@ -300,6 +377,10 @@ export interface StreamOffsetEstimate {
   lastKillVideoMs: number | null;
   clusterKills: number;
   killVideoOffsetMs: number | null;
+  /** Leituras que viraram candidato (passaram no filtro de faixa). */
+  candidates: KillfeedCandidate[];
+  /** Leituras descartadas pelo filtro de faixa, com o motivo. */
+  rejected: KillfeedRejected[];
 }
 
 /**
@@ -335,6 +416,8 @@ export function estimateStreamOffset(
     lastKillVideoMs: null,
     clusterKills: 0,
     killVideoOffsetMs: null,
+    candidates: [],
+    rejected: [],
   });
   const timestamped = kills
     .map((kill, killIndex) => ({ kill, killIndex }))
@@ -352,11 +435,45 @@ export function estimateStreamOffset(
   // leitura legítima (a kill ficava sem observação nenhuma e o
   // resultado virava 'insufficient-matches').
   const firstSeenByKill = new Map<number, { streamAtMs: number; offsetMs: number }>();
+  const rejectedRaw: KillfeedRejected[] = [];
   for (const observation of observations) {
     const kill = kills[observation.killIndex];
-    if (!kill || !Number.isFinite(kill.at) || !Number.isFinite(observation.streamAtMs)) continue;
+    /**
+     * LEITURA DE REPLAY: a linha foi lida com o aviso "REPLAY" na tela
+     * — é a reexibição da kill, não o momento ao vivo. Ela não pode
+     * virar âncora (abriria o clipe depois do round), mas fica
+     * registrada como evidência no log.
+     */
+    if (observation.replay === true) {
+      rejectedRaw.push({
+        killIndex: observation.killIndex,
+        streamAtMs: observation.streamAtMs,
+        offsetMs: Number.NaN,
+        reason: 'replay',
+      });
+      continue;
+    }
+    if (!kill || !Number.isFinite(kill.at) || !Number.isFinite(observation.streamAtMs)) {
+      if (kill != null) {
+        rejectedRaw.push({
+          killIndex: observation.killIndex,
+          streamAtMs: observation.streamAtMs,
+          offsetMs: Number.NaN,
+          reason: 'sem-timestamp',
+        });
+      }
+      continue;
+    }
     const offsetMs = observation.streamAtMs - (kill.at! - scoreboardDelayMs);
-    if (offsetMs < MIN_ALLOWED_OFFSET_MS || offsetMs > maxLagSec * 1000) continue;
+    if (offsetMs < MIN_ALLOWED_OFFSET_MS || offsetMs > maxLagSec * 1000) {
+      rejectedRaw.push({
+        killIndex: observation.killIndex,
+        streamAtMs: observation.streamAtMs,
+        offsetMs,
+        reason: offsetMs < MIN_ALLOWED_OFFSET_MS ? 'offset-negativo' : 'offset-alto',
+      });
+      continue;
+    }
     const current = firstSeenByKill.get(observation.killIndex);
     if (current == null || observation.streamAtMs < current.streamAtMs) {
       firstSeenByKill.set(observation.killIndex, {
@@ -366,11 +483,18 @@ export function estimateStreamOffset(
     }
   }
 
-  const candidates = [...firstSeenByKill].map(([killIndex, first]) => ({
+  const candidates: KillfeedCandidate[] = [...firstSeenByKill].map(([killIndex, first]) => ({
     killIndex,
     offsetMs: first.offsetMs,
     streamAtMs: first.streamAtMs,
   }));
+
+  /**
+   * Os descartados saem AGREGADOS por (kill, motivo): a mesma leitura
+   * errada aparece em vários frames seguidos e o log não pode virar uma
+   * lista de centenas de linhas. O `count` diz quantas vezes aconteceu.
+   */
+  const rejected = aggregateRejected(rejectedRaw);
 
   /**
    * Quantas kills precisam casar para o cluster valer: no mínimo 2 (sem
@@ -493,6 +617,8 @@ export function estimateStreamOffset(
       lastKillVideoMs,
       clusterKills: firstClusterKills,
       killVideoOffsetMs: directKillVideoOffsetMs,
+      candidates,
+      rejected,
     };
   }
 
@@ -511,6 +637,8 @@ export function estimateStreamOffset(
       lastKillVideoMs,
       clusterKills: firstClusterKills,
       killVideoOffsetMs: directKillVideoOffsetMs,
+      candidates,
+      rejected,
     };
   }
 
@@ -538,6 +666,8 @@ export function estimateStreamOffset(
        */
       killVideoOffsetMs:
         Math.round(clusterOffsetMs) - scoreboardDelayMs - KILLFEED_APPEAR_DELAY_MS,
+      candidates,
+      rejected,
     };
   }
 
@@ -552,11 +682,31 @@ export function estimateStreamOffset(
     lastKillVideoMs,
     clusterKills,
     killVideoOffsetMs: null,
+    candidates,
+    rejected,
   };
 }
 
 function normalizeNickname(value: string): string[] {
   return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/**
+ * O texto lido no crop do replay contém o aviso "REPLAY"?
+ *
+ * O OCR erra o banner com frequência ("REPIAY", "REPLAV", "REPI A Y"), por
+ * isso a comparação é por distância de edição (1) sobre as janelas de 6
+ * letras do texto normalizado.
+ *
+ * Puro/testável.
+ */
+export function looksLikeReplay(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[^a-z]/g, '');
+  if (normalized.length < 6) return false;
+  for (let i = 0; i + 6 <= normalized.length; i++) {
+    if (editDistance(normalized.slice(i, i + 6), 'replay', 1) <= 1) return true;
+  }
+  return false;
 }
 
 /** Chave do nome: minúsculas, sem separadores ("KaiR0N-" → "kair0n"). */
@@ -723,9 +873,98 @@ function parseCrop(raw: string): CropCandidate | null {
 }
 
 /**
+ * Resolve o crop do banner de REPLAY para o canal (puro/testável).
+ *
+ * A guarda de replay só funciona se o banner estiver DENTRO do crop: o
+ * banner muda de lugar conforme o organizador do HLTV e o crop errado
+ * não dá erro nenhum — a guarda simplesmente nunca age, e o clipe
+ * errado passa. Por isso:
+ *
+ * - o crop por canal tem precedência sobre o global;
+ * - crop inválido (global ou por canal) sai como AVISO, não como
+ *   silêncio.
+ */
+export function resolveReplayCrop(params: {
+  globalCrop: string;
+  byStreamRaw?: string | null;
+  streamName?: string;
+}): { crop: string | null; warnings: string[] } {
+  const warnings: string[] = [];
+  const { map, invalid } = parseCropMapDetailed(params.byStreamRaw ?? '');
+  for (const entry of invalid) {
+    warnings.push(`crop de replay inválido no mapa por canal (${entry}) — usando o global`);
+  }
+  const name = (params.streamName ?? '').trim().toLowerCase();
+  const perStream = name ? configuredCropForStream(map, name) : null;
+  const globalCrop = (params.globalCrop ?? '').trim();
+  if (perStream != null) return { crop: perStream, warnings };
+  if (parseCrop(globalCrop) == null) {
+    warnings.push(
+      `crop de replay global inválido (${globalCrop || 'vazio'}) — a guarda de replay fica DESLIGADA`,
+    );
+    return { crop: null, warnings };
+  }
+  return { crop: globalCrop, warnings };
+}
+
+/**
+ * Lê o aviso de REPLAY de UM frame do segmento.
+ *
+ * Só é chamada nos frames que casaram uma kill (poucos por segmento),
+ * então o custo extra é de um ffmpeg + um tesseract por acerto.
+ */
+async function readReplayBanner(
+  file: string,
+  offsetSec: number,
+  crop: CropCandidate,
+  ffmpeg: string,
+  worker: OcrWorker,
+  sharp: typeof import('sharp').default,
+): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync(
+      ffmpeg,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-ss',
+        offsetSec.toFixed(3),
+        '-i',
+        file,
+        '-frames:v',
+        '1',
+        '-vf',
+        `crop=iw*${crop.w}:ih*${crop.h}:iw*${crop.x}:ih*${crop.y}`,
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'png',
+        '-',
+      ],
+      { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+    );
+    const image = await sharp(stdout)
+      .resize({ width: 1600 })
+      .grayscale()
+      .normalize()
+      .png()
+      .toBuffer();
+    const { data } = await worker.recognize(image);
+    return looksLikeReplay(String(data.text ?? ''));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Varre um segmento procurando o killfeed. Tenta o crop principal; se
  * não casar nenhuma kill, tenta os alternativos (o killfeed fica em
  * cantos diferentes conforme o canal).
+ *
+ * Os frames que casam passam pela GUARDA DE REPLAY: a linha lida com o
+ * aviso "REPLAY" na tela é a reexibição da kill, não o momento ao vivo
+ * — usá-la como âncora abre o clipe depois do round.
  */
 async function scanSegment(
   file: string,
@@ -737,6 +976,7 @@ async function scanSegment(
   kills: KillEvent[],
   segmentEndMs: number,
   crops: CropCandidate[],
+  replayCrop: CropCandidate | null,
   abort?: () => boolean,
 ): Promise<{ observations: KillfeedObservation[]; crop: string | null }> {
   const observations: KillfeedObservation[] = [];
@@ -770,6 +1010,18 @@ async function scanSegment(
     const frames = fs.readdirSync(framesDir).filter((name) => name.endsWith('.png')).sort();
     const segmentStartMs = segmentEndMs - durationSec * 1000;
     let matched = 0;
+    /**
+     * ÚLTIMO frame em que cada kill foi vista (e o banner lido nela):
+     * a linha do killfeed fica na tela por segundos, e reler o banner
+     * em CADA frame é um ffmpeg + um tesseract por frame à toa.
+     *
+     * O que interessa é a PRIMEIRA aparição de cada kill (o instante ao
+     * vivo) e as aparições NOVAS (a linha sumiu e voltou = a reexibição
+     * do round). Frames seguidos com a mesma kill reusam a leitura do
+     * banner — é a mesma linha na tela, o banner não muda no meio.
+     */
+    const lastFrameByKill = new Map<number, number>();
+    const replayByKill = new Map<number, boolean>();
     for (let i = 0; i < frames.length; i++) {
       if (abort?.()) break;
       const image = await sharp(path.join(framesDir, frames[i]))
@@ -780,8 +1032,33 @@ async function scanSegment(
         .toBuffer();
       const { data } = await worker.recognize(image);
       const streamAtMs = segmentStartMs + (i * 1000) / SAMPLE_RATE;
-      for (const killIndex of matchKillfeedText(String(data.text ?? ''), kills)) {
-        observations.push({ killIndex, streamAtMs });
+      const matchedKills = matchKillfeedText(String(data.text ?? ''), kills);
+      if (matchedKills.length === 0) continue;
+      /**
+       * GUARDA DE REPLAY: o frame que casou mostra o aviso "REPLAY"?
+       * Se mostrar, a linha é a reexibição da kill (o replay reexibe o
+       * killfeed do round) — e usá-la como âncora abre o clipe DEPOIS
+       * do round, perdendo o ace ao vivo.
+       *
+       * O banner é lido UMA vez por aparição (agrupamento de frames
+       * seguidos): uma aparição nova da mesma kill (a linha voltou) é
+       * lida de novo — é ela que distingue o vivo da reexibição.
+       */
+      const isNewOccurrence = (killIndex: number): boolean => {
+        const last = lastFrameByKill.get(killIndex);
+        return last == null || i - last > 1;
+      };
+      const needsBanner = replayCrop != null && matchedKills.some(isNewOccurrence);
+      const banner =
+        needsBanner && replayCrop != null
+          ? await readReplayBanner(file, i / SAMPLE_RATE, replayCrop, ffmpeg, worker, sharp)
+          : null;
+      for (const killIndex of matchedKills) {
+        const fresh = isNewOccurrence(killIndex);
+        const replay = fresh ? (banner ?? false) : (replayByKill.get(killIndex) ?? false);
+        replayByKill.set(killIndex, replay);
+        lastFrameByKill.set(killIndex, i);
+        observations.push({ killIndex, streamAtMs, replay });
         matched++;
       }
     }
@@ -844,6 +1121,11 @@ export async function scanKillfeedForLatency(
     };
   }
   const { startMs: scanStartMs, endMs: scanEndMs } = window;
+  /**
+   * Crop do aviso de replay (vazio = guarda desligada).
+   */
+  const replayCropCandidate =
+    options.replayCrop != null ? parseCrop(options.replayCrop) : null;
   /**
    * Orçamento de espera: o material da janela precisa chegar ao buffer.
    * Sem prazo, uma stream que caiu (ou cujo buffer não avança mais)
@@ -958,6 +1240,7 @@ export async function scanKillfeedForLatency(
           kills,
           segmentEndMs,
           segmentCrops,
+          replayCropCandidate,
           aborted,
         );
         segmentsScanned++;

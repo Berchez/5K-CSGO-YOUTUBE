@@ -167,6 +167,12 @@ export interface MetadataOptions {
    * `at`, deixa o timestamp da descrição alinhado com a tela.
    */
   killTimeOffsetMs?: number;
+  /**
+   * O clipe só tem o REPLAY do round (o material ao vivo não estava no
+   * buffer). O marcador vai para a descrição: um clipe marcado só no
+   * log é indistinguível de um clipe normal para quem assiste.
+   */
+  replayOnly?: boolean;
 }
 
 export interface VideoMetadata {
@@ -836,6 +842,15 @@ export function composeDescription(
 ): string {
   const isShorts = opts.format === 'shorts';
   const blocks = [opening.trim()];
+  /**
+   * Marcador de replay: o clipe mostra a REXIBIÇÃO do round, não o
+   * round ao vivo (o material ao vivo não estava no buffer). Fica no
+   * TOPO da descrição — é a informação que muda o que o espectador
+   * espera ver.
+   */
+  if (opts.replayOnly === true) {
+    blocks.unshift('(replay do round — o material ao vivo não estava no buffer)');
+  }
   const runLine = buildRunLine(ctx, opening);
   if (runLine) blocks.push(runLine);
   // No Short a lista de eliminações com timestamp não é lida (e come o

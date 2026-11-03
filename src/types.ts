@@ -155,7 +155,49 @@ export interface AceEvent {
     estimatedStartLatencyMs?: number | null;
     /** Crop do placar que produziu a leitura. */
     crop?: string | null;
+    /**
+     * De onde veio a ÂNCORA que abriu o clipe: 'placar', 'killfeed'
+     * (medição confirmada) ou 'killfeed+placar' (o menor dos dois).
+     */
+    anchorSource?: 'placar' | 'killfeed' | 'killfeed+placar' | null;
+    /**
+     * Âncora do killfeed: o instante no VÍDEO da 1ª kill lida no
+     * killfeed (ms). Com o motivo (`killfeedReason`), é a evidência
+     * que diz se a janela foi aberta por uma leitura ao vivo ou pela
+     * reexibição do replay.
+     */
+    killfeedFirstKillVideoMs?: number | null;
+    /** Motivo da medição do killfeed (confident/first-kill-only/...). */
+    killfeedReason?: string | null;
+    /** Crop do killfeed que produziu a leitura. */
+    killfeedCrop?: string | null;
+    /**
+     * Leituras do killfeed descartadas por serem REEXIBIÇÃO (o banner
+     * "REPLAY" na tela): elas provam que o round já tinha acabado
+     * quando a âncora foi lida.
+     */
+    killfeedReplayReads?: number | null;
   };
+  /**
+   * Dispersão entre a 1ª e a última kill do ace (ms). Acima do limite a
+   * lista de kills mistura rounds (o `at` do HLTV é o instante do poll,
+   * que atrasa 5..16s por kill) e o clipe atravessa a partida.
+   */
+  killsSpreadMs?: number | null;
+  /**
+   * Auditoria da JANELA depois de renderizar (diagnóstico + guardrail):
+   * as invariantes conferidas e a ação decidida (publicar, descartar
+   * ou publicar marcado como replay).
+   */
+  clipWindowAudit?: {
+    action?: 'ok' | 'discard' | 'replay-only';
+    violations?: string[];
+    reason?: string;
+    coversFirstKill?: boolean | null;
+    coversLastKill?: boolean | null;
+    startsAfterRoundEnd?: boolean | null;
+    liveMaterialAvailable?: boolean | null;
+  } | null;
   /**
    * A janela do clipe contém quebra de continuidade da timeline da
    * fonte (descontinuidade de PTS/salto/stall): o material pode ter um
@@ -200,4 +242,11 @@ export interface ClipResult {
   clipStartMs?: number;
   /** Duração real do clipe (s), medida no arquivo final. */
   clipDurationSec?: number;
+  /**
+   * Início do material mais antigo disponível no buffer (epoch ms): se
+   * for DEPOIS do round, o clipe só pode mostrar a reexibição dele.
+   */
+  bufferOldestMs?: number | null;
+  /** De onde veio a âncora que abriu o clipe (placar/killfeed/...). */
+  anchorSource?: 'placar' | 'killfeed' | 'killfeed+placar' | null;
 }

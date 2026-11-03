@@ -21,6 +21,7 @@
     "publish:shorts": "tsx scripts/publish-shorts.ts",
     "diag:av": "tsx scripts/diag-buffer-av.ts",
     "diag:thumbs": "tsx scripts/diag-thumbs.ts",
+    "diag:clip": "tsx scripts/diag-clip-window.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
