@@ -17,6 +17,7 @@ function kill(at: number, killer: string, victim: string): KillEvent {
     weapon: 'AK47',
     at,
     round: 1,
+    map: 'Mirage',
     team: 'A',
   } as KillEvent;
 }

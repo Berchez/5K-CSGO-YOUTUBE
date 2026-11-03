@@ -859,7 +859,7 @@ describe('resolveAdaptiveLatency', () => {
       latencyMs: -11_000,
       source: 'scoreboard',
       quality: 'confident',
-      reference: 'timer',
+      reference: 'timer-hltv',
     };
     const decision = resolveAdaptiveLatency({
       configuredMs: 25_000,

@@ -8,7 +8,7 @@ import type { AceEvent, ClipResult } from '../types.js';
 import { getLogger } from '../logger.js';
 import { makeSmartThumbnail, type SmartThumbOptions } from './thumbnail.js';
 import { describeAce, killLabel, prettyWeapon } from '../detector/aceDetector.js';
-import { killAll, killStale, track, untrack } from '../procRegistry.js';
+import { killStale, track, untrack } from '../procRegistry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -239,7 +239,6 @@ async function isSegmentReadable(file: string): Promise<boolean> {
 }
 
 export type { ConcatSpan, SegmentAvIssue } from './segmentProbe.js';
-export { classifySegmentAv, inspectSegmentAv, probeConcatSpan, probeSegmentPackets, resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
 import { inspectSegmentAv, probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin, type SegmentAvIssue } from './segmentProbe.js';
 
 /**

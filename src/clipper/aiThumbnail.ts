@@ -262,7 +262,6 @@ REGRAS
  */
 export function buildBackgroundPrompt(ace: AceEvent): string {
   const s = ace.summary;
-  const mainWeapon = s?.mainWeapon ? prettyWeapon(s.mainWeapon) : 'assault rifle';
   const weaponFlavor =
     s?.mainWeapon === 'awp'
       ? 'a sniper rifle silhouette glowing in the foreground,'

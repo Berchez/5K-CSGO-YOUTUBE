@@ -24,7 +24,7 @@
     "diag:clip": "tsx scripts/diag-clip-window.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "playwright:install": "npx playwright install chromium"
   },
   "dependencies": {

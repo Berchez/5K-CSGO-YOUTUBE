@@ -46,7 +46,6 @@ import {
   killPositionsByKill,
   planShortWindow,
   renderShortClip,
-  type ShortWindow,
 } from '../src/clipper/shorts.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, type VideoMetadata } from '../src/uploader/videoMetadata.js';

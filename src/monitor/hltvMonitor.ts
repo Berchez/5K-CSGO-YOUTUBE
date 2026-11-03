@@ -780,7 +780,6 @@ export async function fetchMatchListing(
   filter: LiveMatchFilter = {},
 ): Promise<ListingResult> {
   const log = getLogger();
-  const b = await getBrowser();
   // Sem userAgent fixo de propósito: o contexto stealth envia UA autêntico
   // (+ Client Hints consistentes); UA fixo desatualizado é assinatura clássica.
   const page: Page = await newTrackedPage();

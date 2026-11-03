@@ -368,6 +368,7 @@ function rawCards(partial: Partial<ListingCards>): ListingCards {
     upcomingError: null,
     liveCardErrors: 0,
     upcomingCardErrors: 0,
+    brokenLiveIds: [],
     ...partial,
   };
 }

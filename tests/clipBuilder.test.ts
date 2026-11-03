@@ -1,10 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, makeClipThumbnail, newestSegmentEndMs, parseFreezeIntervals, patchSidecarThumbnail, pickSegments, probeConcatSpan, REPLAY_AWARE_MIN_OVERLAP_MS, resolveConcatTimeline, resolveFfmpegBin, resolveFfprobeBin, resolveReplayAwareEndMs, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { applyDurationCap, buildClip, computeTrimEndSec, computeTrimStartSec, contiguousTail, detectActionResume, detectTruncatedStart, findMotionResume, makeClipThumbnail, newestSegmentEndMs, parseFreezeIntervals, patchSidecarThumbnail, pickSegments, REPLAY_AWARE_MIN_OVERLAP_MS, resolveConcatTimeline, resolveReplayAwareEndMs, sanitizeSegments, verifySegmentAv } from '../src/clipper/clipBuilder.js';
+import { probeConcatSpan, resolveFfmpegBin, resolveFfprobeBin } from '../src/clipper/segmentProbe.js';
 import { computeAceEndMs } from '../src/clipper/clipAnchors.js';
+
+// ffmpeg pelo nome (isSegmentReadable/render): .tools no PATH — restaurado no fim.
+const originalPath = process.env.PATH;
+process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${originalPath ?? ''}`;
+afterAll(() => {
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
+});
 
 // Bin vendored em .tools/ ou PATH — não assume Windows. Sem ffmpeg
 // executável os e2es pulam (CI Linux sem os bins não falha).
@@ -762,9 +771,6 @@ describe('resolveReplayAwareEndMs (replay-aware aplicado)', () => {
 });
 
 describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', () => {
-  // ffmpeg pelo nome (isSegmentReadable/render): .tools no PATH
-  process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
-
   it(
     'produz mp4 com vídeo+áudio a partir de segmentos TS',
     async () => {
@@ -888,8 +894,6 @@ describe.skipIf(!ffmpegOk)('sanitizeSegments (fonte congelada: o mais novo está
 });
 
 describe.skipIf(!ffmpegOk)('makeClipThumbnail (F4: thumb depois do upload)', () => {
-  process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
-
   it('gera a jpg ao lado do mp4 e anota no sidecar', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbclip-'));
     try {

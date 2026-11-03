@@ -2722,7 +2722,7 @@ async function main(): Promise<void> {
   if (deprecated.length > 0) {
     log.warn(
       { vars: deprecated },
-      'envs depreciadas no .env — ignoradas pelo bot (remova do arquivo)',
+      'envs depreciadas no ambiente — ignoradas pelo bot (remova do .env ou do shell/pm2)',
     );
   }
   const invalidBools = invalidBoolEnvs();
