@@ -1,9 +1,48 @@
 /**
  * HTTP dos providers de nuvem: timeout explícito e erro que mostra o que
  * a API respondeu (sem o corpo inteiro no log).
+ *
+ * O timeout vale até o FIM da leitura do corpo: um servidor que manda os
+ * headers e trava no corpo não pode segurar o processo. Por isso o timer
+ * vive junto da `Response` e é liberado em `readJsonResponse`.
  */
 
-/** `fetch` com AbortController (funciona no Node 20+ sem depender de DOM). */
+/** Estado do timeout de uma resposta (ms, abort e liberação). */
+interface ResponseTimeoutState {
+  /** Timeout usado (ms) — aparece na mensagem de erro. */
+  timeoutMs: number;
+  /** O timer já disparou (o abort foi por timeout). */
+  timedOut: boolean;
+  /** Limpa o timer (idempotente). */
+  release: () => void;
+}
+
+/** Timer por resposta: só o `WeakMap` mantém a referência viva. */
+const responseTimeouts = new WeakMap<Response, ResponseTimeoutState>();
+
+/**
+ * Libera o timer de uma resposta (chame quando o corpo não for mais
+ * lido). Idempotente: chamar duas vezes não faz nada.
+ */
+export function releaseResponseTimeout(res: Response): void {
+  const state = responseTimeouts.get(res);
+  if (!state) return;
+  responseTimeouts.delete(res);
+  state.release();
+}
+
+/** `unref` do timer: um timer esquecido não segura o processo Node. */
+function unrefTimer(timer: unknown): void {
+  const unref = (timer as unknown as { unref?: () => void }).unref;
+  if (typeof unref === 'function') unref.call(timer);
+}
+
+/**
+ * `fetch` com AbortController (funciona no Node 20+ sem depender de DOM).
+ *
+ * O timer NÃO é limpo aqui: ele continua valendo durante a leitura do
+ * corpo (veja `readJsonResponse`, que o libera no `finally`).
+ */
 export async function fetchWithTimeout(
   url: string,
   init: RequestInit,
@@ -11,20 +50,48 @@ export async function fetchWithTimeout(
 ): Promise<Response> {
   const ms = Math.max(1_000, Number(timeoutMs) || 60_000);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
+  const state: ResponseTimeoutState = {
+    timeoutMs: ms,
+    timedOut: false,
+    release: () => {},
+  };
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    controller.abort();
+  }, ms);
+  state.release = () => clearTimeout(timer);
+  unrefTimer(timer);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    responseTimeouts.set(res, state);
+    return res;
   } catch (e) {
-    if (controller.signal.aborted) throw new Error(`timeout após ${ms}ms`);
+    state.release();
+    if (state.timedOut) throw new Error(`timeout após ${ms}ms`);
     throw e;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
-/** Lê o corpo como JSON; em erro, joga status + trecho do corpo. */
+/**
+ * Lê o corpo como JSON; em erro, joga status + trecho do corpo.
+ *
+ * O timer da resposta é liberado em TODOS os caminhos (sucesso, erro,
+ * corpo vazio). Se o corpo foi cortado pelo timeout, o erro sai como
+ * timeout (e não como falha genérica de stream).
+ */
 export async function readJsonResponse(res: Response): Promise<unknown> {
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (e) {
+    const state = responseTimeouts.get(res);
+    if (state?.timedOut) {
+      throw new Error(`timeout após ${state.timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    releaseResponseTimeout(res);
+  }
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
   }

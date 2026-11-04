@@ -111,6 +111,7 @@ function clipThumbOptions(
       chatgptMinimized: cfg.CHATGPT_MINIMIZED,
       grokProfileDir: cfg.GROK_PROFILE,
       grokMinimized: cfg.GROK_MINIMIZED,
+      composite: cfg.THUMB_COMPOSITE,
       references,
     },
   };

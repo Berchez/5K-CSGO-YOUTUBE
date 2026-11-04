@@ -15,7 +15,7 @@ import {
   SHORT_DEFAULT_MAX_SEC,
   SHORT_DEFAULT_MIN_SEC,
 } from '../src/clipper/shorts.js';
-import { wrapShortTitle } from '../src/clipper/shortBanner.js';
+import { fitBannerText, wrapShortTitle } from '../src/clipper/shortBanner.js';
 
 describe('planShortWindow', () => {
   it('a folga padrão antes da 1ª kill é 4s (o gancho precisa de respiro)', () => {
@@ -505,6 +505,54 @@ describe('wrapShortTitle (faixa de texto)', () => {
   it('título vazio não gera linha', () => {
     expect(wrapShortTitle('', 20, 3)).toEqual([]);
     expect(wrapShortTitle(null, 20, 3)).toEqual([]);
+  });
+
+  it('emoji do título não vira quadradinho (tofu) na faixa', () => {
+    // A fonte da faixa é do sistema (sem fallback de emoji): o emoji
+    // saía como tofu no topo do Short.
+    const lines = wrapShortTitle('5K 🔥 donk!! 🎯', 20, 3);
+    expect(lines.join(' ')).toBe('5K donk!!');
+    for (const line of lines) {
+      expect(line).not.toMatch(/[\u{1F000}-\u{1FAFF}]/u);
+    }
+  });
+});
+
+describe('fitBannerText (o texto cabe na faixa)', () => {
+  const largura = 1080;
+
+  it('título de 1 linha cheia não encosta nas bordas', () => {
+    // Antes o limite de caracteres era fixo (w/52) e o tamanho da fonte
+    // crescia com menos linhas: um título de 21 caracteres saía colado
+    // nas duas bordas da faixa.
+    const fit = fitBannerText(largura, 'AAAAAAAAAAAAAAAAAAAAA', null);
+    const maisLonga = fit.lines.reduce((max, l) => Math.max(max, l.length), 0);
+    expect(maisLonga * fit.size * 0.62).toBeLessThanOrEqual(fit.maxWidth);
+  });
+
+  it('título de 2 linhas também cabe', () => {
+    const fit = fitBannerText(largura, '4K! KSCERATO — Ancient R27 | IEM Beijing 2026', null);
+    const maisLonga = fit.lines.reduce((max, l) => Math.max(max, l.length), 0);
+    expect(maisLonga * fit.size * 0.62).toBeLessThanOrEqual(fit.maxWidth);
+    expect(fit.lines.length).toBeGreaterThan(0);
+  });
+
+  it('o subtítulo é cortado (com reticências) quando é longo', () => {
+    const fit = fitBannerText(largura, '5K', 'x'.repeat(200));
+    expect(fit.subtitle.length).toBeLessThan(200);
+    expect(fit.subtitle.endsWith('…')).toBe(true);
+  });
+
+  it('título vazio não quebra', () => {
+    const fit = fitBannerText(largura, '', null);
+    expect(fit.lines).toEqual([]);
+    expect(fit.subtitle).toBe('');
+  });
+
+  it('emoji sai do título e do subtítulo (nem tofu, nem sobra de espaço)', () => {
+    const fit = fitBannerText(largura, '🔥 5K donk 🎯', 'KSCERATO 🚀');
+    expect(fit.lines.join(' ')).toBe('5K donk');
+    expect(fit.subtitle).toBe('KSCERATO');
   });
 });
 

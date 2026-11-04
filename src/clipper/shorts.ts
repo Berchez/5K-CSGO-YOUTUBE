@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
+import { repoPath } from '../paths.js';
 import { resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
 import { isValidCrop } from './scoreboardSync.js';
 import { renderShortBannerPng, type ShortBannerText } from './shortBanner.js';
-import { escapeAssFilterPath } from './shortCaptions.js';
+import { escapeAssFilterPath, safeAssName } from './shortCaptions.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -449,7 +450,10 @@ export interface ShortLayoutOptions {
   gameFit?: ShortGameFit;
   gameAspect?: number;
   cropX?: number;
-  /** Dimensoes reais da fonte (default 1920x1080). */
+  /**
+   * Dimensoes reais da fonte (default 1920x1080). O render sempre passa
+   * a medida do ffprobe — o default é só para chamadas sem probe.
+   */
   srcWidth?: number;
   srcHeight?: number;
   /**
@@ -528,10 +532,18 @@ export function buildShortLayout(opts: ShortLayoutOptions): ShortLayout {
   const cropX = clamp(opts.cropX ?? 0.5, 0, 1);
   const wanted = opts.top;
   const camBox = wanted === 'cam' ? (opts.camBox ?? null) : null;
-  // Legenda queimada: o `ass` entra DEPOIS do empilhamento, para as
-  // coordenadas da legenda serem as do vertical (1080x1920).
+  /**
+   * Legenda queimada: o `ass` entra DEPOIS do empilhamento, para as
+   * coordenadas da legenda serem as do vertical (1080x1920).
+   *
+   * O filtro usa só o NOME do arquivo: o ffmpeg roda com o cwd na pasta
+   * do `.ass` (ver `renderShortClip`), então o caminho absoluto — que no
+   * Windows traz `C:` e pode ter apóstrofo — nunca entra no filtergraph
+   * (o `C:` quebra o filtro e o apóstrofo fecha a aspa).
+   */
   const captionsFilter = opts.captionsAssPath
-    ? `ass=filename=${escapeAssFilterPath(opts.captionsAssPath)}`
+    ? `ass=filename=${escapeAssFilterPath(safeAssName(opts.captionsAssPath))}` +
+      `:fontsdir=${escapeAssFilterPath(repoPath('assets', 'fonts'))}`
     : '';
   if (wanted === 'center' || (wanted === 'cam' && !camBox)) {
     const chain = `[0:v]${shortVideoFilter({ width, height, cropX })}`;
@@ -844,12 +856,13 @@ export async function hasAudioStream(file: string): Promise<boolean> {
 const FFMPEG_TIMEOUT_MS = 900_000;
 
 /** execFile com log do erro (o render do Short é um passo do script). */
-async function runFfmpeg(args: string[]): Promise<void> {
+async function runFfmpeg(args: string[], cwd?: string): Promise<void> {
   const bin = resolveFfmpegBin();
   await new Promise<void>((resolve, reject) => {
     const p: ChildProcess = spawn(bin, args, {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
+      cwd,
     });
     let stderr = '';
     let settled = false;
@@ -901,7 +914,29 @@ export async function renderShortClip(
   const log = getLogger();
   const startSec = Math.max(0, opts.startSec);
   const durSec = Math.max(1, opts.durSec);
-  const info = await probeVideoInfo(inPath);
+  // Caminhos ABSOLUTOS: com a legenda o ffmpeg roda com o cwd na pasta do
+  // `.ass` (o filtro usa só o nome do arquivo) e um caminho relativo
+  // deixaria de apontar para o arquivo certo.
+  const srcPath = path.resolve(inPath);
+  const dstPath = path.resolve(outPath);
+  /**
+   * A geometria do crop (caixa da cam e fatia do jogo) sai da resolução
+   * REAL do clipe. Sem o ffprobe o ffmpeg receberia um crop calculado
+   * para 1920x1080: numa fonte 720p ele estoura o quadro (o ffmpeg aborta)
+   * e numa 1440p ele aponta para outro lugar da cena (a faixa da cam sai
+   * errada). Melhor recusar com mensagem clara do que renderizar errado.
+   */
+  if (!resolveFfprobeBin()) {
+    throw new Error(
+      'ffprobe indisponível: o Short precisa da resolução real do clipe (o crop da cam e do jogo saem dela) — instale o ffprobe em .tools/',
+    );
+  }
+  const info = await probeVideoInfo(srcPath);
+  if (!info) {
+    throw new Error(
+      `não consegui medir a resolução de ${path.basename(srcPath)} (ffprobe falhou) — o crop do Short seria um palpite`,
+    );
+  }
   const layout = buildShortLayout({
     width: opts.width ?? 1080,
     height: opts.height ?? 1920,
@@ -915,22 +950,22 @@ export async function renderShortClip(
     gameFit: opts.gameFit,
     gameAspect: opts.gameAspect,
     cropX: opts.cropX,
-    srcWidth: info?.width,
-    srcHeight: info?.height,
+    srcWidth: info.width,
+    srcHeight: info.height,
     captionsAssPath: opts.captionsAssPath ?? null,
   });
   const filter = layout.filter;
-  const withAudio = await hasAudioStream(inPath);
+  const withAudio = await hasAudioStream(srcPath);
   if (opts.top === 'cam' && layout.top === 'center') {
     log.warn(
-      { in: path.basename(inPath) },
+      { in: path.basename(srcPath) },
       'Short sem caixa de cam para o canal — usando o crop central 9:16',
     );
   }
   let bannerPath: string | null = null;
   let ownBanner = false;
   if (layout.top === 'text') {
-    bannerPath = opts.bannerPng ?? null;
+    bannerPath = opts.bannerPng ? path.resolve(opts.bannerPng) : null;
     if (!bannerPath) {
       bannerPath = path.join(
         os.tmpdir(),
@@ -948,17 +983,33 @@ export async function renderShortClip(
   // A pasta de destino tem que existir ANTES do ffmpeg: o mkdir do caller
   // vinha depois do render e o ffmpeg abortava com "Error opening output
   // file" (o Short nunca era gerado para um clipe novo).
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.mkdirSync(path.dirname(dstPath), { recursive: true });
 
   // Render ATÓMICO: o ffmpeg escreve num `.tmp` e o arquivo final só
   // aparece pronto. Um render interrompido (timeout, disco cheio) deixava
   // um mp4 pela metade no destino — e o script o tratava como "vertical já
   // existe" e pulava o clipe para sempre.
-  const tmpPath = `${outPath}.tmp.mp4`;
+  const tmpPath = `${dstPath}.tmp.mp4`;
   try {
     fs.rmSync(tmpPath, { force: true });
   } catch {
     // best-effort
+  }
+
+  /**
+   * O nome do `.ass` no filtro é sempre SEGURO (o filtergraph não
+   * aceita apóstrofo): quando o arquivo tem um nome que o filtro não
+   * aceita, o render usa uma cópia com o nome seguro, na mesma pasta
+   * (o ffmpeg roda com o cwd nela).
+   */
+  let assCopyPath: string | null = null;
+  if (opts.captionsAssPath) {
+    const assPath = path.resolve(opts.captionsAssPath);
+    const safe = safeAssName(assPath);
+    if (path.basename(assPath) !== safe) {
+      assCopyPath = path.join(path.dirname(assPath), safe);
+      fs.copyFileSync(assPath, assCopyPath);
+    }
   }
 
   const args = [
@@ -970,7 +1021,7 @@ export async function renderShortClip(
     '-ss',
     startSec.toFixed(2),
     '-i',
-    inPath,
+    srcPath,
   ];
   if (bannerPath) {
     // A faixa de texto é uma imagem parada: `-loop 1` + a taxa da fonte
@@ -1007,7 +1058,10 @@ export async function renderShortClip(
   args.push('-movflags', '+faststart', tmpPath);
 
   try {
-    await runFfmpeg(args);
+    // Com legenda, o ffmpeg roda na pasta do `.ass`: o filtro usa só o
+    // NOME do arquivo (o caminho absoluto com `C:` e apóstrofo quebra o
+    // filtergraph).
+    await runFfmpeg(args, opts.captionsAssPath ? path.dirname(path.resolve(opts.captionsAssPath)) : undefined);
   } catch (e) {
     try {
       fs.rmSync(tmpPath, { force: true });
@@ -1019,6 +1073,13 @@ export async function renderShortClip(
     if (ownBanner && bannerPath) {
       try {
         fs.rmSync(bannerPath, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    if (assCopyPath) {
+      try {
+        fs.rmSync(assCopyPath, { force: true });
       } catch {
         // best-effort
       }
@@ -1037,29 +1098,29 @@ export async function renderShortClip(
     throw new Error(`Short renderizado ilegível (duração ${outDur})`);
   }
   try {
-    fs.rmSync(outPath, { force: true });
-    fs.renameSync(tmpPath, outPath);
+    fs.rmSync(dstPath, { force: true });
+    fs.renameSync(tmpPath, dstPath);
   } catch (e) {
     try {
       fs.rmSync(tmpPath, { force: true });
     } catch {
       // best-effort
     }
-    throw new Error(`não consegui gravar o vertical em ${outPath}: ${String(e).slice(0, 160)}`);
+    throw new Error(`não consegui gravar o vertical em ${dstPath}: ${String(e).slice(0, 160)}`);
   }
   if (outDur == null) {
     // Sem ffprobe não dá para medir: o arquivo existe e o ffmpeg saiu com 0
     // (nenhum erro), então o render é aceito — mas fica registrado que a
     // duração NÃO foi validada.
     log.warn(
-      { in: path.basename(inPath), out: path.basename(outPath) },
+      { in: path.basename(srcPath), out: path.basename(dstPath) },
       'vertical renderizado (duração não validada: ffprobe indisponível)',
     );
   }
   log.info(
     {
-      in: path.basename(inPath),
-      out: path.basename(outPath),
+      in: path.basename(srcPath),
+      out: path.basename(dstPath),
       durSec: round2(outDur ?? durSec),
       top: layout.top,
       camBox: camBoxToString(layout.camBox),

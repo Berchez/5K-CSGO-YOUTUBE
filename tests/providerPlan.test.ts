@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { planForProvider, type AiProvider } from '../src/clipper/aiThumbnail.js';
+import {
+  buildCompositeBackgroundPrompt,
+  planForProvider,
+  type AiProvider,
+} from '../src/clipper/aiThumbnail.js';
 import type { AceEvent } from '../src/types.js';
 import type { ReferenceImages } from '../src/clipper/referenceImages.js';
 
@@ -64,5 +68,43 @@ describe('planForProvider (roteamento da cadeia de fallback)', () => {
     expect(plan.fullThumb).toBe(true);
     expect(plan.attachments).toEqual([]);
     expect(plan.prompt).not.toContain('REFERÊNCIAS');
+  });
+});
+
+describe('planForProvider com composite (THUMB_COMPOSITE)', () => {
+  it('chatgpt: segue thumb completa, sem composite, com anexos (caminho intocável)', () => {
+    for (const composite of [false, true]) {
+      const plan = planForProvider('chatgpt', ace, refs, all, composite);
+      expect(plan.fullThumb).toBe(true);
+      expect(plan.layout).toBeUndefined();
+      expect(plan.attachments).toEqual(all);
+      expect(plan.prompt).toContain('LAYOUT (3 zonas)');
+    }
+  });
+
+  it('grok / gemini-web: só o fundo, layout composite, sem anexos', () => {
+    for (const p of ['grok', 'gemini-web'] as AiProvider[]) {
+      const plan = planForProvider(p, ace, refs, all, true);
+      expect(plan.fullThumb).toBe(false);
+      expect(plan.layout).toBe('composite');
+      expect(plan.attachments).toEqual([]);
+      expect(plan.prompt).toBe(buildCompositeBackgroundPrompt(ace));
+    }
+  });
+
+  it('APIs (hf / gemini / pollinations): só o fundo, layout composite, sem anexos', () => {
+    for (const p of ['huggingface', 'gemini', 'pollinations'] as AiProvider[]) {
+      const plan = planForProvider(p, ace, refs, all, true);
+      expect(plan.fullThumb).toBe(false);
+      expect(plan.layout).toBe('composite');
+      expect(plan.attachments).toEqual([]);
+    }
+  });
+
+  it('sem composite (false): layout indefinido, comportamento antigo preservado', () => {
+    for (const p of ['grok', 'gemini-web', 'huggingface', 'gemini', 'pollinations'] as AiProvider[]) {
+      const plan = planForProvider(p, ace, refs, all, false);
+      expect(plan.layout).toBeUndefined();
+    }
   });
 });

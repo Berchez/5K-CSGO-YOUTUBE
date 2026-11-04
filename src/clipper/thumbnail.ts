@@ -150,6 +150,26 @@ export async function makeSmartThumbnail(
             .toFile(outPath);
           return outPath;
         }
+        if (result.layout === 'composite') {
+          // Composta: a IA devolveu só o FUNDO; a montagem local (sharp)
+          // cuida do retrato, logos, mapa e textos.
+          const { buildCompositeThumbnail } = await import('./compositeThumbnail.js');
+          try {
+            return await buildCompositeThumbnail({
+              ace,
+              background: result.image,
+              refs: opts.ai?.references,
+              outPath,
+            });
+          } catch (e) {
+            // Falhou a montagem: cai na híbrida (fundo + frame + overlay).
+            const { getLogger } = await import('../logger.js');
+            getLogger().warn(
+              { err: String(e).slice(0, 200) },
+              'thumb composta falhou — usando a híbrida',
+            );
+          }
+        }
         const { buildAiThumbnail } = await import('./aiThumbnail.js');
         const frame = await extractFrame(videoPath, atSec);
         try {

@@ -491,7 +491,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_CAPTION_FONT_FAMILY',
     group: 'clips',
     label: 'Fonte da legenda',
-    help: 'Familia instalada no Windows (ex.: Segoe UI Black, Arial Black, Impact).',
+    help: 'Fonte da legenda. O padrão (Barlow Condensed) vem do repo; outra família precisa estar instalada no Windows.',
     type: 'text',
     advanced: true,
   },
@@ -642,6 +642,14 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     max: 3600000,
     step: 30000,
     unit: 'ms',
+    advanced: true,
+  },
+  {
+    key: 'THUMB_COMPOSITE',
+    group: 'youtube',
+    label: 'Thumb composta',
+    help: 'A IA gera só o fundo e a montagem local (sharp) faz o retrato do jogador, os logos, o mapa e os textos — o texto nunca é alucinado. O chatgpt não muda (a thumb dele já é completa).',
+    type: 'boolean',
     advanced: true,
   },
   {

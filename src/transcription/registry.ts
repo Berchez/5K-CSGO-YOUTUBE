@@ -157,7 +157,8 @@ export const PROVIDERS: TranscriptionProviderInfo[] = [
     supportsVad: false,
     notes:
       'Modelo fixo de português em .tools/models/vosk/vosk-model-small-pt-0.3. Sem tradução e sem detectar outro idioma.',
-    speedNote: '13,5 s por minuto de áudio — o mais rápido dos locais.',
+    speedNote:
+      '13,5 s por minuto de áudio — no mesmo nível do faster-whisper (13,4), mas sem pontuação e com precisão baixa.',
     measured: true,
   },
   {
@@ -172,7 +173,7 @@ export const PROVIDERS: TranscriptionProviderInfo[] = [
         costUsdPerHour: 0.3,
         measuredWallSecPerAudioMin: 3.4,
         timestamps: true,
-        note: 'Interactions API: word timestamps em `annotations`, diarização e 85+ idiomas; ~1h por chamada (30min com timestamps).',
+        note: 'Word timestamps, diarização e 85+ idiomas. O áudio vai INLINE (16 kHz mono): o pedido cabe em ~20 MB ≈ 10 min de áudio por chamada.',
       },
       {
         id: 'gemini-3-flash-preview',
@@ -187,7 +188,7 @@ export const PROVIDERS: TranscriptionProviderInfo[] = [
     languageAuto: true,
     supportsVad: false,
     notes:
-      'Custo por token ($2/M entrada + $12/M saída; ~$0,005/min). `gemini-3.5-transcribe` usa a Interactions API; o áudio vai inline em 16 kHz mono.',
+      'Custo por token ($2/M entrada + $12/M saída; ~$0,005/min). O áudio vai inline em 16 kHz mono (≈32 KB/s): ~20 MB ≈ 10 min de áudio por chamada.',
     speedNote: '8,0 s no clipe de 142,86 s (3,4 s/min) — 51 blocos, pt-BR.',
     measured: true,
   },

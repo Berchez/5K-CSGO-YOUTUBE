@@ -538,8 +538,13 @@ export const ConfigSchema = z.object({
   SHORTS_CAPTION_TIMEOUT_MS: z.coerce.number().min(10_000).max(600_000).default(180_000),
   /** Tamanho da fonte da legenda (px, na saída de 1080). */
   SHORTS_CAPTION_FONT_SIZE: z.coerce.number().int().min(24).max(160).default(54),
-  /** Família da fonte da legenda (precisa estar instalada no Windows). */
-  SHORTS_CAPTION_FONT_FAMILY: z.string().default('Segoe UI Black'),
+  /**
+   * Família da fonte da legenda. O padrão é a fonte VERSÃO NO REPO
+   * (assets/fonts/BarlowCondensed-Bold.ttf): o libass a acha pelo
+   * `fontsdir` e a legenda sai igual em toda máquina (uma fonte do
+   * sistema cairia num fallback diferente em cada host).
+   */
+  SHORTS_CAPTION_FONT_FAMILY: z.string().default('Barlow Condensed'),
   /**
    * Posição da legenda no vertical:
    * - `below-crosshair` (padrão): um pouco abaixo da mira do player, no
@@ -646,6 +651,12 @@ export const ConfigSchema = z.object({
   THUMB_AI_ORDER: z.string().default('huggingface'),
   /** Timeout por provider IA da thumb (ms). Web (chatgpt/grok/gemini-web) às vezes leva >5min p/ renderizar. */
   THUMB_AI_TIMEOUT_MS: z.coerce.number().min(60_000).max(3_600_000).default(600_000),
+  /**
+   * Thumb COMPOSTA: a IA gera só o FUNDO e a montagem local (sharp) faz
+   * retrato do jogador, logos, mapa e textos (nunca alucinados).
+   * O chatgpt ignora: a thumb dele já é completa.
+   */
+  THUMB_COMPOSITE: boolEnvField('THUMB_COMPOSITE', true),
   HF_TOKEN: z.string().default(''),
   HF_IMAGE_MODEL: z.string().default('black-forest-labs/FLUX.1-schnell'),
   GEMINI_API_KEY: z.string().default(''),

@@ -121,6 +121,12 @@ export interface AiThumbOptions {
    * (só resize p/ 1280x720). 'hybrid': fundo IA + frame real + overlay.
    */
   layout?: 'hybrid' | 'full';
+  /**
+   * Thumb COMPOSTA (THUMB_COMPOSITE): a IA devolve só o FUNDO e a montagem
+   * local (sharp) monta foto do jogador, logos, mapa e textos. O chatgpt
+   * ignora esta flag (a thumb dele já é completa).
+   */
+  composite?: boolean;
 }
 
 /** Cor de destaque do canal, usada no prompt e passível de reuso. */
@@ -287,6 +293,37 @@ export function buildBackgroundPrompt(ace: AceEvent): string {
   ].join(' ');
 }
 
+/**
+ * Prompt de FUNDO para a thumb COMPOSTA: só o cenário.
+ *
+ * A IA não desenha gente, texto nem logo — o retrato do jogador, os logos
+ * dos times e todos os textos entram na montagem local (sharp). Assim o
+ * texto nunca é alucinado e o rosto é o de verdade.
+ */
+export function buildCompositeBackgroundPrompt(ace: AceEvent): string {
+  const s = ace.summary;
+  const weaponFlavor =
+    s?.mainWeapon === 'awp'
+      ? 'a sniper rifle silhouette glowing in the foreground,'
+      : s?.mainWeapon === 'knife'
+        ? 'a combat knife stuck in a wooden crate in the foreground,'
+        : s && ['hegrenade', 'molotov', 'incgrenade', 'inferno'].includes(s.mainWeapon)
+          ? 'massive fire explosion and thick smoke dominating the scene, embers flying,'
+          : 'rifles on a weapon rack glowing in the foreground,';
+  const nades = [...new Set((s?.grenades ?? []).map((g) => g.kind.toUpperCase()))];
+  const hasFlash = (s?.flashAssists?.length ?? 0) > 0;
+  return [
+    'Counter-Strike 2 esports arena BACKGROUND for a YouTube thumbnail, 16:9 1920x1080 digital painting.',
+    `Map environment: ${ace.map} (recognizable layout, dramatic lighting).`,
+    weaponFlavor,
+    ...(nades.length > 0 ? [`Subtle ${nades.join(' and ')} explosion smoke in the air.`] : []),
+    ...(hasFlash ? ['Fading white flash bloom on one side.'] : []),
+    `Dark almost black scene with ${ACCENT} accents, glowing particles, motion blur, high contrast.`,
+    'The LEFT third and the TOP RIGHT corner stay dark and uncluttered (reserved for the player photo and the killfeed).',
+    'NO people, NO faces, NO text, NO letters, NO numbers, NO logos, NO watermark, NO HUD.',
+  ].join(' ');
+}
+
 /** Prompt por provider: web (chatgpt/grok/gemini-web) = thumb completa; APIs = fundo. */
 export function aiBackgroundPrompt(ace: AceEvent, provider?: string): string {
   if (provider === 'huggingface' || provider === 'gemini' || provider === 'pollinations') {
@@ -400,6 +437,8 @@ export interface AiResult {
   provider: AiProvider;
   /** true = imagem IA JÁ É a thumb (só resize); false = fundo p/ overlay. */
   fullThumb: boolean;
+  /** 'composite' = a imagem é só o FUNDO; a thumb é montada localmente. */
+  layout?: 'composite';
 }
 
 export interface ProviderPlan {
@@ -407,15 +446,18 @@ export interface ProviderPlan {
   attachments: string[];
   /** true = a imagem IA JÁ É a thumb (só resize); false = fundo p/ overlay. */
   fullThumb: boolean;
+  /** 'composite' = fundo IA + montagem local da thumb. */
+  layout?: 'composite';
 }
 
 /**
  * Roteamento puro por provider (testável sem rede):
- * - chatgpt/grok (thumb completa): prompt do layout do canal + REFERÊNCIAS
- *   no texto + todos os anexos.
- * - gemini-web (thumb completa, policy-safe): mesmo layout, mas o retrato
- *   vira figura estilizada com rosto na sombra — o Gemini recusa semelhança
- *   de pessoa real; recebe as 4 referências igualmente.
+ * - chatgpt: thumb COMPLETA (prompt do layout do canal + REFERÊNCIAS no
+ *   texto + todos os anexos). Caminho preservado byte a byte — a thumb
+ *   composta não entra aqui.
+ * - composta (composite=true, demais providers): a IA devolve só o FUNDO
+ *   (sem gente/texto/logo); a montagem local (sharp) faz o resto.
+ * - grok/gemini-web sem composta: thumb completa (gemini-web policy-safe).
  * - APIs (hf/gemini/pollinations): fundo, sem anexos locais.
  */
 export function planForProvider(
@@ -423,8 +465,24 @@ export function planForProvider(
   ace: AceEvent,
   refs: ReferenceImages | undefined,
   availableAttachments: string[],
+  composite = false,
 ): ProviderPlan {
-  if (provider === 'chatgpt' || provider === 'grok' || provider === 'gemini-web') {
+  if (provider === 'chatgpt') {
+    return {
+      prompt: buildThumbnailPrompt(ace, refs),
+      attachments: availableAttachments,
+      fullThumb: true,
+    };
+  }
+  if (composite) {
+    return {
+      prompt: buildCompositeBackgroundPrompt(ace),
+      attachments: [],
+      fullThumb: false,
+      layout: 'composite',
+    };
+  }
+  if (provider === 'grok' || provider === 'gemini-web') {
     return {
       prompt: buildThumbnailPrompt(ace, refs, provider === 'gemini-web'),
       attachments: availableAttachments,
@@ -493,7 +551,13 @@ export async function buildAiBackground(
       continue;
     }
     try {
-      const plan = planForProvider(provider, ace, refs, availableAttachments);
+      const plan = planForProvider(
+        provider,
+        ace,
+        refs,
+        availableAttachments,
+        opts.composite ?? false,
+      );
       if (provider === 'chatgpt' || provider === 'grok') {
         const isGrok = provider === 'grok';
         const mod = isGrok
@@ -516,7 +580,7 @@ export async function buildAiBackground(
         log.info({ provider }, isGrok ? 'thumb IA via grok' : 'thumb IA via chatgpt');
         clearIfFlagged(provider);
         note(provider, 'ok', null);
-        return { image: buf, provider, fullThumb: plan.fullThumb };
+        return { image: buf, provider, fullThumb: plan.fullThumb, layout: plan.layout };
       }
       if (provider === 'gemini-web') {
         const { geminiWebBackground } = await import('./geminiWeb.js');
@@ -531,7 +595,7 @@ export async function buildAiBackground(
         log.info('fundo IA via gemini-web');
         clearIfFlagged('gemini-web');
         note('gemini-web', 'ok', null);
-        return { image: buf, provider, fullThumb: plan.fullThumb };
+        return { image: buf, provider, fullThumb: plan.fullThumb, layout: plan.layout };
       }
       if (provider === 'huggingface') {
         if (!opts.hfToken) {
@@ -546,7 +610,7 @@ export async function buildAiBackground(
         );
         log.info('fundo IA via huggingface');
         note('huggingface', 'ok', null);
-        return { image: buf, provider, fullThumb: plan.fullThumb };
+        return { image: buf, provider, fullThumb: plan.fullThumb, layout: plan.layout };
       }
       if (provider === 'gemini') {
         if (!opts.geminiApiKey) {
@@ -561,13 +625,13 @@ export async function buildAiBackground(
         );
         log.info('fundo IA via gemini');
         note('gemini', 'ok', null);
-        return { image: buf, provider, fullThumb: plan.fullThumb };
+        return { image: buf, provider, fullThumb: plan.fullThumb, layout: plan.layout };
       }
       if (provider === 'pollinations') {
         const buf = await pollinationsBackground(plan.prompt, timeoutMs);
         log.info('fundo IA via pollinations');
         note('pollinations', 'ok', null);
-        return { image: buf, provider, fullThumb: plan.fullThumb };
+        return { image: buf, provider, fullThumb: plan.fullThumb, layout: plan.layout };
       }
       log.warn({ provider }, 'provider IA desconhecido, ignorando');
     } catch (e) {

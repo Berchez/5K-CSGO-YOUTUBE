@@ -17,6 +17,11 @@ export interface CaptionAiOptions {
   geminiModel?: string;
   hfToken?: string;
   hfModel?: string;
+  /**
+   * Transcritores injetados (testes). Sem isto, cada provider é chamado
+   * direto e a matriz silêncio/falha/sem-chave não é testável.
+   */
+  transcribers?: Partial<Record<CaptionProvider, CaptionProviderFn>>;
 }
 
 export interface ParsedTranscript {
@@ -34,6 +39,12 @@ export type CaptionTranscriber = (
   audioPath: string,
   durSec: number,
 ) => Promise<CaptionTranscript | null>;
+
+/** Transcritor de um provider (sem o campo `provider` — quem chama põe). */
+export type CaptionProviderFn = (
+  audioPath: string,
+  durSec: number,
+) => Promise<ParsedTranscript | null>;
 
 const DEFAULT_ORDER = 'gemini,huggingface';
 const DEFAULT_TIMEOUT_MS = 180_000;
@@ -115,10 +126,10 @@ export function buildCaptionPrompt(durSec: number): string {
 }
 
 /**
- * Lê o JSON da transcrição. `text_pt` tem prioridade quando existe (a
- * legenda vai em português; o áudio pode ser inglês).
+ * Lê o JSON cru da transcrição (aceita cercas ```json e texto em volta).
+ * Devolve `null` quando não é JSON.
  */
-export function parseGeminiTranscript(raw: string): ParsedTranscript | null {
+function parseTranscriptJson(raw: string): Record<string, unknown> | null {
   const text = String(raw ?? '').trim();
   if (!text) return null;
   const unfenced = text.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
@@ -132,7 +143,23 @@ export function parseGeminiTranscript(raw: string): ParsedTranscript | null {
     return null;
   }
   if (!parsed || typeof parsed !== 'object') return null;
-  const obj = parsed as { language?: unknown; lines?: unknown };
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Linhas USÁVEIS de um JSON de transcrição: só entram as que têm tempo
+ * finito e texto com conteúdo. `text_pt` tem prioridade (a legenda vai em
+ * português; o áudio pode ser inglês).
+ *
+ * Esta é a ÚNICA definição de "linha aproveitável" — a classificação e o
+ * parse usam a mesma, senão uma transcrição com tempo inválido era
+ * "silêncio" (estado final) num lugar e "ok" no outro.
+ */
+export function usableTranscriptLines(obj: Record<string, unknown>): {
+  lines: CaptionLine[];
+  language: string | null;
+  translated: boolean;
+} {
   const rawLines = Array.isArray(obj.lines) ? obj.lines : [];
   const lines: CaptionLine[] = [];
   let translated = false;
@@ -156,9 +183,20 @@ export function parseGeminiTranscript(raw: string): ParsedTranscript | null {
     if (!clean) continue;
     lines.push({ startSec, endSec, text: clean });
   }
-  if (lines.length === 0) return null;
   const language = typeof obj.language === 'string' ? obj.language.trim() : '';
   return { lines, language: language || null, translated };
+}
+
+/**
+ * Lê o JSON da transcrição. `text_pt` tem prioridade quando existe (a
+ * legenda vai em português; o áudio pode ser inglês).
+ */
+export function parseGeminiTranscript(raw: string): ParsedTranscript | null {
+  const obj = parseTranscriptJson(raw);
+  if (!obj) return null;
+  const { lines, language, translated } = usableTranscriptLines(obj);
+  if (lines.length === 0) return null;
+  return { lines, language, translated };
 }
 
 export interface CaptionChunk {
@@ -264,9 +302,16 @@ export async function transcribeWithGemini(
           required: ['language', 'lines'],
         },
         temperature: 0.2,
-        maxOutputTokens: 8192,
+        // O thinking do modelo "flash-preview" consome o teto de tokens e
+        // corta o JSON no meio (resposta invalida = legenda perdida).
+        thinkingConfig: { thinkingBudget: 0 },
+        maxOutputTokens: 16384,
       },
     });
+    const finish = res.candidates?.[0]?.finishReason;
+    if (finish && /MAX_TOKENS/i.test(String(finish))) {
+      throw new Error(`resposta truncada (finishReason=${String(finish)})`);
+    }
     return res.text ?? '';
   })();
   const raw = await withTimeout(run, opts.timeoutMs, 'gemini-transcricao');
@@ -276,8 +321,54 @@ export async function transcribeWithGemini(
     // o modelo devolveu (JSON inválido, texto puro, lista vazia...).
     const log = getLogger().child({ feature: 'short-captions' });
     log.warn({ raw: String(raw).slice(0, 500) }, 'resposta da transcrição sem JSON utilizável');
+    // JSON cortado no meio = FALHA (não silêncio): a resposta chegou
+    // truncada e a legenda se perdeu. Silêncio de verdade é `lines: []`.
+    if (looksTruncatedJson(raw)) {
+      throw new Error('resposta da transcrição truncada (JSON incompleto)');
+    }
+    // JSON inválido (texto puro, chave faltando, sintaxe quebrada) também
+    // é FALHA: era o que a transcrição devolveu, não silêncio. Sem esta
+    // distinção o Short saía sem legenda e nunca mais era refeito.
+    if (classifyTranscriptResponse(raw) === 'invalid') {
+      throw new Error('resposta da transcrição com JSON inválido');
+    }
   }
   return parsed;
+}
+
+/** A resposta parece JSON cortado no meio (falha), não um JSON válido. */
+export function looksTruncatedJson(raw: string): boolean {
+  const text = String(raw ?? '').trim();
+  if (!text) return false;
+  if (!text.includes('{')) return false;
+  return !text.endsWith('}') && !text.endsWith('}]');
+}
+
+/**
+ * Como a resposta crua da transcrição se classifica.
+ *
+ * - `ok`: JSON válido com linhas;
+ * - `silence`: JSON válido SEM fala (`lines: []`) — estado final, não é
+ *   falha (repetir a transcrição não muda nada);
+ * - `invalid`: não é JSON (texto puro, JSON cortado, JSON quebrado) — é
+ *   FALHA: a legenda se perdeu e a próxima rodada tem que tentar de novo.
+ *
+ * Sem essa distinção, um JSON inválido que acabasse em `}` era tratado
+ * como "ninguém falou" e o Short saía sem legenda para sempre.
+ */
+export function classifyTranscriptResponse(raw: string): 'ok' | 'silence' | 'invalid' {
+  const text = String(raw ?? '').trim();
+  if (!text) return 'silence';
+  const obj = parseTranscriptJson(raw);
+  if (!obj) return 'invalid';
+  const rawLines = obj.lines;
+  if (!Array.isArray(rawLines)) return 'silence';
+  if (rawLines.length === 0) return 'silence';
+  // Havia linhas, mas NENHUMA é aproveitável (tempo inválido, texto
+  // vazio): a transcrição existiu e se perdeu — é FALHA (retry), não
+  // silêncio (estado final).
+  const { lines } = usableTranscriptLines(obj);
+  return lines.length > 0 ? 'ok' : 'invalid';
 }
 
 /** Transcreve com o Whisper do HuggingFace (timestamps por palavra). */
@@ -305,6 +396,17 @@ export async function transcribeWithHuggingface(
 /**
  * Transcriber com fallback: tenta os providers na ordem e devolve o
  * primeiro que responder. Sem legenda é melhor do que Short perdido.
+ *
+ * Regras de estado (o que decide se o Short é segurado ou publicado):
+ *
+ * - provider RESPONDEU "silêncio" → estado FINAL: o Short sai sem
+ *   legenda (repetir não muda nada);
+ * - provider FALHOU (timeout, chave inválida, JSON truncado) → dá para
+ *   tentar de novo: o Short fica marcado para a próxima rodada;
+ * - provider sem credencial configurada → nem é resposta nem falha: ele
+ *   simplesmente não existe nesta máquina. Antes isso contava como
+ *   falha e segurava o Short para sempre (com o Gemini respondendo
+ *   "silêncio" e o HuggingFace sem token, o Short NUNCA publicava).
  */
 export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTranscriber {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -313,22 +415,30 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
   const providers = captionProviders(opts.order);
   const log = getLogger().child({ feature: 'short-captions' });
   return async (audioPath: string, durSec: number): Promise<CaptionTranscript | null> => {
+    let sawFailure = false;
+    let lastError = '';
+    let sawSilence = false;
+    let lastUnavailable = '';
     for (const provider of providers) {
       const startedAt = Date.now();
       try {
         if (provider === 'gemini') {
-          if (!opts.geminiApiKey) {
+          if (!opts.geminiApiKey && !opts.transcribers?.gemini) {
             log.info('gemini sem GEMINI_API_KEY — pulando');
+            lastUnavailable = 'gemini sem GEMINI_API_KEY';
             continue;
           }
-          const parsed = await transcribeWithGemini(audioPath, {
-            apiKey: opts.geminiApiKey,
-            model: geminiModel,
-            timeoutMs,
-            durSec,
-          });
+          const parsed = opts.transcribers?.gemini
+            ? await opts.transcribers.gemini(audioPath, durSec)
+            : await transcribeWithGemini(audioPath, {
+                apiKey: opts.geminiApiKey as string,
+                model: geminiModel,
+                timeoutMs,
+                durSec,
+              });
           if (!parsed) {
             log.warn('gemini devolveu transcrição vazia');
+            sawSilence = true;
             continue;
           }
           log.info(
@@ -343,17 +453,21 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
           );
           return { ...parsed, provider };
         }
-        if (!opts.hfToken) {
+        if (!opts.hfToken && !opts.transcribers?.huggingface) {
           log.info('huggingface sem HF_TOKEN — pulando');
+          lastUnavailable = 'huggingface sem HF_TOKEN';
           continue;
         }
-        const parsed = await transcribeWithHuggingface(audioPath, {
-          token: opts.hfToken,
-          model: hfModel,
-          timeoutMs,
-        });
+        const parsed = opts.transcribers?.huggingface
+          ? await opts.transcribers.huggingface(audioPath, durSec)
+          : await transcribeWithHuggingface(audioPath, {
+              token: opts.hfToken as string,
+              model: hfModel,
+              timeoutMs,
+            });
         if (!parsed) {
           log.warn('huggingface devolveu transcrição vazia');
+          sawSilence = true;
           continue;
         }
         log.info(
@@ -366,13 +480,27 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
         );
         return { ...parsed, provider };
       } catch (e) {
+        sawFailure = true;
+        lastError = String(e).slice(0, 200);
         log.warn(
-          { provider, err: String(e).slice(0, 200) },
+          { provider, err: lastError },
           'provider de transcrição falhou',
         );
       }
     }
-    log.warn('nenhum provider de transcrição respondeu — o Short sai sem legenda');
-    return null;
+    if (sawFailure) {
+      // Falha de verdade (cota/chave/timeout/truncagem): o Short fica
+      // marcado para nova tentativa na próxima rodada.
+      throw new Error(`nenhum provider de transcrição respondeu: ${lastError || 'erro'}`);
+    }
+    if (sawSilence) {
+      // Alguém respondeu e disse que ninguém falou: estado final.
+      log.warn('nenhum provider achou fala — o Short sai sem legenda');
+      return null;
+    }
+    // Nenhum provider respondeu e nenhum falhou: nenhum está configurado.
+    throw new Error(
+      `nenhum provider de transcrição configurado (${lastUnavailable || 'sem chave'})`,
+    );
   };
 }

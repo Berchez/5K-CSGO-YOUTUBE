@@ -19,7 +19,7 @@ Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizonta
 ## Prerequisites (Windows)
 
 ```powershell
-node --version  # >= 20
+node --version  # >= 22 (o `package.json` exige `engines.node >= 22`)
 npm install
 npx playwright install chromium
 Copy-Item .env.example .env
@@ -387,6 +387,9 @@ npm run publish:shorts -- --dry-run --no-captions
 # 5. publica (unlisted por padrão — teste sem risco de claim no canal)
 #    exige SHORTS_ENABLED=true no .env (ou no painel)
 npm run publish:shorts -- --publish --clip data/clips/2399958_Inferno_r12_doc
+
+# 6. publica mesmo com a legenda quebrada (o normal é segurar o Short)
+npm run publish:shorts -- --publish --allow-no-captions --clip data/clips/...
 ```
 
 O script (`scripts/publish-shorts.ts`):
@@ -431,14 +434,31 @@ assiste sem som.
 - cada Short re-renderizado gasta **1 chamada de transcrição** (um Short
   já pronto não gasta nada);
 - se a transcrição falhar, o Short é gravado **sem** legenda (e a
-  próxima rodada tenta de novo) — melhor do que perder o vídeo.
+  próxima rodada tenta de novo) — melhor do que perder o vídeo;
+- **no `--publish` a legenda quebrada SEGURA o Short**: ele não sobe
+  (o `youtubeId` fica vazio no marker), para a próxima rodada tentar
+  a transcrição de novo. Publicar sem a legenda é decisão do dono:
+  `--allow-no-captions`. Sem áudio (`no-audio`) ou ninguém falando
+  (`no-speech`) não seguram nada — são estado final;
+- **Short que falhou espera antes de ser tentado de novo** (backoff no
+  marker: 10min → 30min → 2h → 6h). Depois de 5 tentativas o script
+  para de tentar sozinho: só volta com `--force`. O `--last N` também
+  pula os clipes no backoff — senão o lote ficava preso no mesmo clipe
+  quebrado;
+- o `ffprobe` é obrigatório no render do Short: a caixa da cam e a
+  fatia do jogo são calculadas sobre a resolução REAL do clipe. Sem
+  ele o script recusa com mensagem clara (crop em 1920x1080 numa fonte
+  720p/1440p sai no lugar errado).
 
 A legenda entra um pouco abaixo da mira do player
 (`SHORTS_CAPTION_POSITION=below-crosshair`), no centro da área do jogo.
 `game-top` volta para logo abaixo da faixa da cam e `bottom` joga para o
-rodapé (posição clássica de legenda). A fonte padrão é `Segoe UI Black`
-(mais moderna e pesada); `SHORTS_CAPTION_FONT_FAMILY` aceita qualquer
-família instalada no Windows.
+rodapé (posição clássica de legenda). A fonte padrão é a **Barlow
+Condensed que vem no repo** (`assets/fonts/BarlowCondensed-Bold.ttf`): o
+libass a acha pelo `fontsdir` do filtro `ass`, então a legenda sai igual
+em toda máquina (uma fonte do sistema cairia num fallback diferente em
+cada host e a largura medida não batia). `SHORTS_CAPTION_FONT_FAMILY`
+aceita outra família — aí ela precisa estar instalada no Windows.
 
 | variável | padrão | efeito |
 | --- | --- | --- |
@@ -464,7 +484,7 @@ família instalada no Windows.
 | `SHORTS_CAPTION_HF_MODEL` | `openai/whisper-large-v3-turbo` | modelo do Whisper (reserva) |
 | `SHORTS_CAPTION_TIMEOUT_MS` | `180000` | teto de tempo da transcrição |
 | `SHORTS_CAPTION_FONT_SIZE` | `54` | tamanho da fonte da legenda (px) |
-| `SHORTS_CAPTION_FONT_FAMILY` | `Segoe UI Black` | família da fonte (instalada no Windows) |
+| `SHORTS_CAPTION_FONT_FAMILY` | `Barlow Condensed` | família da fonte (a padrão vem do repo, em `assets/fonts`) |
 | `SHORTS_CAPTION_POSITION` | `below-crosshair` | `below-crosshair` (abaixo da mira), `game-top` (abaixo da cam) ou `bottom` (rodapé) |
 | `SHORTS_MIN_KILLS` | `3` | mínimo de kills (o bot também grava 3K/4K) |
 | `SHORTS_PRIVACY` | `unlisted` | visibilidade do Short |
@@ -476,6 +496,18 @@ família instalada no Windows.
 deixar pelo menos 160 px para o jogo. O painel recusa a gravação
 inconsistente; o script recusa na hora de rodar (o bot live não depende
 dessas chaves — uma config de Shorts quebrada não impede o bot de subir).
+
+**Migração dos defaults dos Shorts**: o default atual é
+`SHORTS_MIN_SEC=60` / `SHORTS_MAX_SEC=90` / `SHORTS_CAPTIONS=on` (a
+legenda queimada passa a gastar 1 chamada de IA por Short). Um `.env`
+antigo com `30/60` explícito continua com o valor antigo — o default só
+muda quando a chave não está no `.env`. Atenção: quem tinha só
+`SHORTS_MAX_SEC` abaixo de 60 (ex.: `30`) passa a falhar na validação
+(MIN default 60 > MAX 30): baixe o `SHORTS_MIN_SEC` junto ou suba o
+`SHORTS_MAX_SEC`. O `SHORTS_MIN_SEC=60` deixa o Short **na fronteira de
+1 minuto** (o YouTube bloqueia globalmente Short acima de 1min com claim
+de copyright ativo): se os Shorts estiverem sendo barrados, baixe o
+`SHORTS_MIN_SEC` (45s é um valor seguro).
 
 A cota do YouTube é do **projeto de API** (10 000 units/dia, 1600 por
 `videos.insert`) e é dividida com o bot: o script conta os vídeos já
@@ -543,14 +575,17 @@ vezes é engolido pelo npm, então prefira `npx tsx`.
 
 | provider | tipo | padrão | medido no clipe de 142,86s | custo |
 | --- | --- | --- | --- | --- |
-| `faster-whisper` | local | `small` int8 | ~36s (15,11 s/min) | US$ 0 |
+| `faster-whisper` | local | `small` int8 | 32,0s (13,4 s/min) | US$ 0 |
 | `whisper-cpp` | local | `small` ggml | 51,3s (35,9 s/min) | US$ 0 |
-| `vosk` | local | `vosk-model-small-pt-0.3` | 21,6s; rápido e sem pontuação | US$ 0 |
+| `vosk` | local | `vosk-model-small-pt-0.3` | 13,5 s/min; rápido e sem pontuação | US$ 0 |
 | `gemini` | nuvem | `gemini-3.5-transcribe` | 8,0s; 51 blocos em pt-BR | ~US$ 0,012/clipe |
 | `openai`, `groq`, `deepgram`, `assemblyai`, `elevenlabs` | nuvem | ver registry | não medido (requer chave) | por minuto |
 
 Todos os providers recebem o **mesmo WAV 16 kHz mono** extraído com
 ffmpeg; VAD local (`TRANSCRIPTION_VAD`) pula silêncio e evita alucinação.
+O áudio vai **inline** no pedido (≈32 KB/s): ~20 MB ≈ **10 min de
+áudio por chamada** no Gemini e 25 MB ≈ **13 min** no OpenAI/Groq. Para
+vídeos maiores, corte em pedaços (não há chunking automático).
 `TRANSCRIPTION_PROVIDER` default é `gemini` (o mesmo provider da legenda
 do Short de referência); `TRANSCRIPTION_MODEL` vazio usa o modelo padrão
 do provider (`gemini-3.5-transcribe`); `TRANSCRIPTION_LANGUAGE=auto`
@@ -577,8 +612,15 @@ src/clipper/killfeedSync.ts (OCR do killfeed: instante exato da 1ª kill)
 src/clipper/clipAnchors.ts (puro: âncoras de início/fim do clipe)
 src/clipper/clipBuilder.ts (concat + sidecar json)
 src/clipper/shorts.ts (janela 60-90s + render vertical 9:16 atômico)
+src/clipper/shortCaptions.ts (legenda queimada: linhas, .ass, decisão de publicar)
+src/clipper/shortCaptionsAi.ts (transcrição da legenda: gemini/huggingface)
+src/clipper/shortBanner.ts (faixa de texto do topo do Short)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
+src/clipper/compositeThumbnail.ts (thumb composta determinística: layout, killfeed, textos)
+src/clipper/thumbText.ts (fontes versionadas em assets/fonts: texto em path)
+src/clipper/thumbCutout.ts + thumbCutoutWorker.ts (recorte do jogador em processo isolado)
+src/transcription/ (adapter de transcrição: registry, providers, export srt/vtt/txt)
 src/uploader/youtubeUploader.ts (private)
 src/uploader/videoMetadata.ts (título/descrição: IA com guarda anti-alucinação + gerador determinístico)
 src/uploader/metadataAi.ts (prompt + parse da resposta da IA)
@@ -603,20 +645,28 @@ render — web render sometimes takes over 5min.
 
 ```text
 THUMB_AI_ORDER=chatgpt,grok,gemini-web
-                │       │      └─ fundo híbrido (overlay sharp por cima)
-                │       └─ thumb completa (layout do canal) — falha se sem login
-                └─ thumb completa — falha se cota esgotada → segue a cadeia
+                │       │      └─ só o FUNDO (com THUMB_COMPOSITE=1) — a thumb é montada localmente
+                │       └─ só o FUNDO (com THUMB_COMPOSITE=1) — ou thumb completa sem a composta
+                └─ thumb completa (5 refs) — falha se cota esgotada → segue a cadeia
 ```
 
 | Provider | Generates | Cost | Needs |
 |---|---|---|---|
-| `chatgpt` | full thumb (5 refs attached) | free (daily quota) | `chatgpt-login.ts` once, throwaway account |
-| `grok` | full thumb (5 refs attached) | free (X quota) | `grok-login.ts` once, throwaway X account |
-| `gemini-web` | full **policy-safe** thumb (5 refs; stylized portrait with the face in shadow; the prefix "Generate an image…" is mandatory — without it the app replies with text) | free (app quota) | `gemini-login.ts` once, throwaway **Gmail** account (edu/Workspace accounts may not have image generation) |
+| `chatgpt` | full thumb (5 refs attached) — nunca passa pela composta | free (daily quota) | `chatgpt-login.ts` once, throwaway account |
+| `grok` | só o FUNDO com `THUMB_COMPOSITE=1` (o default); thumb completa (5 refs) sem a composta | free (X quota) | `grok-login.ts` once, throwaway X account |
+| `gemini-web` | só o FUNDO com `THUMB_COMPOSITE=1` (o default); thumb **policy-safe** completa (5 refs; stylized portrait with the face in shadow) sem a composta | free (app quota) | `gemini-login.ts` once, throwaway **Gmail** account (edu/Workspace accounts may not have image generation) |
 | `huggingface` | background | free **without credits** (paid to use) | `HF_TOKEN` + credits |
 | `gemini` | background | ~US$0.13/img | `GEMINI_API_KEY` + billing |
 | `pollinations` | background | became paid (402) | nothing (fails fast) |
 | *(end of chain)* | **composite** (sharp) | US$0 | nothing — always works |
+
+`THUMB_COMPOSITE=1` (o default) muda o que os providers devolvem: **grok e
+gemini-web passam a devolver só o FUNDO** (sem anexos, sem gente, sem
+texto) e a thumb é montada localmente com sharp (retrato do jogador,
+logos, killfeed e todos os textos na fonte versionada em `assets/fonts`).
+O `chatgpt` não muda: ele continua devolvendo a thumb completa. Para o
+comportamento antigo (grok/gemini-web com a thumb completa), ponha
+`THUMB_COMPOSITE=0` no `.env`.
 
 Policy per provider: **Gemini refuses portraits of real people** — that is why,
 in `gemini-web`, the layout portrait becomes a **stylized figure with the face in
@@ -625,6 +675,22 @@ the full layout with the portrait. Team logos come from Liquipedia with a prefix
 search `"Team <Name>"` (raw search matches homonymous pages — e.g. "Spirit"
 is another team — and has already downloaded the wrong logo; there is a tested
 regression for this).
+
+O `@imgly/background-removal-node` (recorte do fundo da foto do jogador) é
+**AGPL-3.0** — copyleft, com cláusula de rede. Ele é opcional e o fallback
+(retrato emoldurado) é determinístico: se o canal for comercial e a
+licença atrapalhar, remova a dependência (`npm uninstall
+@imgly/background-removal-node`) ou deixe o pacote fora do `node_modules`
+— a thumb continua saindo, só com a moldura.
+
+O recorte é cacheado pelo **conteúdo** da foto (`data/clips/refs/cutouts`),
+então o mesmo jogador não é reprocessado a cada partida. Três cuidados:
+o recorte cacheado é **validado** antes de ser usado (PNG válido com
+fundo transparente — um arquivo pela metade vai para o lixo e é
+refeito); quando a remoção de fundo **falha**, a foto ganha um marcador
+`.none` (cache negativo, vale 24h) para o script não ficar spawnando
+um node a cada thumb; e sem a dependência instalada o worker nem é
+spawnado (o retrato emoldurado sai direto).
 
 ### Throwaway web login (chatgpt and gemini-web)
 Automating the web UI violates the Terms (OpenAI and Google) — a caught account can be

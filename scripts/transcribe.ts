@@ -34,6 +34,12 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   const args: Args = { video: '', list: false };
+  /** Valor da flag: sem valor (ou com outra flag na frente) é erro. */
+  const value = (name: string, index: number): string => {
+    const raw = argv[index];
+    if (!raw || raw.startsWith('--')) throw new Error(`${name} exige um valor`);
+    return raw;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--list') {
@@ -41,15 +47,15 @@ function parseArgs(argv: string[]): Args {
     } else if (arg === '--no-vad') {
       args.vad = false;
     } else if (arg === '--provider') {
-      args.provider = argv[++i];
+      args.provider = value('--provider', ++i);
     } else if (arg === '--model') {
-      args.model = argv[++i];
+      args.model = value('--model', ++i);
     } else if (arg === '--language') {
-      args.language = argv[++i];
+      args.language = value('--language', ++i);
     } else if (arg === '--format') {
-      args.format = argv[++i] as TranscriptFormat;
+      args.format = value('--format', ++i) as TranscriptFormat;
     } else if (arg === '--out') {
-      args.outPath = argv[++i];
+      args.outPath = value('--out', ++i);
     } else if (arg.startsWith('--')) {
       throw new Error(`flag desconhecida: ${arg}`);
     } else if (!args.video) {

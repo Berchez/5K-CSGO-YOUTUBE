@@ -3,7 +3,7 @@
  *
  * O material é o clipe 16:9 do ao vivo (`data/clips/<pasta>/<pasta>.mp4`
  * + sidecar `.json`). Aqui:
- * 1. a janela do Short é calculada (da 1ª à última kill, 30-60s);
+ * 1. a janela do Short é calculada (da 1ª à última kill, 60-90s);
  * 2. o vertical é renderizado (cam do streamer no topo + jogo embaixo,
  *    crop centralizado) — o YouTube só mostra vídeo VERTICAL no feed
  *    Shorts;
@@ -27,6 +27,8 @@
  *   --privacy <p>      private|unlisted|public (default: SHORTS_PRIVACY)
  *   --no-ai            não chama a IA de metadados (usa o gerador local)
  *   --no-captions      não transcreve a legenda (o Short sai sem ela)
+ *   --allow-no-captions  publica mesmo com a legenda quebrada (sem isso o
+ *                      Short fica para a próxima rodada tentar de novo)
  *   --force            re-renderiza mesmo com o vertical já existente
  *                      (e publica Shorts com a abertura limitada pelo
  *                      teto de latência — as posições das kills não são
@@ -63,12 +65,18 @@ import {
   buildCaptionsAss,
   captionCrosshairTopY,
   captionMaxChars,
+  canPublishShortWithCaptions,
+  isCaptionFilterError,
+  isRetryableCaptionFailure,
+  shortRetryDecision,
+  type CaptionStatus,
 } from '../src/clipper/shortCaptions.js';
 import {
   createCaptionTranscriber,
   extractAudioWindow,
   type CaptionTranscriber,
 } from '../src/clipper/shortCaptionsAi.js';
+import { loadThumbFont, measureThumbText } from '../src/clipper/thumbText.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, type VideoMetadata } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
@@ -114,6 +122,7 @@ interface Args {
   force: boolean;
   noAi: boolean;
   noCaptions: boolean;
+  allowNoCaptions: boolean;
 }
 
 const PRIVACY_VALUES = ['private', 'unlisted', 'public'];
@@ -131,6 +140,7 @@ function parseArgs(argv: string[]): Args {
     force: false,
     noAi: false,
     noCaptions: false,
+    allowNoCaptions: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -154,6 +164,7 @@ function parseArgs(argv: string[]): Args {
     else if (name === '--force') args.force = true;
     else if (name === '--no-ai') args.noAi = true;
     else if (name === '--no-captions') args.noCaptions = true;
+    else if (name === '--allow-no-captions') args.allowNoCaptions = true;
     else if (name === '--clip') args.clips.push(next());
     else if (name === '--last') {
       const raw = next();
@@ -299,6 +310,10 @@ interface ShortMarker {
     source: string;
     privacy: string;
   };
+  /** Quantas vezes a publicação já falhou (tente de novo depois). */
+  attempts?: number;
+  /** Quando foi a última tentativa que falhou (ISO). */
+  lastAttemptAt?: string | null;
 }
 
 function readShortMarker(file: string): ShortMarker | null {
@@ -412,13 +427,23 @@ interface CandidateResult {
 }
 
 /** O que a legenda queimada gravou no vertical (e de onde veio). */
-interface CaptionInfo {
-  applied: boolean;
-  provider?: string;
-  language?: string | null;
-  lines?: number;
-  translated?: boolean;
-  reason?: 'no-audio' | 'no-speech' | 'error' | 'failed' | 'disabled';
+type CaptionInfo = CaptionStatus;
+
+/**
+ * Largura MÉDIA por caractere da fonte da legenda.
+ *
+ * A fonte da legenda é a versão no repo (Barlow Condensed Bold): a
+ * largura é medida nela, então a linha cabe de verdade. Se o dono
+ * apontar outra fonte, o valor conservador (0.62) é usado — com uma
+ * fonte mais larga a linha estoura e o libass re-quebra sozinho.
+ */
+function captionAvgCharWidth(fontFamily: string): number {
+  if (!/barlow/i.test(String(fontFamily ?? ''))) return 0.62;
+  const font = loadThumbFont('ui');
+  if (!font) return 0.62;
+  const sample = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz0123456789,.!?';
+  const width = measureThumbText(font, sample, 100);
+  return width > 0 ? width / sample.length / 100 : 0.62;
 }
 
 /**
@@ -448,7 +473,11 @@ async function buildCaptionsForShort(
     if (!transcript) return null;
     const lines = buildCaptionLines(transcript.lines, {
       durSec,
-      maxCharsPerLine: captionMaxChars(cfg.SHORTS_WIDTH, cfg.SHORTS_CAPTION_FONT_SIZE),
+      maxCharsPerLine: captionMaxChars(
+        cfg.SHORTS_WIDTH,
+        cfg.SHORTS_CAPTION_FONT_SIZE,
+        captionAvgCharWidth(cfg.SHORTS_CAPTION_FONT_FAMILY),
+      ),
       maxLines: 2,
     });
     if (lines.length === 0) return null;
@@ -484,8 +513,10 @@ async function buildCaptionsForShort(
     try {
       fs.rmSync(assPath, { force: true });
     } catch {}
-    console.log(`  (falha interna de legenda: ${String(e).slice(0, 200)})`);
-    return null;
+    // Repropaga: o chamador marca o Short para nova tentativa (motivo
+    // 'error'). Engolir aqui transformaria FALHA em "sem fala" (estado
+    // final) e a legenda nunca mais seria tentada.
+    throw e;
   } finally {
     try {
       fs.rmSync(wavPath, { force: true });
@@ -564,6 +595,22 @@ async function processCandidate(
     return null;
   }
   /**
+   * Backoff: um Short que falhou (legenda quebrada, ffmpeg caiu) não é
+   * tentado a cada rodada — o provedor pode ainda estar fora e o
+   * `--last N` ficaria preso no mesmo clipe. Depois de
+   * MAX_SHORT_ATTEMPTS, só o dono manda de novo (`--force`).
+   */
+  if (!args.force) {
+    const decision = shortRetryDecision({
+      attempts: previous?.attempts ?? 0,
+      lastAttemptAt: previous?.lastAttemptAt ?? null,
+    });
+    if (decision.skip) {
+      console.log(`- ${name}: ignorado (${decision.reason})`);
+      return null;
+    }
+  }
+  /**
    * Abertura limitada pelo TETO de latência: o bot desconfiou da
    * latência estimada (abriu o clipe pelo teto) e as posições das kills
    * vêm dessa mesma estimativa — elas podem estar deslocadas, e a
@@ -609,6 +656,13 @@ async function processCandidate(
     configuredCropForStream(cfg.SHORTS_CAM_BOX_BY_STREAM, streamName) ??
     (cfg.SHORTS_CAM_BOX.trim() || null);
   const camBox = parseShortCamBox(camCrop);
+  if (camCrop && !camBox) {
+    // A caixa existe mas está MAL DIGITADA: sem este aviso o dono
+    // achava que o canal não tinha mapa de cam.
+    console.log(
+      `  ATENÇÃO: caixa de cam inválida ("${camCrop}") — o topo vai como faixa com o título (formato: x:y:w:h)`,
+    );
+  }
   const topMode: ShortTopMode =
     cfg.SHORTS_TOP === 'center'
       ? 'center'
@@ -705,13 +759,13 @@ async function processCandidate(
     captionFontFamily: cfg.SHORTS_CAPTION_FONT_FAMILY,
   });
   const staleLayout = isStaleRender(previous?.render, signature);
-  // A legenda pedida NÃO entrou no arquivo (a transcrição falhou na
-  // rodada anterior): o vertical precisa ser refeito — senão o Short
-  // ficaria sem legenda para sempre.
+  // A legenda pedida NÃO entrou no arquivo (a transcrição ou o libass
+  // falharam na rodada anterior): o vertical precisa ser refeito — senão
+  // o Short ficaria sem legenda para sempre.
   const staleCaptions =
     captionsOn &&
     previous?.captionInfo?.applied !== true &&
-    previous?.captionInfo?.reason === 'error' &&
+    isRetryableCaptionFailure(previous?.captionInfo) &&
     fs.existsSync(outMp4);
   const rendered =
     args.force || staleWindow || staleLayout || staleCaptions || !fs.existsSync(outMp4);
@@ -756,7 +810,7 @@ async function processCandidate(
             captionInfo = { applied: false, reason: 'no-speech' };
           }
         } catch (e) {
-          console.log('  legenda: falha na transcrição/ASS — o Short sai sem ela');
+          console.log(`  legenda: falha na transcrição/ASS — o Short sai sem ela (${String(e).slice(0, 200)})`);
           captionInfo = { applied: false, reason: 'error' };
         }
       }
@@ -783,7 +837,10 @@ async function processCandidate(
       durSec = out.durSec;
       console.log(`  vertical: ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
     } catch (renderErr) {
-      if (captionsAssPath) {
+      if (captionsAssPath && isCaptionFilterError(renderErr)) {
+        // A falha é do FILTRO de legenda (fonte/ASS): o vertical sem
+        // legenda ainda vale (o Short vai ao ar na próxima rodada com a
+        // legenda refeita).
         console.log('  (falha do filtro ass — re-tentando sem legenda)');
         try {
           const out = await renderShortClip(mp4Path, outMp4, {
@@ -812,6 +869,9 @@ async function processCandidate(
           throw secondErr;
         }
       } else {
+        // Falha de OUTRA coisa (disco cheio, timeout, crop inválido): o
+        // erro sobe como está — repetir sem a legenda só gastaria um
+        // render e esconderia a causa.
         throw renderErr;
       }
     } finally {
@@ -827,8 +887,31 @@ async function processCandidate(
     console.log(`  vertical: já existe (${path.relative(process.cwd(), outMp4)})`);
   }
 
+  // O status da legenda que DESCREVE o arquivo que vai subir: quando o
+  // vertical foi refeito agora, é o de agora; quando já existia, é o do
+  // marker anterior (o mp4 não mudou).
+  const captionStatus = rendered ? captionInfo : (previous?.captionInfo ?? null);
+  const verdict = canPublishShortWithCaptions({
+    captionsOn,
+    status: captionStatus,
+    allowNoCaptions: args.allowNoCaptions,
+  });
+  /**
+   * A rodada falhou de verdade? (a legenda quebrou e o Short ficou
+   * para a próxima) — conta como tentativa, para o backoff agir.
+   */
+  const failedNow = captionsOn && isRetryableCaptionFailure(captionStatus) && !verdict.publish;
+
   let videoId: string | null = null;
-  if (args.publish) {
+  if (args.publish && !verdict.publish) {
+    // A legenda foi pedida e QUEBROU: publicar assim entrega ao canal um
+    // Short sem legenda que nunca mais seria refeito (o marker recebe o
+    // `youtubeId` e a próxima rodada pula o clipe). O Short fica para a
+    // próxima rodada tentar de novo.
+    console.log(
+      `  (${verdict.reason}) — o Short NÃO vai ao ar; rode de novo para tentar a legenda de novo (ou --allow-no-captions para publicar sem ela)`,
+    );
+  } else if (args.publish) {
     // Guarda de cota: cada `videos.insert` custa 1600 units do limite
     // diário (10000) do projeto de API — o mesmo que o bot live usa.
     const units = ctx.quotaUsed + QUOTA_UNITS_PER_UPLOAD;
@@ -907,6 +990,13 @@ async function processCandidate(
     },
     youtubeId: videoId ?? previous?.youtubeId ?? null,
     publishedAt: videoId ? new Date().toISOString() : previous?.publishedAt ?? null,
+    /**
+     * Contador de tentativas: uma legenda que quebrou (ou um render que
+     * falhou) conta como tentativa — a próxima rodada espera o backoff
+     * em vez de reprocessar o mesmo clipe. Published/ok zera o contador.
+     */
+    attempts: failedNow ? (previous?.attempts ?? 0) + 1 : 0,
+    lastAttemptAt: failedNow ? new Date().toISOString() : null,
   };
   // A pasta do Short só nasce quando há algo para gravar nela.
   fs.mkdirSync(outDir, { recursive: true });
@@ -939,6 +1029,8 @@ async function processCandidate(
       kills: includedKills.length,
       title: metadata?.title ?? null,
       youtubeId: videoId ?? null,
+      captions: captionStatus?.applied ? 'on' : (captionStatus?.reason ?? 'off'),
+      ...(verdict.publish ? {} : { notPublishedReason: verdict.reason ?? null }),
     },
   };
 }
@@ -947,6 +1039,35 @@ async function processCandidate(
 function metadataMode(cfg: AppConfig, args: Args): 'ai' | 'template' | 'legacy' {
   if (cfg.YT_META_MODE === 'legacy') return 'legacy';
   return cfg.YT_META_MODE === 'ai' && !args.noAi ? 'ai' : 'template';
+}
+
+/**
+ * Grava a tentativa que falhou no marker do Short (o contador alimenta
+ * o backoff). Um marker que não existe ainda é criado: a falha aconteceu
+ * antes do marker ser gravado.
+ */
+function recordFailedAttempt(shortsDir: string, name: string): void {
+  try {
+    const outDir = path.join(shortsDir, name);
+    const markerPath = path.join(outDir, `${name}_short.json`);
+    const marker = readShortMarker(markerPath) ?? {};
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(
+      markerPath,
+      JSON.stringify(
+        {
+          ...marker,
+          attempts: (marker.attempts ?? 0) + 1,
+          lastAttemptAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  } catch {
+    // best-effort: sem contador, o clipe é tentado de novo (o pior caso
+    // é repetir uma tentativa).
+  }
 }
 
 async function runBatch(ctx: BatchContext, candidates: Candidate[]): Promise<void> {
@@ -967,6 +1088,9 @@ async function runBatch(ctx: BatchContext, candidates: Candidate[]): Promise<voi
         const message = String((e as { message?: string })?.message ?? e).slice(0, 300);
         console.error(`  ✗ ${candidate.name}: ${message}`);
         report.push({ name: candidate.name, error: message });
+        // A falha conta como tentativa: o backoff segura o clipe nas
+        // próximas rodadas (e o `--last N` não fica preso nele).
+        recordFailedAttempt(shortsDir, candidate.name);
         if (isQuotaError(e)) {
           console.error('  (cota do YouTube esgotada — o lote para aqui)');
           break;
@@ -1022,7 +1146,8 @@ async function main(): Promise<void> {
     const all = discoverCandidates(clipsDir, args);
     // `--last N` conta os clipes AINDA NÃO publicados: sem isso, os N
     // mais recentes saíam todos no lote anterior e o comando não
-    // publicava nada.
+    // publicava nada. Clipe no BACKOFF também não conta: senão o `--last
+    // N` fica preso no mesmo clipe quebrado e o lote novo não sai.
     const pending = args.last
       ? all
           .filter((candidate) => {
@@ -1036,7 +1161,12 @@ async function main(): Promise<void> {
             const marker = readShortMarker(
               path.join(shortsDir, candidate.name, `${candidate.name}_short.json`),
             );
-            return !marker?.youtubeId;
+            if (marker?.youtubeId) return false;
+            if (args.force) return true;
+            return !shortRetryDecision({
+              attempts: marker?.attempts ?? 0,
+              lastAttemptAt: marker?.lastAttemptAt ?? null,
+            }).skip;
           })
           .slice(0, args.last)
       : all;

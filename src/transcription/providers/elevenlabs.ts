@@ -18,7 +18,7 @@ import {
   type ProviderTranscript,
 } from './common.js';
 
-const URL = 'https://api.elevenlabs.io/v1/speech-to-text';
+const ENDPOINT = 'https://api.elevenlabs.io/v1/speech-to-text';
 
 export async function transcribe(req: ProviderRequest): Promise<ProviderTranscript> {
   const apiKey = requireEnvKey('ELEVENLABS_API_KEY');
@@ -28,7 +28,7 @@ export async function transcribe(req: ProviderRequest): Promise<ProviderTranscri
   form.append('model_id', req.model);
   if (req.language) form.append('language_code', req.language);
   const res = await fetchWithTimeout(
-    URL,
+    ENDPOINT,
     { method: 'POST', headers: { 'xi-api-key': apiKey }, body: form },
     req.timeoutMs,
   );

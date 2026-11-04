@@ -26,6 +26,7 @@ import {
 } from './audio.js';
 import { normalizeLanguageCode, sanitizeSegments } from './segments.js';
 import { toTranscript, transcriptExtension } from './export.js';
+import { assertAudioWithinLimit } from './limits.js';
 import type {
   ProviderStatus,
   TranscribeFileOptions,
@@ -101,8 +102,13 @@ export async function transcribeVideo(
   try {
     const wavPath = path.join(tmpDir, 'audio.wav');
     await extractAudioWav(videoPath, wavPath, Math.min(resolved.timeoutMs, 180_000));
-    const audioSec = wavDurationSecFromBytes(fs.statSync(wavPath).size);
+    const wavBytes = fs.statSync(wavPath).size;
+    const audioSec = wavDurationSecFromBytes(wavBytes);
     if (audioSec <= 0) throw new Error('o vídeo não tem áudio utilizável');
+    assertAudioWithinLimit(resolved.provider, {
+      bytes: wavBytes,
+      seconds: audioSec,
+    });
     const startedAt = Date.now();
     const provider = TRANSCRIBERS[resolved.provider];
     const raw = await provider({
@@ -210,13 +216,23 @@ export function providerStatus(rt: StatusRuntime = defaultRuntime()): ProviderSt
         reason: ready ? '' : 'baixe o whisper-cli e o modelo ggml para .tools',
       };
     }
-    const ready =
-      !!pythonFrom(rt) && rt.exists(resolveVoskModelDir(info.defaultModel));
+    if (info.id === 'vosk') {
+      const ready =
+        !!pythonFrom(rt) && rt.exists(resolveVoskModelDir(info.defaultModel));
+      return {
+        id: info.id,
+        label,
+        ready,
+        reason: ready ? '' : 'baixe o modelo Vosk para .tools/models/vosk',
+      };
+    }
+    // Provider local novo: sem status implementado, o "pronto" seria
+    // mentira (o fallthrough antigo tratava qualquer provider como Vosk).
     return {
       id: info.id,
       label,
-      ready,
-      reason: ready ? '' : 'baixe o modelo Vosk para .tools/models/vosk',
+      ready: false,
+      reason: `sem verificação de prontidão para o provider "${info.id}"`,
     };
   });
 }

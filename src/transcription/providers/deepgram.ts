@@ -18,7 +18,7 @@ import {
   type ProviderTranscript,
 } from './common.js';
 
-const URL = 'https://api.deepgram.com/v1/listen';
+const ENDPOINT = 'https://api.deepgram.com/v1/listen';
 
 export async function transcribe(req: ProviderRequest): Promise<ProviderTranscript> {
   const apiKey = requireEnvKey('DEEPGRAM_API_KEY');
@@ -33,7 +33,7 @@ export async function transcribe(req: ProviderRequest): Promise<ProviderTranscri
   });
   const bytes = new Uint8Array(fs.readFileSync(req.wavPath));
   const res = await fetchWithTimeout(
-    `${URL}?${params.toString()}`,
+    `${ENDPOINT}?${params.toString()}`,
     {
       method: 'POST',
       headers: {

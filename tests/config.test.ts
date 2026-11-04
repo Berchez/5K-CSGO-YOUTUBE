@@ -283,7 +283,7 @@ describe('regras cruzadas dos Shorts', () => {
 });
 
 describe('layout dos Shorts (cam no topo)', () => {
-  it('default: cam no topo, faixa de 540, zoom no fill e jogo centralizado', () => {
+  it('default: cam no topo, faixa de 660, zoom no fill e jogo centralizado', () => {
     const cfg = ConfigSchema.parse({});
     expect(cfg.SHORTS_TOP).toBe('cam');
     expect(cfg.SHORTS_CAM_HEIGHT).toBe(660);
@@ -308,7 +308,7 @@ describe('layout dos Shorts (cam no topo)', () => {
     expect(cfg.SHORTS_CAPTIONS).toBe(true);
     expect(cfg.SHORTS_CAPTION_POSITION).toBe('below-crosshair');
     expect(cfg.SHORTS_CAPTION_FONT_SIZE).toBe(54);
-    expect(cfg.SHORTS_CAPTION_FONT_FAMILY).toBe('Segoe UI Black');
+    expect(cfg.SHORTS_CAPTION_FONT_FAMILY).toBe('Barlow Condensed');
     expect(cfg.SHORTS_CAPTION_AI_ORDER).toBe('gemini,huggingface');
     expect(cfg.SHORTS_CAPTION_GEMINI_MODEL).toBe('gemini-3-flash-preview');
     expect(cfg.SHORTS_CAPTION_HF_MODEL).toBe('openai/whisper-large-v3-turbo');

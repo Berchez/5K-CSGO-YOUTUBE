@@ -2,19 +2,28 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCaptionLines,
   buildCaptionsAss,
+  canPublishShortWithCaptions,
   captionCrosshairTopY,
   captionMaxChars,
   escapeAssFilterPath,
   escapeAssText,
   fitCaptionLines,
   formatAssTime,
+  isRetryableCaptionFailure,
   normalizeCaptionText,
+  safeAssName,
+  shortRetryBackoffMs,
+  shortRetryDecision,
+  MAX_SHORT_ATTEMPTS,
   wrapCaptionText,
 } from '../src/clipper/shortCaptions.js';
 import {
   captionProviders,
+  classifyTranscriptResponse,
+  createCaptionTranscriber,
   groupCaptionChunks,
   parseGeminiTranscript,
+  usableTranscriptLines,
 } from '../src/clipper/shortCaptionsAi.js';
 import { buildShortLayout, isStaleRender, shortRenderSignature } from '../src/clipper/shorts.js';
 
@@ -101,6 +110,27 @@ describe('buildCaptionLines', () => {
     for (const linha of linhas) expect(linha.endSec - linha.startSec).toBeLessThanOrEqual(6.01);
   });
 
+  it('texto que não cabe na tela vira OUTRO bloco (nada de fala se perde)', () => {
+    const texto = 'primeira parte da fala que é bem comprida mesmo segunda parte da fala que também é comprida';
+    const linhas = buildCaptionLines([{ startSec: 0, endSec: 4, text: texto }], {
+      durSec: 10,
+      maxCharsPerLine: 20,
+      maxLines: 2,
+      maxLineSec: 6,
+    });
+    expect(linhas.length).toBeGreaterThan(1);
+    // Nenhuma linha tem mais de 2 linhas de 20 caracteres.
+    for (const linha of linhas) {
+      for (const parte of linha.text.split('\n')) {
+        expect(parte.length).toBeLessThanOrEqual(20);
+      }
+    }
+    // A fala inteira está na tela (sem reticências).
+    const naTela = linhas.map((l) => l.text.replace(/\n/g, ' ')).join(' ');
+    expect(naTela).not.toContain('…');
+    expect(naTela.replace(/\s+/g, ' ').trim()).toBe(texto);
+  });
+
   it('dá tempo mínimo de leitura', () => {
     const linhas = buildCaptionLines([{ startSec: 1, endSec: 1.1, text: 'oi' }], {
       durSec: 10,
@@ -147,6 +177,22 @@ describe('escapeAssFilterPath', () => {
   });
 });
 
+describe('safeAssName', () => {
+  it('mantém um nome normal', () => {
+    expect(safeAssName('C:\\tmp\\legenda.ass')).toBe('legenda.ass');
+  });
+
+  it('apóstrofo (e qualquer caractere do filtergraph) sai do nome', () => {
+    // O apóstrofo fecha a aspa do filtro `ass` e quebra o filtergraph.
+    expect(safeAssName("C:\\tmp\\O'Brien.ass")).toBe('O_Brien.ass');
+    expect(safeAssName('C:\\tmp\\a:b,c.ass')).toBe('a_b_c.ass');
+  });
+
+  it('nome vazio vira um nome válido', () => {
+    expect(safeAssName('')).toBe('caption.ass');
+  });
+});
+
 describe('captionMaxChars', () => {
   it('cabe mais caracteres com a fonte menor', () => {
     expect(captionMaxChars(1080, 40)).toBeGreaterThan(captionMaxChars(1080, 80));
@@ -187,7 +233,7 @@ describe('buildCaptionsAss', () => {
 
   it('usa a fonte mais forte na legenda', () => {
     const ass = buildCaptionsAss(linhas);
-    expect(ass).toContain('Style: Caption,Segoe UI Black,54');
+    expect(ass).toContain('Style: Caption,Barlow Condensed,54');
     expect(ass).toContain(',-1,0,0,0,100,100,0,0,1,3,1,8,');
   });
 
@@ -298,7 +344,10 @@ describe('layout com legenda queimada', () => {
       camBox: { x: 0.8, y: 0.3, w: 0.18, h: 0.24 },
       captionsAssPath: 'C:\\tmp\\legenda.ass',
     });
-    expect(com.filter).toContain("ass=filename='C\\:/tmp/legenda.ass'");
+    // O filtro usa só o NOME do arquivo (o ffmpeg roda na pasta dele):
+    // o caminho absoluto com `C:` e apóstrofo quebraria o filtergraph.
+    expect(com.filter).toContain("ass=filename='legenda.ass'");
+    expect(com.filter).toContain('fontsdir=');
     expect(com.filter.indexOf('vstack')).toBeLessThan(com.filter.indexOf('ass=filename'));
   });
 
@@ -350,5 +399,205 @@ describe('assinatura com legendas', () => {
   it('mesma configuração não invalida', () => {
     const atual = shortRenderSignature({ top: 'cam', captions: 'on' });
     expect(isStaleRender(atual, atual)).toBe(false);
+  });
+});
+
+describe('legenda quebrada no publish (o Short não pode ir ao ar sem ela)', () => {
+  it('falha técnica (erro/libass) segura a publicação', () => {
+    expect(
+      canPublishShortWithCaptions({
+        captionsOn: true,
+        status: { applied: false, reason: 'error' },
+        allowNoCaptions: false,
+      }).publish,
+    ).toBe(false);
+    expect(
+      canPublishShortWithCaptions({
+        captionsOn: true,
+        status: { applied: false, reason: 'failed' },
+        allowNoCaptions: false,
+      }).publish,
+    ).toBe(false);
+  });
+
+  it('o dono pode forçar a publicação sem legenda', () => {
+    expect(
+      canPublishShortWithCaptions({
+        captionsOn: true,
+        status: { applied: false, reason: 'error' },
+        allowNoCaptions: true,
+      }).publish,
+    ).toBe(true);
+  });
+
+  it('legenda aplicada (ou não pedida) publica normalmente', () => {
+    expect(
+      canPublishShortWithCaptions({
+        captionsOn: true,
+        status: { applied: true, lines: 13 },
+        allowNoCaptions: false,
+      }).publish,
+    ).toBe(true);
+    expect(
+      canPublishShortWithCaptions({
+        captionsOn: false,
+        status: null,
+        allowNoCaptions: false,
+      }).publish,
+    ).toBe(true);
+  });
+
+  it('silêncio (sem fala) e áudio ausente são estado final: publica', () => {
+    for (const reason of ['no-speech', 'no-audio', 'disabled'] as const) {
+      expect(
+        canPublishShortWithCaptions({
+          captionsOn: true,
+          status: { applied: false, reason },
+          allowNoCaptions: false,
+        }).publish,
+      ).toBe(true);
+      expect(isRetryableCaptionFailure({ applied: false, reason })).toBe(false);
+    }
+    expect(isRetryableCaptionFailure({ applied: false, reason: 'error' })).toBe(true);
+    expect(isRetryableCaptionFailure({ applied: false, reason: 'failed' })).toBe(true);
+  });
+});
+
+describe('classifyTranscriptResponse (JSON inválido é FALHA, não silêncio)', () => {
+  it('JSON válido com linhas é ok', () => {
+    expect(
+      classifyTranscriptResponse('{"language":"pt-BR","lines":[{"start":1,"end":2,"text":"oi"}]}'),
+    ).toBe('ok');
+  });
+
+  it('JSON válido sem fala é silêncio', () => {
+    expect(classifyTranscriptResponse('{"language":"pt-BR","lines":[]}')).toBe('silence');
+    expect(classifyTranscriptResponse('')).toBe('silence');
+  });
+
+  it('JSON inválido é falha (inclusive o que termina em })', () => {
+    expect(classifyTranscriptResponse('{"language":"pt-BR","lines":[}')).toBe('invalid');
+    expect(classifyTranscriptResponse('{"language":"pt-BR","lines":[]}')).toBe('silence');
+    expect(classifyTranscriptResponse('{"language":"pt-BR","lines":[{"start":1}')).toBe('invalid');
+    expect(classifyTranscriptResponse('resposta em texto puro')).toBe('invalid');
+  });
+
+  it('linhas com tempo inválido é FALHA (a transcrição existiu e se perdeu)', () => {
+    expect(
+      classifyTranscriptResponse(
+        '{"language":"pt-BR","lines":[{"start":"0:01.2","end":"0:02.2","text":"oi"}]}',
+      ),
+    ).toBe('invalid');
+  });
+});
+
+describe('usableTranscriptLines (a definição única de linha aproveitável)', () => {
+  it('descarta a linha com tempo inválido e mantém a boa', () => {
+    const usable = usableTranscriptLines({
+      language: 'pt-BR',
+      lines: [
+        { start: '0:01.2', end: '0:02.2', text: 'tempo ruim' },
+        { start: 1, end: 2, text: 'tempo bom' },
+      ],
+    });
+    expect(usable.lines).toHaveLength(1);
+    expect(usable.lines[0].text).toBe('tempo bom');
+  });
+
+  it('nada aproveitável devolve lista vazia', () => {
+    const usable = usableTranscriptLines({ lines: [{ start: 'x', end: 'y', text: 'oi' }] });
+    expect(usable.lines).toEqual([]);
+  });
+});
+
+describe('createCaptionTranscriber (silêncio é estado final; falta de chave não é falha)', () => {
+  const silent = async (): Promise<null> => null;
+  const failed = async (): Promise<never> => {
+    throw new Error('timeout gemini');
+  };
+  const spoke = async () => ({
+    lines: [{ startSec: 1, endSec: 2, text: 'que jogada' }],
+    language: 'pt-BR',
+    translated: false,
+  });
+
+  it('gemini em silêncio + huggingface sem token: o Short sai sem legenda (NÃO é falha)', async () => {
+    const transcriber = createCaptionTranscriber({
+      transcribers: { gemini: silent },
+      hfToken: undefined,
+    });
+    await expect(transcriber('audio.wav', 30)).resolves.toBeNull();
+  });
+
+  it('gemini em silêncio + huggingface que também cala: sem legenda, sem erro', async () => {
+    const transcriber = createCaptionTranscriber({
+      transcribers: { gemini: silent, huggingface: silent },
+    });
+    await expect(transcriber('audio.wav', 30)).resolves.toBeNull();
+  });
+
+  it('gemini falha + huggingface em silêncio: é FALHA (o Short espera a próxima rodada)', async () => {
+    const transcriber = createCaptionTranscriber({
+      transcribers: { gemini: failed, huggingface: silent },
+    });
+    await expect(transcriber('audio.wav', 30)).rejects.toThrow(/timeout gemini/);
+  });
+
+  it('gemini falha + huggingface responde: usa o huggingface', async () => {
+    const transcriber = createCaptionTranscriber({
+      transcribers: { gemini: failed, huggingface: spoke },
+    });
+    const result = await transcriber('audio.wav', 30);
+    expect(result?.provider).toBe('huggingface');
+    expect(result?.lines[0].text).toBe('que jogada');
+  });
+
+  it('nenhum provider configurado: erro claro (setup, não silêncio)', async () => {
+    const transcriber = createCaptionTranscriber({});
+    await expect(transcriber('audio.wav', 30)).rejects.toThrow(/nenhum provider de transcrição configurado/);
+  });
+});
+
+describe('backoff das tentativas do Short', () => {
+  const agora = Date.parse('2026-01-01T12:00:00.000Z');
+
+  it('sem falha anterior, o Short é tentado', () => {
+    expect(shortRetryDecision(undefined, agora).skip).toBe(false);
+    expect(shortRetryDecision({ attempts: 0 }, agora).skip).toBe(false);
+  });
+
+  it('a espera cresce com o número de falhas', () => {
+    expect(shortRetryBackoffMs(0)).toBe(0);
+    expect(shortRetryBackoffMs(1)).toBeLessThan(shortRetryBackoffMs(2));
+    expect(shortRetryBackoffMs(2)).toBeLessThan(shortRetryBackoffMs(3));
+    expect(shortRetryBackoffMs(9)).toBe(shortRetryBackoffMs(4));
+  });
+
+  it('falhou há pouco: espera antes de tentar de novo', () => {
+    const state = {
+      attempts: 1,
+      lastAttemptAt: new Date(agora - 60_000).toISOString(),
+    };
+    const decision = shortRetryDecision(state, agora);
+    expect(decision.skip).toBe(true);
+    expect(decision.reason).toMatch(/aguardando/);
+  });
+
+  it('a espera já passou: tenta de novo', () => {
+    const state = {
+      attempts: 1,
+      lastAttemptAt: new Date(agora - 11 * 60_000).toISOString(),
+    };
+    expect(shortRetryDecision(state, agora).skip).toBe(false);
+  });
+
+  it('passou do teto: só o dono manda tentar de novo (--force)', () => {
+    const state = {
+      attempts: MAX_SHORT_ATTEMPTS,
+      lastAttemptAt: new Date(agora - 10 * 24 * 3_600_000).toISOString(),
+    };
+    const decision = shortRetryDecision(state, agora);
+    expect(decision.skip).toBe(true);
+    expect(decision.reason).toMatch(/--force/);
   });
 });

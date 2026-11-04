@@ -8,6 +8,7 @@
  * gerar o `.ass`. Quem chama (o script dos Shorts) cuida do áudio, da IA
  * e do render.
  */
+import path from 'node:path';
 
 /** Uma linha de legenda (tempos relativos ao INÍCIO do Short). */
 export interface CaptionLine {
@@ -19,6 +20,148 @@ export interface CaptionLine {
 
 /** Onde a legenda fica no vertical. */
 export type CaptionPosition = 'game-top' | 'below-crosshair' | 'bottom';
+
+/**
+ * Por que a legenda NÃO entrou no vertical.
+ *
+ * - `no-audio`: o clipe não tem trilha de áudio (não há o que transcrever);
+ * - `no-speech`: ninguém falou na janela (estado final);
+ * - `error`: a transcrição quebrou (timeout, chave, JSON inválido) — dá
+ *   para tentar de novo;
+ * - `failed`: a transcrição saiu, mas o libass não queimou a legenda no
+ *   mp4 (fonte/ASS) — dá para tentar de novo;
+ * - `disabled`: a legenda não foi pedida.
+ */
+export type CaptionSkipReason = 'no-audio' | 'no-speech' | 'error' | 'failed' | 'disabled';
+
+/** Como a legenda ficou no vertical (o que o marker do Short guarda). */
+export interface CaptionStatus {
+  applied: boolean;
+  provider?: string;
+  language?: string | null;
+  lines?: number;
+  translated?: boolean;
+  reason?: CaptionSkipReason;
+}
+
+/**
+ * A falha é TÉCNICA (vale tentar de novo) ou FINAL?
+ *
+ * `no-audio`/`no-speech` são finais: repetir a transcrição não muda nada.
+ * `error`/`failed` são técnicas: a próxima rodada tenta de novo.
+ */
+export function isRetryableCaptionFailure(
+  status: CaptionStatus | null | undefined,
+): boolean {
+  return status?.reason === 'error' || status?.reason === 'failed';
+}
+
+/**
+ * O Short pode subir sem a legenda que foi pedida?
+ *
+ * A legenda é pedida com `SHORTS_CAPTIONS=on` (ou sem `--no-captions`).
+ * Se a transcrição QUEBROU, publicar assim entrega ao canal um Short sem
+ * legenda que nunca mais vai ser refeito (o marker recebe o `youtubeId` e
+ * a próxima rodada pula o clipe). Melhor segurar o Short para a próxima
+ * rodada tentar de novo — o dono pode forçar com `--allow-no-captions`.
+ */
+export function canPublishShortWithCaptions(opts: {
+  /** A legenda foi pedida? */
+  captionsOn: boolean;
+  /** Como a legenda ficou no arquivo que vai subir. */
+  status: CaptionStatus | null | undefined;
+  /** O dono mandou publicar mesmo sem a legenda? */
+  allowNoCaptions: boolean;
+}): { publish: boolean; reason?: string } {
+  if (!opts.captionsOn) return { publish: true };
+  if (opts.status?.applied) return { publish: true };
+  if (!isRetryableCaptionFailure(opts.status)) return { publish: true };
+  if (opts.allowNoCaptions) return { publish: true };
+  return {
+    publish: false,
+    reason: `a legenda falhou (${opts.status?.reason}) — a próxima rodada tenta de novo`,
+  };
+}
+
+/**
+ * O erro do render veio do FILTRO de legenda (ass/libass/fonte)?
+ *
+ * Só nesse caso vale refazer o vertical sem a legenda: nas outras
+ * causas (disco cheio, timeout, crop inválido) o render sem legenda
+ * também falha e a mensagem real se perde.
+ */
+export function isCaptionFilterError(error: unknown): boolean {
+  const message = String(
+    (error as { message?: string })?.message ?? error ?? '',
+  ).toLowerCase();
+  return /parsed_ass|libass|\bass\b|fontselect|glyph|subtitle|caption/.test(message);
+}
+
+/** Quantas vezes a publicação do Short já falhou. */
+export interface ShortAttemptState {
+  /** Tentativas que falharam (a que está em curso ainda não conta). */
+  attempts?: number | null;
+  /** Quando foi a última tentativa que falhou (ISO). */
+  lastAttemptAt?: string | null;
+}
+
+/**
+ * Teto de tentativas: depois disso o Short para de ser tentado sozinho
+ * (o dono tem que pedir com `--force`).
+ */
+export const MAX_SHORT_ATTEMPTS = 5;
+
+/** Espera entre as tentativas: cresce com o número de falhas (ms). */
+const RETRY_BACKOFF_MS = [10 * 60_000, 30 * 60_000, 2 * 3_600_000, 6 * 3_600_000];
+
+/**
+ * Quanto tempo esperar antes da próxima tentativa.
+ *
+ * A primeira falha espera 10min, a segunda 30min, a terceira 2h e a
+ * quarta 6h: um provedor de IA fora do ar não pode virar uma fila de
+ * chamadas a cada rodada.
+ */
+export function shortRetryBackoffMs(attempts: number): number {
+  const n = Math.max(0, Math.floor(Number(attempts) || 0));
+  if (n === 0) return 0;
+  const idx = Math.min(n - 1, RETRY_BACKOFF_MS.length - 1);
+  return RETRY_BACKOFF_MS[idx];
+}
+
+/**
+ * O Short deve ser pulado AGORA?
+ *
+ * - Backoff: a última falha foi há pouco (não adianta tentar de novo
+ *   na mesma hora — o provedor provavelmente ainda está fora);
+ * - Teto: já falhou `MAX_SHORT_ATTEMPTS` vezes — o dono precisa mandar
+ *   com `--force`.
+ */
+export function shortRetryDecision(
+  state: ShortAttemptState | null | undefined,
+  nowMs: number = Date.now(),
+): { skip: boolean; reason?: string; waitMs?: number } {
+  const attempts = Math.max(0, Math.floor(Number(state?.attempts) || 0));
+  if (attempts <= 0) return { skip: false };
+  if (attempts >= MAX_SHORT_ATTEMPTS) {
+    return {
+      skip: true,
+      reason: `já falhou ${attempts} vez(es) — o Short precisa de --force para ser tentado de novo`,
+    };
+  }
+  const last = state?.lastAttemptAt ? Date.parse(String(state.lastAttemptAt)) : NaN;
+  if (!Number.isFinite(last)) return { skip: false };
+  const waitMs = shortRetryBackoffMs(attempts);
+  const elapsed = nowMs - last;
+  if (elapsed < waitMs) {
+    const minRest = Math.ceil((waitMs - elapsed) / 60_000);
+    return {
+      skip: true,
+      reason: `aguardando ${minRest}min antes de tentar de novo (última tentativa há ${Math.max(1, Math.floor(elapsed / 60_000))}min)`,
+      waitMs: waitMs - elapsed,
+    };
+  }
+  return { skip: false };
+}
 
 /** Onde a legenda fica no vertical e com que fonte. */
 export interface CaptionStyle {
@@ -47,7 +190,13 @@ export const CAPTION_DEFAULT_STYLE: CaptionStyle = {
   height: 1920,
   topY: 1350,
   fontSize: 54,
-  fontFamily: 'Segoe UI Black',
+  /**
+   * A fonte da legenda é a VERSÃO NO REPO (assets/fonts/BarlowCondensed-Bold.ttf).
+   * Uma fonte do sistema ("Segoe UI Black") não existe em toda máquina e o
+   * libass cairia num fallback silencioso — a legenda saía com outra
+   * fonte em cada host (e a largura medida não batia).
+   */
+  fontFamily: 'Barlow Condensed',
   maxCharsPerLine: 32,
   maxLines: 2,
   position: 'below-crosshair',
@@ -153,13 +302,60 @@ export interface CaptionTimingOptions {
 }
 
 /**
- * Máximo de caracteres por linha que cabe na largura do vertical
- * (estimativa da largura média do Arial Bold).
+ * Máximo de caracteres por linha que cabe na largura do vertical.
+ *
+ * `avgCharWidth` é a largura MÉDIA por caractere na fonte da legenda
+ * (medida na fonte do repo). O padrão é o valor conservador de uma
+ * fonte bold qualquer (0.62): com a fonte errada a linha estoura e o
+ * libass re-quebra sozinho, furando o limite de linhas.
  */
-export function captionMaxChars(width: number, fontSize: number): number {
+export function captionMaxChars(
+  width: number,
+  fontSize: number,
+  avgCharWidth = 0.62,
+): number {
   const usable = Math.max(120, (Number(width) || 1080) - 80);
   const size = Math.max(16, Number(fontSize) || 54);
-  return Math.max(14, Math.floor(usable / (size * 0.56)));
+  const avg = Math.max(0.2, Number(avgCharWidth) || 0.62);
+  return Math.max(14, Math.floor(usable / (size * avg)));
+}
+
+/**
+ * Quebra o texto em BLOCOS que cabem em `maxLines` (sem perder fala).
+ *
+ * O texto é quebrado em linhas e as linhas viram grupos de `maxLines`:
+ * cada grupo cabe na tela. Nenhum trecho é cortado com reticências —
+ * o que não couber vira OUTRO bloco, com o tempo repartido.
+ */
+export function captionTextChunks(
+  text: string,
+  maxChars: number,
+  maxLines: number,
+): string[][] {
+  const lines = wrapCaptionText(text, maxChars);
+  if (lines.length === 0) return [];
+  const max = Math.max(1, Math.floor(maxLines));
+  const chunks: string[][] = [];
+  for (let i = 0; i < lines.length; i += max) {
+    chunks.push(lines.slice(i, i + max));
+  }
+  return chunks;
+}
+
+/** Reparte as palavras do texto em `pieces` grupos (sem cortar palavra). */
+function splitTextByWords(text: string, pieces: number): string[] {
+  const words = String(text ?? '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) return [];
+  const count = Math.max(1, Math.min(pieces, words.length));
+  const out: string[] = [];
+  const per = Math.ceil(words.length / count);
+  for (let i = 0; i < words.length; i += per) {
+    out.push(words.slice(i, i + per).join(' '));
+  }
+  return out;
 }
 
 /**
@@ -186,31 +382,32 @@ export function buildCaptionLines(
     const end = clamp(Number(item.endSec) || 0, 0, dur);
     if (end - start < 0.05) continue;
 
-    // Um bloco de 15s na tela não é lido: divide em pedaços e reparte o
-    // tempo e o texto proporcionalmente.
-    const pieces = Math.max(1, Math.ceil((end - start) / maxLineSec));
-    if (pieces === 1) {
-      out.push(makeCaptionBlock(text, start, end, maxChars, maxLines));
-      continue;
+    // O bloco é dividido em pedaços que CABEM na tela (no máximo
+    // `maxLines` linhas) e na tela por tempo (no máximo `maxLineSec`).
+    // NENHUM trecho de fala é cortado: o que não cabe vira outro
+    // pedaço, e o tempo é repartido entre eles.
+    const span = end - start;
+    const byTime = Math.max(1, Math.ceil(span / maxLineSec));
+    let pieces = byTime;
+    let groups: string[][] = [];
+    for (let attempt = 0; attempt < 8; attempt++) {
+      groups = splitTextByWords(text, pieces).map((part) => wrapCaptionText(part, maxChars));
+      if (groups.every((g) => g.length > 0 && g.length <= maxLines)) break;
+      pieces += 1;
     }
-    let consumed = 0;
-    for (let i = 0; i < pieces; i++) {
-      const targetLen =
-        i === pieces - 1 ? text.length - consumed : Math.ceil(text.length / pieces);
-      // Quebra no limite de palavra (não corta no meio); último pedaço usa até o fim.
-      let pieceEnd = Math.min(text.length, consumed + targetLen);
-      if (i !== pieces - 1) {
-        while (pieceEnd > consumed && text[pieceEnd - 1] !== ' ') pieceEnd--;
-        if (pieceEnd === consumed) pieceEnd = Math.min(text.length, consumed + targetLen);
-      }
-      const piece = text.slice(consumed, pieceEnd).trim();
-      consumed = pieceEnd;
-      if (!piece) continue;
-      const pieceStart = start + ((end - start) * i) / pieces;
-      const pieceEndSec =
-        i === pieces - 1 ? end : start + ((end - start) * (i + 1)) / pieces;
-      out.push(makeCaptionBlock(piece, pieceStart, pieceEndSec, maxChars, maxLines));
-    }
+    if (groups.length === 0) continue;
+    // A parte que ainda não cabe (palavra enorme) é o último recurso:
+    // corta com reticências em vez de estourar a tela.
+    const safeGroups = groups.map((g) =>
+      g.length > maxLines ? fitCaptionLines(g.join(' '), maxChars, maxLines) : g,
+    );
+
+    const step = span / safeGroups.length;
+    safeGroups.forEach((group, i) => {
+      const pieceStart = start + step * i;
+      const pieceEnd = i === safeGroups.length - 1 ? end : start + step * (i + 1);
+      out.push({ startSec: pieceStart, endSec: pieceEnd, text: group.join('\n') });
+    });
   }
 
   // Um bloco termina quando o próximo começa: legenda não se sobrepõe.
@@ -229,17 +426,6 @@ export function buildCaptionLines(
     }
   }
   return out.filter((line) => line.endSec > line.startSec && line.text.trim().length > 0);
-}
-
-function makeCaptionBlock(
-  text: string,
-  startSec: number,
-  endSec: number,
-  maxChars: number,
-  maxLines: number,
-): CaptionLine {
-  const lines = fitCaptionLines(text, maxChars, maxLines);
-  return { startSec, endSec, text: lines.join('\n') };
 }
 
 /** Tempo no formato do `.ass` (`H:MM:SS.cc`). */
@@ -262,6 +448,19 @@ export function escapeAssText(text: string): string {
     .replace(/\{/g, '\\{')
     .replace(/\}/g, '\\}')
     .replace(/\r\n|\r|\n/g, '\\N');
+}
+
+/**
+ * Nome do `.ass` que o filtro `ass` aceita.
+ *
+ * O filtro separa opções por `:` e a aspa simples fecha o valor: um
+ * nome com apóstrofo (`O'Brien.ass`) quebrava o filtergraph. O nome
+ * seguro tem só letras, números, ponto, hífen e underscore.
+ */
+export function safeAssName(filePath: string): string {
+  const base = path.basename(String(filePath ?? ''));
+  const clean = base.replace(/[^A-Za-z0-9._-]/g, '_');
+  return clean || 'caption.ass';
 }
 
 /**
