@@ -2,8 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { boolEnv, ConfigSchema, parseBoolEnv, shortsCrossFieldErrors } from './config.js';
 import type { AppConfig } from './config.js';
+import { providerSelectOptions } from './transcription/registry.js';
 
-export type ConfigGroup = 'capture' | 'stream' | 'clips' | 'youtube' | 'system';
+export type ConfigGroup =
+  | 'capture'
+  | 'stream'
+  | 'clips'
+  | 'youtube'
+  | 'transcription'
+  | 'system';
 
 export interface ConfigField {
   key: keyof AppConfig;
@@ -308,7 +315,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_MAX_SEC',
     group: 'clips',
     label: 'Duração máx. do Short',
-    help: 'Duração máxima do Short (o YouTube aceita até 3min; 60s é o corte).',
+    help: 'Duração máxima do Short. O YouTube aceita até 3min, mas acima de 1min um Short com claim de copyright é bloqueado — por isso o corte é 90s.',
     type: 'number',
     min: 10,
     max: 180,
@@ -331,7 +338,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_MIN_SEC',
     group: 'clips',
     label: 'Duração mín. do Short',
-    help: 'Abaixo disso o Short é rápido demais e perde retenção.',
+    help: 'Abaixo disso o Short é rápido demais e perde retenção. Quando a jogada é curta, a janela é esticada para frente (reação/rotação final).',
     type: 'number',
     min: 5,
     max: 180,
@@ -348,6 +355,144 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     min: 0,
     max: 1,
     step: 0.05,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_TOP',
+    group: 'clips',
+    label: 'Topo do Short',
+    help: 'Cam do streamer no topo (caixa medida por canal no SHORTS_CAM_BOX_BY_STREAM) ou faixa com o título do vídeo. Center = crop vertical antigo.',
+    type: 'select',
+    options: [
+      { value: 'cam', label: 'Cam do streamer' },
+      { value: 'text', label: 'Faixa com o título' },
+      { value: 'center', label: 'Crop 9:16 antigo' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAM_HEIGHT',
+    group: 'clips',
+    label: 'Altura da faixa do topo',
+    help: 'Quanto da saída é a cam (o resto é o jogo). 660 em 1920: ~80% da caixa da webcam do gaules no quadro e o jogo 1:1 em 1080x1080. Ajuste em 20px.',
+    type: 'number',
+    min: 160,
+    max: 1800,
+    step: 20,
+    unit: 'px',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAM_FIT',
+    group: 'clips',
+    label: 'Preenchimento da cam',
+    help: 'Cover = a cam é zoomada até preencher a faixa (sem barras pretas). Blur = a cam inteira sobre um fundo desfocado.',
+    type: 'select',
+    options: [
+      { value: 'cover', label: 'Zoom (sem barras)' },
+      { value: 'blur', label: 'Fundo desfocado' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAM_ANCHOR',
+    group: 'clips',
+    label: 'Âncora do corte da cam',
+    help: 'Onde o corte vertical da cam pega (0 = topo, 0.5 = centro, 1 = base). Deixe perto de 0.35 para o rosto ficar inteiro.',
+    type: 'number',
+    min: 0,
+    max: 1,
+    step: 0.05,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_GAME_CROP',
+    group: 'clips',
+    label: 'Altura do crop do jogo (fração)',
+    help: 'Fração da altura do clipe usada pelo jogo. 0.95 é o default: o HUD de vida/munição entra no quadro.',
+    type: 'number',
+    min: 0.3,
+    max: 1,
+    step: 0.05,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_GAME_Y',
+    group: 'clips',
+    label: 'Posição vertical do crop do jogo',
+    help: '0 = topo (come o placar), 0.5 = centro (recomendado), 1 = base. Só vale no modo "Zoom" do preenchimento do jogo.',
+    type: 'number',
+    min: 0,
+    max: 1,
+    step: 0.05,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_GAME_FIT',
+    group: 'clips',
+    label: 'Preenchimento do jogo',
+    help: 'Fundo desfocado = o crop do jogo fica centralizado sobre a cena desfocada. Zoom = crop 9:16 apertado, ação grande mas com o killfeed fora.',
+    type: 'select',
+    options: [
+      { value: 'blur', label: 'Fundo desfocado' },
+      { value: 'cover', label: 'Zoom (sem barras)' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_GAME_ASPECT',
+    group: 'clips',
+    label: 'Proporção do jogo',
+    help: 'Proporção (largura/altura) do crop do jogo com o preenchimento "Fundo desfocado". Mais largo = mais da transmissão no quadro, com o jogo menor. Dá para escrever qualquer número no .env.',
+    type: 'select',
+    options: [
+      { value: '1', label: '1:1 (quadrado, ~53%)' },
+      { value: '1.3333', label: '4:3 (~71%)' },
+      { value: '1.5', label: '3:2 (~80%)' },
+      { value: '1.7778', label: '16:9 (~95%)' },
+      { value: '0.7826', label: '9:16 (o crop de antes, ~42%)' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAPTIONS',
+    group: 'clips',
+    label: 'Legenda no Short',
+    help: 'Grava a legenda da narração no proprio mp4 (nao depende do caption do YouTube). Cada Short gasta uma chamada de IA para transcrever.',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAPTION_POSITION',
+    group: 'clips',
+    label: 'Posicao da legenda',
+    help: 'Abaixo da mira = centro da area do jogo, um pouco abaixo do crosshair (padrao). Topo do jogo = logo abaixo da cam. Rodape = posicao classica.',
+    type: 'select',
+    options: [
+      { value: 'below-crosshair', label: 'Abaixo da mira (padrao)' },
+      { value: 'game-top', label: 'Topo do jogo' },
+      { value: 'bottom', label: 'Rodape' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAPTION_FONT_SIZE',
+    group: 'clips',
+    label: 'Tamanho da fonte da legenda',
+    help: 'Altura do texto da legenda em px (na saida de 1080 de largura).',
+    type: 'number',
+    min: 24,
+    max: 160,
+    step: 2,
+    unit: 'px',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAPTION_FONT_FAMILY',
+    group: 'clips',
+    label: 'Fonte da legenda',
+    help: 'Familia instalada no Windows (ex.: Segoe UI Black, Arial Black, Impact).',
+    type: 'text',
     advanced: true,
   },
   {
@@ -500,6 +645,63 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     advanced: true,
   },
   {
+    key: 'TRANSCRIPTION_PROVIDER',
+    group: 'transcription',
+    label: 'Provider de transcrição',
+    help: 'Local = grátis e sem enviar áudio (Whisper/Vosk); nuvem = mais preciso/rápido, mas exige chave no .env. A velocidade medida está no README.',
+    type: 'select',
+    options: providerSelectOptions(),
+  },
+  {
+    key: 'TRANSCRIPTION_MODEL',
+    group: 'transcription',
+    label: 'Modelo',
+    help: 'Vazio = modelo padrão do provider. Ex.: small, medium, large-v3-turbo-q5_0, gemini-3.5-transcribe, whisper-large-v3-turbo.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'TRANSCRIPTION_LANGUAGE',
+    group: 'transcription',
+    label: 'Idioma do áudio',
+    help: 'auto = o provider detecta; pt, en... força um idioma (útil quando o caster fala baixo ou há muito ruído).',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'TRANSCRIPTION_VAD',
+    group: 'transcription',
+    label: 'Detectar fala (VAD)',
+    help: 'Ligado = pula silêncio antes de transcrever (mais rápido e evita alucinação). Só vale nos providers locais.',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
+    key: 'TRANSCRIPTION_OUTPUT_FORMAT',
+    group: 'transcription',
+    label: 'Formato da legenda',
+    help: 'SRT é o formato que o YouTube e os editores importam; VTT é o da web; TXT é só o texto.',
+    type: 'select',
+    options: [
+      { value: 'srt', label: 'SRT' },
+      { value: 'vtt', label: 'WebVTT' },
+      { value: 'txt', label: 'Texto puro' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'TRANSCRIPTION_TIMEOUT_MS',
+    group: 'transcription',
+    label: 'Timeout da transcrição',
+    help: 'Tempo máximo por transcrição (extração do áudio + inferência).',
+    type: 'number',
+    min: 10000,
+    max: 1800000,
+    step: 30000,
+    unit: 'ms',
+    advanced: true,
+  },
+  {
     key: 'LOG_LEVEL',
     group: 'system',
     label: 'Nível de log',
@@ -521,6 +723,11 @@ export const CONFIG_GROUPS: Array<{ id: ConfigGroup; label: string; description:
   { id: 'stream', label: 'Stream', description: 'Qual transmissão é escolhida e em que ordem.' },
   { id: 'clips', label: 'Clipes e thumbs', description: 'Corte, sincronização, espaço em disco e thumbnail.' },
   { id: 'youtube', label: 'YouTube', description: 'Upload, privacidade e metadados.' },
+  {
+    id: 'transcription',
+    label: 'Transcrição',
+    description: 'Fala do clipe → legenda (SRT/VTT/TXT): provider, modelo, idioma e VAD.',
+  },
   { id: 'system', label: 'Sistema', description: 'Diagnóstico e comportamento geral.' },
 ];
 
@@ -726,7 +933,14 @@ export function validateConfigPatch(
   // Regras CRUZADAS (dois campos ao mesmo tempo): salvar só o MAX dos
   // Shorts sem o MIN deixaria um .env que o script de Shorts recusa —
   // e o painel é justamente o lugar de pegar isso antes de gravar.
-  const effective = (key: 'SHORTS_MIN_SEC' | 'SHORTS_MAX_SEC' | 'SHORTS_WIDTH' | 'SHORTS_HEIGHT'): number => {
+  const effective = (
+    key:
+      | 'SHORTS_MIN_SEC'
+      | 'SHORTS_MAX_SEC'
+      | 'SHORTS_WIDTH'
+      | 'SHORTS_HEIGHT'
+      | 'SHORTS_CAM_HEIGHT',
+  ): number => {
     const raw = values[key] ?? current[key];
     if (raw != null && String(raw).trim() !== '') {
       const n = Number(String(raw).trim());
@@ -741,6 +955,7 @@ export function validateConfigPatch(
       maxSec: effective('SHORTS_MAX_SEC'),
       width: effective('SHORTS_WIDTH'),
       height: effective('SHORTS_HEIGHT'),
+      camHeight: effective('SHORTS_CAM_HEIGHT'),
     }),
   );
   return errors.length > 0 ? { ok: false, errors } : { ok: true, values };

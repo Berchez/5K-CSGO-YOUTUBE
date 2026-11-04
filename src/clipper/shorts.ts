@@ -5,6 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import { resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
+import { isValidCrop } from './scoreboardSync.js';
+import { renderShortBannerPng, type ShortBannerText } from './shortBanner.js';
+import { escapeAssFilterPath } from './shortCaptions.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -16,17 +19,28 @@ const execFileAsync = promisify(execFile);
  * render, não na captura (o capture é `-c copy` e continua 16:9).
  *
  * Duas peças:
- * 1. `planShortWindow` — a janela de 30-60s que cobre a jogada (a 1ª
+ * 1. `planShortWindow` — a janela de 60-90s que cobre a jogada (a 1ª
  *    kill até a última). O clipe do bot tem 60-190s (pre-roll + ação +
- *    cauda) e o Shorts aceita 60s.
- * 2. `renderShortClip` — o corte 9:16 (crop central + scale) numa
- *    passada de ffmpeg.
+ *    cauda) e o YouTube aceita Shorts de até 3min.
+ * 2. `renderShortClip` — o vertical numa passada de ffmpeg. Três
+ *    layouts (`buildShortLayout`):
+ *    - `cam`: a cam do STREAMER (caixa medida por canal) num painel no
+ *      topo + o jogo embaixo (mais largo que 9:16);
+ *    - `text`: mesma faixa do topo, mas com o título do vídeo (canal sem
+ *      cam mapeada — melhor que exibir a caixa errada do quadro);
+ *    - `center`: o crop central 9:16 antigo (fallback/comparação).
  */
 
-/** Duração máxima do Short (o YouTube aceita até 3min, mas 60s é o corte). */
-export const SHORT_DEFAULT_MAX_SEC = 60;
+/**
+ * Duração máxima do Short.
+ *
+ * O YouTube aceita até 3min, mas acima de 1min um Short com claim de
+ * copyright ativo é bloqueado globalmente (a transmissão de torneio é
+ * justamente o tipo de conteúdo que é claimed). 90s é o corte.
+ */
+export const SHORT_DEFAULT_MAX_SEC = 90;
 /** Duração mínima (abaixo disso o Short é rápido demais e perde retenção). */
-export const SHORT_DEFAULT_MIN_SEC = 30;
+export const SHORT_DEFAULT_MIN_SEC = 60;
 /** Folga ANTES da 1ª kill (o gancho do Short: a ação começa logo). */
 export const SHORT_DEFAULT_HEAD_SEC = 4;
 /** Folga DEPOIS da última kill (a reação/rolagem final). */
@@ -117,7 +131,7 @@ function chooseTruncatedWindow(
 }
 
 /**
- * Janela do Short: da 1ª kill até a última, dentro de 30-60s.
+ * Janela do Short: da 1ª kill até a última, dentro de 60-90s.
  *
  * Regras:
  * - A 1ª kill é o GANCHO: a janela abre `headSec` antes dela.
@@ -308,6 +322,54 @@ export function isStaleWindow(
   return Math.abs(start - plan.startSec) > 0.05 || Math.abs(dur - plan.durSec) > 0.05;
 }
 
+/** Layout do topo do Short. */
+export type ShortTopMode = 'cam' | 'text' | 'center';
+
+/**
+ * Como a cam preenche a largura (sem barras pretas):
+ * - `cover`: a cam é ZOOMADA até preencher a faixa (corta o topo/base da
+ *   caixa, nunca distorce);
+ * - `blur`: a cam inteira sobre um fundo desfocado da cena (as sobras
+ *   laterais ficam com o desfoque).
+ */
+export type ShortCamFit = 'cover' | 'blur';
+
+/**
+ * Como o JOGO preenche a faixa de baixo:
+ * - `cover`: o 16:9 é CORTADO num 9:16 esticado (a ação em tamanho
+ *   grande, mas o killfeed/placar/rodapé e as laterais saem do quadro);
+ * - `blur`: o 16:9 INTEIRO entra na faixa (1080x607) sobre um fundo
+ *   desfocado — nada é cortado (placar, killfeed e rodapé no quadro),
+ *   mas a ação ocupa menos altura.
+ */
+export type ShortGameFit = 'cover' | 'blur';
+
+
+/** Caixa da cam do streamer, em fração do frame (0-1). */
+export interface ShortCamBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Lê a caixa da cam no formato `x:y:w:h` (mesmo formato dos crops por
+ * canal do placar/killfeed). Inválida ou ausente = null.
+ */
+export function parseShortCamBox(value: string | null | undefined): ShortCamBox | null {
+  const raw = (value ?? '').trim();
+  if (!raw || !isValidCrop(raw)) return null;
+  const [x, y, w, h] = raw.split(':').map(Number);
+  return { x, y, w, h };
+}
+
+/** Texto `x:y:w:h` da caixa (assinatura do render, comparação estável). */
+export function camBoxToString(box: ShortCamBox | null | undefined): string | null {
+  if (!box) return null;
+  return `${box.x}:${box.y}:${box.w}:${box.h}`;
+}
+
 export interface ShortRenderOptions {
   /** Início da janela no clipe (s). */
   startSec: number;
@@ -318,16 +380,109 @@ export interface ShortRenderOptions {
   /** Altura de saída (default 1920). */
   height?: number;
   /**
-   * Posição horizontal do crop (0 = esquerda, 0.5 = centro, 1 = direita).
-   * O crop 9:16 de um 16:9 corta ~2/3 da largura: o HUD (placar no topo,
-   * killfeed na direita) pode ficar de fora — este é o ajuste para
-   * puxar a janela sem mexer no código.
+   * Posição horizontal do crop do JOGO (0 = esquerda, 0.5 = centro,
+   * 1 = direita).
    */
   cropX?: number;
   /** CRF do x264 (default 18). */
   crf?: number;
   /** Preset do x264 (default veryfast — o render não pode saturar a CPU). */
   preset?: string;
+  /** Layout do topo (default: 'cam' quando há caixa, senão 'center'). */
+  top?: ShortTopMode;
+  /** Caixa da cam do streamer (fração do frame). */
+  camBox?: ShortCamBox | null;
+  /** Altura da faixa do topo (px, default 540 = 28% de 1920). */
+  camHeight?: number;
+  /** Como a cam preenche a faixa (default 'cover'). */
+  camFit?: ShortCamFit;
+  /**
+   * Âncora vertical do corte da cam no modo `cover` (0 = topo, 0.5 =
+   * centro, 1 = base). A caixa da cam tem forma de retrato e a faixa é
+   * 2:1 — o corte tem que ficar no rosto, não no meio da cena.
+   */
+  camAnchor?: number;
+  /**
+   * Fração da altura da FONTE usada pelo crop do jogo. Default 0.95 (o
+   * resto é a margem de segurança do quadro da transmissão). Só vale no
+   * modo `cover` (no `blur` o quadro inteiro entra).
+   */
+  gameCrop?: number;
+  /**
+   * Posição vertical do crop do jogo (0 = topo, 0.5 = centro, 1 = base).
+   * Default 0.5 (centralizado: corta um pouco em cima e um pouco embaixo
+   * em vez de comer o topo inteiro e deixar o rodapé de fora).
+   */
+  gameY?: number;
+  /**
+   * Como o jogo preenche a faixa de baixo: `cover` (crop 9:16 apertado,
+   * ação grande) ou `blur` (crop com a proporção pedida, centralizado
+   * sobre fundo desfocado).
+   */
+  gameFit?: ShortGameFit;
+  /**
+   * Proporção (largura/altura) do crop do jogo no modo `blur`.
+   * Default 4:3 (1.3333): mostra ~71% da largura da transmissão.
+   */
+  gameAspect?: number;
+  /** Texto da faixa quando `top='text'`. */
+  banner?: ShortBannerText | null;
+  /** PNG da faixa já rasterizado (evita regerar). */
+  bannerPng?: string | null;
+  /**
+   * Arquivo `.ass` da legenda queimada (opcional). Com ele, o libass
+   * grava a legenda no próprio mp4 (sem depender do caption do YouTube).
+   */
+  captionsAssPath?: string | null;
+}
+
+export interface ShortLayoutOptions {
+  width: number;
+  height: number;
+  top: ShortTopMode;
+  camBox?: ShortCamBox | null;
+  camHeight?: number;
+  camFit?: ShortCamFit;
+  camAnchor?: number;
+  gameCrop?: number;
+  gameY?: number;
+  gameFit?: ShortGameFit;
+  gameAspect?: number;
+  cropX?: number;
+  /** Dimensoes reais da fonte (default 1920x1080). */
+  srcWidth?: number;
+  srcHeight?: number;
+  /**
+   * Arquivo `.ass` da legenda queimada (opcional). O libass do ffmpeg
+   * queima a faixa no vertical depois do `vstack` — assim a legenda é
+   * posicionada no espaço 9:16, e não no do clipe 16:9.
+   */
+  captionsAssPath?: string | null;
+}
+
+export interface ShortLayout {
+  /** Cadeia de filtros, terminando no rótulo `[v]`. */
+  filter: string;
+  width: number;
+  height: number;
+  /** Altura da faixa do topo (px). Igual à saída no layout `center`. */
+  topHeight: number;
+  /** Altura da faixa do jogo (px). */
+  gameHeight: number;
+  /** Layout efetivo (o pedido pode cair no `center` sem caixa). */
+  top: ShortTopMode;
+  camBox: ShortCamBox | null;
+  /** Como a cam preenche a faixa (só no layout `cam`). */
+  camFit: ShortCamFit;
+  /** Como o jogo preenche a faixa de baixo. */
+  gameFit: ShortGameFit;
+  /** Proporção do crop do jogo no modo `blur` (largura/altura). */
+  gameAspect: number;
+}
+
+function even(value: number): number {
+  const rounded = Math.round(value);
+  return rounded - (rounded % 2);
 }
 
 /**
@@ -337,7 +492,13 @@ export interface ShortRenderOptions {
  * `crop=ih*9/16` recorta pela altura (o 16:9 tem largura de sobra) — o
  * centro do frame é onde a mira e a ação ficam no CS2.
  */
-export function shortVideoFilter(opts: ShortRenderOptions): string {
+export interface ShortFilterOptions {
+  width?: number;
+  height?: number;
+  cropX?: number;
+}
+
+export function shortVideoFilter(opts: ShortFilterOptions = {}): string {
   const width = Math.max(2, Math.round(opts.width ?? 1080));
   const height = Math.max(2, Math.round(opts.height ?? 1920));
   const cropX = clamp(opts.cropX ?? 0.5, 0, 1);
@@ -346,6 +507,267 @@ export function shortVideoFilter(opts: ShortRenderOptions): string {
     `scale=${width}:${height}:flags=lanczos`,
     'setsar=1',
   ].join(',');
+}
+
+/**
+ * Monta o filtro do vertical (puro).
+ *
+ * `cam`: cam no topo + jogo embaixo (`vstack`). A cam preenche a faixa
+ * SEM barras pretas: no modo `cover` ela é zoomada até estourar a faixa
+ * (e cortada na vertical, ancorada no rosto); no modo `blur` ela entra
+ * inteira sobre um fundo desfocado da cena.
+ * `text`: faixa de texto (input 1) + jogo embaixo.
+ * `center`: crop central 9:16 antigo (uma passada, sem vstack).
+ *
+ * As dimensões da fonte entram como números (probe do ffprobe) em vez de
+ * expressões `iw/ih`: a cadeia fica legível e testável.
+ */
+export function buildShortLayout(opts: ShortLayoutOptions): ShortLayout {
+  const width = Math.max(2, even(opts.width));
+  const height = Math.max(2, even(opts.height));
+  const cropX = clamp(opts.cropX ?? 0.5, 0, 1);
+  const wanted = opts.top;
+  const camBox = wanted === 'cam' ? (opts.camBox ?? null) : null;
+  // Legenda queimada: o `ass` entra DEPOIS do empilhamento, para as
+  // coordenadas da legenda serem as do vertical (1080x1920).
+  const captionsFilter = opts.captionsAssPath
+    ? `ass=filename=${escapeAssFilterPath(opts.captionsAssPath)}`
+    : '';
+  if (wanted === 'center' || (wanted === 'cam' && !camBox)) {
+    const chain = `[0:v]${shortVideoFilter({ width, height, cropX })}`;
+    return {
+      filter: captionsFilter
+        ? `${chain}[base];[base]${captionsFilter},format=yuv420p[v]`
+        : `${chain}[v]`,
+      width,
+      height,
+      topHeight: height,
+      gameHeight: height,
+      top: 'center',
+      camBox: null,
+      camFit: 'cover',
+      gameFit: 'cover',
+      gameAspect: clamp(opts.gameAspect ?? 4 / 3, 0.3, 2),
+    };
+  }
+
+  const topHeight = Math.max(2, even(clamp(opts.camHeight ?? Math.round(height * 0.28), 2, height - 2)));
+  const gameHeight = height - topHeight;
+  const srcWidth = Number.isFinite(opts.srcWidth) && (opts.srcWidth ?? 0) >= 2 ? Math.round(opts.srcWidth as number) : 1920;
+  const srcHeight = Number.isFinite(opts.srcHeight) && (opts.srcHeight ?? 0) >= 2 ? Math.round(opts.srcHeight as number) : 1080;
+  // O jogo é centralizado: o crop come um pouco em cima e um pouco embaixo
+  // (o placar no topo e o HUD de vida/munição embaixo entram no quadro).
+  const gameCrop = clamp(opts.gameCrop ?? 0.95, 0.2, 1);
+  const gameYPos = clamp(opts.gameY ?? 0.5, 0, 1);
+  const gameCropHeight = Math.max(2, even(Math.min(srcHeight, Math.round(srcHeight * gameCrop))));
+  const gameCropWidth = clamp(
+    Math.round(gameCropHeight * (width / gameHeight)),
+    2,
+    srcWidth,
+  );
+  const gameX = Math.max(0, Math.round((srcWidth - gameCropWidth) * cropX));
+  const gameY = clamp(
+    Math.round((srcHeight - gameCropHeight) * gameYPos),
+    0,
+    Math.max(0, srcHeight - gameCropHeight),
+  );
+  const gameFit: ShortGameFit = opts.gameFit === 'blur' ? 'blur' : 'cover';
+  // Proporção (largura/altura) do CROP do jogo no modo `blur`. O crop
+  // pega essa fatia da fonte (altura = `gameCrop`), encaixa na faixa
+  // mantendo a proporção e fica CENTRALIZADO sobre o fundo desfocado.
+  // Mais largo = mais conteúdo da transmissão no quadro (e o jogo
+  // encolhe): 1 = quadrado, 4:3 = 1.3333, 3:2 = 1.5, 16:9 = 1.7778.
+  const gameAspect = clamp(opts.gameAspect ?? 4 / 3, 0.3, 2);
+  // No modo `cover` o crop tem o aspecto da FAIXA (o jogo preenche tudo);
+  // no modo `blur` o crop tem a proporção pedida.
+  const blurCropWidth = clamp(Math.round(gameCropHeight * gameAspect), 2, srcWidth);
+  const blurCropX = Math.max(0, Math.round((srcWidth - blurCropWidth) * cropX));
+  // `cover`: o 16:9 é cortado no aspecto da faixa (ação grande, mas o
+  // killfeed/placar/rodapé e as laterais ficam de fora).
+  // `blur`: o crop com a proporção pedida é encaixado e centralizado sobre
+  // um fundo desfocado da própria cena — nada é distorcido.
+  const gameChain = (source: string): string =>
+    gameFit === 'blur'
+      ? `[${source}]split=2[gamesplit0][gamesplit1];` +
+        `[gamesplit0]scale=${width}:${gameHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,` +
+        `crop=${width}:${gameHeight},boxblur=20:2,setsar=1[gamebg];` +
+        `[gamesplit1]crop=${blurCropWidth}:${gameCropHeight}:${blurCropX}:${gameY},` +
+        `scale=${width}:${gameHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[gamefg];` +
+        `[gamebg][gamefg]overlay=(W-w)/2:(H-h)/2[game]`
+      : `[${source}]crop=${gameCropWidth}:${gameCropHeight}:${gameX}:${gameY},` +
+        `scale=${width}:${gameHeight}:flags=lanczos,setsar=1[game]`;
+
+  if (opts.top === 'text') {
+    return {
+      filter:
+        `[1:v]scale=${width}:${topHeight}:flags=lanczos,setsar=1[top];${gameChain('0:v')};` +
+        `[top][game]vstack=inputs=2${captionsFilter ? `,${captionsFilter}` : ''},format=yuv420p[v]`,
+      width,
+      height,
+      topHeight,
+      gameHeight,
+      top: 'text',
+      camBox: null,
+      camFit: 'cover',
+      gameFit,
+      gameAspect,
+    };
+  }
+
+  const box = camBox as ShortCamBox;
+  const camCropW = clamp(Math.round(srcWidth * box.w), 2, srcWidth);
+  const camCropH = clamp(Math.round(srcHeight * box.h), 2, srcHeight);
+  const camCropX = clamp(Math.round(srcWidth * box.x), 0, srcWidth - camCropW);
+  const camCropY = clamp(Math.round(srcHeight * box.y), 0, srcHeight - camCropH);
+  const fit: ShortCamFit = opts.camFit === 'blur' ? 'blur' : 'cover';
+  const anchor = clamp(opts.camAnchor ?? 0.35, 0, 1);
+  const camCrop = `crop=${camCropW}:${camCropH}:${camCropX}:${camCropY}`;
+  const head =
+    fit === 'cover'
+      ? [
+          `[0:v]split=2[camsrc][gamesrc]`,
+          // Zoom até estourar a faixa e corte vertical ancorado no rosto:
+          // sem barra preta nas laterais e sem distorcer o aspecto.
+          `[camsrc]${camCrop},scale=${width}:${topHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,` +
+            `crop=${width}:${topHeight}:(iw-ow)/2:(ih-oh)*${anchor},setsar=1[top]`,
+        ]
+      : [
+          `[0:v]split=3[bgsrc][camsrc][gamesrc]`,
+          // Fundo: a cena inteira desfocada preenchendo a faixa (a caixa da
+          // cam é 4:3~16:9 e a faixa é 2:1: sem isso sobrariam barras pretas).
+          `[bgsrc]scale=${width}:${topHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,` +
+            `crop=${width}:${topHeight},boxblur=20:2,setsar=1[topbg]`,
+          // Cam: encaixa inteira (contain) — nada de cortar a cabeça.
+          `[camsrc]${camCrop},scale=${width}:${topHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[topfg]`,
+          // Overlay CENTRALIZADO: com `pad` preto o desenho da cam
+          // cobria o fundo desfocado e voltavam as barras pretas.
+          `[topbg][topfg]overlay=(W-w)/2:(H-h)/2[top]`,
+        ];
+  return {
+    filter: [
+      ...head,
+      gameChain('gamesrc'),
+      `[top][game]vstack=inputs=2${captionsFilter ? `,${captionsFilter}` : ''},format=yuv420p[v]`,
+    ].join(';'),
+    width,
+    height,
+    topHeight,
+    gameHeight,
+    top: 'cam',
+    camBox: box,
+    camFit: fit,
+    gameFit,
+    gameAspect,
+  };
+}
+
+/** Assinatura do render gravada no marker (layout + geometria). */
+export interface ShortRenderSignature {
+  top: ShortTopMode;
+  camBox: string | null;
+  camHeight: number;
+  camFit: ShortCamFit;
+  camAnchor: number;
+  gameCrop: number;
+  gameY: number;
+  gameFit: ShortGameFit;
+  gameAspect: number;
+  width: number;
+  height: number;
+  bannerText: string | null;
+  cropX?: number;
+  /** Legenda queimada pedida (`on`) ou não (`off`). */
+  captions: ShortCaptionMode;
+  /** Tamanho da fonte da legenda (px). */
+  captionFontSize: number;
+  /** Posição da legenda no vertical. */
+  captionPosition: ShortCaptionPosition;
+  /** Família da fonte da legenda. */
+  captionFontFamily: string;
+}
+
+export type ShortCaptionMode = 'off' | 'on';
+export type ShortCaptionPosition = 'below-crosshair' | 'game-top' | 'bottom';
+
+export function shortRenderSignature(opts: {
+  top: ShortTopMode;
+  camBox?: ShortCamBox | null;
+  camHeight?: number;
+  camFit?: ShortCamFit;
+  camAnchor?: number;
+  gameCrop?: number;
+  gameY?: number;
+  gameFit?: ShortGameFit;
+  gameAspect?: number;
+  width?: number;
+  height?: number;
+  bannerText?: string | null;
+  cropX?: number;
+  captions?: ShortCaptionMode;
+  captionFontSize?: number;
+  captionPosition?: ShortCaptionPosition;
+  captionFontFamily?: string;
+}): ShortRenderSignature {
+  return {
+    top: opts.top,
+    camBox: camBoxToString(opts.camBox),
+    camHeight: Math.round(opts.camHeight ?? 540),
+    camFit: opts.camFit === 'blur' ? 'blur' : 'cover',
+    camAnchor: Number((opts.camAnchor ?? 0.35).toFixed(4)),
+    gameCrop: Number((opts.gameCrop ?? 0.95).toFixed(4)),
+    gameY: Number((opts.gameY ?? 0.5).toFixed(4)),
+    gameFit: opts.gameFit === 'blur' ? 'blur' : 'cover',
+    gameAspect: Number((opts.gameAspect ?? 4 / 3).toFixed(4)),
+    width: Math.round(opts.width ?? 1080),
+    height: Math.round(opts.height ?? 1920),
+    bannerText: opts.bannerText ?? null,
+    cropX: Number((opts.cropX ?? 0.5).toFixed(4)),
+    captions: opts.captions === 'on' ? 'on' : 'off',
+    captionFontSize: Math.round(opts.captionFontSize ?? 54),
+    captionPosition:
+      opts.captionPosition === 'bottom'
+        ? 'bottom'
+        : opts.captionPosition === 'below-crosshair'
+          ? 'below-crosshair'
+          : 'game-top',
+    captionFontFamily: String(opts.captionFontFamily ?? 'Segoe UI Black').trim() || 'Segoe UI Black',
+  };
+}
+
+/**
+ * O vertical em disco foi gerado com OUTRO layout/geometria?
+ *
+ * Sem a assinatura (marker antigo) não há como saber: re-renderiza. Um
+ * Short publicado tem `youtubeId` e nem chega aqui (o script pula).
+ */
+export function isStaleRender(
+  previous: ShortRenderSignature | null | undefined,
+  current: ShortRenderSignature,
+): boolean {
+  if (!previous) return true;
+  return (
+    previous.top !== current.top ||
+    (previous.camBox ?? null) !== (current.camBox ?? null) ||
+    previous.camHeight !== current.camHeight ||
+    // Estrito de propósito: um marker de uma versão anterior do layout
+    // não tem estes campos (undefined) e precisa cair no re-render.
+    previous.camFit !== current.camFit ||
+    previous.camAnchor !== current.camAnchor ||
+    previous.gameCrop !== current.gameCrop ||
+    previous.gameY !== current.gameY ||
+    previous.gameFit !== current.gameFit ||
+    previous.gameAspect !== current.gameAspect ||
+    previous.width !== current.width ||
+    previous.height !== current.height ||
+    (previous.bannerText ?? null) !== (current.bannerText ?? null) ||
+    (previous.cropX ?? 0.5) !== (current.cropX ?? 0.5) ||
+    // Legenda queimada: um marker antigo não tem estes campos e precisa
+    // cair no re-render (o mp4 foi gravado sem legenda).
+    previous.captions !== current.captions ||
+    previous.captionFontSize !== current.captionFontSize ||
+    previous.captionPosition !== current.captionPosition ||
+    previous.captionFontFamily !== current.captionFontFamily
+  );
 }
 
 async function probeDurationSec(file: string): Promise<number | null> {
@@ -364,7 +786,46 @@ async function probeDurationSec(file: string): Promise<number | null> {
   }
 }
 
-async function hasAudioStream(file: string): Promise<boolean> {
+/** Dimensões e taxa da fonte (o filtro precisa de números, não `iw/ih`). */
+async function probeVideoInfo(
+  file: string,
+): Promise<{ width: number; height: number; fps: number } | null> {
+  const ffprobe = resolveFfprobeBin();
+  if (!ffprobe) return null;
+  try {
+    const out = await execFileAsync(
+      ffprobe,
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=width,height,r_frame_rate',
+        '-of',
+        'csv=p=0',
+        file,
+      ],
+      { timeout: 15_000, windowsHide: true },
+    ).then((r) => String(r.stdout ?? '').trim());
+    const [rawW, rawH, rawRate] = out.split(',');
+    const width = Number.parseInt(rawW ?? '', 10);
+    const height = Number.parseInt(rawH ?? '', 10);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 2 || height < 2) {
+      return null;
+    }
+    const [num, den] = String(rawRate ?? '').split('/').map(Number);
+    const fps =
+      Number.isFinite(num) && Number.isFinite(den) && den > 0 && num > 0
+        ? Math.round(num / den)
+        : 60;
+    return { width, height, fps: Math.max(1, fps) };
+  } catch {
+    return null;
+  }
+}
+
+export async function hasAudioStream(file: string): Promise<boolean> {
   const ffprobe = resolveFfprobeBin();
   if (!ffprobe) return true;
   try {
@@ -379,7 +840,7 @@ async function hasAudioStream(file: string): Promise<boolean> {
   }
 }
 
-/** Teto do render: um vertical de 60s não passa de minutos. */
+/** Teto do render: um vertical de 90s não passa de minutos. */
 const FFMPEG_TIMEOUT_MS = 900_000;
 
 /** execFile com log do erro (o render do Short é um passo do script). */
@@ -429,19 +890,61 @@ async function runFfmpeg(args: string[]): Promise<void> {
  * Renderiza o Short (9:16) a partir do clipe 16:9 já pronto.
  *
  * Uma passada só: `-ss` antes do input (seek rápido; o ffmpeg busca com
- * precisão ao re-encodar) + crop/scale no filtro. O áudio vai junto
+ * precisão ao re-encodar) + o filtro do layout. O áudio vai junto
  * (o Short sem a narração do caster perde metade do appeal).
  */
 export async function renderShortClip(
   inPath: string,
   outPath: string,
   opts: ShortRenderOptions,
-): Promise<{ durSec: number }> {
+): Promise<{ durSec: number; top: ShortTopMode }> {
   const log = getLogger();
   const startSec = Math.max(0, opts.startSec);
   const durSec = Math.max(1, opts.durSec);
-  const filter = shortVideoFilter(opts);
+  const info = await probeVideoInfo(inPath);
+  const layout = buildShortLayout({
+    width: opts.width ?? 1080,
+    height: opts.height ?? 1920,
+    top: opts.top ?? (opts.camBox ? 'cam' : 'center'),
+    camBox: opts.camBox ?? null,
+    camHeight: opts.camHeight,
+    camFit: opts.camFit,
+    camAnchor: opts.camAnchor,
+    gameCrop: opts.gameCrop,
+    gameY: opts.gameY,
+    gameFit: opts.gameFit,
+    gameAspect: opts.gameAspect,
+    cropX: opts.cropX,
+    srcWidth: info?.width,
+    srcHeight: info?.height,
+    captionsAssPath: opts.captionsAssPath ?? null,
+  });
+  const filter = layout.filter;
   const withAudio = await hasAudioStream(inPath);
+  if (opts.top === 'cam' && layout.top === 'center') {
+    log.warn(
+      { in: path.basename(inPath) },
+      'Short sem caixa de cam para o canal — usando o crop central 9:16',
+    );
+  }
+  let bannerPath: string | null = null;
+  let ownBanner = false;
+  if (layout.top === 'text') {
+    bannerPath = opts.bannerPng ?? null;
+    if (!bannerPath) {
+      bannerPath = path.join(
+        os.tmpdir(),
+        `5k-short-banner-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`,
+      );
+      ownBanner = true;
+      await renderShortBannerPng(
+        layout.width,
+        layout.topHeight,
+        opts.banner ?? { title: 'CS2' },
+        bannerPath,
+      );
+    }
+  }
   // A pasta de destino tem que existir ANTES do ffmpeg: o mkdir do caller
   // vinha depois do render e o ffmpeg abortava com "Error opening output
   // file" (o Short nunca era gerado para um clipe novo).
@@ -468,21 +971,21 @@ export async function renderShortClip(
     startSec.toFixed(2),
     '-i',
     inPath,
-    '-t',
-    durSec.toFixed(2),
   ];
-  if (withAudio) {
-    args.push(
-      '-filter_complex',
-      `[0:v]${filter}[v];[0:a]aresample=async=1:first_pts=0[a]`,
-      '-map',
-      '[v]',
-      '-map',
-      '[a]',
-    );
-  } else {
-    args.push('-vf', filter, '-map', '0:v:0');
+  if (bannerPath) {
+    // A faixa de texto é uma imagem parada: `-loop 1` + a taxa da fonte
+    // para o vstack receber frames no mesmo passo do jogo.
+    args.push('-loop', '1', '-framerate', String(info?.fps ?? 60), '-i', bannerPath);
   }
+  // `-t` é opção de SAÍDA: depois de todos os inputs.
+  args.push('-t', durSec.toFixed(2));
+  args.push(
+    '-filter_complex',
+    withAudio ? `${filter};[0:a]aresample=async=1:first_pts=0[a]` : filter,
+    '-map',
+    '[v]',
+  );
+  if (withAudio) args.push('-map', '[a]');
   args.push(
     '-c:v',
     'libx264',
@@ -512,6 +1015,14 @@ export async function renderShortClip(
       // best-effort
     }
     throw e;
+  } finally {
+    if (ownBanner && bannerPath) {
+      try {
+        fs.rmSync(bannerPath, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
   }
 
   const outDur = await probeDurationSec(tmpPath);
@@ -546,8 +1057,15 @@ export async function renderShortClip(
     );
   }
   log.info(
-    { in: path.basename(inPath), out: path.basename(outPath), durSec: round2(outDur ?? durSec) },
+    {
+      in: path.basename(inPath),
+      out: path.basename(outPath),
+      durSec: round2(outDur ?? durSec),
+      top: layout.top,
+      camBox: camBoxToString(layout.camBox),
+      camFit: layout.camFit,
+    },
     'short vertical renderizado',
   );
-  return { durSec: round2(outDur ?? durSec) };
+  return { durSec: round2(outDur ?? durSec), top: layout.top };
 }

@@ -269,4 +269,94 @@ describe('regras cruzadas dos Shorts', () => {
     expect(cfg.SHORTS_MIN_SEC).toBe(45);
     expect(cfg.SHORTS_MAX_SEC).toBe(30);
   });
+
+  it('cam do topo maior que a saída deixa o jogo sem espaço', () => {
+    const errors = shortsCrossFieldErrors({
+      minSec: 30,
+      maxSec: 60,
+      width: 1080,
+      height: 1920,
+      camHeight: 1900,
+    });
+    expect(errors.map((e) => e.key)).toContain('SHORTS_CAM_HEIGHT');
+  });
+});
+
+describe('layout dos Shorts (cam no topo)', () => {
+  it('default: cam no topo, faixa de 540, zoom no fill e jogo centralizado', () => {
+    const cfg = ConfigSchema.parse({});
+    expect(cfg.SHORTS_TOP).toBe('cam');
+    expect(cfg.SHORTS_CAM_HEIGHT).toBe(660);
+    expect(cfg.SHORTS_CAM_FIT).toBe('cover');
+    expect(cfg.SHORTS_CAM_ANCHOR).toBe(0.35);
+    expect(cfg.SHORTS_GAME_CROP).toBe(0.95);
+    expect(cfg.SHORTS_GAME_Y).toBe(0.5);
+    expect(cfg.SHORTS_GAME_FIT).toBe('blur');
+    expect(cfg.SHORTS_GAME_ASPECT).toBe(1);
+    expect(cfg.SHORTS_CAM_BOX_BY_STREAM.gaules).toBe('0.816:0.310:0.177:0.240');
+    expect(cfg.SHORTS_CAM_BOX).toBe('');
+  });
+
+  it('default: Short de 60s a 90s', () => {
+    const cfg = ConfigSchema.parse({});
+    expect(cfg.SHORTS_MIN_SEC).toBe(60);
+    expect(cfg.SHORTS_MAX_SEC).toBe(90);
+  });
+
+  it('default: legenda queimada ligada, abaixo da mira, com Gemini na frente', () => {
+    const cfg = ConfigSchema.parse({});
+    expect(cfg.SHORTS_CAPTIONS).toBe(true);
+    expect(cfg.SHORTS_CAPTION_POSITION).toBe('below-crosshair');
+    expect(cfg.SHORTS_CAPTION_FONT_SIZE).toBe(54);
+    expect(cfg.SHORTS_CAPTION_FONT_FAMILY).toBe('Segoe UI Black');
+    expect(cfg.SHORTS_CAPTION_AI_ORDER).toBe('gemini,huggingface');
+    expect(cfg.SHORTS_CAPTION_GEMINI_MODEL).toBe('gemini-3-flash-preview');
+    expect(cfg.SHORTS_CAPTION_HF_MODEL).toBe('openai/whisper-large-v3-turbo');
+  });
+
+  it('legenda desligada é aceita (sem IA no render)', () => {
+    const cfg = ConfigSchema.parse({ SHORTS_CAPTIONS: 'false' });
+    expect(cfg.SHORTS_CAPTIONS).toBe(false);
+  });
+
+  it('modo de legenda inválido é corrigido pelo boolEnv (não lança)', () => {
+    const cfg = ConfigSchema.parse({ SHORTS_CAPTIONS: 'talvez' });
+    expect(cfg.SHORTS_CAPTIONS).toBe(true);
+  });
+
+  it('mapa de cam por canal: entrada inválida é ignorada', () => {
+    const cfg = ConfigSchema.parse({
+      SHORTS_CAM_BOX_BY_STREAM: '{"gaules":"0.1:0.2:0.3:0.4","x":"lixo"}',
+    });
+    expect(cfg.SHORTS_CAM_BOX_BY_STREAM).toEqual({ gaules: '0.1:0.2:0.3:0.4' });
+  });
+
+  it('topo inválido é recusado pelo schema', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_TOP: 'sticker' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_TOP: 'text' }).success).toBe(true);
+  });
+
+  it('preenchimento da cam inválido é recusado', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_CAM_FIT: 'sticker' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_CAM_FIT: 'blur' }).success).toBe(true);
+  });
+
+  it('preenchimento do jogo inválido é recusado', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_FIT: 'sticker' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_FIT: 'cover' }).success).toBe(true);
+  });
+
+  it('proporção do jogo fora da faixa é recusada', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_ASPECT: 0.1 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_ASPECT: 5 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_ASPECT: 1.5 }).success).toBe(true);
+  });
+
+  it('âncora e crop do jogo fora da faixa são recusados', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_CAM_ANCHOR: 1.5 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_CAM_ANCHOR: -0.1 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_CROP: 0.1 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_CROP: 1.1 }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_GAME_Y: 2 }).success).toBe(false);
+  });
 });

@@ -2,6 +2,7 @@ import './env.js';
 import { z } from 'zod';
 import { parseLatencyMap } from './monitor/streamLatency.js';
 import { parseCropList, parseCropMap } from './clipper/scoreboardSync.js';
+import { PROVIDER_IDS } from './transcription/registry.js';
 
 /** Valores aceitos como "ligado" nas variáveis de ambiente. */
 const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'sim']);
@@ -430,10 +431,17 @@ export const ConfigSchema = z.object({
    * ace) e no feed Shorts um 4K é tão bom quanto um ace.
    */
   SHORTS_MIN_KILLS: z.coerce.number().min(2).max(5).default(3),
-  /** Duração máxima do Short (o YouTube aceita até 3min; 60s é o corte). */
-  SHORTS_MAX_SEC: z.coerce.number().min(10).max(180).default(60),
+  /**
+   * Duração máxima do Short.
+   *
+   * O YouTube aceita Shorts de até 3min (180s), mas ACIMA DE 1MIN um
+   * Short com claim de copyright ativo é bloqueado globalmente — e a
+   * transmissão de torneio é justamente o conteúdo que é claimed. Por
+   * isso o corte é 90s.
+   */
+  SHORTS_MAX_SEC: z.coerce.number().min(10).max(180).default(90),
   /** Duração mínima (abaixo disso o Short é rápido demais e perde retenção). */
-  SHORTS_MIN_SEC: z.coerce.number().min(5).max(180).default(30),
+  SHORTS_MIN_SEC: z.coerce.number().min(5).max(180).default(60),
   /** Folga antes da 1ª kill (o gancho do Short). */
   SHORTS_HEAD_SEC: z.coerce.number().min(0).max(20).default(4),
   /** Folga depois da última kill. */
@@ -449,6 +457,139 @@ export const ConfigSchema = z.object({
    * puxar a janela sem mexer no código.
    */
   SHORTS_CROP_X: z.coerce.number().min(0).max(1).default(0.5),
+  /**
+   * Layout do topo do Short:
+   * - `cam` (padrão): a cam do STREAMER (caixa por canal) num painel no
+   *   topo, jogo embaixo. Canal sem caixa mapeada cai na faixa de texto;
+   * - `text`: faixa escura com o título do vídeo (substitui a cam);
+   * - `center`: o crop central 9:16 antigo (fallback/comparação).
+   */
+  SHORTS_TOP: z.enum(['cam', 'text', 'center']).default('cam'),
+  /**
+   * Altura (px) da faixa do topo. O resto da saída é o jogo.
+   * Default 660 (34% de 1920): a cam do streamer ganha altura (com 660
+   * ~80% da caixa da webcam do gaules cabe no quadro) e o jogo, com
+   * proporção 1:1, continua em 1080x1080 sobre o fundo desfocado.
+   */
+  SHORTS_CAM_HEIGHT: z.coerce.number().int().min(160).max(1800).default(660),
+  /**
+   * Como a cam preenche a faixa do topo:
+   * - `cover` (padrão): a cam é ZOOMADA até preencher a faixa (corta o
+   *   topo/base da caixa, sem distorcer) — sem barras pretas nas laterais;
+   * - `blur`: a cam inteira sobre um fundo desfocado da cena.
+   */
+  SHORTS_CAM_FIT: z.enum(['cover', 'blur']).default('cover'),
+  /**
+   * Âncora vertical do corte da cam no modo `cover` (0 = topo, 0.5 =
+   * centro, 1 = base). A caixa da cam é um retrato e a faixa é 2:1: o
+   * corte tem que pegar o rosto, não o meio da cena.
+   */
+  SHORTS_CAM_ANCHOR: z.coerce.number().min(0).max(1).default(0.35),
+  /**
+   * Fração da altura da FONTE usada pelo crop do jogo. Default 0.95: o
+   * resto é a margem da transmissão (com 0.8 o HUD de vida/munição e a
+   * parte de baixo do quadro ficam fora).
+   */
+  SHORTS_GAME_CROP: z.coerce.number().min(0.3).max(1).default(0.95),
+  /**
+   * Posição vertical do crop do jogo (0 = topo, 0.5 = centro, 1 = base).
+   * Default 0.5 (centralizado: corta um pouco em cima e um pouco embaixo
+   * em vez de comer o topo inteiro e deixar o rodapé de fora). Só vale
+   * no modo `cover`.
+   */
+  SHORTS_GAME_Y: z.coerce.number().min(0).max(1).default(0.5),
+  /**
+   * Como o JOGO preenche a faixa de baixo do vertical:
+   * - `cover`: o 16:9 é CORTADO no 9:16 da faixa (a ação fica grande,
+   *   mas o killfeed, o placar, o rodapé e as laterais saem do quadro —
+   *   só ~42% da largura da transmissão aparece);
+   * - `blur` (padrão): o crop entra na faixa com a proporção de
+   *   `SHORTS_GAME_ASPECT`, centralizado sobre um fundo desfocado da
+   *   própria cena (sem distorcer).
+   */
+  SHORTS_GAME_FIT: z.enum(['cover', 'blur']).default('blur'),
+  /**
+   * Proporção (largura/altura) do crop do jogo no modo `blur`.
+   *
+   * Mais largo = mais da transmissão no quadro (e o jogo encolhe):
+   * 1 = quadrado (~53% da largura), 4:3 = 1.3333 (~71%), 3:2 = 1.5
+   * (~80%), 16:9 = 1.7778 (~95%). 0.7826 é o 9:16 do crop antigo.
+   */
+  SHORTS_GAME_ASPECT: z.coerce.number().min(0.3).max(2).default(1),
+  /**
+   * Legenda QUEIMADA no Short (o texto entra no próprio mp4, via libass).
+   *
+   * `on`: o áudio da janela do Short é transcrito pela IA e a legenda é
+   * gravada no vertical (funciona sem depender do caption do YouTube).
+   * `off`: o Short sai sem legenda.
+   */
+  SHORTS_CAPTIONS: boolEnvField('SHORTS_CAPTIONS', true),
+  /**
+   * Ordem dos providers de transcrição (`gemini,huggingface`).
+   * O Gemini transcreve e (se o áudio não for português) traduz na mesma
+   * chamada; o Whisper do HuggingFace é a reserva (traz os tempos reais).
+   */
+  SHORTS_CAPTION_AI_ORDER: z.string().default('gemini,huggingface'),
+  /** Modelo do Gemini usado na transcrição. */
+  SHORTS_CAPTION_GEMINI_MODEL: z.string().default('gemini-3-flash-preview'),
+  /** Modelo do Whisper (HuggingFace) usado na reserva. */
+  SHORTS_CAPTION_HF_MODEL: z.string().default('openai/whisper-large-v3-turbo'),
+  /** Teto de tempo da transcrição (upload do áudio + inferência). */
+  SHORTS_CAPTION_TIMEOUT_MS: z.coerce.number().min(10_000).max(600_000).default(180_000),
+  /** Tamanho da fonte da legenda (px, na saída de 1080). */
+  SHORTS_CAPTION_FONT_SIZE: z.coerce.number().int().min(24).max(160).default(54),
+  /** Família da fonte da legenda (precisa estar instalada no Windows). */
+  SHORTS_CAPTION_FONT_FAMILY: z.string().default('Segoe UI Black'),
+  /**
+   * Posição da legenda no vertical:
+   * - `below-crosshair` (padrão): um pouco abaixo da mira do player, no
+   *   centro da área do jogo;
+   * - `game-top`: logo abaixo da faixa da cam, no topo da área do jogo;
+   * - `bottom`: no rodapé do vertical (posição clássica de legenda).
+   */
+  SHORTS_CAPTION_POSITION: z
+    .enum(['below-crosshair', 'game-top', 'bottom'])
+    .default('below-crosshair'),
+  /**
+   * Provider de transcrição usado pelo adapter (`src/transcription`).
+   * Local = sem custo e sem enviar o áudio; nuvem = mais preciso/rápido,
+   * mas exige a chave do provider. `PROVIDER_IDS` é a fonte única.
+   */
+  TRANSCRIPTION_PROVIDER: z.enum(PROVIDER_IDS).default('gemini'),
+  /** Modelo do provider (vazio = modelo padrão do provider). */
+  TRANSCRIPTION_MODEL: z.string().default(''),
+  /** Idioma: `auto` deixa o provider detectar; `pt`, `en`... força. */
+  TRANSCRIPTION_LANGUAGE: z.string().default('auto'),
+  /** VAD (pula silêncio) nos providers locais que suportam. */
+  TRANSCRIPTION_VAD: boolEnvField('TRANSCRIPTION_VAD', true),
+  /** Teto de tempo da transcrição (extração do áudio + inferência). */
+  TRANSCRIPTION_TIMEOUT_MS: z.coerce.number().min(10_000).max(1_800_000).default(600_000),
+  /** Formato padrão da legenda exportada pelo adapter. */
+  TRANSCRIPTION_OUTPUT_FORMAT: z.enum(['srt', 'vtt', 'txt']).default('srt'),
+  /** Python do venv local (vazio = .tools/py312 ou PATH). */
+  TRANSCRIPTION_PYTHON: z.string().default(''),
+  /** Caixa da cam do streamer (x:y:w:h, fração do frame) para QUALQUER canal. */
+  SHORTS_CAM_BOX: z.string().default(''),
+  /**
+   * Caixa da cam POR CANAL (JSON {"gaules":"0.816:0.310:0.177:0.240"}).
+   * O overlay de cada streamer fica num canto/forma diferente — sem o
+   * mapa o `cam` do Short cortaria o quadro errado. As medidas abaixo
+   * foram tiradas dos clipes reais (1080p); ajuste no .env quando o
+   * streamer mudar a cena. Canal fora do mapa (ou caixa inválida) cai na
+   * faixa de texto.
+   *
+   * A borda ESQUERDA tem que cair exatamente onde a webcam começa: o
+   * `cover` amplia a caixa ~3x, então 10px de cena (parede do mapa) na
+   * borda viram uma tarja de ~35px na faixa do Short. No gaules a
+   * webcam tem moldura azul de 4px — a caixa começa DEPOIS dela
+   * (interior), então nem a moldura nem a cena aparecem na faixa.
+   */
+  SHORTS_CAM_BOX_BY_STREAM: z
+    .string()
+    .default(
+      '{"gaules":"0.816:0.310:0.177:0.240","forg1":"0.795:0.331:0.187:0.192","dayneez":"0.820:0.324:0.180:0.171","nightkkid":"0.809:0.259:0.170:0.204"}',
+    )
+    .transform((v) => parseCropMap(v)),
   /** Visibilidade do Short no upload (unlisted = testa sem risco de claim). */
   SHORTS_PRIVACY: z.enum(['private', 'unlisted', 'public']).default('unlisted'),
   /**
@@ -508,6 +649,12 @@ export const ConfigSchema = z.object({
   HF_TOKEN: z.string().default(''),
   HF_IMAGE_MODEL: z.string().default('black-forest-labs/FLUX.1-schnell'),
   GEMINI_API_KEY: z.string().default(''),
+  /** Chaves dos providers de transcrição por API (vazio = requer setup). */
+  OPENAI_API_KEY: z.string().default(''),
+  GROQ_API_KEY: z.string().default(''),
+  DEEPGRAM_API_KEY: z.string().default(''),
+  ASSEMBLYAI_API_KEY: z.string().default(''),
+  ELEVENLABS_API_KEY: z.string().default(''),
   GEMINI_IMAGE_MODEL: z.string().default('gemini-3.1-flash-lite-image'),
   GEMINI_WEB_PROFILE: z.string().default('./data/gemini-profile'),
   /** Perfil do Chrome dentro do user-data-dir (ex.: "Profile 2"). Vazio = default do Chromium. */
@@ -550,6 +697,7 @@ export function shortsCrossFieldErrors(values: {
   maxSec: number;
   width: number;
   height: number;
+  camHeight?: number;
 }): ConfigCrossFieldError[] {
   const errors: ConfigCrossFieldError[] = [];
   if (values.minSec > values.maxSec) {
@@ -564,6 +712,13 @@ export function shortsCrossFieldErrors(values: {
       message: `SHORTS_WIDTH (${values.width}) tem que ser menor que SHORTS_HEIGHT (${values.height}) — o Short é vertical`,
     });
   }
+  const camHeight = values.camHeight ?? 0;
+  if (camHeight > 0 && camHeight + 160 > values.height) {
+    errors.push({
+      key: 'SHORTS_CAM_HEIGHT',
+      message: `SHORTS_CAM_HEIGHT (${camHeight}) deixa menos de 160px para o jogo em ${values.height}px de saída`,
+    });
+  }
   return errors;
 }
 
@@ -574,6 +729,7 @@ export function validateConfigCrossFields(cfg: AppConfig): void {
     maxSec: cfg.SHORTS_MAX_SEC,
     width: cfg.SHORTS_WIDTH,
     height: cfg.SHORTS_HEIGHT,
+    camHeight: cfg.SHORTS_CAM_HEIGHT,
   });
   if (errors.length > 0) {
     throw new Error(errors.map((e) => e.message).join('; '));

@@ -4,14 +4,15 @@
  * O material é o clipe 16:9 do ao vivo (`data/clips/<pasta>/<pasta>.mp4`
  * + sidecar `.json`). Aqui:
  * 1. a janela do Short é calculada (da 1ª à última kill, 30-60s);
- * 2. o vertical é renderizado (crop 9:16 + scale) — o YouTube só mostra
- *    vídeo VERTICAL no feed Shorts;
+ * 2. o vertical é renderizado (cam do streamer no topo + jogo embaixo,
+ *    crop centralizado) — o YouTube só mostra vídeo VERTICAL no feed
+ *    Shorts;
  * 3. os metadados são gerados no formato Shorts (título curto, #Shorts);
  * 4. o vídeo sobe pelo MESMO pipeline do bot (API do YouTube).
  *
- * A legenda fica por conta do YouTube (auto-caption PT-BR): subir uma
- * faixa própria exige `captions.insert`, que pede o scope
- * `youtube.force-ssl` (o token atual tem só `youtube.upload`).
+ * A legenda é QUEIMADA no mp4 (transcrição do áudio da janela + libass):
+ * não depende do caption do YouTube (que pediria o scope
+ * `youtube.force-ssl`).
  *
  * Uso:
  *   npx tsx scripts/publish-shorts.ts --dry-run
@@ -25,12 +26,14 @@
  *   --last <n>         processa os n clipes mais recentes AINDA NÃO publicados
  *   --privacy <p>      private|unlisted|public (default: SHORTS_PRIVACY)
  *   --no-ai            não chama a IA de metadados (usa o gerador local)
+ *   --no-captions      não transcreve a legenda (o Short sai sem ela)
  *   --force            re-renderiza mesmo com o vertical já existente
  *                      (e publica Shorts com a abertura limitada pelo
  *                      teto de latência — as posições das kills não são
  *                      confiáveis)
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { getConfig, validateConfigCrossFields, type AppConfig } from '../src/config.js';
 import {
@@ -42,11 +45,30 @@ import {
 } from '../src/db.js';
 import { gb, getFreeBytes, isFreeSpaceOk } from '../src/diskSpace.js';
 import {
+  camBoxToString,
+  isStaleRender,
   isStaleWindow,
   killPositionsByKill,
+  parseShortCamBox,
   planShortWindow,
   renderShortClip,
+  shortRenderSignature,
+  hasAudioStream,
+  type ShortRenderSignature,
+  type ShortTopMode,
 } from '../src/clipper/shorts.js';
+import { configuredCropForStream } from '../src/clipper/scoreboardSync.js';
+import {
+  buildCaptionLines,
+  buildCaptionsAss,
+  captionCrosshairTopY,
+  captionMaxChars,
+} from '../src/clipper/shortCaptions.js';
+import {
+  createCaptionTranscriber,
+  extractAudioWindow,
+  type CaptionTranscriber,
+} from '../src/clipper/shortCaptionsAi.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, type VideoMetadata } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
@@ -71,6 +93,7 @@ interface Sidecar {
   clipStartMs?: number;
   clipDurationSec?: number;
   killVideoOffsetMs?: number;
+  streamName?: string;
   createdAt?: string;
   [key: string]: unknown;
 }
@@ -90,6 +113,7 @@ interface Args {
   privacy: string | null;
   force: boolean;
   noAi: boolean;
+  noCaptions: boolean;
 }
 
 const PRIVACY_VALUES = ['private', 'unlisted', 'public'];
@@ -106,6 +130,7 @@ function parseArgs(argv: string[]): Args {
     privacy: null,
     force: false,
     noAi: false,
+    noCaptions: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -128,6 +153,7 @@ function parseArgs(argv: string[]): Args {
     else if (name === '--dry-run') args.publish = false;
     else if (name === '--force') args.force = true;
     else if (name === '--no-ai') args.noAi = true;
+    else if (name === '--no-captions') args.noCaptions = true;
     else if (name === '--clip') args.clips.push(next());
     else if (name === '--last') {
       const raw = next();
@@ -257,6 +283,10 @@ interface ShortMarker {
   publishedAt?: string;
   /** Janela que o vertical já gravado cobre. */
   shortWindow?: { startSec?: number; durSec?: number };
+  /** Layout/geometria com que o vertical gravado foi gerado. */
+  render?: ShortRenderSignature;
+  /** Legenda queimada no vertical gravado. */
+  captionInfo?: CaptionInfo | null;
   /** Kills dentro da janela que o vertical gravado cobre. */
   kills?: KillEvent[];
   clipStartMs?: number;
@@ -369,6 +399,8 @@ interface BatchContext {
   published: Map<string, string>;
   useAi: boolean;
   metadataAi?: MetadataAiFn;
+  /** Transcrição da legenda queimada (criado uma vez por rodada). */
+  captionTranscriber: CaptionTranscriber;
   shortsDir: string;
   /** Units de cota já consumidas hoje (vídeos enviados). */
   quotaUsed: number;
@@ -377,6 +409,90 @@ interface BatchContext {
 interface CandidateResult {
   report: Record<string, unknown>;
   published: boolean;
+}
+
+/** O que a legenda queimada gravou no vertical (e de onde veio). */
+interface CaptionInfo {
+  applied: boolean;
+  provider?: string;
+  language?: string | null;
+  lines?: number;
+  translated?: boolean;
+  reason?: 'no-audio' | 'no-speech' | 'error' | 'failed' | 'disabled';
+}
+
+/**
+ * Transcreve o áudio da JANELA do Short e monta o `.ass` da legenda
+ * queimada.
+ *
+ * Devolve `null` quando não há legenda (sem áudio, IA falhou, áudio
+ * mudo): o Short sai sem ela — melhor do que perder o vídeo.
+ */
+async function buildCaptionsForShort(
+  mp4Path: string,
+  startSec: number,
+  durSec: number,
+  cfg: AppConfig,
+  topMode: ShortTopMode,
+  transcriber: CaptionTranscriber,
+): Promise<{ assPath: string; info: CaptionInfo } | null> {
+  const base = path.join(
+    os.tmpdir(),
+    `5k-short-captions-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+  );
+  const wavPath = `${base}.wav`;
+  const assPath = `${base}.ass`;
+  try {
+    await extractAudioWindow(mp4Path, startSec, durSec, wavPath);
+    const transcript = await transcriber(wavPath, durSec);
+    if (!transcript) return null;
+    const lines = buildCaptionLines(transcript.lines, {
+      durSec,
+      maxCharsPerLine: captionMaxChars(cfg.SHORTS_WIDTH, cfg.SHORTS_CAPTION_FONT_SIZE),
+      maxLines: 2,
+    });
+    if (lines.length === 0) return null;
+    const topY =
+      cfg.SHORTS_CAPTION_POSITION === 'below-crosshair'
+        ? captionCrosshairTopY(
+            cfg.SHORTS_HEIGHT,
+            topMode === 'center' ? 0 : cfg.SHORTS_CAM_HEIGHT,
+          )
+        : topMode === 'center'
+          ? 40
+          : cfg.SHORTS_CAM_HEIGHT + 8;
+    const ass = buildCaptionsAss(lines, {
+      width: cfg.SHORTS_WIDTH,
+      height: cfg.SHORTS_HEIGHT,
+      topY,
+      fontSize: cfg.SHORTS_CAPTION_FONT_SIZE,
+      fontFamily: cfg.SHORTS_CAPTION_FONT_FAMILY,
+      position: cfg.SHORTS_CAPTION_POSITION,
+    });
+    fs.writeFileSync(assPath, ass, 'utf8');
+    return {
+      assPath,
+      info: {
+        applied: true,
+        provider: transcript.provider,
+        language: transcript.language,
+        lines: lines.length,
+        translated: transcript.translated,
+      },
+    };
+  } catch (e) {
+    try {
+      fs.rmSync(assPath, { force: true });
+    } catch {}
+    console.log(`  (falha interna de legenda: ${String(e).slice(0, 200)})`);
+    return null;
+  } finally {
+    try {
+      fs.rmSync(wavPath, { force: true });
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 /** Processa um clipe: render, metadados, upload, marker e banco. */
@@ -484,30 +600,46 @@ async function processCandidate(
     console.log(`  (cauda cortada para caber em ${cfg.SHORTS_MAX_SEC}s — todas as kills dentro)`);
   }
 
+  // Layout do topo: cam do canal (caixa medida) ou a faixa com o título.
+  // O `SHORTS_TOP` manda; no `cam` sem caixa mapeada, o título assume em
+  // vez de cortar uma região qualquer do quadro.
   let durSec = plan.durSec;
-  // O vertical já gravado só serve se cobrir A MESMA janela: com a
-  // folga/limite mudados no .env, o mp4 antigo é de outro trecho do
-  // clipe (e ia ao ar com o título da janela nova).
-  const staleWindow = isStaleWindow(previous?.shortWindow, plan, fs.existsSync(outMp4));
-  const rendered = args.force || staleWindow || !fs.existsSync(outMp4);
-  if (rendered) {
-    if (staleWindow) {
-      console.log('  (a janela mudou — re-renderizando o vertical)');
-    }
-    const out = await renderShortClip(mp4Path, outMp4, {
-      startSec: plan.startSec,
-      durSec: plan.durSec,
-      width: cfg.SHORTS_WIDTH,
-      height: cfg.SHORTS_HEIGHT,
-      cropX: cfg.SHORTS_CROP_X,
-    });
-    durSec = out.durSec;
-    console.log(`  vertical: ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
+  const streamName = typeof side.streamName === 'string' ? side.streamName : '';
+  const camCrop =
+    configuredCropForStream(cfg.SHORTS_CAM_BOX_BY_STREAM, streamName) ??
+    (cfg.SHORTS_CAM_BOX.trim() || null);
+  const camBox = parseShortCamBox(camCrop);
+  const topMode: ShortTopMode =
+    cfg.SHORTS_TOP === 'center'
+      ? 'center'
+      : cfg.SHORTS_TOP === 'text'
+        ? 'text'
+        : camBox
+          ? 'cam'
+          : 'text';
+  if (cfg.SHORTS_TOP === 'cam' && !camBox) {
+    console.log(
+      `  topo: faixa com o título (canal ${streamName ? `"${streamName}"` : 'sem nome'} sem caixa de cam no SHORTS_CAM_BOX_BY_STREAM)`,
+    );
+  } else if (topMode === 'cam') {
+    console.log(
+      `  topo: cam do canal (${camBoxToString(camBox)}, ${cfg.SHORTS_CAM_FIT}) — jogo ${cfg.SHORTS_GAME_FIT}${
+        cfg.SHORTS_GAME_FIT === 'cover'
+          ? ` (crop ${cfg.SHORTS_GAME_CROP}, y ${cfg.SHORTS_GAME_Y})`
+          : ` (proporção ${cfg.SHORTS_GAME_ASPECT} centralizado sobre o fundo desfocado)`
+      }`,
+    );
   } else {
-    console.log(`  vertical: já existe (${path.relative(process.cwd(), outMp4)})`);
+    console.log(`  topo: ${topMode}`);
   }
 
   const ace = sidecarToAce({ ...side, kills: includedKills }, plan.truncated);
+  // O vertical só serve se cobrir A MESMA janela E tiver sido gerado com
+  // o MESMO layout: com a folga/limite/topo mudados no .env, o mp4 antigo
+  // é de outro trecho/corte (e ia ao ar com o título da janela nova).
+  const staleWindow = isStaleWindow(previous?.shortWindow, plan, fs.existsSync(outMp4));
+  // A faixa mostra o título do vídeo; ele é gerado ANTES do render para
+  // a imagem não sair com texto velho (o marker guarda o texto usado).
   // Os metadados já gerados (dry-run) são REUTILIZADOS: publicar o que
   // o dono viu no dry-run evita o título surpresa no canal.
   const reusable =
@@ -542,6 +674,158 @@ async function processCandidate(
 
   console.log(`  título: ${metadata?.title ?? '(legado)'}`);
   console.log(`  descrição: ${(metadata?.description ?? '').split('\n')[0]?.slice(0, 120)}...`);
+
+  const banner =
+    topMode === 'text'
+      ? {
+          title:
+            metadata?.title ??
+            `${side.player} — ${side.map} R${side.round} | ${side.event}`,
+          subtitle: `${side.team1} vs ${side.team2} • ${side.event}`,
+        }
+      : null;
+  const captionsOn = cfg.SHORTS_CAPTIONS === true && !args.noCaptions;
+  const signature = shortRenderSignature({
+    top: topMode,
+    camBox,
+    camHeight: cfg.SHORTS_CAM_HEIGHT,
+    camFit: cfg.SHORTS_CAM_FIT,
+    camAnchor: cfg.SHORTS_CAM_ANCHOR,
+    gameCrop: cfg.SHORTS_GAME_CROP,
+    gameY: cfg.SHORTS_GAME_Y,
+    gameFit: cfg.SHORTS_GAME_FIT,
+    gameAspect: cfg.SHORTS_GAME_ASPECT,
+    width: cfg.SHORTS_WIDTH,
+    height: cfg.SHORTS_HEIGHT,
+    bannerText: banner?.title ?? null,
+    captions: captionsOn ? 'on' : 'off',
+    cropX: cfg.SHORTS_CROP_X,
+    captionFontSize: cfg.SHORTS_CAPTION_FONT_SIZE,
+    captionPosition: cfg.SHORTS_CAPTION_POSITION,
+    captionFontFamily: cfg.SHORTS_CAPTION_FONT_FAMILY,
+  });
+  const staleLayout = isStaleRender(previous?.render, signature);
+  // A legenda pedida NÃO entrou no arquivo (a transcrição falhou na
+  // rodada anterior): o vertical precisa ser refeito — senão o Short
+  // ficaria sem legenda para sempre.
+  const staleCaptions =
+    captionsOn &&
+    previous?.captionInfo?.applied !== true &&
+    previous?.captionInfo?.reason === 'error' &&
+    fs.existsSync(outMp4);
+  const rendered =
+    args.force || staleWindow || staleLayout || staleCaptions || !fs.existsSync(outMp4);
+  let captionInfo: CaptionInfo | null = null;
+  if (rendered) {
+    if (staleWindow) {
+      console.log('  (a janela mudou — re-renderizando o vertical)');
+    } else if (staleLayout) {
+      console.log('  (o layout mudou — re-renderizando o vertical)');
+    } else if (staleCaptions) {
+      console.log('  (a legenda não entrou no vertical anterior — re-renderizando)');
+    }
+    // A legenda é transcrita só quando o vertical vai ser refeito: um
+    // Short já pronto não gasta IA.
+    let captionsAssPath: string | null = null;
+    if (captionsOn) {
+      const hasAudio = await hasAudioStream(mp4Path).catch(() => true);
+      if (!hasAudio) {
+        console.log('  legenda: clipe sem trilha de áudio — sem legenda');
+        captionInfo = { applied: false, reason: 'no-audio' };
+      } else {
+        console.log('  (transcrevendo a legenda da janela...)');
+        try {
+          const built = await buildCaptionsForShort(
+            mp4Path,
+            plan.startSec,
+            plan.durSec,
+            cfg,
+            topMode,
+            ctx.captionTranscriber,
+          );
+          if (built) {
+            captionsAssPath = built.assPath;
+            captionInfo = built.info;
+            console.log(
+              `  legenda: ${built.info.lines} linhas (${built.info.provider}${
+                built.info.translated ? ', traduzida' : ''
+              }${built.info.language ? `, ${built.info.language}` : ''})`,
+            );
+          } else {
+            console.log('  legenda: transcrição vazia — o Short sai sem ela');
+            captionInfo = { applied: false, reason: 'no-speech' };
+          }
+        } catch (e) {
+          console.log('  legenda: falha na transcrição/ASS — o Short sai sem ela');
+          captionInfo = { applied: false, reason: 'error' };
+        }
+      }
+    }
+    try {
+      const out = await renderShortClip(mp4Path, outMp4, {
+        startSec: plan.startSec,
+        durSec: plan.durSec,
+        width: cfg.SHORTS_WIDTH,
+        height: cfg.SHORTS_HEIGHT,
+        cropX: cfg.SHORTS_CROP_X,
+        top: topMode,
+        camBox,
+        camHeight: cfg.SHORTS_CAM_HEIGHT,
+        camFit: cfg.SHORTS_CAM_FIT,
+        camAnchor: cfg.SHORTS_CAM_ANCHOR,
+        gameCrop: cfg.SHORTS_GAME_CROP,
+        gameY: cfg.SHORTS_GAME_Y,
+        gameFit: cfg.SHORTS_GAME_FIT,
+        gameAspect: cfg.SHORTS_GAME_ASPECT,
+        banner,
+        captionsAssPath,
+      });
+      durSec = out.durSec;
+      console.log(`  vertical: ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
+    } catch (renderErr) {
+      if (captionsAssPath) {
+        console.log('  (falha do filtro ass — re-tentando sem legenda)');
+        try {
+          const out = await renderShortClip(mp4Path, outMp4, {
+            startSec: plan.startSec,
+            durSec: plan.durSec,
+            width: cfg.SHORTS_WIDTH,
+            height: cfg.SHORTS_HEIGHT,
+            cropX: cfg.SHORTS_CROP_X,
+            top: topMode,
+            camBox,
+            camHeight: cfg.SHORTS_CAM_HEIGHT,
+            camFit: cfg.SHORTS_CAM_FIT,
+            camAnchor: cfg.SHORTS_CAM_ANCHOR,
+            gameCrop: cfg.SHORTS_GAME_CROP,
+            gameY: cfg.SHORTS_GAME_Y,
+            gameFit: cfg.SHORTS_GAME_FIT,
+            gameAspect: cfg.SHORTS_GAME_ASPECT,
+            banner,
+            captionsAssPath: null,
+          });
+          durSec = out.durSec;
+          captionInfo = { applied: false, reason: 'failed' };
+          console.log(`  vertical (sem legenda): ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
+        } catch (secondErr) {
+          console.log(`  (render falhou mesmo sem legenda — descartando): ${String(secondErr).slice(0, 200)}`);
+          throw secondErr;
+        }
+      } else {
+        throw renderErr;
+      }
+    } finally {
+      if (captionsAssPath) {
+        try {
+          fs.rmSync(captionsAssPath, { force: true });
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  } else {
+    console.log(`  vertical: já existe (${path.relative(process.cwd(), outMp4)})`);
+  }
 
   let videoId: string | null = null;
   if (args.publish) {
@@ -605,6 +889,14 @@ async function processCandidate(
     format: 'shorts',
     width: cfg.SHORTS_WIDTH,
     height: cfg.SHORTS_HEIGHT,
+    // O marker descreve o ARQUIVO em disco: quando não houve render, o
+    // layout é o do marker anterior (o mp4 não mudou).
+    render: rendered ? signature : (previous?.render ?? signature),
+    // A legenda queimada descreve o ARQUIVO em disco: quando não houve
+    // render, é a do vertical anterior.
+    captionInfo: rendered
+      ? (captionInfo ?? { applied: false })
+      : (previous?.captionInfo ?? { applied: false }),
     title: metadata?.title ?? null,
     metadata: {
       title: metadata?.title ?? '',
@@ -642,6 +934,7 @@ async function processCandidate(
     report: {
       name,
       window: plan,
+      top: topMode,
       durationSec: durSec,
       kills: includedKills.length,
       title: metadata?.title ?? null,
@@ -760,6 +1053,15 @@ async function main(): Promise<void> {
         })
       : undefined;
 
+    const captionTranscriber = createCaptionTranscriber({
+      order: cfg.SHORTS_CAPTION_AI_ORDER,
+      timeoutMs: cfg.SHORTS_CAPTION_TIMEOUT_MS,
+      geminiApiKey: cfg.GEMINI_API_KEY || undefined,
+      geminiModel: cfg.SHORTS_CAPTION_GEMINI_MODEL,
+      hfToken: cfg.HF_TOKEN || undefined,
+      hfModel: cfg.SHORTS_CAPTION_HF_MODEL,
+    });
+
     const ctx: BatchContext = {
       cfg,
       args,
@@ -767,6 +1069,7 @@ async function main(): Promise<void> {
       published,
       useAi,
       metadataAi,
+      captionTranscriber,
       shortsDir,
       quotaUsed: countPublishedClips(cfg.DB_PATH, startOfUtcDaySql()) * QUOTA_UNITS_PER_UPLOAD,
     };

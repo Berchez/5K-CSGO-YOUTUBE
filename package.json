@@ -19,6 +19,7 @@
     "clip:vod": "tsx scripts/clip-from-vod.ts",
     "upload:vod": "tsx scripts/upload-vod-clips.ts",
     "publish:shorts": "tsx scripts/publish-shorts.ts",
+    "transcribe:clip": "tsx scripts/transcribe.ts",
     "diag:av": "tsx scripts/diag-buffer-av.ts",
     "diag:thumbs": "tsx scripts/diag-thumbs.ts",
     "diag:clip": "tsx scripts/diag-clip-window.ts",

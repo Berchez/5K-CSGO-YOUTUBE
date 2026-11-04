@@ -343,8 +343,33 @@ do relógio de origem.
 ## Shorts (vertical 9:16)
 
 O YouTube só mostra vídeo **vertical** no feed Shorts — o material do bot é
-16:9 (transmissão da HLTV), então o 9:16 é produzido no *render* (crop
-central + scale), nunca na captura (o recorder continua `-c copy` 16:9).
+16:9 (transmissão da HLTV), então o 9:16 é produzido no *render*, nunca na
+captura (o recorder continua `-c copy` 16:9).
+
+O vertical tem duas faixas: a **cam do streamer** no topo (recortada da
+transmissão e **zoomada até preencher a faixa**, sem barra preta nas
+laterais) e o **jogo** embaixo (`SHORTS_CAM_HEIGHT` manda na divisão;
+`SHORTS_GAME_FIT`/`SHORTS_GAME_ASPECT` decidem se o jogo é cortado num
+9:16 apertado ou se entra como um crop mais largo, centralizado, sobre o
+fundo desfocado). A caixa da cam muda de canal para canal, então ela é
+configurada por `streamName` em `SHORTS_CAM_BOX_BY_STREAM`. Canal sem
+caixa mapeada cai na faixa de texto (`SHORTS_TOP=text`), com o título do
+Short no lugar da cam.
+
+As caixas medidas (fração do frame 16:9; em px de um frame 1920x1080):
+
+| canal | caixa | px (x, y, w, h) |
+| --- | --- | --- |
+| gaules | `0.816:0.310:0.177:0.240` | 1567, 335, 340, 259 |
+| forg1 | `0.795:0.331:0.187:0.192` | 1526, 357, 359, 207 |
+| dayneez | `0.820:0.324:0.180:0.171` | 1574, 350, 346, 185 |
+| nightkkid | `0.809:0.259:0.170:0.204` | 1553, 280, 326, 220 |
+
+A borda **esquerda** da caixa tem que cair exatamente onde a webcam
+começa: o `cover` amplia a caixa ~3x, então 10px de cena (a parede do
+mapa) na borda viram uma **tarja de ~35px** na lateral da faixa. No
+gaules a webcam tem moldura azul de 4px — a caixa começa DEPOIS dela
+(interior), então nem a moldura nem a cena aparecem na faixa.
 
 ```powershell
 # 1. calcula e renderiza os verticais, sem publicar (default)
@@ -356,7 +381,10 @@ npm run publish:shorts -- --dry-run --clip data/clips/2399958_Inferno_r12_doc
 # 3. sem gastar IA de metadados (usa o gerador local)
 npm run publish:shorts -- --dry-run --no-ai
 
-# 4. publica (unlisted por padrão — teste sem risco de claim no canal)
+# 4. sem legenda queimada (não transcreve o áudio)
+npm run publish:shorts -- --dry-run --no-captions
+
+# 5. publica (unlisted por padrão — teste sem risco de claim no canal)
 #    exige SHORTS_ENABLED=true no .env (ou no painel)
 npm run publish:shorts -- --publish --clip data/clips/2399958_Inferno_r12_doc
 ```
@@ -366,16 +394,19 @@ O script (`scripts/publish-shorts.ts`):
 1. lê os sidecars em `data/clips/` (precisa de `clipStartMs` e de
    `killVideoOffsetMs` — sem o offset as posições das kills ficam
    deslocadas e o clipe é pulado);
-2. calcula a **janela do Short** (30–60s): da 1ª à última kill. Quando a
+2. calcula a **janela do Short** (60–90s): da 1ª à última kill. Quando a
    jogada não cabe, ele prioriza o **clímax** (a última kill) e reporta as
    kills que ficaram de fora;
-3. renderiza o vertical (`crop=ih*9/16` → `scale=1080:1920`) em
-   `data/shorts/<pasta>/` (render atômico: só vira `.mp4` final quando
-   termina inteiro);
-4. gera os metadados no formato Shorts (título ≤70 chars, `#Shorts` no
+3. renderiza o vertical em `data/shorts/<pasta>/` (cam no topo + jogo
+   embaixo; render atômico: só vira `.mp4` final quando termina inteiro). O
+   marker guarda a assinatura do layout (`render`) — se ele mudar (envs ou
+   caixa da cam), o vertical é re-renderizado mesmo com marcador;
+4. transcreve a legenda da janela (IA) e queima no `.mp4` — só quando o
+   vertical vai ser refeito (um Short pronto não gasta IA);
+5. gera os metadados no formato Shorts (título ≤70 chars, `#Shorts` no
    fim da descrição, sem a lista de eliminações) e sobe pelo mesmo
    pipeline do bot (`videos.insert`);
-5. grava o Short no SQLite (`clips.is_shorts = 1`, chaveado pelo ace) e
+6. grava o Short no SQLite (`clips.is_shorts = 1`, chaveado pelo ace) e
    um relatório em `data/shorts/report.json` (com o histórico das
    rodadas).
 
@@ -386,25 +417,63 @@ Um clipe cuja **abertura foi limitada pelo teto de latência** é **pulado**: as
 posições das kills vêm da estimativa (e podem estar deslocadas), e a janela do
 Short cortaria o começo do ace. `--force` publica mesmo assim.
 
-A legenda fica por conta do YouTube (auto-caption PT-BR): subir uma faixa
-própria exige `captions.insert`, que pede o scope `youtube.force-ssl` (o
-token atual tem só `youtube.upload`).
+A legenda é **queimada no próprio `.mp4`** (o texto entra no vídeo, via
+libass): o áudio da janela do Short é transcrito pela IA e a legenda é
+gravada na vertical. Não depende do caption do YouTube (que exigiria o
+scope `youtube.force-ssl`, que o token atual não tem) e vale para quem
+assiste sem som.
+
+- O **Gemini** (`GEMINI_API_KEY`) transcreve e, quando o áudio não está
+  em português, traz a tradução para PT-BR na mesma chamada;
+- o **Whisper do HuggingFace** (`HF_TOKEN`) é a reserva (traz os tempos
+  reais de cada palavra). O Inference Provider do HF exige créditos na
+  conta — sem eles, esse provider falha e o Short sai sem legenda;
+- cada Short re-renderizado gasta **1 chamada de transcrição** (um Short
+  já pronto não gasta nada);
+- se a transcrição falhar, o Short é gravado **sem** legenda (e a
+  próxima rodada tenta de novo) — melhor do que perder o vídeo.
+
+A legenda entra um pouco abaixo da mira do player
+(`SHORTS_CAPTION_POSITION=below-crosshair`), no centro da área do jogo.
+`game-top` volta para logo abaixo da faixa da cam e `bottom` joga para o
+rodapé (posição clássica de legenda). A fonte padrão é `Segoe UI Black`
+(mais moderna e pesada); `SHORTS_CAPTION_FONT_FAMILY` aceita qualquer
+família instalada no Windows.
 
 | variável | padrão | efeito |
 | --- | --- | --- |
 | `SHORTS_ENABLED` | `false` | só publicar exige esta chave ligada |
-| `SHORTS_MAX_SEC` | `60` | duração máxima do Short |
-| `SHORTS_MIN_SEC` | `30` | duração mínima |
+| `SHORTS_MAX_SEC` | `90` | duração máxima do Short (o YouTube aceita até 180s) |
+| `SHORTS_MIN_SEC` | `60` | duração mínima (jogada curta é esticada para frente) |
 | `SHORTS_HEAD_SEC` / `SHORTS_TAIL_SEC` | `4` / `4` | folga antes da 1ª kill e depois da última |
 | `SHORTS_WIDTH` / `SHORTS_HEIGHT` | `1080` / `1920` | saída do vertical |
-| `SHORTS_CROP_X` | `0.5` | posição horizontal do crop (0 = esquerda, 1 = direita) |
+| `SHORTS_TOP` | `cam` | topo do vertical: `cam`, `text` (faixa com o título) ou `center` (crop 9:16 antigo) |
+| `SHORTS_CAM_HEIGHT` | `660` | altura da faixa da cam em px (o jogo fica com o resto) |
+| `SHORTS_CAM_FIT` | `cover` | `cover` = a cam é zoomada até preencher a faixa (sem barras pretas); `blur` = cam inteira sobre fundo desfocado |
+| `SHORTS_CAM_ANCHOR` | `0.35` | âncora vertical do corte da cam (0 = topo, 0.5 = centro, 1 = base) — o corte tem que pegar o rosto |
+| `SHORTS_GAME_CROP` | `0.95` | fração da altura da fonte usada pelo crop do jogo (só no modo `cover`) |
+| `SHORTS_GAME_Y` | `0.5` | posição vertical do crop do jogo (0 = topo, 0.5 = centro, 1 = base) — só no modo `cover` |
+| `SHORTS_GAME_FIT` | `blur` | `blur` = o crop do jogo fica **centralizado** sobre um fundo desfocado da cena; `cover` = crop 9:16 apertado, sem barras (ação grande, ~42% da largura) |
+| `SHORTS_GAME_ASPECT` | `1` | proporção (largura/altura) do crop do jogo no modo `blur`: `1` = 1:1 (~53% da largura), `1.3333` = 4:3 (~71%), `1.5` = 3:2 (~80%), `1.7778` = 16:9 (~95%), `0.7826` = o 9:16 antigo |
+| `SHORTS_CAM_BOX` | vazio | caixa da cam de fallback, `x:y:w:h` em frações do 16:9 |
+| `SHORTS_CAM_BOX_BY_STREAM` | 4 canais medidos | JSON `{"canal":"x:y:w:h"}`; vence o `SHORTS_CAM_BOX` |
+| `SHORTS_CROP_X` | `0.5` | posição horizontal do crop do jogo (0 = esquerda, 1 = direita) |
+| `SHORTS_CAPTIONS` | `on` | legenda queimada no mp4 (`on`/`off`) |
+| `SHORTS_CAPTION_AI_ORDER` | `gemini,huggingface` | ordem dos providers de transcrição |
+| `SHORTS_CAPTION_GEMINI_MODEL` | `gemini-3-flash-preview` | modelo do Gemini na transcrição |
+| `SHORTS_CAPTION_HF_MODEL` | `openai/whisper-large-v3-turbo` | modelo do Whisper (reserva) |
+| `SHORTS_CAPTION_TIMEOUT_MS` | `180000` | teto de tempo da transcrição |
+| `SHORTS_CAPTION_FONT_SIZE` | `54` | tamanho da fonte da legenda (px) |
+| `SHORTS_CAPTION_FONT_FAMILY` | `Segoe UI Black` | família da fonte (instalada no Windows) |
+| `SHORTS_CAPTION_POSITION` | `below-crosshair` | `below-crosshair` (abaixo da mira), `game-top` (abaixo da cam) ou `bottom` (rodapé) |
 | `SHORTS_MIN_KILLS` | `3` | mínimo de kills (o bot também grava 3K/4K) |
 | `SHORTS_PRIVACY` | `unlisted` | visibilidade do Short |
 | `SHORTS_HASHTAG` | `#Shorts` | hashtag de classificação (no `.env`, entre aspas) |
 | `SHORTS_DIR` | `./data/shorts` | onde os verticais, os markers e o relatório são gravados |
 
-`SHORTS_MIN_SEC` tem que ser **menor ou igual** a `SHORTS_MAX_SEC`, e
-`SHORTS_WIDTH` menor que `SHORTS_HEIGHT`. O painel recusa a gravação
+`SHORTS_MIN_SEC` tem que ser **menor ou igual** a `SHORTS_MAX_SEC`,
+`SHORTS_WIDTH` menor que `SHORTS_HEIGHT` e `SHORTS_CAM_HEIGHT` tem que
+deixar pelo menos 160 px para o jogo. O painel recusa a gravação
 inconsistente; o script recusa na hora de rodar (o bot live não depende
 dessas chaves — uma config de Shorts quebrada não impede o bot de subir).
 
@@ -412,10 +481,83 @@ A cota do YouTube é do **projeto de API** (10 000 units/dia, 1600 por
 `videos.insert`) e é dividida com o bot: o script conta os vídeos já
 enviados no dia e recusa o lote quando a cota estourar.
 
-O crop 9:16 tira ~2/3 da largura do 16:9: o placar (topo) e a facecam
-(rodapé) continuam no quadro, mas o **killfeed** (canto direito) sai. Se
-a ação ficar de fora, mexa em `SHORTS_CROP_X` (0.3–0.7) — não precisa
-mudar código.
+O YouTube aceita Shorts de **até 3 minutos** (180s) desde 15/out/2024 (vertical
+ou quadrado). Mas **acima de 1 minuto um Short com claim de copyright ativo
+é bloqueado globalmente** — e a transmissão de torneio é justamente o
+conteúdo que é claimed. Por isso o corte do bot é 90s: dá para alongar
+(`SHORTS_MAX_SEC` vai até 180s), mas cada minuto acima de 1min é um Short
+que pode não ficar no ar.
+
+O jogo entra na faixa de baixo de dois jeitos (`SHORTS_GAME_FIT`):
+
+- `blur` (padrão): um **crop** da transmissão, com a proporção de
+  `SHORTS_GAME_ASPECT`, é encaixado na faixa **centralizado** sobre um
+  **fundo desfocado** da própria cena. A proporção decide quanto da
+  transmissão entra no quadro (com `gameCrop=0.95`): 1:1 = 53% da
+  largura, 4:3 = 71%, 3:2 = 80%, 16:9 = 95%. Quanto mais largo, mais
+  lateral (killfeed, placar, rodapé) aparece — e os pixels do jogo
+  encolhem, porque o crop é escalado para caber na faixa.
+- `cover`: o 16:9 é **cortado** no 9:16 da faixa (803x1026 de 1920x1080,
+  ~42% da largura) e esticado. A ação fica grande e imersiva, mas o
+  **killfeed**, o rodapé e as laterais ficam de fora. `SHORTS_CROP_X`
+  (0.3–0.7) desloca o corte (não amplia) e `SHORTS_GAME_CROP`/`SHORTS_GAME_Y`
+  mexem na fatia vertical.
+
+Como o 16:9 não cabe num 9:16, "zoom out" só existe diminuindo a faixa
+do jogo: com `SHORTS_CAM_HEIGHT` maior, a faixa de baixo encolhe, o crop
+fica mais largo (840px de cam → 53% da largura; 960px → 60%) e os pixels
+do jogo ficam menores. O `SHORTS_GAME_ASPECT` faz o mesmo sem mexer na
+altura da cam.
+
+Com o default atual (cam 660 + jogo 1:1) o vertical fica: **cam
+1080x660** (~80% da caixa da webcam do gaules no quadro) + **jogo
+1080x1080** (crop quadrado = 53% da largura da transmissão) sobre 90px de
+fundo desfocado acima e abaixo.
+
+A cam é procurada só no canto direito da transmissão; para calibrar outro
+canal, tire um frame 16:9 e meça a caixa `x:y:w:h` em frações — cuidado
+para a borda esquerda cair **exatamente** na borda da webcam (uma tarja de
+cena na lateral é o defeito mais visível da faixa). No modo `cover` a caixa
+é recortada e **esticada por zoom** (sem distorcer): se o corte pegou o
+meio da cena em vez do rosto, ajuste `SHORTS_CAM_ANCHOR`.
+
+## Transcrição de áudio (legendas)
+
+Adapter independente para transcrever um clipe e gravar `srt`, `vtt` ou
+`txt`. **Não substitui** a legenda IA queimada dos Shorts
+(`SHORTS_CAPTION_*`); serve para gerar legendas de um arquivo já cortado.
+
+```bash
+# lista o que está pronto nesta máquina (binário/modelo/chave)
+npx tsx scripts/transcribe.ts --list
+
+# padrão do .env (Gemini 3.5 Transcribe): grava <clip>.srt ao lado do mp4
+npx tsx scripts/transcribe.ts data/clips/<pasta>/<clip>.mp4
+
+# força provider/modelo/idioma e escolhe a saída
+npx tsx scripts/transcribe.ts <clip>.mp4 --provider gemini --model gemini-3.5-transcribe --format vtt --out legenda.vtt
+```
+
+`npm run transcribe:clip -- ...` é o atalho; no PowerShell, `--flag` às
+vezes é engolido pelo npm, então prefira `npx tsx`.
+
+| provider | tipo | padrão | medido no clipe de 142,86s | custo |
+| --- | --- | --- | --- | --- |
+| `faster-whisper` | local | `small` int8 | ~36s (15,11 s/min) | US$ 0 |
+| `whisper-cpp` | local | `small` ggml | 51,3s (35,9 s/min) | US$ 0 |
+| `vosk` | local | `vosk-model-small-pt-0.3` | 21,6s; rápido e sem pontuação | US$ 0 |
+| `gemini` | nuvem | `gemini-3.5-transcribe` | 8,0s; 51 blocos em pt-BR | ~US$ 0,012/clipe |
+| `openai`, `groq`, `deepgram`, `assemblyai`, `elevenlabs` | nuvem | ver registry | não medido (requer chave) | por minuto |
+
+Todos os providers recebem o **mesmo WAV 16 kHz mono** extraído com
+ffmpeg; VAD local (`TRANSCRIPTION_VAD`) pula silêncio e evita alucinação.
+`TRANSCRIPTION_PROVIDER` default é `gemini` (o mesmo provider da legenda
+do Short de referência); `TRANSCRIPTION_MODEL` vazio usa o modelo padrão
+do provider (`gemini-3.5-transcribe`); `TRANSCRIPTION_LANGUAGE=auto`
+detecta o idioma. Chaves de nuvem: `GEMINI_API_KEY`, `OPENAI_API_KEY`,
+`GROQ_API_KEY`, `DEEPGRAM_API_KEY`, `ASSEMBLYAI_API_KEY`,
+`ELEVENLABS_API_KEY`. Ausente = provider aparece como “requer setup” no
+`--list` (nunca gera legenda vazia em silêncio).
 
 ## Structure
 
@@ -434,7 +576,7 @@ src/clipper/scoreboardSync.ts (OCR da virada de round no vídeo; crop por canal)
 src/clipper/killfeedSync.ts (OCR do killfeed: instante exato da 1ª kill)
 src/clipper/clipAnchors.ts (puro: âncoras de início/fim do clipe)
 src/clipper/clipBuilder.ts (concat + sidecar json)
-src/clipper/shorts.ts (janela 30-60s + render vertical 9:16 atômico)
+src/clipper/shorts.ts (janela 60-90s + render vertical 9:16 atômico)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/uploader/youtubeUploader.ts (private)
