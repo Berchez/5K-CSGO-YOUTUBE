@@ -88,6 +88,62 @@ export function resolveTranscriptionOptions(
   return { provider, model, language, vad, timeoutMs };
 }
 
+/**
+ * Transcrição de um WAV já extraído (o chamador cuida do arquivo).
+ *
+ * É o miolo do `transcribeVideo`: a legenda queimada já tem o WAV da
+ * janela e chama este caminho direto, sem extrair o áudio de novo.
+ */
+/**
+ * O áudio (WAV) não tem conteúdo utilizável — erro com CLASSE, para
+ * quem chama não precisar casar a mensagem por string.
+ */
+export class EmptyAudioError extends Error {
+  constructor(message = 'o áudio não tem conteúdo utilizável') {
+    super(message);
+    this.name = 'EmptyAudioError';
+  }
+}
+
+export async function transcribeWav(
+  wavPath: string,
+  opts: TranscribeOptions = {},
+): Promise<TranscriptResult> {
+  if (!fs.existsSync(wavPath)) {
+    throw new Error(`áudio não encontrado: ${wavPath}`);
+  }
+  const cfg = getConfig();
+  const resolved = resolveTranscriptionOptions(opts, cfg);
+  const wavBytes = fs.statSync(wavPath).size;
+  const audioSec = wavDurationSecFromBytes(wavBytes);
+  if (audioSec <= 0) throw new EmptyAudioError();
+  assertAudioWithinLimit(resolved.provider, {
+    bytes: wavBytes,
+    seconds: audioSec,
+  });
+  const startedAt = Date.now();
+  const provider = TRANSCRIBERS[resolved.provider];
+  const raw = await provider({
+    wavPath,
+    audioSec,
+    model: resolved.model,
+    language: resolved.language,
+    vad: resolved.vad,
+    timeoutMs: resolved.timeoutMs,
+    words: opts.words,
+    maxSegmentChars: opts.maxSegmentChars,
+  });
+  const segments = sanitizeSegments(raw.segments, audioSec);
+  return {
+    provider: resolved.provider,
+    model: resolved.model,
+    language: raw.language ?? resolved.language,
+    segments,
+    audioSec,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
 /** Transcrição completa de um vídeo/clipe (extrai o WAV e descarta). */
 export async function transcribeVideo(
   videoPath: string,
@@ -96,38 +152,19 @@ export async function transcribeVideo(
   if (!fs.existsSync(videoPath)) {
     throw new Error(`vídeo não encontrado: ${videoPath}`);
   }
-  const cfg = getConfig();
-  const resolved = resolveTranscriptionOptions(opts, cfg);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), '5k-asr-'));
   try {
     const wavPath = path.join(tmpDir, 'audio.wav');
-    await extractAudioWav(videoPath, wavPath, Math.min(resolved.timeoutMs, 180_000));
-    const wavBytes = fs.statSync(wavPath).size;
-    const audioSec = wavDurationSecFromBytes(wavBytes);
-    if (audioSec <= 0) throw new Error('o vídeo não tem áudio utilizável');
-    assertAudioWithinLimit(resolved.provider, {
-      bytes: wavBytes,
-      seconds: audioSec,
-    });
-    const startedAt = Date.now();
-    const provider = TRANSCRIBERS[resolved.provider];
-    const raw = await provider({
-      wavPath,
-      audioSec,
-      model: resolved.model,
-      language: resolved.language,
-      vad: resolved.vad,
-      timeoutMs: resolved.timeoutMs,
-    });
-    const segments = sanitizeSegments(raw.segments, audioSec);
-    return {
-      provider: resolved.provider,
-      model: resolved.model,
-      language: raw.language ?? resolved.language,
-      segments,
-      audioSec,
-      elapsedMs: Date.now() - startedAt,
-    };
+    const timeoutMs = resolveTranscriptionOptions(opts, getConfig()).timeoutMs;
+    await extractAudioWav(videoPath, wavPath, Math.min(timeoutMs, 180_000));
+    return await transcribeWav(wavPath, opts);
+  } catch (e) {
+    // A mensagem é a mesma de sempre (quem casa por string continua
+    // funcionando): só o WAV sem conteúdo vira outra frase.
+    if (e instanceof EmptyAudioError) {
+      throw new Error('o vídeo não tem áudio utilizável');
+    }
+    throw e;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

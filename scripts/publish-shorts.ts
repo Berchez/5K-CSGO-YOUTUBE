@@ -33,6 +33,10 @@
  *                      (e publica Shorts com a abertura limitada pelo
  *                      teto de latência — as posições das kills não são
  *                      confiáveis)
+ *   --retry-captions   processa SÓ os Shorts que falharam na legenda
+ *                      (tradução/erro/libass): os que estão OK ficam de
+ *                      fora, e o backoff é ignorado — sem liberar a
+ *                      janela com posição não confiável
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -69,11 +73,16 @@ import {
   isCaptionFilterError,
   isRetryableCaptionFailure,
   shortRetryDecision,
+  type CaptionLine,
   type CaptionStatus,
 } from '../src/clipper/shortCaptions.js';
 import {
+  captionContextFromAce,
+  captionProviderFrom,
   createCaptionTranscriber,
   extractAudioWindow,
+  type CaptionContext,
+  type CaptionTranscript,
   type CaptionTranscriber,
 } from '../src/clipper/shortCaptionsAi.js';
 import { loadThumbFont, measureThumbText } from '../src/clipper/thumbText.js';
@@ -120,6 +129,8 @@ interface Args {
   last: number | null;
   privacy: string | null;
   force: boolean;
+  /** Refazer SÓ a legenda dos Shorts que falharam nela (sem `--force`). */
+  retryCaptions: boolean;
   noAi: boolean;
   noCaptions: boolean;
   allowNoCaptions: boolean;
@@ -138,6 +149,7 @@ function parseArgs(argv: string[]): Args {
     last: null,
     privacy: null,
     force: false,
+    retryCaptions: false,
     noAi: false,
     noCaptions: false,
     allowNoCaptions: false,
@@ -162,6 +174,7 @@ function parseArgs(argv: string[]): Args {
     if (name === '--publish') args.publish = true;
     else if (name === '--dry-run') args.publish = false;
     else if (name === '--force') args.force = true;
+    else if (name === '--retry-captions') args.retryCaptions = true;
     else if (name === '--no-ai') args.noAi = true;
     else if (name === '--no-captions') args.noCaptions = true;
     else if (name === '--allow-no-captions') args.allowNoCaptions = true;
@@ -358,15 +371,30 @@ function writeReport(
  * Trava de execução: duas rodadas simultâneas publicariam o MESMO Short
  * duas vezes (o dedupe é por marker/DB, mas as duas leriam o estado
  * antes de qualquer uma gravar).
+ *
+ * A trava envelhece: ela vale `staleMs` a partir do último toque. Um
+ * lote longo (3 chamadas de IA por Short, com 180s cada) passaria do
+ * prazo e a segunda rodada tomaria a trava no meio — daí o `touch`
+ * a cada Short processado.
  */
-function acquireLock(lockPath: string): { release: () => void } | null {
+function acquireLock(lockPath: string): { release: () => void; touch: () => void } | null {
   const staleMs = 30 * 60_000;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, 'wx');
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
       fs.closeSync(fd);
+      const touch = (): void => {
+        // Renova a idade da trava (o mtime é o que manda).
+        try {
+          const now = new Date();
+          fs.utimesSync(lockPath, now, now);
+        } catch {
+          // best-effort
+        }
+      };
       return {
+        touch,
         release: () => {
           try {
             fs.rmSync(lockPath, { force: true });
@@ -447,6 +475,40 @@ function captionAvgCharWidth(fontFamily: string): number {
 }
 
 /**
+ * Despejo da legenda em texto (`[início → fim] fala`), um por linha.
+ *
+ * Fica ao lado do mp4 (`<name>_legenda.txt`) para o dono revisar o que
+ * foi ao ar e (`<name>_legenda.orig.txt`) guardar o idioma original
+ * quando a fala foi traduzida.
+ *
+ * A fala é quebrada em uma linha por bloco: se o modelo devolveu uma
+ * quebra de linha no meio, ela viraria uma linha sem tempo no arquivo.
+ */
+function captionTextDump(lines: CaptionLine[]): string {
+  return (
+    (lines ?? [])
+      .map((line) => {
+        const text = String(line.text ?? '')
+          .replace(/[\r\n]+/g, ' ')
+          .trim();
+        return `[${line.startSec.toFixed(2)} → ${line.endSec.toFixed(2)}] ${text}`;
+      })
+      .join('\n') + '\n'
+  );
+}
+
+/** Apaga o despejo de texto de uma legenda anterior (órfão). */
+function removeCaptionTextFiles(txtBase: string): void {
+  for (const suffix of ['.txt', '.orig.txt']) {
+    try {
+      fs.rmSync(`${txtBase}${suffix}`, { force: true });
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/**
  * Transcreve o áudio da JANELA do Short e monta o `.ass` da legenda
  * queimada.
  *
@@ -460,7 +522,9 @@ async function buildCaptionsForShort(
   cfg: AppConfig,
   topMode: ShortTopMode,
   transcriber: CaptionTranscriber,
-): Promise<{ assPath: string; info: CaptionInfo } | null> {
+  context: CaptionContext,
+  cached?: CaptionTranscript | null,
+): Promise<{ assPath: string; info: CaptionInfo; text: string; originalText: string | null } | null> {
   const base = path.join(
     os.tmpdir(),
     `5k-short-captions-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
@@ -469,7 +533,7 @@ async function buildCaptionsForShort(
   const assPath = `${base}.ass`;
   try {
     await extractAudioWindow(mp4Path, startSec, durSec, wavPath);
-    const transcript = await transcriber(wavPath, durSec);
+    const transcript = await transcriber(wavPath, durSec, context, cached ?? null);
     if (!transcript) return null;
     const lines = buildCaptionLines(transcript.lines, {
       durSec,
@@ -499,6 +563,8 @@ async function buildCaptionsForShort(
       position: cfg.SHORTS_CAPTION_POSITION,
     });
     fs.writeFileSync(assPath, ass, 'utf8');
+    // O texto (`.txt`/`.orig.txt`) é escrito pelo CHAMADOR, depois do
+    // render: só o que foi ao ar merece um arquivo ao lado do mp4.
     return {
       assPath,
       info: {
@@ -507,7 +573,29 @@ async function buildCaptionsForShort(
         language: transcript.language,
         lines: lines.length,
         translated: transcript.translated,
+        ...(transcript.degraded?.length ? { degraded: transcript.degraded } : {}),
+        ...(transcript.untranslated ? { reason: 'untranslated' as const } : {}),
+        ...(transcript.correctionsApplied?.length
+          ? { correctionsApplied: transcript.correctionsApplied }
+          : {}),
+        // A transcrição vai no marker: a próxima rodada refaz só o
+        // passe que falhou (tradução/revisão) sem transcrever de novo
+        // (cota do Gemini + tempo do whisper).
+        transcript: {
+          provider: transcript.provider,
+          language: transcript.language,
+          translated: transcript.translated,
+          lines: transcript.lines,
+          ...(transcript.originalLines?.length
+            ? { originalLines: transcript.originalLines }
+            : {}),
+        },
       },
+      text: captionTextDump(lines),
+      originalText:
+        transcript.translated && transcript.originalLines?.length
+          ? captionTextDump(transcript.originalLines)
+          : null,
     };
   } catch (e) {
     try {
@@ -599,8 +687,23 @@ async function processCandidate(
    * tentado a cada rodada — o provedor pode ainda estar fora e o
    * `--last N` ficaria preso no mesmo clipe. Depois de
    * MAX_SHORT_ATTEMPTS, só o dono manda de novo (`--force`).
+   *
+   * `--retry-captions` é a exceção: ele refaz SÓ a legenda dos Shorts
+   * que falharam nela (tradução/erro/libass) e NÃO libera a janela
+   * limitada pelo teto de latência (que o `--force` libera).
    */
-  if (!args.force) {
+  const captionFailure = isRetryableCaptionFailure(previous?.captionInfo);
+  // `--retry-captions` é SÓ para quem falhou na legenda: os Shorts sem
+  // falha de legenda ficam de fora (o help promete "refaz SÓ a legenda
+  // dos que falharam").
+  if (args.retryCaptions && !captionFailure) {
+    console.log(
+      `- ${name}: pulado (--retry-captions: a legenda deste Short não falhou)`,
+    );
+    return null;
+  }
+  const retryCaptions = args.retryCaptions && captionFailure;
+  if (!args.force && !retryCaptions) {
     const decision = shortRetryDecision({
       attempts: previous?.attempts ?? 0,
       lastAttemptAt: previous?.lastAttemptAt ?? null,
@@ -764,11 +867,43 @@ async function processCandidate(
   // o Short ficaria sem legenda para sempre.
   const staleCaptions =
     captionsOn &&
-    previous?.captionInfo?.applied !== true &&
-    isRetryableCaptionFailure(previous?.captionInfo) &&
+    ((previous?.captionInfo?.applied !== true &&
+      isRetryableCaptionFailure(previous?.captionInfo)) ||
+      // A legenda queimada ficou no idioma original: ela tem que ser
+      // refeita (traduzida) antes do Short ir ao ar.
+      previous?.captionInfo?.reason === 'untranslated') &&
     fs.existsSync(outMp4);
   const rendered =
-    args.force || staleWindow || staleLayout || staleCaptions || !fs.existsSync(outMp4);
+    args.force ||
+    retryCaptions ||
+    staleWindow ||
+    staleLayout ||
+    staleCaptions ||
+    !fs.existsSync(outMp4);
+  /**
+   * Transcrição guardada no marker da rodada anterior: com a JANELA
+   * igual, ela é reaproveitada e só a tradução/revisão rodam de novo
+   * (o provider de transcrição não é chamado — economiza cota do
+   * Gemini e o tempo do whisper).
+   *
+   * Só quando a legenda FALHOU: aí o objetivo é retomar do passo que
+   * falhou. Um Short que já tem legenda vai de transcrição nova (o
+   * dono pode querer o textomelhor depois de mexer nas regras).
+   */
+  const cachedTranscript: CaptionTranscript | null =
+    !staleWindow &&
+    isRetryableCaptionFailure(previous?.captionInfo) &&
+    previous?.captionInfo?.transcript?.lines?.length
+      ? {
+          provider: captionProviderFrom(previous.captionInfo.transcript.provider),
+          language: previous.captionInfo.transcript.language ?? null,
+          translated: previous.captionInfo.transcript.translated === true,
+          lines: previous.captionInfo.transcript.lines,
+          ...(previous.captionInfo.transcript.originalLines?.length
+            ? { originalLines: previous.captionInfo.transcript.originalLines }
+            : {}),
+        }
+      : null;
   let captionInfo: CaptionInfo | null = null;
   if (rendered) {
     if (staleWindow) {
@@ -781,6 +916,10 @@ async function processCandidate(
     // A legenda é transcrita só quando o vertical vai ser refeito: um
     // Short já pronto não gasta IA.
     let captionsAssPath: string | null = null;
+    // O texto da legenda só é gravado depois do render (o arquivo
+    // descreve o que foi ao ar).
+    let captionText: string | null = null;
+    let captionOriginalText: string | null = null;
     if (captionsOn) {
       const hasAudio = await hasAudioStream(mp4Path).catch(() => true);
       if (!hasAudio) {
@@ -796,14 +935,32 @@ async function processCandidate(
             cfg,
             topMode,
             ctx.captionTranscriber,
+            // O contexto (nomes do clipe + gíria) segura a grafia:
+            // sem ele o modelo escreve "molodoij" e "é quinho".
+            captionContextFromAce({
+              player: side.player,
+              team1: side.team1,
+              team2: side.team2,
+              event: side.event,
+              map: side.map,
+              round: side.round,
+              kills: includedKills,
+            }),
+            cachedTranscript,
           );
           if (built) {
             captionsAssPath = built.assPath;
             captionInfo = built.info;
+            captionText = built.text;
+            captionOriginalText = built.originalText;
             console.log(
               `  legenda: ${built.info.lines} linhas (${built.info.provider}${
                 built.info.translated ? ', traduzida' : ''
-              }${built.info.language ? `, ${built.info.language}` : ''})`,
+              }${built.info.language ? `, ${built.info.language}` : ''}${
+                built.info.degraded?.length
+                  ? `, degradada: ${built.info.degraded.join('+')}`
+                  : ''
+              })`,
             );
           } else {
             console.log('  legenda: transcrição vazia — o Short sai sem ela');
@@ -862,7 +1019,13 @@ async function processCandidate(
             captionsAssPath: null,
           });
           durSec = out.durSec;
-          captionInfo = { applied: false, reason: 'failed' };
+          // A transcrição que deu certo continua guardada: a próxima
+          // rodada refaz só o render (e a legenda), sem transcrever.
+          captionInfo = {
+            applied: false,
+            reason: 'failed',
+            ...(captionInfo?.transcript ? { transcript: captionInfo.transcript } : {}),
+          };
           console.log(`  vertical (sem legenda): ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
         } catch (secondErr) {
           console.log(`  (render falhou mesmo sem legenda — descartando): ${String(secondErr).slice(0, 200)}`);
@@ -882,6 +1045,25 @@ async function processCandidate(
           // best-effort
         }
       }
+    }
+    // O despejo de texto (.txt/.orig.txt) descreve o mp4 que vai subir:
+    // só é gravado quando a legenda foi queimada nele, e o arquivo de
+    // uma rodada anterior que NÃO entrou no vertical é apagado (órfão).
+    const txtBase = path.join(outDir, `${name}_legenda`);
+    try {
+      if (captionInfo?.applied && captionText) {
+        fs.mkdirSync(path.dirname(txtBase), { recursive: true });
+        fs.writeFileSync(`${txtBase}.txt`, captionText, 'utf8');
+        if (captionOriginalText) {
+          fs.writeFileSync(`${txtBase}.orig.txt`, captionOriginalText, 'utf8');
+        } else {
+          fs.rmSync(`${txtBase}.orig.txt`, { force: true });
+        }
+      } else {
+        removeCaptionTextFiles(txtBase);
+      }
+    } catch {
+      // best-effort: o Short vale mais do que o dump de texto.
     }
   } else {
     console.log(`  vertical: já existe (${path.relative(process.cwd(), outMp4)})`);
@@ -1029,7 +1211,7 @@ async function processCandidate(
       kills: includedKills.length,
       title: metadata?.title ?? null,
       youtubeId: videoId ?? null,
-      captions: captionStatus?.applied ? 'on' : (captionStatus?.reason ?? 'off'),
+      captions: captionStatus?.reason ?? (captionStatus?.applied ? 'on' : 'off'),
       ...(verdict.publish ? {} : { notPublishedReason: verdict.reason ?? null }),
     },
   };
@@ -1070,12 +1252,20 @@ function recordFailedAttempt(shortsDir: string, name: string): void {
   }
 }
 
-async function runBatch(ctx: BatchContext, candidates: Candidate[]): Promise<void> {
+async function runBatch(
+  ctx: BatchContext,
+  candidates: Candidate[],
+  touchLock?: () => void,
+): Promise<void> {
   const { shortsDir } = ctx;
   const report: Array<Record<string, unknown>> = [];
   let publishedCount = 0;
   try {
     for (const candidate of candidates) {
+      // A trava é renovada a cada Short: um lote com várias chamadas de
+      // IA pode passar do prazo de 30min e a segunda rodada tomaria a
+      // trava no meio (upload duplicado).
+      touchLock?.();
       try {
         const result = await processCandidate(ctx, candidate);
         if (!result) continue;
@@ -1162,6 +1352,11 @@ async function main(): Promise<void> {
               path.join(shortsDir, candidate.name, `${candidate.name}_short.json`),
             );
             if (marker?.youtubeId) return false;
+            // `--retry-captions`: só entram os Shorts que falharam na
+            // legenda — e o backoff NÃO vale (é o que o flag promete).
+            if (args.retryCaptions) {
+              return isRetryableCaptionFailure(marker?.captionInfo);
+            }
             if (args.force) return true;
             return !shortRetryDecision({
               attempts: marker?.attempts ?? 0,
@@ -1190,6 +1385,11 @@ async function main(): Promise<void> {
       geminiModel: cfg.SHORTS_CAPTION_GEMINI_MODEL,
       hfToken: cfg.HF_TOKEN || undefined,
       hfModel: cfg.SHORTS_CAPTION_HF_MODEL,
+      whisperModel: cfg.SHORTS_CAPTION_WHISPER_MODEL,
+      dedicatedModel: cfg.SHORTS_CAPTION_DEDICATED_MODEL,
+      silenceFinal: cfg.SHORTS_CAPTION_SILENCE_FINAL,
+      refine: cfg.SHORTS_CAPTION_REFINE,
+      translate: cfg.SHORTS_CAPTION_TRANSLATE,
     });
 
     const ctx: BatchContext = {
@@ -1208,7 +1408,7 @@ async function main(): Promise<void> {
         `cota do dia: ${ctx.quotaUsed} units já usadas (${ctx.quotaUsed / QUOTA_UNITS_PER_UPLOAD} vídeo(s))`,
       );
     }
-    await runBatch(ctx, pending);
+    await runBatch(ctx, pending, lock.touch);
   } finally {
     lock.release();
   }

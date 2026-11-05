@@ -17,6 +17,14 @@ export interface ProviderRequest {
   language: string | null;
   vad: boolean;
   timeoutMs: number;
+  /**
+   * Pede timestamps por PALAVRA (providers que suportam). A legenda
+   * queimada usa isso: bloco montado das palavras reais nunca fica
+   * adiantado em relação à fala.
+   */
+  words?: boolean;
+  /** Tamanho máximo do bloco (caracteres) quando o provider segmenta. */
+  maxSegmentChars?: number;
 }
 
 /** Resposta crua do provider (antes do `TranscriptResult`). */

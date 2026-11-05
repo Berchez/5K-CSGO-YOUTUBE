@@ -534,6 +534,25 @@ export const ConfigSchema = z.object({
   SHORTS_CAPTION_GEMINI_MODEL: z.string().default('gemini-3-flash-preview'),
   /** Modelo do Whisper (HuggingFace) usado na reserva. */
   SHORTS_CAPTION_HF_MODEL: z.string().default('openai/whisper-large-v3-turbo'),
+  /**
+   * Modelo ggml do whisper.cpp LOCAL (`SHORTS_CAPTION_AI_ORDER` com
+   * `whisper-cpp`): `large-v3-turbo-q5_0` é o melhor custo/qualidade
+   * desta máquina.
+   */
+  SHORTS_CAPTION_WHISPER_MODEL: z.string().default('large-v3-turbo-q5_0'),
+  /**
+   * Modelo DEDICADO de transcrição (Interactions API): é a reserva
+   * quando a cota do Gemini de texto acaba — a cota dele é outra.
+   */
+  SHORTS_CAPTION_DEDICATED_MODEL: z.string().default('gemini-3.5-transcribe'),
+  /**
+   * O silêncio de um provider é FINAL? (`on` = sim, padrão)
+   *
+   * `off`: um provider que devolveu "ninguém falou" deixa o próximo
+   * ser consultado (um falso-negativo não mata a legenda) — mas o
+   * whisper local sem VAD pode inventar fala no silêncio.
+   */
+  SHORTS_CAPTION_SILENCE_FINAL: boolEnvField('SHORTS_CAPTION_SILENCE_FINAL', true),
   /** Teto de tempo da transcrição (upload do áudio + inferência). */
   SHORTS_CAPTION_TIMEOUT_MS: z.coerce.number().min(10_000).max(600_000).default(180_000),
   /** Tamanho da fonte da legenda (px, na saída de 1080). */
@@ -555,6 +574,17 @@ export const ConfigSchema = z.object({
   SHORTS_CAPTION_POSITION: z
     .enum(['below-crosshair', 'game-top', 'bottom'])
     .default('below-crosshair'),
+  /**
+   * Passe REVISOR da legenda: uma segunda chamada ao Gemini corrige só
+   * nome de jogador/time/termo de CS (sem reescrever a fala). Custa uma
+   * chamada por Short; desligue para economizar cota.
+   */
+  SHORTS_CAPTION_REFINE: boolEnvField('SHORTS_CAPTION_REFINE', true),
+  /**
+   * Tradução da legenda para pt-BR quando o streamer fala outra língua
+   * (en/es/ru...). O texto original continua no `.orig.txt`.
+   */
+  SHORTS_CAPTION_TRANSLATE: boolEnvField('SHORTS_CAPTION_TRANSLATE', true),
   /**
    * Provider de transcrição usado pelo adapter (`src/transcription`).
    * Local = sem custo e sem enviar o áudio; nuvem = mais preciso/rápido,

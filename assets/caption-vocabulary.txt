@@ -1,0 +1,176 @@
+# Vocabulário fixo da legenda (entra no prompt de TODA transcrição).
+# Um termo por linha. Tudo depois de "#" é comentário.
+# Serve para o modelo não "corrigir" a grafia do que ouve:
+#   - nomes de jogadores/times (a grafia aqui é a oficial)
+#   - gíria de CS2 que o caster usa (não deve ser traduzida)
+#
+# NÃO coloque palavra COMUM aqui (try, rain, fame, rate, doc, frozen,
+# case, big, solid, just, icy): o modelo passa a escrever esses termos
+# como se fossem nome de jogador e a legenda sai estranha. A grafia de
+# apelido ambíguo fica nas CORREÇÕES (assets/caption-corrections.txt).
+#
+# Time, mapa e apelido de jogador (Liquid, Train, koala, hades...) NÃO
+# são palavra comum: são nome próprio de CS2 e valem aqui.
+#
+# Nomes de jogadores (grafia oficial):
+molodoy
+donk
+sh1ro
+zont1x
+n0rb3r7
+magixx
+bLitz
+KSCERATO
+cobrazera
+910
+nin9
+artFr0st
+BELCHONOKK
+jL
+KaiR0N
+w0nderful
+YEKINDAR
+khaN
+jcobbb
+FalleN
+yuurih
+JBOEN
+biguzera
+koala
+Techno
+latto
+iM
+npl
+esenthial
+ZywOo
+flameZ
+ropz
+apEX
+mezii
+nssin
+dumau
+saadzin
+nqz
+zayut
+equinho
+makazze
+aleksib
+b1t
+Twistzz
+kyousuke
+m0NESY
+NiKo
+huNter-
+broky
+Spinx
+s1mple
+electroNic
+chopper
+tN1R
+xertioN
+torzsi
+Brollan
+Jimpphat
+siuhy
+Snax
+hades
+mopoz
+deko
+Jame
+FL1T
+Norbert
+#
+# Times (grafia oficial):
+The MongolZ
+Baiters
+FURIA
+Spirit
+FaZe
+G2
+Vitality
+MOUZ
+Astralis
+Liquid
+NAVI
+HEROIC
+3DMAX
+ENCE
+Legacy
+Imperial
+NOFN
+paiN
+MIBR
+Sharks
+KRÜ
+RED Canids
+ODDIK
+Fluxo
+Wildcard
+Complexity
+Virtus.pro
+Eternal Fire
+Aurora
+BetBoom
+fnatic
+Lynn Vision
+TYLOO
+Rare Atom
+Passion UA
+9z
+M80
+NRG
+Nemiga
+B8
+PARIVISION
+Falcons
+#
+# Gíria de CS2 (NÃO traduzir):
+kills
+ace
+clutch
+HS
+eco
+molotov
+incendiária
+flash
+smoke
+save
+lurk
+rotate
+defuse
+plant
+push
+rush
+trade
+wallbang
+one-tap
+spray
+site
+bombsite
+Bomb A
+Bomb B
+bomba plantada
+HE
+HEzinha
+C4
+AWP
+AK-47
+M4A1-S
+Desert Eagle
+Deagle
+Tec-9
+USP-S
+Glock-18
+#
+# Mapas (grafia oficial):
+Mirage
+Dust2
+Nuke
+Ancient
+Anubis
+Inferno
+Overpass
+Train
+Vertigo
+Cache
+Cobblestone

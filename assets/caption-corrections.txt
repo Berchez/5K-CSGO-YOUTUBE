@@ -1,0 +1,66 @@
+# Correções do texto da legenda: o que o modelo sempre erra → a forma certa.
+# Uma regra por linha: ERRADO>CERTO (o ">" separa as duas partes).
+# A correção é aplicada DEPOIS da transcrição (e de novo depois da revisão),
+# em cada fala. A troca é por PALAVRA INTEIRA (não troca dentro de outra
+# palavra) e ignora maiúsculas/minúsculas.
+#
+# Ordem importa: as regras de frase vêm ANTES das de palavra (senão
+# "the mongolz" vira "the The MongolZ").
+#
+# "@ctx" no fim da regra = a regra só vale quando o nome do lado DIREITO
+# está no CONTEXTO do clipe (jogador do ace, times ou jogadores citados).
+# Use em toda regra cujo lado esquerdo também é palavra comum: sem o
+# gate, "twist" viraria "Twistzz" (e "lex", "yuri", "robô"...) em qualquer
+# legenda do canal.
+#
+# As regras de GÍRIA (quilos>kills, boa plantada>bomba plantada,
+# bombear>Bomb A...) NÃO precisam de @ctx: elas são do contexto de CS2
+# (o áudio é sempre comentário de caster) e o lado direito não é nome.
+# "bombear" NÃO entra: a troca é cega (bombear o site B viraria "Bomb A").
+#
+# Exemplos: molodói>molodoy | tech nine>Tec-9 | cacerato>KSCERATO
+molodói>molodoy
+molodoij>molodoy
+molodore>molodoy
+lodói>molodoy
+lodoí>molodoy
+é quinho>equinho
+quinho>equinho
+quilos>kills
+cobrazeira>cobrazera
+cobraceira>cobrazera
+cobraseira>cobrazera
+makassi>makazze
+cacerato>KSCERATO
+kacerato>KSCERATO
+iekindar>YEKINDAR
+yekindar>YEKINDAR
+kairon>KaiR0N
+khan>khaN
+yuri>yuurih @ctx
+vitaly>Vitality
+flames>flameZ @ctx
+belchonokk>BELCHONOKK
+nissin>nssin
+iem>iM @ctx
+robô>ropz @ctx
+hops>ropz @ctx
+twist>Twistzz @ctx
+bisqué>biskela
+bisque>biskela
+boa plantada>bomba plantada
+bela a gae>bela HE
+a gaezinha>a HEzinha
+gaezinha>HEzinha
+gae>HE
+tech nine>Tec-9
+tec nine>Tec-9
+the mongolz>The MongolZ
+demongols>The MongolZ
+mongolz>MongolZ
+lex>Legacy @ctx
+gal>Gau
+legacy>Legacy
+baters>Baiters
+baiters>Baiters
+kscerato>KSCERATO

@@ -463,6 +463,22 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     advanced: true,
   },
   {
+    key: 'SHORTS_CAPTION_REFINE',
+    group: 'clips',
+    label: 'Revisar legenda com IA',
+    help: 'Segunda chamada de IA corrige nome de jogador/time e termo de CS sem reescrever a fala. Custa 1 chamada por Short.',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_CAPTION_TRANSLATE',
+    group: 'clips',
+    label: 'Traduzir legenda estrangeira',
+    help: 'Traduz para PT-BR quando o streamer fala outra lingua (o texto original fica no .orig.txt ao lado do Short).',
+    type: 'boolean',
+    advanced: true,
+  },
+  {
     key: 'SHORTS_CAPTION_POSITION',
     group: 'clips',
     label: 'Posicao da legenda',

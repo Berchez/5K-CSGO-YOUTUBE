@@ -30,9 +30,38 @@ export type CaptionPosition = 'game-top' | 'below-crosshair' | 'bottom';
  *   para tentar de novo;
  * - `failed`: a transcrição saiu, mas o libass não queimou a legenda no
  *   mp4 (fonte/ASS) — dá para tentar de novo;
+ * - `untranslated`: o áudio era estrangeiro e a legenda ficou no idioma
+ *   original (a tradução falhou) — dá para tentar de novo;
  * - `disabled`: a legenda não foi pedida.
  */
-export type CaptionSkipReason = 'no-audio' | 'no-speech' | 'error' | 'failed' | 'disabled';
+export type CaptionSkipReason =
+  | 'no-audio'
+  | 'no-speech'
+  | 'error'
+  | 'failed'
+  | 'untranslated'
+  | 'disabled';
+
+/**
+ * A transcrição guardada no marker do Short.
+ *
+ * Ela existe para RETOMAR do passo que falhou: quando a tradução (ou a
+ * revisão) quebra, a próxima rodada reaproveita a transcrição e só
+ * refaz o passe que faltou — sem gastar outra chamada de transcrição
+ * (a cota do Gemini é pequena) nem rodar o whisper de novo.
+ */
+export interface CaptionTranscriptCache {
+  /** Provider que fez a transcrição. */
+  provider?: string;
+  /** Idioma detectado pelo provider. */
+  language?: string | null;
+  /** A legenda já saiu traduzida? */
+  translated?: boolean;
+  /** Falas (tempos relativos ao início do Short). */
+  lines: Array<{ startSec: number; endSec: number; text: string }>;
+  /** Falas no idioma original (quando houve tradução). */
+  originalLines?: Array<{ startSec: number; endSec: number; text: string }>;
+}
 
 /** Como a legenda ficou no vertical (o que o marker do Short guarda). */
 export interface CaptionStatus {
@@ -42,18 +71,39 @@ export interface CaptionStatus {
   lines?: number;
   translated?: boolean;
   reason?: CaptionSkipReason;
+  /**
+   * Passes que rodaram "pela metade": `translate` (o áudio estrangeiro
+   * ficou no idioma original) e/ou `refine` (a revisão não rodou).
+   */
+  degraded?: Array<'translate' | 'refine'>;
+  /**
+   * Regras de correção que mexeram na legenda (`molodoij>molodoy`).
+   * O dono vê no marker qual regra disparou — é como se caça falso
+   * positivo nas regras.
+   */
+  correctionsApplied?: string[];
+  /**
+   * Transcrição guardada: a próxima rodada refaz só o passe que
+   * falhou (tradução/revisão) sem transcriar de novo.
+   */
+  transcript?: CaptionTranscriptCache;
 }
 
 /**
  * A falha é TÉCNICA (vale tentar de novo) ou FINAL?
  *
  * `no-audio`/`no-speech` são finais: repetir a transcrição não muda nada.
- * `error`/`failed` são técnicas: a próxima rodada tenta de novo.
+ * `error`/`failed`/`untranslated` são técnicas: a próxima rodada tenta de
+ * novo.
  */
 export function isRetryableCaptionFailure(
   status: CaptionStatus | null | undefined,
 ): boolean {
-  return status?.reason === 'error' || status?.reason === 'failed';
+  return (
+    status?.reason === 'error' ||
+    status?.reason === 'failed' ||
+    status?.reason === 'untranslated'
+  );
 }
 
 /**
@@ -74,6 +124,18 @@ export function canPublishShortWithCaptions(opts: {
   allowNoCaptions: boolean;
 }): { publish: boolean; reason?: string } {
   if (!opts.captionsOn) return { publish: true };
+  // A legenda queimada está no IDIOMA ORIGINAL: o áudio estrangeiro não
+  // foi traduzido. Publicar assim entrega ao canal um Short com legenda
+  // em inglês — o Short fica para a próxima rodada (o tradutor pode
+  // funcionar na próxima, depois da cota resetar).
+  if (opts.status?.reason === 'untranslated') {
+    if (opts.allowNoCaptions) return { publish: true };
+    return {
+      publish: false,
+      reason:
+        'a legenda ficou no idioma original (a tradução falhou) — a próxima rodada tenta de novo',
+    };
+  }
   if (opts.status?.applied) return { publish: true };
   if (!isRetryableCaptionFailure(opts.status)) return { publish: true };
   if (opts.allowNoCaptions) return { publish: true };

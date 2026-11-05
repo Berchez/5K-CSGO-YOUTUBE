@@ -56,6 +56,14 @@ export interface TranscribeOptions {
   /** VAD (detecção de fala) quando o provider suporta. */
   vad?: boolean;
   timeoutMs?: number;
+  /**
+   * Timestamps por palavra quando o provider suporta (whisper.cpp).
+   * A legenda queimada pede isso: o bloco sai do tempo das palavras, não
+   * do segmento inteiro.
+   */
+  words?: boolean;
+  /** Tamanho máximo do bloco em caracteres (provider que segmenta). */
+  maxSegmentChars?: number;
 }
 
 /** Pedido de transcrição já gravando a legenda num arquivo. */

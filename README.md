@@ -390,6 +390,10 @@ npm run publish:shorts -- --publish --clip data/clips/2399958_Inferno_r12_doc
 
 # 6. publica mesmo com a legenda quebrada (o normal é segurar o Short)
 npm run publish:shorts -- --publish --allow-no-captions --clip data/clips/...
+
+# 7. refaz SÓ a legenda dos Shorts que falharam nela (tradução/erro/libass),
+#    ignorando o backoff — sem liberar a janela com posição não confiável
+npm run publish:shorts -- --dry-run --retry-captions
 ```
 
 O script (`scripts/publish-shorts.ts`):
@@ -431,15 +435,71 @@ assiste sem som.
 - o **Whisper do HuggingFace** (`HF_TOKEN`) é a reserva (traz os tempos
   reais de cada palavra). O Inference Provider do HF exige créditos na
   conta — sem eles, esse provider falha e o Short sai sem legenda;
-- cada Short re-renderizado gasta **1 chamada de transcrição** (um Short
-  já pronto não gasta nada);
+- o **whisper.cpp local** pode entrar na ordem (`SHORTS_CAPTION_AI_ORDER`,
+  ex.: `gemini,whisper-cpp`) — usa o ggml de `.tools/models/ggml`
+  (`SHORTS_CAPTION_WHISPER_MODEL`, padrão `large-v3-turbo-q5_0`) e não
+  gasta cota. No modo legenda ele roda **sem VAD** e monta os blocos pelo
+  tempo de cada palavra: o VAD do whisper.cpp comprime a linha do tempo
+  (os silêncios pulados não voltam nos offsets) e adiantava as falas em
+  segundos. O `-sns` descarta a fala inventada no silêncio, a frase de
+  despedida clássica ("obrigado por assistir") nunca entra na legenda e
+  um token com acento quebrado refaz o segmento inteiro pelo texto (a
+  palavra não fica truncada). Medido nesta máquina: **47s** para uma
+  janela de 80s (o `small` leva 16s, mas erra mais nome) — o teto de
+  `SHORTS_CAPTION_TIMEOUT_MS` (180s) sobra com folga;
+- depois da transcrição, dois passes de IA no texto (Gemini): **tradução**
+  (`SHORTS_CAPTION_TRANSLATE`) leva o áudio estrangeiro para PT-BR
+  mantendo nomes e gíria, e **revisor** (`SHORTS_CAPTION_REFINE`) corrige
+  só nome/termo de CS sem reescrever a fala. A ordem é **traduzir →
+  corrigir → revisar** (as correções do repo são escritas em português:
+  corrigir o texto estrangeiro quebraria palavra comum). Cada passe é
+  best-effort e gasta 1 chamada;
+- **custo por Short ativo: 1 chamada de transcrição + até 2 passes**
+  (tradução só quando o áudio é estrangeiro; revisão só quando o texto
+  já está em português). A transcrição em si pode vir junto com a
+  tradução (`text_pt` na mesma resposta do Gemini). O free tier do
+  Gemini é de 20 `generate_content`/dia — dá para ~6 Shorts por dia com
+  os três passes;
+- o **idioma é conferido pelo texto**, não só pelo provider: gíria em
+  inglês ("clutch", "one-tap") não faz o áudio ser inglês, e provider que
+  não diz o idioma (HuggingFace) tem o texto como resposta. Aí o áudio
+  estrangeiro sem tradutor configurado fica marcado como degradado
+  (visível no marker);
+- **legenda que ficou no idioma original SEGURA o Short** (`untranslated`):
+  ou a tradução FALHOU de verdade (a próxima rodada tenta de novo), ou
+  não há tradutor configurado (sem chave/sem tradutor — a legenda em
+  inglês não vai ao ar; o dono pode forçar com `--allow-no-captions`).
+  Se o tradutor rodou e devolveu as mesmas falas (fala só de nome/gíria),
+  não há o que traduzir: o Short não é segurado. Com
+  `SHORTS_CAPTION_TRANSLATE=off` o dono aceitou o idioma original: o
+  Short não é segurado. A falha só da revisão (`degraded`) também não
+  segura: a legenda vai ao ar como saiu;
+- a transcrição que deu certo fica guardada no marker: quando a legenda
+  FALHOU (tradução/libass), a próxima rodada **retoma do passo que
+  falhou** — o provider de transcrição não é chamado de novo (economiza
+  cota e o tempo do whisper). A transcrição só é refeita se a janela do
+  Short mudar;
+- o **silêncio de um provider é estado final** (o provider local não é
+  chamado depois: sem VAD ele "alucina" fala onde não tem). Com
+  `SHORTS_CAPTION_SILENCE_FINAL=off` o próximo provider é consultado
+  (um falso-negativo do Gemini não mata a legenda) — ao custo de poder
+  aceitar fala inventada;
+- a legenda final fica também em texto ao lado do mp4
+  (`<name>_legenda.txt`; com tradução, o original em
+  `<name>_legenda.orig.txt`) — dá para revisar sem abrir o vídeo. O
+  arquivo é escrito **depois** do render (o que não entrou no vertical
+  não deixa arquivo órfão);
+- cada Short re-renderizado gasta **1 chamada de transcrição** (mais os
+  passes de tradução/revisão quando eles rodam) — um Short já pronto não
+  gasta nada;
 - se a transcrição falhar, o Short é gravado **sem** legenda (e a
   próxima rodada tenta de novo) — melhor do que perder o vídeo;
 - **no `--publish` a legenda quebrada SEGURA o Short**: ele não sobe
   (o `youtubeId` fica vazio no marker), para a próxima rodada tentar
   a transcrição de novo. Publicar sem a legenda é decisão do dono:
   `--allow-no-captions`. Sem áudio (`no-audio`) ou ninguém falando
-  (`no-speech`) não seguram nada — são estado final;
+  (`no-speech`) não seguram nada — são estado final (o provider local
+  não é chamado depois do silêncio: ele "alucina" fala onde não tem);
 - **Short que falhou espera antes de ser tentado de novo** (backoff no
   marker: 10min → 30min → 2h → 6h). Depois de 5 tentativas o script
   para de tentar sozinho: só volta com `--force`. O `--last N` também
@@ -460,6 +520,25 @@ em toda máquina (uma fonte do sistema cairia num fallback diferente em
 cada host e a largura medida não batia). `SHORTS_CAPTION_FONT_FAMILY`
 aceita outra família — aí ela precisa estar instalada no Windows.
 
+**Corrigir nome/gíria da legenda** (vale para os próximos Shorts, sem mexer
+no código):
+
+- `assets/caption-vocabulary.txt` — grafia **oficial** de jogador, time,
+  mapa, arma e gíria que não deve ser traduzida. Entra no prompt de toda
+  transcrição e nos passes de revisão/tradução. **Não coloque palavra
+  comum** (`try`, `rain`, `fame`, `rate`, `doc`, `frozen`...): o modelo
+  passa a escrever esses termos como se fossem nome de jogador;
+- `assets/caption-corrections.txt` — troca literal `ERRADO>CERTO`
+  aplicada depois da transcrição **e de novo** depois da revisão
+  (`cacerato>KSCERATO`, `tech nine>Tec-9`, `cobraceira>cobrazera`).
+  A troca é por palavra inteira; regras de frase vêm antes das de
+  palavra. `ERRADO>CERTO @ctx` marca a regra como **contextual**: ela
+  só entra quando o nome do lado direito está no clipe (jogador do ace,
+  times ou jogadores citados) — é o que impede "twist" de virar
+  "Twistzz" (e "lex", "yuri", "robô"...) em qualquer legenda do canal.
+  As regras que dispararam ficam no marker do Short: é como se caça
+  falso positivo nas regras;
+
 | variável | padrão | efeito |
 | --- | --- | --- |
 | `SHORTS_ENABLED` | `false` | só publicar exige esta chave ligada |
@@ -479,10 +558,15 @@ aceita outra família — aí ela precisa estar instalada no Windows.
 | `SHORTS_CAM_BOX_BY_STREAM` | 4 canais medidos | JSON `{"canal":"x:y:w:h"}`; vence o `SHORTS_CAM_BOX` |
 | `SHORTS_CROP_X` | `0.5` | posição horizontal do crop do jogo (0 = esquerda, 1 = direita) |
 | `SHORTS_CAPTIONS` | `on` | legenda queimada no mp4 (`on`/`off`) |
-| `SHORTS_CAPTION_AI_ORDER` | `gemini,huggingface` | ordem dos providers de transcrição |
+| `SHORTS_CAPTION_AI_ORDER` | `gemini,huggingface` | ordem dos providers de transcrição (`gemini`, `huggingface`, `whisper-cpp`) |
 | `SHORTS_CAPTION_GEMINI_MODEL` | `gemini-3-flash-preview` | modelo do Gemini na transcrição |
 | `SHORTS_CAPTION_HF_MODEL` | `openai/whisper-large-v3-turbo` | modelo do Whisper (reserva) |
+| `SHORTS_CAPTION_WHISPER_MODEL` | `large-v3-turbo-q5_0` | modelo ggml do whisper.cpp local (reserva sem cota) |
+| `SHORTS_CAPTION_DEDICATED_MODEL` | `gemini-3.5-transcribe` | modelo dedicado de transcrição (cota separada, usado quando a cota do Gemini de texto acaba) |
+| `SHORTS_CAPTION_SILENCE_FINAL` | `on` | `on` = o silêncio de um provider é final; `off` = o próximo provider é consultado |
 | `SHORTS_CAPTION_TIMEOUT_MS` | `180000` | teto de tempo da transcrição |
+| `SHORTS_CAPTION_REFINE` | `on` | passe revisor da legenda (corrige nomes sem reescrever) |
+| `SHORTS_CAPTION_TRANSLATE` | `on` | traduz a legenda para PT-BR quando o áudio não é português |
 | `SHORTS_CAPTION_FONT_SIZE` | `54` | tamanho da fonte da legenda (px) |
 | `SHORTS_CAPTION_FONT_FAMILY` | `Barlow Condensed` | família da fonte (a padrão vem do repo, em `assets/fonts`) |
 | `SHORTS_CAPTION_POSITION` | `below-crosshair` | `below-crosshair` (abaixo da mira), `game-top` (abaixo da cam) ou `bottom` (rodapé) |
@@ -499,7 +583,8 @@ dessas chaves — uma config de Shorts quebrada não impede o bot de subir).
 
 **Migração dos defaults dos Shorts**: o default atual é
 `SHORTS_MIN_SEC=60` / `SHORTS_MAX_SEC=90` / `SHORTS_CAPTIONS=on` (a
-legenda queimada passa a gastar 1 chamada de IA por Short). Um `.env`
+legenda queimada passa a gastar 1 chamada de transcrição + até 2 passes
+de texto por Short). Um `.env`
 antigo com `30/60` explícito continua com o valor antigo — o default só
 muda quando a chave não está no `.env`. Atenção: quem tinha só
 `SHORTS_MAX_SEC` abaixo de 60 (ex.: `30`) passa a falhar na validação
