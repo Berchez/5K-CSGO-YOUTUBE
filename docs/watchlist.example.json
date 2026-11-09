@@ -3,27 +3,32 @@
   "enabled": true,
   "defaults": {
     "minKills": 4,
+    "minStars": 0,
     "clutch": false
   },
   "teams": [
     {
       "names": ["FURIA", "FURIA Esports"],
       "minKills": 3,
+      "minStars": 2,
       "enabled": true
     },
     {
       "names": ["Legacy"],
       "minKills": 4,
+      "minStars": 0,
       "enabled": true
     },
     {
       "names": ["Imperial", "Imperial Esports"],
       "minKills": 5,
+      "minStars": 3,
       "enabled": true
     },
     {
       "names": ["paiN", "paiN Gaming"],
       "minKills": 3,
+      "minStars": 0,
       "enabled": true
     }
   ],

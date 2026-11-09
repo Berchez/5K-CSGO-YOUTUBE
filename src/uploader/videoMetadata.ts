@@ -173,6 +173,14 @@ export interface MetadataOptions {
    * log é indistinguível de um clipe normal para quem assiste.
    */
   replayOnly?: boolean;
+  /**
+   * Vídeo RELACIONADO (o clipe 16:9 do mesmo ace): o link entra no
+   * rodapé da descrição. Aceita o ID puro ou a URL completa.
+   *
+   * O Short e o clipe longo são dois vídeos: o link é o que amarra os
+   * dois (quem vê o Short chega no clipe com o contexto todo).
+   */
+  relatedVideoId?: string;
 }
 
 export interface VideoMetadata {
@@ -967,6 +975,22 @@ export function buildHashtags(
   return unique.slice(0, 10).join(' ');
 }
 
+/**
+ * Link do vídeo relacionado (puro): aceita o ID puro ou a URL completa
+ * (`watch?v=`, `youtu.be/`, `shorts/`) e devolve a URL canônica.
+ *
+ * Devolve null quando o valor não parece um ID do YouTube — um link
+ * quebrado na descrição é pior do que nenhum link.
+ */
+export function relatedVideoUrl(value: string | null | undefined): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  const fromUrl = raw.match(/(?:v=|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{11})/);
+  const id = fromUrl ? fromUrl[1] : /^[A-Za-z0-9_-]{11}$/.test(raw) ? raw : null;
+  if (!id) return null;
+  return `https://www.youtube.com/watch?v=${id}`;
+}
+
 export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): string {
   const privacy = opts.privacy ?? 'private';
   const isShorts = opts.format === 'shorts';
@@ -984,7 +1008,9 @@ export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): s
     base = `${what} automático${who}${where}. Assine o canal para não perder nenhum highlight.`;
   }
   const cta = (opts.cta ?? '').trim();
-  const footer = cta ? `${base}\n${cta}` : base;
+  const link = relatedVideoUrl(opts.relatedVideoId);
+  const linkLine = link ? `Clipe completo (16:9): ${link}` : '';
+  const footer = [base, cta, linkLine].filter(Boolean).join('\n');
   // O rodapé entra DEPOIS do sanitize do corpo (o CTA pode ter URL, e
   // link é aceito na descrição), mas < e > o YouTube rejeita com
   // invalidDescription — então a limpeza é aplicada aqui.

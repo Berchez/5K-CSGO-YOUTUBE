@@ -37,11 +37,64 @@
  *                      (tradução/erro/libass): os que estão OK ficam de
  *                      fora, e o backoff é ignorado — sem liberar a
  *                      janela com posição não confiável
+ *   --retranscribe    refaz a transcrição do zero (ignora a transcrição
+ *                      guardada no marker) — o jeito de trocar o provider
+ *                      da legenda sem mexer na janela
+ *   --republish       sobe de novo um Short já publicado (o vídeo NOVO
+ *                      entra com outro id; o antigo continua no canal)
+ *   --head-sec <n>     folga ANTES da 1ª kill da janela (default: .env)
+ *   --tail-sec <n>     folga DEPOIS da última kill (default: .env)
+ *   --min-sec <n>      duração mínima da janela (default: .env)
+ *   --max-sec <n>      duração máxima da janela (default: .env)
+ *   --caption-order <lista>
+ *                      ordem dos providers da legenda (default: .env).
+ *                      Ex.: `whisper-cpp,gemini,huggingface` — o whisper
+ *                      local tem timestamp REAL de cada fala (a legenda
+ *                      sai sincronizada com o áudio).
+ *   --caption-timing <p>
+ *                      de onde vem o TEMPO da legenda: `whisper-cpp`
+ *                      (default: .env) casa o texto do modelo com o
+ *                      tempo real do whisper local; `off` usa o tempo
+ *                      do próprio modelo (que o inventa).
+ *   --overlay-text <texto>
+ *                      adesivo (botão) no começo do Short, que some em
+ *                      fade out. Ex.: `Furia nos playoffs`
+ *   --overlay-hold-sec <n>  segundos que o adesivo fica visível (default: .env)
+ *   --overlay-fade-sec <n>  duração do fade out do adesivo (default: .env)
+ *   --overlay-preset <id>  visual do adesivo: polex|polex-die|gaules|
+ *                      madhouse|rei|diecut|pill|custom (default: .env)
+ *   --overlay-style <forma>  capsule|rect (sobrescreve o preset)
+ *   --overlay-tag <texto>  tag pequena no topo (sobrescreve o preset)
+ *   --overlay-background <#rrggbb>  cor de fundo
+ *   --overlay-color <#rrggbb>  cor do texto
+ *   --overlay-border-color <#rrggbb>  cor da borda
+ *   --overlay-border-px <n>  espessura da borda (0 = sem borda)
+ *   --overlay-shadow-color <#rrggbb>  cor da sombra
+ *   --overlay-shadow-px <n>  deslocamento da sombra (0 = sem sombra)
+ *   --overlay-shadow-blur-px <n>  blur da sombra (0 = sólida)
+ *   --overlay-tilt-deg <n>  inclinação em graus (-15 a 15)
+ *   --overlay-font <fonte>  Arial Black|Impact|Arial
+ *   --overlay-uppercase <on|off>  caixa alta forçada
+ *   --overlay-y <0..1>  posição vertical do adesivo
+ *   --cam-height <n>   altura da faixa da cam (default: .env)
+ *   --caption-font-size <n>  fonte da legenda (default: .env)
+ *   --caption-position <pos>  below-crosshair|game-top|bottom
+ *   --link-video <id|url>
+ *                      vídeo relacionado (o clipe 16:9) que entra no
+ *                      rodapé da descrição do Short. Ex.:
+ *                      --link-video N3SilLCce64
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getConfig, validateConfigCrossFields, type AppConfig } from '../src/config.js';
+import {
+  getConfig,
+  invalidShortsOverlayEnvs,
+  SHORTS_OVERLAY_PRESETS,
+  validateConfigCrossFields,
+  type AppConfig,
+} from '../src/config.js';
 import {
   aceKey,
   countPublishedClips,
@@ -58,12 +111,16 @@ import {
   parseShortCamBox,
   planShortWindow,
   renderShortClip,
+  resolveShortWindowConfig,
   shortRenderSignature,
+  shortWindowConfigErrors,
   hasAudioStream,
   type ShortRenderSignature,
   type ShortTopMode,
+  type ShortWindowConfig,
 } from '../src/clipper/shorts.js';
 import { configuredCropForStream } from '../src/clipper/scoreboardSync.js';
+import { repoPath } from '../src/paths.js';
 import {
   buildCaptionLines,
   buildCaptionsAss,
@@ -85,9 +142,10 @@ import {
   type CaptionTranscript,
   type CaptionTranscriber,
 } from '../src/clipper/shortCaptionsAi.js';
+import { resolveShortOverlayStyle } from '../src/clipper/shortOverlay.js';
 import { loadThumbFont, measureThumbText } from '../src/clipper/thumbText.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
-import { buildVideoMetadataSafe, type VideoMetadata } from '../src/uploader/videoMetadata.js';
+import { buildVideoMetadataSafe, relatedVideoUrl, type VideoMetadata } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
 import type { MetadataAiFn } from '../src/uploader/videoMetadata.js';
 import type { AceEvent, KillEvent, RoundSummary } from '../src/types.js';
@@ -131,16 +189,119 @@ interface Args {
   force: boolean;
   /** Refazer SÓ a legenda dos Shorts que falharam nela (sem `--force`). */
   retryCaptions: boolean;
+  /** Refazer a transcrição do zero (ignora a transcrição guardada no marker). */
+  retranscribe: boolean;
+  /** Subir de novo um Short já publicado (o vídeo antigo continua no canal). */
+  republish: boolean;
   noAi: boolean;
   noCaptions: boolean;
   allowNoCaptions: boolean;
+  /** Sobreposição da janela nesta execução (o .env manda por default). */
+  headSec: number | null;
+  tailSec: number | null;
+  minSec: number | null;
+  maxSec: number | null;
+  /** Ordem dos providers da legenda nesta execução. */
+  captionOrder: string | null;
+  /** Provider do TEMPO da legenda nesta execução (vazio = o do modelo). */
+  captionTiming: string | null;
+  /** Adesivo (botão) no começo do Short nesta execução. */
+  overlayText: string | null;
+  overlayHoldSec: number | null;
+  overlayFadeSec: number | null;
+  /** Preset e overrides do adesivo nesta execução. */
+  overlayPreset: string | null;
+  overlayStyle: string | null;
+  overlayTag: string | null;
+  overlayUppercase: boolean | null;
+  overlayBackground: string | null;
+  overlayColor: string | null;
+  overlayBorderColor: string | null;
+  overlayBorderPx: number | null;
+  overlayShadowColor: string | null;
+  overlayShadowPx: number | null;
+  overlayShadowBlurPx: number | null;
+  overlayTiltDeg: number | null;
+  overlayFont: string | null;
+  overlayY: number | null;
+  /** Geometria/legenda sobrescritas nesta execução. */
+  camHeight: number | null;
+  captionFontSize: number | null;
+  captionPosition: string | null;
+  /** Vídeo relacionado (o clipe 16:9) que entra no rodapé da descrição. */
+  linkVideo: string | null;
 }
 
 const PRIVACY_VALUES = ['private', 'unlisted', 'public'];
 
+/** Número de segundos de janela (aceita 0 e decimais). */
+function parseSeconds(raw: string, flag: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 600) {
+    throw new Error(`${flag} precisa de um número de segundos entre 0 e 600 (recebido: ${raw})`);
+  }
+  return value;
+}
+
+/** Número em faixa (inteiro opcional) para as flags numéricas. */
+function parseNumberInRange(
+  raw: string,
+  flag: string,
+  min: number,
+  max: number,
+  integer = false,
+): number {
+  const value = Number(raw);
+  if (
+    !Number.isFinite(value) ||
+    value < min ||
+    value > max ||
+    (integer && !Number.isInteger(value))
+  ) {
+    throw new Error(`${flag} precisa de um número entre ${min} e ${max} (recebido: ${raw})`);
+  }
+  return value;
+}
+
+/** Cor hex aceita com ou sem `#`; devolve sempre `#rrggbb`. */
+function parseHexColor(raw: string, flag: string): string {
+  const value = raw.trim();
+  if (!/^#?[0-9a-f]{6}$/i.test(value)) {
+    throw new Error(`${flag} precisa de uma cor hex (#rrggbb) — recebido: ${raw}`);
+  }
+  return value.startsWith('#') ? value.toLowerCase() : `#${value.toLowerCase()}`;
+}
+
+/** Ligado/desligado no vocabulário do `.env`. */
+function parseOnOff(raw: string, flag: string): boolean {
+  const value = raw.trim().toLowerCase();
+  if (['1', 'true', 'on', 'yes', 'sim'].includes(value)) return true;
+  if (['0', 'false', 'off', 'no', 'nao', 'não'].includes(value)) return false;
+  throw new Error(`${flag} aceita on/off (recebido: ${raw})`);
+}
+
 /** Cota diária do YouTube (units do projeto de API). */
 const QUOTA_UNITS_PER_UPLOAD = 1600;
 const QUOTA_UNITS_PER_DAY = 10_000;
+
+/**
+ * Hash das regras de correção da legenda (`assets/caption-corrections.txt`).
+ *
+ * O texto da legenda é QUEIMADO no mp4: quando o dono mexe numa regra, o
+ * vertical já gravado tem a legenda antiga. O hash entra na assinatura do
+ * render (marker) para o vertical ser refeito com a regra nova.
+ */
+function captionRulesHash(): string {
+  try {
+    return crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(repoPath('assets', 'caption-corrections.txt')))
+      .digest('hex')
+      .slice(0, 12);
+  } catch {
+    return '';
+  }
+}
 
 function parseArgs(argv: string[]): Args {
   const args: Args = {
@@ -150,9 +311,38 @@ function parseArgs(argv: string[]): Args {
     privacy: null,
     force: false,
     retryCaptions: false,
+    retranscribe: false,
+    republish: false,
     noAi: false,
     noCaptions: false,
     allowNoCaptions: false,
+    headSec: null,
+    tailSec: null,
+    minSec: null,
+    maxSec: null,
+    captionOrder: null,
+    captionTiming: null,
+    overlayText: null,
+    overlayHoldSec: null,
+    overlayFadeSec: null,
+    overlayPreset: null,
+    overlayStyle: null,
+    overlayTag: null,
+    overlayUppercase: null,
+    overlayBackground: null,
+    overlayColor: null,
+    overlayBorderColor: null,
+    overlayBorderPx: null,
+    overlayShadowColor: null,
+    overlayShadowPx: null,
+    overlayShadowBlurPx: null,
+    overlayTiltDeg: null,
+    overlayFont: null,
+    overlayY: null,
+    camHeight: null,
+    captionFontSize: null,
+    captionPosition: null,
+    linkVideo: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -175,10 +365,89 @@ function parseArgs(argv: string[]): Args {
     else if (name === '--dry-run') args.publish = false;
     else if (name === '--force') args.force = true;
     else if (name === '--retry-captions') args.retryCaptions = true;
+    else if (name === '--retranscribe') args.retranscribe = true;
+    else if (name === '--republish') args.republish = true;
     else if (name === '--no-ai') args.noAi = true;
     else if (name === '--no-captions') args.noCaptions = true;
     else if (name === '--allow-no-captions') args.allowNoCaptions = true;
-    else if (name === '--clip') args.clips.push(next());
+    else if (name === '--head-sec') args.headSec = parseSeconds(next(), name);
+    else if (name === '--tail-sec') args.tailSec = parseSeconds(next(), name);
+    else if (name === '--min-sec') args.minSec = parseSeconds(next(), name);
+    else if (name === '--max-sec') args.maxSec = parseSeconds(next(), name);
+    else if (name === '--caption-order') {
+      const raw = next();
+      if (!raw.trim()) throw new Error('--caption-order precisa de uma lista de providers');
+      args.captionOrder = raw;
+    } else if (name === '--caption-timing') {
+      const raw = next().trim();
+      if (raw !== 'whisper-cpp' && raw !== 'off' && raw !== '') {
+        throw new Error(`--caption-timing inválido: ${raw} (use whisper-cpp|off)`);
+      }
+      args.captionTiming = raw === 'off' ? '' : raw;
+    } else if (name === '--overlay-text') {
+      args.overlayText = next();
+    } else if (name === '--overlay-hold-sec') {
+      args.overlayHoldSec = parseSeconds(next(), name);
+    } else if (name === '--overlay-fade-sec') {
+      args.overlayFadeSec = parseSeconds(next(), name);
+    } else if (name === '--overlay-preset') {
+      const raw = next().trim();
+      if (!(SHORTS_OVERLAY_PRESETS as readonly string[]).includes(raw)) {
+        throw new Error(`--overlay-preset inválido: ${raw} (use ${SHORTS_OVERLAY_PRESETS.join('|')})`);
+      }
+      args.overlayPreset = raw;
+    } else if (name === '--overlay-style') {
+      const raw = next().trim();
+      if (!['capsule', 'rect'].includes(raw)) {
+        throw new Error(`--overlay-style inválido: ${raw} (use capsule|rect)`);
+      }
+      args.overlayStyle = raw;
+    } else if (name === '--overlay-tag') {
+      // `none` = SEM tag (sem isso não dá para tirar a tag do preset).
+      args.overlayTag = next().trim();
+    } else if (name === '--overlay-uppercase') {
+      args.overlayUppercase = parseOnOff(next(), name);
+    } else if (name === '--overlay-background') {
+      args.overlayBackground = parseHexColor(next(), name);
+    } else if (name === '--overlay-color') {
+      args.overlayColor = parseHexColor(next(), name);
+    } else if (name === '--overlay-border-color') {
+      args.overlayBorderColor = parseHexColor(next(), name);
+    } else if (name === '--overlay-border-px') {
+      args.overlayBorderPx = parseNumberInRange(next(), name, 0, 40);
+    } else if (name === '--overlay-shadow-color') {
+      args.overlayShadowColor = parseHexColor(next(), name);
+    } else if (name === '--overlay-shadow-px') {
+      args.overlayShadowPx = parseNumberInRange(next(), name, 0, 40);
+    } else if (name === '--overlay-shadow-blur-px') {
+      args.overlayShadowBlurPx = parseNumberInRange(next(), name, 0, 20);
+    } else if (name === '--overlay-tilt-deg') {
+      args.overlayTiltDeg = parseNumberInRange(next(), name, -15, 15);
+    } else if (name === '--overlay-font') {
+      const raw = next().trim();
+      if (!['Arial Black', 'Impact', 'Arial'].includes(raw)) {
+        throw new Error(`--overlay-font inválido: ${raw} (use Arial Black|Impact|Arial)`);
+      }
+      args.overlayFont = raw;
+    } else if (name === '--overlay-y') {
+      args.overlayY = parseNumberInRange(next(), name, 0, 1);
+    } else if (name === '--cam-height') {
+      args.camHeight = parseNumberInRange(next(), name, 160, 1800, true);
+    } else if (name === '--caption-font-size') {
+      args.captionFontSize = parseNumberInRange(next(), name, 24, 160, true);
+    } else if (name === '--caption-position') {
+      const raw = next().trim();
+      if (!['below-crosshair', 'game-top', 'bottom'].includes(raw)) {
+        throw new Error(`--caption-position inválido: ${raw} (use below-crosshair|game-top|bottom)`);
+      }
+      args.captionPosition = raw;
+    } else if (name === '--link-video') {
+      const raw = next().trim();
+      if (!relatedVideoUrl(raw)) {
+        throw new Error(`--link-video inválido: ${raw} (use o ID do YouTube ou a URL do vídeo)`);
+      }
+      args.linkVideo = raw;
+    } else if (name === '--clip') args.clips.push(next());
     else if (name === '--last') {
       const raw = next();
       const n = Number(raw);
@@ -447,6 +716,10 @@ interface BatchContext {
   shortsDir: string;
   /** Units de cota já consumidas hoje (vídeos enviados). */
   quotaUsed: number;
+  /** Janela resolvida (flags > .env) — validada antes do lote. */
+  window: ShortWindowConfig;
+  /** Hash das regras de correção da legenda (o texto é queimado no mp4). */
+  captionRulesHash: string;
 }
 
 interface CandidateResult {
@@ -589,6 +862,14 @@ async function buildCaptionsForShort(
           ...(transcript.originalLines?.length
             ? { originalLines: transcript.originalLines }
             : {}),
+          // O texto CRU (antes das correções/revisão) é o que o re-render
+          // reaproveita: as regras são aplicadas de novo por cima dele.
+          ...(transcript.rawLines?.length
+            ? { rawLines: transcript.rawLines }
+            : {}),
+          ...(transcript.rawOriginalLines?.length
+            ? { rawOriginalLines: transcript.rawOriginalLines }
+            : {}),
         },
       },
       text: captionTextDump(lines),
@@ -645,12 +926,21 @@ async function processCandidate(
     return null;
   }
   const positions = positioned.map((p) => p.sec);
-  const plan = planShortWindow(positions, side.clipDurationSec, {
-    maxSec: cfg.SHORTS_MAX_SEC,
-    minSec: cfg.SHORTS_MIN_SEC,
-    headSec: cfg.SHORTS_HEAD_SEC,
-    tailSec: cfg.SHORTS_TAIL_SEC,
+  // A janela pode ser apertada por flag (uma jogada específica), sem
+  // mexer no .env do bot. A janela já foi validada no main() (antes do
+  // lote) — aqui é só uma rede de segurança: um erro NÃO pode virar
+  // "tentativa falha" do clipe (o backoff seguraria o clip por horas).
+  const windowOpts = ctx.window;
+  const windowErrors = shortWindowConfigErrors(windowOpts, {
+    width: cfg.SHORTS_WIDTH,
+    height: cfg.SHORTS_HEIGHT,
+    camHeight: cfg.SHORTS_CAM_HEIGHT,
   });
+  if (windowErrors.length > 0) {
+    console.log(`- ${name}: ignorado (janela inválida: ${windowErrors.join(' ')})`);
+    return null;
+  }
+  const plan = planShortWindow(positions, side.clipDurationSec, windowOpts);
   if (plan.durSec < 5) {
     console.log(`- ${name}: ignorado (janela de ${plan.durSec}s)`);
     return null;
@@ -663,7 +953,7 @@ async function processCandidate(
   );
   if (included.length < cfg.SHORTS_MIN_KILLS) {
     console.log(
-      `- ${name}: ignorado (${included.length} kill(s) dentro da janela de ${cfg.SHORTS_MAX_SEC}s — mínimo ${cfg.SHORTS_MIN_KILLS})`,
+      `- ${name}: ignorado (${included.length} kill(s) dentro da janela de ${windowOpts.maxSec}s — mínimo ${cfg.SHORTS_MIN_KILLS})`,
     );
     return null;
   }
@@ -676,11 +966,16 @@ async function processCandidate(
   const previous = readShortMarker(outSidecar);
   const key = aceKey(side.matchId, side.map, side.round, side.player);
   const publishedId = published.get(key);
-  if (previous?.youtubeId || publishedId) {
+  if ((previous?.youtubeId || publishedId) && !args.republish) {
     console.log(
       `- ${name}: já publicado (${previous?.youtubeId ?? publishedId}) — pulando`,
     );
     return null;
+  }
+  if ((previous?.youtubeId || publishedId) && args.republish) {
+    console.log(
+      `  ATENÇÃO (--republish): o Short já foi publicado (${previous?.youtubeId ?? publishedId}) — este upload é um NOVO vídeo; o antigo continua no canal`,
+    );
   }
   /**
    * Backoff: um Short que falhou (legenda quebrada, ffmpeg caiu) não é
@@ -742,12 +1037,12 @@ async function processCandidate(
   );
   if (plan.droppedKills.length > 0) {
     console.log(
-      `  ATENÇÃO: ${plan.droppedKills.length} kill(s) fora da janela de ${cfg.SHORTS_MAX_SEC}s: ${plan.droppedKills
+      `  ATENÇÃO: ${plan.droppedKills.length} kill(s) fora da janela de ${windowOpts.maxSec}s: ${plan.droppedKills
         .map((p) => `${p}s`)
         .join(', ')}`,
     );
   } else if (plan.truncated) {
-    console.log(`  (cauda cortada para caber em ${cfg.SHORTS_MAX_SEC}s — todas as kills dentro)`);
+    console.log(`  (cauda cortada para caber em ${windowOpts.maxSec}s — todas as kills dentro)`);
   }
 
   // Layout do topo: cam do canal (caixa medida) ou a faixa com o título.
@@ -827,7 +1122,17 @@ async function processCandidate(
         clipStartMs: side.clipStartMs + Math.round(plan.startSec * 1000),
         clipDurationSec: durSec,
         killTimeOffsetMs: side.killVideoOffsetMs,
+        // O link do clipe 16:9 entra no rodapé da descrição (o Short e o
+        // clipe longo são dois vídeos: o link é o que amarra os dois).
+        relatedVideoId: args.linkVideo ?? undefined,
       });
+  // Metadados REAPROVEITADOS (dry-run anterior) podem ter sido gerados
+  // sem o link: ele é acrescentado agora (o rodapé nunca é cortado pelo
+  // limite de bytes — quem cede é o corpo).
+  const relatedUrl = relatedVideoUrl(args.linkVideo);
+  if (relatedUrl && metadata && !metadata.description.includes(relatedUrl)) {
+    metadata.description = `${metadata.description}\n\nClipe completo (16:9): ${relatedUrl}`;
+  }
 
   console.log(`  título: ${metadata?.title ?? '(legado)'}`);
   console.log(`  descrição: ${(metadata?.description ?? '').split('\n')[0]?.slice(0, 120)}...`);
@@ -842,6 +1147,33 @@ async function processCandidate(
         }
       : null;
   const captionsOn = cfg.SHORTS_CAPTIONS === true && !args.noCaptions;
+  /**
+   * Adesivo (botão) no começo do Short: texto vem da flag (esta
+   * execução) ou do `.env`; preset, visual e tempo também podem ser
+   * sobrescritos por flag.
+   */
+  const overlayText = (args.overlayText ?? cfg.SHORTS_OVERLAY_TEXT).trim();
+  const overlayButton = resolveShortOverlayStyle({
+    preset: args.overlayPreset ?? cfg.SHORTS_OVERLAY_PRESET,
+    text: overlayText,
+    holdSec: args.overlayHoldSec ?? cfg.SHORTS_OVERLAY_HOLD_SEC,
+    fadeSec: args.overlayFadeSec ?? cfg.SHORTS_OVERLAY_FADE_SEC,
+    y: args.overlayY ?? cfg.SHORTS_OVERLAY_Y,
+    overrides: {
+      shape: args.overlayStyle ?? cfg.SHORTS_OVERLAY_STYLE,
+      tag: args.overlayTag ?? cfg.SHORTS_OVERLAY_TAG,
+      uppercase: args.overlayUppercase ?? cfg.SHORTS_OVERLAY_UPPERCASE,
+      background: args.overlayBackground ?? cfg.SHORTS_OVERLAY_BACKGROUND,
+      color: args.overlayColor ?? cfg.SHORTS_OVERLAY_COLOR,
+      borderColor: args.overlayBorderColor ?? cfg.SHORTS_OVERLAY_BORDER_COLOR,
+      borderPx: args.overlayBorderPx ?? cfg.SHORTS_OVERLAY_BORDER_PX,
+      shadowColor: args.overlayShadowColor ?? cfg.SHORTS_OVERLAY_SHADOW_COLOR,
+      shadowPx: args.overlayShadowPx ?? cfg.SHORTS_OVERLAY_SHADOW_PX,
+      shadowBlurPx: args.overlayShadowBlurPx ?? cfg.SHORTS_OVERLAY_SHADOW_BLUR_PX,
+      tiltDeg: args.overlayTiltDeg ?? cfg.SHORTS_OVERLAY_TILT_DEG,
+      font: args.overlayFont ?? cfg.SHORTS_OVERLAY_FONT,
+    },
+  });
   const signature = shortRenderSignature({
     top: topMode,
     camBox,
@@ -860,6 +1192,24 @@ async function processCandidate(
     captionFontSize: cfg.SHORTS_CAPTION_FONT_SIZE,
     captionPosition: cfg.SHORTS_CAPTION_POSITION,
     captionFontFamily: cfg.SHORTS_CAPTION_FONT_FAMILY,
+    captionRulesHash: ctx.captionRulesHash,
+    overlayText,
+    overlayHoldSec: overlayButton?.holdSec ?? 0,
+    overlayFadeSec: overlayButton?.fadeSec ?? 0,
+    overlayY: overlayButton?.y ?? 0,
+    overlayPreset: overlayButton?.preset ?? '',
+    overlayShape: overlayButton?.shape ?? '',
+    overlayBackground: overlayButton?.background ?? '',
+    overlayColor: overlayButton?.color ?? '',
+    overlayBorderColor: overlayButton?.borderColor ?? '',
+    overlayBorderPx: overlayButton?.borderPx ?? 0,
+    overlayShadowColor: overlayButton?.shadowColor ?? '',
+    overlayShadowPx: overlayButton?.shadowPx ?? 0,
+    overlayShadowBlurPx: overlayButton?.shadowBlurPx ?? 0,
+    overlayTiltDeg: overlayButton?.tiltDeg ?? 0,
+    overlayFont: overlayButton?.font ?? '',
+    overlayUppercase: overlayButton?.uppercase ?? false,
+    overlayTag: overlayButton?.tag ?? '',
   });
   const staleLayout = isStaleRender(previous?.render, signature);
   // A legenda pedida NÃO entrou no arquivo (a transcrição ou o libass
@@ -876,6 +1226,9 @@ async function processCandidate(
   const rendered =
     args.force ||
     retryCaptions ||
+    // Transcrição nova = legenda nova = vertical novo: o texto é QUEIMADO
+    // no mp4, então o vertical antigo não pode ser reaproveitado.
+    args.retranscribe ||
     staleWindow ||
     staleLayout ||
     staleCaptions ||
@@ -886,13 +1239,19 @@ async function processCandidate(
    * (o provider de transcrição não é chamado — economiza cota do
    * Gemini e o tempo do whisper).
    *
-   * Só quando a legenda FALHOU: aí o objetivo é retomar do passo que
-   * falhou. Um Short que já tem legenda vai de transcrição nova (o
-   * dono pode querer o textomelhor depois de mexer nas regras).
+   * Vale para QUALQUER legenda já gravada (não só a que falhou): o
+   * re-render por outro motivo (layout, adesivo) não precisa pagar a
+   * transcrição de novo. A tradução NÃO é refeita (o texto guardado já
+   * vem traduzido); as correções e a revisão do dono rodam de novo
+   * sobre ele — é o que o dono quer quando mexe nas regras.
+   *
+   * `--retranscribe` joga esse cache fora: a transcrição roda de novo
+   * (com o provider da ordem desta execução) — é o jeito de trocar o
+   * provider da legenda sem mexer na janela.
    */
   const cachedTranscript: CaptionTranscript | null =
+    !args.retranscribe &&
     !staleWindow &&
-    isRetryableCaptionFailure(previous?.captionInfo) &&
     previous?.captionInfo?.transcript?.lines?.length
       ? {
           provider: captionProviderFrom(previous.captionInfo.transcript.provider),
@@ -901,6 +1260,14 @@ async function processCandidate(
           lines: previous.captionInfo.transcript.lines,
           ...(previous.captionInfo.transcript.originalLines?.length
             ? { originalLines: previous.captionInfo.transcript.originalLines }
+            : {}),
+          // O texto CRU (antes das correções/revisão) é o que vale
+          // re-render: as regras são aplicadas de novo por cima dele.
+          ...(previous.captionInfo.transcript.rawLines?.length
+            ? { rawLines: previous.captionInfo.transcript.rawLines }
+            : {}),
+          ...(previous.captionInfo.transcript.rawOriginalLines?.length
+            ? { rawOriginalLines: previous.captionInfo.transcript.rawOriginalLines }
             : {}),
         }
       : null;
@@ -962,9 +1329,22 @@ async function processCandidate(
                   : ''
               })`,
             );
+            // O texto vai ao console ANTES do upload: o dono lê a legenda
+            // que vai queimar no vertical (nome errado, frase furada) e
+            // aborta o lote antes de gastar cota do YouTube.
+            for (const line of built.text.trimEnd().split('\n')) {
+              if (line.trim()) console.log(`    ${line}`);
+            }
           } else {
             console.log('  legenda: transcrição vazia — o Short sai sem ela');
-            captionInfo = { applied: false, reason: 'no-speech' };
+            // De qual provider veio o "ninguém falou": é o que separa
+            // silêncio real de falso-negativo do provider local.
+            const noSpeechFrom = ctx.captionTranscriber.lastNoSpeechFrom;
+            captionInfo = {
+              applied: false,
+              reason: 'no-speech',
+              ...(noSpeechFrom ? { noSpeechFrom } : {}),
+            };
           }
         } catch (e) {
           console.log(`  legenda: falha na transcrição/ASS — o Short sai sem ela (${String(e).slice(0, 200)})`);
@@ -990,6 +1370,7 @@ async function processCandidate(
         gameAspect: cfg.SHORTS_GAME_ASPECT,
         banner,
         captionsAssPath,
+        overlayButton,
       });
       durSec = out.durSec;
       console.log(`  vertical: ${path.relative(process.cwd(), outMp4)} (${durSec}s)`);
@@ -1017,6 +1398,7 @@ async function processCandidate(
             gameAspect: cfg.SHORTS_GAME_ASPECT,
             banner,
             captionsAssPath: null,
+            overlayButton,
           });
           durSec = out.durSec;
           // A transcrição que deu certo continua guardada: a próxima
@@ -1298,11 +1680,49 @@ async function runBatch(
 }
 
 async function main(): Promise<void> {
-  const cfg = getConfig();
   const args = parseArgs(process.argv.slice(2));
+  const cfg: AppConfig = { ...getConfig() };
+  // Geometria/legenda por flag valem só nesta execução (o .env manda
+  // no resto); o painel continua sendo a fonte de verdade do bot.
+  if (args.camHeight != null) cfg.SHORTS_CAM_HEIGHT = args.camHeight;
+  if (args.captionFontSize != null) cfg.SHORTS_CAPTION_FONT_SIZE = args.captionFontSize;
+  if (args.captionPosition != null) {
+    cfg.SHORTS_CAPTION_POSITION = args.captionPosition as AppConfig['SHORTS_CAPTION_POSITION'];
+  }
   // A config dos Shorts é do SCRIPT: se estiver inconsistente, o script
   // recusa (o bot live não depende dela — ver shortsCrossFieldErrors).
   validateConfigCrossFields(cfg);
+  /**
+   * A JANELA é validada AQUI, antes do lote: as flags (`--min/--max/…`)
+   * não passam pela validação cruzada da config (que só vê o `.env`) e
+   * uma janela invertida/barrava geraria um vertical errado. Se a
+   * validação ficasse dentro do processamento de cada clipe, o erro
+   * contaria como tentativa de TODOS os clipes do lote (marker +
+   * backoff de horas) — sem nenhum Short publicado.
+   */
+  const window = resolveShortWindowConfig(cfg, {
+    minSec: args.minSec,
+    maxSec: args.maxSec,
+    headSec: args.headSec,
+    tailSec: args.tailSec,
+  });
+  const windowErrors = shortWindowConfigErrors(window, {
+    width: cfg.SHORTS_WIDTH,
+    height: cfg.SHORTS_HEIGHT,
+    camHeight: cfg.SHORTS_CAM_HEIGHT,
+  });
+  if (windowErrors.length > 0) {
+    throw new Error(`janela inválida: ${windowErrors.join(' ')}`);
+  }
+  // Env do adesivo inválido: o bot não derruba por isso (cai no default),
+  // mas o script avisa — senão o dono acha que o adesivo saiu do jeito
+  // que pediu e ele só não saiu.
+  const invalidOverlayEnvs = invalidShortsOverlayEnvs(process.env);
+  if (invalidOverlayEnvs.length > 0) {
+    console.warn(
+      `⚠ env do adesivo inválido (o default vale): ${invalidOverlayEnvs.join(' | ')}`,
+    );
+  }
   const privacy = (args.privacy ?? cfg.SHORTS_PRIVACY) as 'private' | 'unlisted' | 'public';
 
   if (args.publish && !cfg.SHORTS_ENABLED) {
@@ -1379,7 +1799,7 @@ async function main(): Promise<void> {
       : undefined;
 
     const captionTranscriber = createCaptionTranscriber({
-      order: cfg.SHORTS_CAPTION_AI_ORDER,
+      order: args.captionOrder ?? cfg.SHORTS_CAPTION_AI_ORDER,
       timeoutMs: cfg.SHORTS_CAPTION_TIMEOUT_MS,
       geminiApiKey: cfg.GEMINI_API_KEY || undefined,
       geminiModel: cfg.SHORTS_CAPTION_GEMINI_MODEL,
@@ -1390,6 +1810,11 @@ async function main(): Promise<void> {
       silenceFinal: cfg.SHORTS_CAPTION_SILENCE_FINAL,
       refine: cfg.SHORTS_CAPTION_REFINE,
       translate: cfg.SHORTS_CAPTION_TRANSLATE,
+      // O tempo real da legenda vem do whisper local; o texto continua
+      // do modelo de linguagem (que acerta a grafia).
+      timingProvider: (args.captionTiming ?? cfg.SHORTS_CAPTION_TIMING ?? null) as
+        | 'whisper-cpp'
+        | null,
     });
 
     const ctx: BatchContext = {
@@ -1402,6 +1827,8 @@ async function main(): Promise<void> {
       captionTranscriber,
       shortsDir,
       quotaUsed: countPublishedClips(cfg.DB_PATH, startOfUtcDaySql()) * QUOTA_UNITS_PER_UPLOAD,
+      window,
+      captionRulesHash: captionRulesHash(),
     };
     if (ctx.quotaUsed > 0) {
       console.log(

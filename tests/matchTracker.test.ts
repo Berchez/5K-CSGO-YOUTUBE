@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { RoundTracker } from '../src/detector/aceDetector.js';
 import {
+  indexPlayerTeams,
   MAX_KILLS_PER_ROUND,
   parseRoundTimer,
+  playerTeamKey,
   processPoll,
   roundOverObservation,
   shouldResetTracker,
@@ -380,5 +382,33 @@ describe('anchorConfidence (confiança na 1ª kill)', () => {
     r = processPoll(tr, snap(4, 3, [{ name: 'x', kills: 3 }]), last, 3);
     expect(r.event?.player).toBe('x');
     expect(r.event?.anchorConfidence?.settleKills).toBe(3);
+  });
+});
+
+describe('índice jogador → time (watchlist)', () => {
+  it('normaliza o nome do jogador (case e espaços)', () => {
+    expect(playerTeamKey('  Yuriz  ')).toBe('yuriz');
+    expect(playerTeamKey('yuRiz')).toBe('yuriz');
+  });
+
+  it('amarra cada jogador ao time do cabeçalho do placar', () => {
+    const index = indexPlayerTeams([
+      { name: 'yuriz', kills: 3, team: 'FURIA' },
+      { name: 'KSCERATO', kills: 1, team: 'Imperial' },
+    ]);
+    expect(index.get('yuriz')).toBe('FURIA');
+    expect(index.get('kscerato')).toBe('Imperial');
+  });
+
+  it('mescla polls: jogador que some do placar mantém o time', () => {
+    const index = indexPlayerTeams([{ name: 'yuriz', kills: 3, team: 'FURIA' }]);
+    indexPlayerTeams([{ name: 'kn1ght', kills: 2, team: 'FURIA' }], index);
+    expect(index.get('yuriz')).toBe('FURIA');
+    expect(index.get('kn1ght')).toBe('FURIA');
+  });
+
+  it('jogador sem time no placar não entra no índice', () => {
+    const index = indexPlayerTeams([{ name: 'yuriz', kills: 3 }]);
+    expect(index.size).toBe(0);
   });
 });

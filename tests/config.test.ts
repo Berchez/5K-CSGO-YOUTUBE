@@ -6,8 +6,10 @@ import {
   deprecatedEnvVars,
   divergentLatencyEnvs,
   invalidBoolEnvs,
+  invalidShortsOverlayEnvs,
   normalizeShortsHashtag,
   parseBoolEnv,
+  parseConfigEnv,
   shortsCrossFieldErrors,
   validateConfigCrossFields,
 } from '../src/config.js';
@@ -239,11 +241,67 @@ describe('hashtag dos Shorts', () => {
   });
 });
 
+describe('config do adesivo do Short (o .env quebrado NÃO derruba o bot)', () => {
+  it('hex sem # é normalizado (o SVG sairia inválido sem isso)', () => {
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_BACKGROUND: 'e10600' }).SHORTS_OVERLAY_BACKGROUND).toBe(
+      '#e10600',
+    );
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_BACKGROUND: '#E10600' }).SHORTS_OVERLAY_BACKGROUND).toBe(
+      '#e10600',
+    );
+    expect(ConfigSchema.parse({}).SHORTS_OVERLAY_BACKGROUND).toBe('');
+  });
+
+  it('env inválido do adesivo cai no default e é listado para o aviso', () => {
+    const env = {
+      SHORTS_OVERLAY_PRESET: 'foo',
+      SHORTS_OVERLAY_UPPERCASE: 'talvez',
+      SHORTS_OVERLAY_BORDER_PX: '50',
+      SHORTS_OVERLAY_BACKGROUND: 'vermelho',
+    };
+    const invalid = invalidShortsOverlayEnvs(env);
+    expect(invalid.length).toBe(4);
+    const { config, invalidOverlayEnvs } = parseConfigEnv(env);
+    expect(invalidOverlayEnvs.length).toBe(4);
+    expect(config.SHORTS_OVERLAY_PRESET).toBe('polex');
+    expect(config.SHORTS_OVERLAY_UPPERCASE).toBeNull();
+    expect(config.SHORTS_OVERLAY_BORDER_PX).toBeNull();
+    expect(config.SHORTS_OVERLAY_BACKGROUND).toBe('');
+  });
+
+  it('erro em outro campo continua falhando alto', () => {
+    expect(() => parseConfigEnv({ HLTV_MATCHES_URL: 'nao-e-url' })).toThrow();
+  });
+
+  it('env quebrado do TEMPO/POSIÇÃO do adesivo também não derruba o bot', () => {
+    // Sem estes campos na lista, o bot INTEIRO caía no boot por um
+    // `SHORTS_OVERLAY_HOLD_SEC=abc` digitado à mão.
+    const env = {
+      SHORTS_OVERLAY_HOLD_SEC: 'abc',
+      SHORTS_OVERLAY_FADE_SEC: '99',
+      SHORTS_OVERLAY_Y: '5',
+    };
+    const invalid = invalidShortsOverlayEnvs(env);
+    expect(invalid.length).toBe(3);
+    const { config, invalidOverlayEnvs } = parseConfigEnv(env);
+    expect(invalidOverlayEnvs.length).toBe(3);
+    expect(config.SHORTS_OVERLAY_HOLD_SEC).toBe(2);
+    expect(config.SHORTS_OVERLAY_FADE_SEC).toBe(0.5);
+    expect(config.SHORTS_OVERLAY_Y).toBe(0.54);
+  });
+});
+
 describe('regras cruzadas dos Shorts', () => {
   it('MIN > MAX é erro', () => {
     const errors = shortsCrossFieldErrors({ minSec: 45, maxSec: 30, width: 1080, height: 1920 });
     expect(errors.length).toBe(1);
     expect(errors[0].key).toBe('SHORTS_MIN_SEC');
+  });
+
+  it('MAX acima de 180s é erro (o Short do YouTube tem 3 minutos)', () => {
+    const errors = shortsCrossFieldErrors({ minSec: 30, maxSec: 600, width: 1080, height: 1920 });
+    expect(errors.length).toBe(1);
+    expect(errors[0].key).toBe('SHORTS_MAX_SEC');
   });
 
   it('largura >= altura é erro (o Short é vertical)', () => {
@@ -283,10 +341,10 @@ describe('regras cruzadas dos Shorts', () => {
 });
 
 describe('layout dos Shorts (cam no topo)', () => {
-  it('default: cam no topo, faixa de 660, zoom no fill e jogo centralizado', () => {
+  it('default: cam no topo, faixa de 600, zoom no fill e jogo centralizado', () => {
     const cfg = ConfigSchema.parse({});
     expect(cfg.SHORTS_TOP).toBe('cam');
-    expect(cfg.SHORTS_CAM_HEIGHT).toBe(660);
+    expect(cfg.SHORTS_CAM_HEIGHT).toBe(600);
     expect(cfg.SHORTS_CAM_FIT).toBe('cover');
     expect(cfg.SHORTS_CAM_ANCHOR).toBe(0.35);
     expect(cfg.SHORTS_GAME_CROP).toBe(0.95);
@@ -303,13 +361,16 @@ describe('layout dos Shorts (cam no topo)', () => {
     expect(cfg.SHORTS_MAX_SEC).toBe(90);
   });
 
-  it('default: legenda queimada ligada, abaixo da mira, com Gemini na frente', () => {
+  it('default: legenda queimada ligada, abaixo da mira, com o whisper local na frente', () => {
     const cfg = ConfigSchema.parse({});
     expect(cfg.SHORTS_CAPTIONS).toBe(true);
     expect(cfg.SHORTS_CAPTION_POSITION).toBe('below-crosshair');
-    expect(cfg.SHORTS_CAPTION_FONT_SIZE).toBe(54);
+    expect(cfg.SHORTS_CAPTION_FONT_SIZE).toBe(64);
     expect(cfg.SHORTS_CAPTION_FONT_FAMILY).toBe('Barlow Condensed');
-    expect(cfg.SHORTS_CAPTION_AI_ORDER).toBe('gemini,huggingface');
+    // O whisper local abre a lista: o tempo da legenda é REAL (o modelo
+    // de linguagem inventa o tempo).
+    expect(cfg.SHORTS_CAPTION_AI_ORDER).toBe('whisper-cpp,gemini,huggingface');
+    expect(cfg.SHORTS_CAPTION_TIMING).toBe('whisper-cpp');
     expect(cfg.SHORTS_CAPTION_GEMINI_MODEL).toBe('gemini-3-flash-preview');
     expect(cfg.SHORTS_CAPTION_HF_MODEL).toBe('openai/whisper-large-v3-turbo');
   });
@@ -358,5 +419,48 @@ describe('layout dos Shorts (cam no topo)', () => {
     expect(ConfigSchema.safeParse({ SHORTS_GAME_CROP: 0.1 }).success).toBe(false);
     expect(ConfigSchema.safeParse({ SHORTS_GAME_CROP: 1.1 }).success).toBe(false);
     expect(ConfigSchema.safeParse({ SHORTS_GAME_Y: 2 }).success).toBe(false);
+  });
+});
+
+describe('adesivo do Short (preset + overrides)', () => {
+  it('default: preset polex, sem texto e overrides vazios', () => {
+    const cfg = ConfigSchema.parse({});
+    expect(cfg.SHORTS_OVERLAY_TEXT).toBe('');
+    expect(cfg.SHORTS_OVERLAY_PRESET).toBe('polex');
+    expect(cfg.SHORTS_OVERLAY_STYLE).toBe('');
+    expect(cfg.SHORTS_OVERLAY_TAG).toBe('');
+    expect(cfg.SHORTS_OVERLAY_UPPERCASE).toBeNull();
+    expect(cfg.SHORTS_OVERLAY_BACKGROUND).toBe('');
+    expect(cfg.SHORTS_OVERLAY_COLOR).toBe('');
+    expect(cfg.SHORTS_OVERLAY_BORDER_COLOR).toBe('');
+    expect(cfg.SHORTS_OVERLAY_BORDER_PX).toBeNull();
+    expect(cfg.SHORTS_OVERLAY_SHADOW_COLOR).toBe('');
+    expect(cfg.SHORTS_OVERLAY_SHADOW_PX).toBeNull();
+    expect(cfg.SHORTS_OVERLAY_SHADOW_BLUR_PX).toBeNull();
+    expect(cfg.SHORTS_OVERLAY_TILT_DEG).toBeNull();
+    expect(cfg.SHORTS_OVERLAY_FONT).toBe('');
+  });
+
+  it('preset inválido é recusado pelo schema', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_PRESET: 'sticker' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_PRESET: 'madhouse' }).success).toBe(true);
+  });
+
+  it('override numérico: vazio = preset e 0 é override válido', () => {
+    const empty = ConfigSchema.parse({ SHORTS_OVERLAY_BORDER_PX: '' });
+    expect(empty.SHORTS_OVERLAY_BORDER_PX).toBeNull();
+    const zero = ConfigSchema.parse({ SHORTS_OVERLAY_BORDER_PX: '0' });
+    expect(zero.SHORTS_OVERLAY_BORDER_PX).toBe(0);
+  });
+
+  it('cor hex inválida é recusada', () => {
+    expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_BACKGROUND: 'vermelho' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_BACKGROUND: '#e10600' }).success).toBe(true);
+  });
+
+  it('caixa alta é tri-estado (vazio = preset)', () => {
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: '' }).SHORTS_OVERLAY_UPPERCASE).toBeNull();
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: 'on' }).SHORTS_OVERLAY_UPPERCASE).toBe(true);
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: 'off' }).SHORTS_OVERLAY_UPPERCASE).toBe(false);
   });
 });

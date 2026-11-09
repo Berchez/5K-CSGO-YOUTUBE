@@ -92,6 +92,9 @@ export type MinKillsRule = number | ((player: string) => number);
 export function requiredKills(rule: MinKillsRule, player: string): number {
   if (typeof rule !== 'function') return rule;
   const n = rule(player);
+  // Infinity = bloqueio explícito (ex.: adversário em partida que só
+  // entrou pela watchlist): nunca gera clipe.
+  if (n === Number.POSITIVE_INFINITY) return n;
   // Resolver quebrado não pode virar clipe a torto: exige o máximo.
   return Number.isFinite(n) ? n : 5;
 }

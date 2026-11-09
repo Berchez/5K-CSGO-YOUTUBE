@@ -9,6 +9,7 @@ import {
   killLabel,
   normWeapon,
   prettyWeapon,
+  requiredKills,
   RoundTracker,
 } from '../src/detector/aceDetector.js';
 import type { KillEvent } from '../src/types.js';
@@ -88,6 +89,21 @@ describe('detectMultiKill', () => {
     expect(detectMultiKill(ace, () => Number.NaN)?.player).toBe('a');
     const four = ['a', 'a', 'a', 'a'].map((p) => k(p));
     expect(detectMultiKill(four, () => Number.NaN)).toBeNull();
+  });
+
+  it('bloqueio explícito (Infinity): o jogador nunca gera clipe', () => {
+    const blocked = ['a', 'a', 'a', 'a', 'a'].map((p) => k(p));
+    expect(detectMultiKill(blocked, () => Number.POSITIVE_INFINITY)).toBeNull();
+    expect(requiredKills(() => Number.POSITIVE_INFINITY, 'a')).toBe(
+      Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it('jogador bloqueado não impede o outro de gerar o clipe', () => {
+    const kills = ['a', 'a', 'a', 'a', 'a', 'b', 'b', 'b', 'b'].map((p) => k(p));
+    const m = detectMultiKill(kills, (p) => (p === 'a' ? Number.POSITIVE_INFINITY : 4));
+    expect(m?.player).toBe('b');
+    expect(m?.kills).toHaveLength(4);
   });
 });
 

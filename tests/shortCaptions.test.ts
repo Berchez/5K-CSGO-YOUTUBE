@@ -22,6 +22,7 @@ import {
   captionVocabulary,
   captionContextFromAce,
   alignReferenceWords,
+  alignCaptionTimings,
   applyCaptionCorrections,
   buildCaptionPrompt,
   buildRefinePrompt,
@@ -31,6 +32,7 @@ import {
   captionLooksPortuguese,
   captionPromptLanguage,
   captionSimilarity,
+  captionTokensMatch,
   classifyTranscriptResponse,
   createCaptionTranscriber,
   dedicatedResponseLanguage,
@@ -1534,6 +1536,70 @@ describe('tradução: guarda por fala e guarda de tamanho', () => {
     expect(isPlausibleTranslation('what a clutch', 'x'.repeat(300))).toBe(false);
     expect(isPlausibleTranslation('a very long original sentence here', 'oi')).toBe(false);
     expect(isPlausibleTranslation('', 'que jogada')).toBe(false);
+  });
+});
+
+describe('tempo real da legenda (whisper local) com o texto do modelo', () => {
+  const timing = [
+    { startSec: 10.5, endSec: 12.9, text: 'A USP dele é envenenada, Gal.' },
+    { startSec: 13.0, endSec: 14.8, text: 'Eu avisei, eu avisei.' },
+    { startSec: 18.0, endSec: 19.9, text: 'Certeza que ele pegou aquele DMzinho.' },
+  ];
+
+  it('a palavra é a mesma mesmo com a grafia diferente', () => {
+    expect(captionTokensMatch('kscerato', 'cacerato')).toBe(false);
+    expect(captionTokensMatch('defusa', 'defuse')).toBe(true);
+    expect(captionTokensMatch('fallen', 'fallenn')).toBe(true);
+    expect(captionTokensMatch('nao', 'não')).toBe(false);
+  });
+
+  it('o texto do modelo ganha o tempo do whisper', () => {
+    const out = alignCaptionTimings(
+      [
+        { startSec: 0, endSec: 1.5, text: 'A USP dele é envenenada, Gau.' },
+        { startSec: 1.5, endSec: 3, text: 'Eu avisei, eu avisei.' },
+        { startSec: 3, endSec: 4.5, text: 'Certeza que ele pegou aquele DMzinho.' },
+      ],
+      timing,
+    );
+    expect(out[0].text).toBe('A USP dele é envenenada, Gau.');
+    expect(out[0].startSec).toBeCloseTo(10.5, 1);
+    expect(out[0].endSec).toBeCloseTo(12.9, 1);
+    expect(out[2].startSec).toBeCloseTo(18.0, 1);
+  });
+
+  it('fala sem par no whisper fica no vão entre as vizinhas (sem invadir a fala seguinte)', () => {
+    const out = alignCaptionTimings(
+      [
+        { startSec: 0, endSec: 1, text: 'A USP dele é envenenada, Gau.' },
+        { startSec: 1, endSec: 2, text: 'Brasil!' },
+        { startSec: 2, endSec: 3, text: 'Eu avisei, eu avisei.' },
+      ],
+      timing,
+    );
+    expect(out[1].text).toBe('Brasil!');
+    expect(out[1].startSec).toBeGreaterThanOrEqual(out[0].endSec - 0.001);
+    expect(out[1].endSec).toBeLessThanOrEqual(out[2].startSec + 0.001);
+  });
+
+  it('as falas nunca se sobrepõem nem voltam atrás', () => {
+    const out = alignCaptionTimings(
+      [
+        { startSec: 0, endSec: 1, text: 'A USP dele é envenenada, Gal.' },
+        { startSec: 1, endSec: 2, text: 'Eu avisei, eu avisei.' },
+        { startSec: 2, endSec: 3, text: 'Certeza que ele pegou aquele DMzinho.' },
+      ],
+      timing,
+    );
+    for (let i = 0; i < out.length - 1; i++) {
+      expect(out[i].endSec).toBeLessThanOrEqual(out[i + 1].startSec + 0.001);
+      expect(out[i + 1].startSec).toBeGreaterThanOrEqual(out[i].startSec);
+    }
+  });
+
+  it('sem provider de tempo, a legenda sai como o modelo falou', () => {
+    const lines = [{ startSec: 0, endSec: 1, text: 'A USP dele é envenenada, Gal.' }];
+    expect(alignCaptionTimings(lines, [])).toEqual(lines);
   });
 });
 

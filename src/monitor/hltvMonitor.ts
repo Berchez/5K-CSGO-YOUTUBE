@@ -6,6 +6,7 @@ import { trySolveChallenge } from '../clipper/stealthBrowser.js';
 import {
   resolveMatchRule,
   type MatchRuleResolution,
+  type MatchTeamMatch,
   type WatchlistDoc,
 } from '../watchlist.js';
 
@@ -411,6 +412,20 @@ export interface UpcomingMatch {
   watchlistedTeams?: string[];
 }
 
+/** Time da watchlist que casou com a partida, mas o piso de estrelas não deixou. */
+export interface WatchlistDiscard {
+  /** Onde a partida foi vista. */
+  section: 'live' | 'upcoming';
+  /** Time da lista que casou. */
+  team: string;
+  /** Estrelas da partida no listing (0 = desconhecido). */
+  stars: number;
+  /** Piso pedido pelo time. */
+  minStars: number;
+  /** A partida entrou MESMO ASSIM pela política geral. */
+  enteredByGeneral: boolean;
+}
+
 /** Listing completo de uma consulta: o que está live e o que vem a seguir. */
 export interface MatchListing {
   /** Live que passou no filtro (vira recorder/tracker). */
@@ -420,7 +435,7 @@ export interface MatchListing {
   upcoming: UpcomingMatch[];
   /**
    * Partidas futuras com horário válido, ANTES do filtro de elegibilidade.
-   * Serve para distinguir "não há partida elegível" de "a extração quebrau".
+   * Serve para distinguir "não há partida elegível" de "a extração quebrou".
    */
   upcomingTotal: number;
   /** Cards futuros vistos no DOM (antes do dedupe). */
@@ -430,7 +445,14 @@ export interface MatchListing {
    * horário (DOM mudou / extração falhou) → o poll não pode adiar.
    */
   scheduleReliable: boolean;
+  /**
+   * Times da watchlist que casaram mas foram barrados pelo piso de
+   * estrelas (o override NÃO valeu). Sem isso o descarte é silencioso:
+   * o time simplesmente não aparece nem no live nem na agenda.
+   */
+  discarded: WatchlistDiscard[];
 }
+
 
 /**
  * Timestamp do HLTV (`data-unix` / `data-zonedgrouping-entry-unix`).
@@ -506,7 +528,8 @@ export interface LiveMatchFilter {
 
 /**
  * Regra efetiva da partida: time na watchlist vence a política por estrelas
- * (grava mesmo com 0★) e usa o menor limiar dos times casados.
+ * (dentro do piso de estrelas do time) e usa o menor limiar dos times
+ * casados QUE ATENDERAM o piso.
  */
 export function effectiveMatchRule(
   match: Pick<LiveMatch, 'stars' | 'team1' | 'team2'>,
@@ -517,7 +540,53 @@ export function effectiveMatchRule(
     filter.starredMinKills ?? 4,
     filter.unstarredMinKills ?? 5,
   );
-  return resolveMatchRule(filter.watchlist ?? null, [match.team1, match.team2], fallback);
+  return resolveMatchRule(
+    filter.watchlist ?? null,
+    [match.team1, match.team2],
+    fallback,
+    match.stars,
+  );
+}
+
+/** Resultado do filtro de uma partida (general x override da watchlist). */
+export interface MatchKeepDecision {
+  /** A partida entra no listing (e, portanto, no bot). */
+  keep: boolean;
+  /** Passa na política geral de estrelas/top-tier. */
+  passesGeneral: boolean;
+  /** O override da watchlist está ATIVO (algum time atendeu o piso). */
+  passesWatchlist: boolean;
+  /** O time casou com a watchlist (mas o piso pode não ter sido atendido). */
+  matchedTeams: string[];
+  /** Piso de estrelas pedido pelo time da lista. */
+  minStars: number;
+  /** Times que casaram com a lista mas NÃO atenderam o piso. */
+  blockedTeams: MatchTeamMatch[];
+}
+
+/**
+ * Filtro da partida (puro): entra quem passa na política geral OU entra
+ * pelo override da watchlist (time na lista COM o piso de estrelas
+ * atendido).
+ */
+export function shouldKeepMatch(
+  match: Pick<LiveMatch, 'stars' | 'team1' | 'team2' | 'isTopTierGuess'>,
+  rule: MatchRuleResolution,
+  minStars: number,
+  topTierOnly: boolean,
+): MatchKeepDecision {
+  const passesGeneral = matchPassesFilter(match.stars, match.isTopTierGuess, minStars, topTierOnly);
+  // O piso é POR TIME: o override vale quando ALGUM time da partida atendeu
+  // o piso DELE (não o menor piso da partida).
+  const passesWatchlist = rule.watchlisted && rule.teams.some((team) => team.floorMet);
+  return {
+    keep: passesGeneral || passesWatchlist,
+    passesGeneral,
+    passesWatchlist,
+    matchedTeams: rule.matchedTeams,
+    minStars: rule.minStars,
+    blockedTeams: rule.teams.filter((team) => !team.floorMet),
+  };
 }
 
 /** Card futuro cru: mesmo formato do live + o timestamp bruto do listing. */
@@ -767,6 +836,12 @@ export function shouldStopRecorder(
 }
 
 /**
+ * Estado do último aviso de descarte por piso de estrelas: o aviso só
+ * repete quando a situação MUDA (o poll roda a cada 45s).
+ */
+let lastDiscardSignature = '';
+
+/**
  * Busca o listing de /matches (layout HLTV 2026): partidas LIVE que passam
  * no filtro + as próximas partidas futuras que também passam no filtro.
  * Container live: div.match[data-livescore-match] (externo — o interno
@@ -835,6 +910,29 @@ export async function fetchMatchListing(
     }
 
     const listing = buildListing(cards, minStars, topTierOnly, filter);
+    // Time da watchlist barrado pelo piso de estrelas: sem este aviso o
+    // descarte é INVISÍVEL (o time simplesmente não aparece no live nem
+    // na agenda e o dono acha que o filtro está quebrado).
+    const discardSignature = listing.discarded
+      .map((d) => `${d.section}:${d.team}:${d.stars}:${d.minStars}`)
+      .sort()
+      .join('|');
+    if (discardSignature && discardSignature !== lastDiscardSignature) {
+      lastDiscardSignature = discardSignature;
+      // Estrelas DESCONHECIDAS (0 no listing) é outra história: o piso
+      // não foi "atingido" — as estrelas não chegaram a ser lidas. O
+      // dono precisa saber que o filtro está cego, não que a lista
+      // está errada.
+      const estrelasDesconhecidas = listing.discarded.some((d) => d.stars === 0);
+      log.warn(
+        { descartados: listing.discarded, estrelasDesconhecidas },
+        estrelasDesconhecidas
+          ? 'time da watchlist fora pelo piso de estrelas (estrelas DESCONHECIDAS no listing — 0★ não atende piso > 0)'
+          : 'time da watchlist fora pelo piso de estrelas (o override NÃO valeu)',
+      );
+    } else if (!discardSignature) {
+      lastDiscardSignature = '';
+    }
     log.info(
       {
         live: listing.liveTotal,
@@ -884,19 +982,38 @@ export function buildListing(
   filter: LiveMatchFilter = {},
 ): MatchListing {
   const matches: LiveMatch[] = [];
+  const discarded: WatchlistDiscard[] = [];
   for (const card of cards.live) {
     if (!card.isLive) continue; // tese do projeto: só lives (velocidade)
     const m = cardToLiveMatch(card);
     const rule = effectiveMatchRule(m, filter);
-    m.minKills = rule.minKills;
+    const decision = shouldKeepMatch(m, rule, minStars, topTierOnly);
+    // O limiar EFETIVO da partida: o da watchlist só vale quando o override
+    // está ativo (algum time atendeu o piso). Sem override, vale o limiar
+    // geral — mostrar o do time (que nem se aplica) engana o log.
+    m.minKills = decision.passesWatchlist
+      ? rule.minKills
+      : minKillsForStars(
+          m.stars,
+          filter.starredMinKills ?? 4,
+          filter.unstarredMinKills ?? 5,
+        );
     if (rule.watchlisted) {
-      // Watchlist ignora o corte de estrelas/top-tier: grava e usa o
-      // limiar do time (menor entre os que casaram).
-      m.watchlisted = true;
+      // Time da lista: o override só vale se o piso de estrelas (minStars)
+      // for atendido — `watchlisted` marca o override ATIVO.
+      m.watchlisted = decision.passesWatchlist;
       m.watchlistedTeams = rule.matchedTeams;
-    } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
-      continue;
+      for (const team of decision.blockedTeams) {
+        discarded.push({
+          section: 'live',
+          team: team.team,
+          stars: m.stars,
+          minStars: team.minStars,
+          enteredByGeneral: decision.passesGeneral,
+        });
+      }
     }
+    if (!decision.keep) continue;
     matches.push(m);
   }
   // Estrelas primeiro: com MAX_RECORDINGS limitado, elas não podem perder
@@ -919,12 +1036,21 @@ export function buildListing(
   const upcoming: UpcomingMatch[] = [];
   for (const m of deduped) {
     const rule = effectiveMatchRule(m, filter);
+    const decision = shouldKeepMatch(m, rule, minStars, topTierOnly);
     if (rule.watchlisted) {
-      m.watchlisted = true;
+      m.watchlisted = decision.passesWatchlist;
       m.watchlistedTeams = rule.matchedTeams;
-    } else if (!matchPassesFilter(m.stars, m.isTopTierGuess, minStars, topTierOnly)) {
-      continue;
+      for (const team of decision.blockedTeams) {
+        discarded.push({
+          section: 'upcoming',
+          team: team.team,
+          stars: m.stars,
+          minStars: team.minStars,
+          enteredByGeneral: decision.passesGeneral,
+        });
+      }
     }
+    if (!decision.keep) continue;
     upcoming.push(m);
   }
   upcoming.sort((a, b) => a.startsAt - b.startsAt);
@@ -952,6 +1078,7 @@ export function buildListing(
       cards.upcomingCardErrors === 0 &&
       deduped.length > 0 &&
       timeRatio >= SCHEDULE_MIN_TIME_RATIO,
+    discarded,
   };
 }
 

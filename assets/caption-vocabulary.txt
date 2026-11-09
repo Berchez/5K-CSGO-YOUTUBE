@@ -52,7 +52,6 @@ dumau
 saadzin
 nqz
 zayut
-equinho
 makazze
 aleksib
 b1t
@@ -137,7 +136,7 @@ smoke
 save
 lurk
 rotate
-defuse
+defusa
 plant
 push
 rush
@@ -150,6 +149,8 @@ bombsite
 Bomb A
 Bomb B
 bomba plantada
+DMzinho
+only pistol
 HE
 HEzinha
 C4

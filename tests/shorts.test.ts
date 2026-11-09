@@ -9,8 +9,10 @@ import {
   killPositionsSec,
   parseShortCamBox,
   planShortWindow,
+  resolveShortWindowConfig,
   shortRenderSignature,
   shortVideoFilter,
+  shortWindowConfigErrors,
   SHORT_DEFAULT_HEAD_SEC,
   SHORT_DEFAULT_MAX_SEC,
   SHORT_DEFAULT_MIN_SEC,
@@ -465,6 +467,24 @@ describe('shortRenderSignature / isStaleRender', () => {
     expect(isStaleRender(sig, { ...sig })).toBe(false);
   });
 
+  it('regra de correção da legenda diferente re-renderiza (o texto é queimado)', () => {
+    const comLegenda = shortRenderSignature({
+      top: 'cam',
+      captions: 'on',
+      captionRulesHash: 'aaa111',
+    });
+    expect(isStaleRender(comLegenda, { ...comLegenda })).toBe(false);
+    expect(isStaleRender(comLegenda, { ...comLegenda, captionRulesHash: 'bbb222' })).toBe(true);
+    // Marker de uma versão antiga (sem o campo) re-renderiza.
+    const antigo = { ...comLegenda, captionRulesHash: undefined } as unknown as typeof comLegenda;
+    expect(isStaleRender(antigo, comLegenda)).toBe(true);
+  });
+
+  it('sem legenda, a regra de correção não força re-render', () => {
+    const semLegenda = shortRenderSignature({ top: 'cam', captions: 'off' });
+    expect(isStaleRender(semLegenda, { ...semLegenda, captionRulesHash: 'ccc333' })).toBe(false);
+  });
+
   it('layout/caixa/geometria/texto diferentes re-renderizam', () => {
     expect(isStaleRender(sig, { ...sig, top: 'text' })).toBe(true);
     expect(isStaleRender(sig, { ...sig, camBox: '0.1:0.1:0.1:0.1' })).toBe(true);
@@ -476,6 +496,100 @@ describe('shortRenderSignature / isStaleRender', () => {
     expect(isStaleRender(sig, { ...sig, gameFit: 'cover' })).toBe(true);
     expect(isStaleRender(sig, { ...sig, width: 720 })).toBe(true);
     expect(isStaleRender(sig, { ...sig, bannerText: 'outro título' })).toBe(true);
+  });
+
+  it('adesivo do começo diferente re-renderiza', () => {
+    const comAdesivo = shortRenderSignature({
+      top: 'cam',
+      overlayText: 'Furia nos playoffs',
+      overlayHoldSec: 2,
+    });
+    expect(isStaleRender(sig, comAdesivo)).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayText: 'Outro texto' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayHoldSec: 3 })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo })).toBe(false);
+  });
+
+  it('visual do adesivo diferente re-renderiza (preset, cor, borda, sombra)', () => {
+    const comAdesivo = shortRenderSignature({
+      top: 'cam',
+      overlayText: 'Furia nos playoffs',
+      overlayHoldSec: 2,
+      overlayPreset: 'polex',
+      overlayShape: 'capsule',
+      overlayBackground: '#e10600',
+      overlayBorderPx: 0,
+      overlayShadowPx: 10,
+      overlayUppercase: true,
+    });
+    expect(isStaleRender(comAdesivo, { ...comAdesivo })).toBe(false);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayPreset: 'madhouse' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayShape: 'rect' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayBackground: '#2563eb' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayBorderPx: 7 })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayShadowPx: 12 })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayShadowBlurPx: 4 })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayTiltDeg: -2 })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayFont: 'Impact' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayTag: 'MADHOUSE' })).toBe(true);
+    expect(isStaleRender(comAdesivo, { ...comAdesivo, overlayUppercase: false })).toBe(true);
+  });
+
+  it('sem adesivo: o preset/visual do adesivo NÃO força re-render', () => {
+    // O adesivo não existe no vertical: mudar o preset (ou o hash do
+    // visual no código) não muda o mp4 — forçar o re-render aqui
+    // refazia TODOS os clipes sem adesivo a cada mudança de preset.
+    expect(isStaleRender(sig, { ...sig, overlayPreset: 'madhouse' })).toBe(false);
+    expect(isStaleRender(sig, { ...sig, overlayVisuals: 'outro-hash' })).toBe(false);
+    // Marker de uma versão anterior (sem o campo overlayVisuals) segue
+    // valendo quando não há adesivo.
+    const antigo = { ...sig, overlayVisuals: undefined } as unknown as typeof sig;
+    expect(isStaleRender(antigo, sig)).toBe(false);
+  });
+
+  it('adesivo que aparece (ou some) re-renderiza', () => {
+    const comAdesivo = shortRenderSignature({ top: 'cam', overlayText: 'Furia' });
+    expect(isStaleRender(sig, comAdesivo)).toBe(true);
+    expect(isStaleRender(comAdesivo, sig)).toBe(true);
+  });
+});
+
+describe('resolveShortWindowConfig / shortWindowConfigErrors', () => {
+  const cfg = {
+    SHORTS_MIN_SEC: 60,
+    SHORTS_MAX_SEC: 90,
+    SHORTS_HEAD_SEC: 4,
+    SHORTS_TAIL_SEC: 4,
+  };
+
+  it('as flags da execução ganham do .env', () => {
+    expect(resolveShortWindowConfig(cfg)).toEqual({
+      minSec: 60,
+      maxSec: 90,
+      headSec: 4,
+      tailSec: 4,
+    });
+    expect(resolveShortWindowConfig(cfg, { minSec: 30, maxSec: null })).toEqual({
+      minSec: 30,
+      maxSec: 90,
+      headSec: 4,
+      tailSec: 4,
+    });
+  });
+
+  it('janela invertida ou grande demais é recusada (antes do lote)', () => {
+    const geo = { width: 1080, height: 1920, camHeight: 600 };
+    expect(shortWindowConfigErrors(resolveShortWindowConfig(cfg), geo)).toEqual([]);
+    const invertida = shortWindowConfigErrors(
+      resolveShortWindowConfig(cfg, { minSec: 120, maxSec: 90 }),
+      geo,
+    );
+    expect(invertida.length).toBeGreaterThan(0);
+    const grande = shortWindowConfigErrors(
+      resolveShortWindowConfig(cfg, { maxSec: 400 }),
+      geo,
+    );
+    expect(grande.length).toBeGreaterThan(0);
   });
 });
 

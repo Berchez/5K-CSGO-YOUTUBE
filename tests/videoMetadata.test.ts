@@ -12,6 +12,7 @@ import {
   composeDescription,
   DESCRIPTION_MAX_BYTES,
   joinDescription,
+  relatedVideoUrl,
   resetTemplateRotation,
   resetUsedTitles,
   sanitizeDescription,
@@ -785,5 +786,57 @@ describe('formato Shorts (vertical 9:16)', () => {
     expect(validateTitle(metadata.title, ctx).ok).toBe(true);
     expect(metadata.title).toContain('donk');
     expect(metadata.description).toContain('#Shorts');
+  });
+});
+
+describe('vídeo relacionado (link do clipe 16:9)', () => {
+  it('aceita o ID puro e a URL completa', () => {
+    expect(relatedVideoUrl('N3SilLCce64')).toBe(
+      'https://www.youtube.com/watch?v=N3SilLCce64',
+    );
+    expect(relatedVideoUrl('https://www.youtube.com/watch?v=N3SilLCce64')).toBe(
+      'https://www.youtube.com/watch?v=N3SilLCce64',
+    );
+    expect(relatedVideoUrl('https://youtu.be/N3SilLCce64')).toBe(
+      'https://www.youtube.com/watch?v=N3SilLCce64',
+    );
+    expect(relatedVideoUrl(' https://www.youtube.com/shorts/N3SilLCce64 ')).toBe(
+      'https://www.youtube.com/watch?v=N3SilLCce64',
+    );
+  });
+
+  it('rejeita valor que não é ID/URL de vídeo (link quebrado é pior que nenhum)', () => {
+    expect(relatedVideoUrl(null)).toBeNull();
+    expect(relatedVideoUrl('')).toBeNull();
+    expect(relatedVideoUrl('   ')).toBeNull();
+    expect(relatedVideoUrl('N3Sil')).toBeNull();
+    expect(relatedVideoUrl('https://example.com/video')).toBeNull();
+  });
+
+  it('o link entra no rodapé da descrição do Short', async () => {
+    const metadata = await buildVideoMetadata(makeAce(), {
+      mode: 'template',
+      format: 'shorts',
+      privacy: 'unlisted',
+      relatedVideoId: 'N3SilLCce64',
+    });
+    expect(metadata.description).toContain(
+      'Clipe completo (16:9): https://www.youtube.com/watch?v=N3SilLCce64',
+    );
+    expect(metadata.description).toContain('#Shorts');
+    // O rodapé (com o link) não pode ser cortado pelo limite de bytes:
+    // quem cede é o corpo.
+    expect(utf8Length(metadata.description)).toBeLessThanOrEqual(
+      SHORTS_DESCRIPTION_MAX_BYTES,
+    );
+  });
+
+  it('sem relatedVideoId a descrição não muda', async () => {
+    const metadata = await buildVideoMetadata(makeAce(), {
+      mode: 'template',
+      format: 'shorts',
+      privacy: 'unlisted',
+    });
+    expect(metadata.description).not.toContain('Clipe completo');
   });
 });

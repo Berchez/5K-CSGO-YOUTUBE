@@ -12,12 +12,13 @@ import sharp from 'sharp';
 const ACCENT = '#e10600';
 const ACCENT_2 = '#ffd400';
 
-function esc(s: string): string {
+/** Escapa o texto para ir dentro do SVG (o nome curto demais confunde). */
+export function escapeXml(s: string): string {
   return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/&/g, `&amp;`)
+    .replace(/</g, `&lt;`)
+    .replace(/>/g, `&gt;`)
+    .replace(/"/g, `&quot;`);
 }
 
 /**
@@ -190,14 +191,14 @@ export function shortBannerSvg(width: number, height: number, text: ShortBannerT
       return (
         `<text x="${Math.round(w / 2)}" y="${Math.round(firstBaseline + i * lineH)}" ` +
         `font-family="Arial Black, Arial, sans-serif" font-size="${Math.round(size)}" ` +
-        `font-weight="900" fill="white" text-anchor="middle"${squeeze}>${esc(line)}</text>`
+        `font-weight="900" fill="white" text-anchor="middle"${squeeze}>${escapeXml(line)}</text>`
       );
     })
     .join('');
   const subtitleSvg = subtitle
     ? `<text x="${Math.round(w / 2)}" y="${Math.round(firstBaseline + lines.length * lineH + subtitleSize * 1.4)}" ` +
       `font-family="Arial, Arial, sans-serif" font-size="${Math.round(subtitleSize)}" ` +
-      `font-weight="bold" fill="${ACCENT_2}" text-anchor="middle">${esc(subtitle)}</text>`
+      `font-weight="bold" fill="${ACCENT_2}" text-anchor="middle">${escapeXml(subtitle)}</text>`
     : '';
   return `
 <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">

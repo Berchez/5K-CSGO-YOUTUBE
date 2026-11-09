@@ -14,7 +14,7 @@ HLTV /matches (Playwright, 45s base; ocioso espera até 30min conforme a próxim
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal clips + optional Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records even at 0–1★ with its own threshold (see below).
+Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal clips + optional Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records below `MIN_STARS` with its own threshold (and its own star floor), and in a match that only qualified through the watchlist the opponent is not recorded (see below).
 
 ## Prerequisites (Windows)
 
@@ -87,9 +87,24 @@ Useful commands: `pm2 list/logs/stop/restart 5k-bot`.
 Edit `data/watchlist.json` (or use the panel's **Watchlist** tab) to record
 teams even when HLTV lists the match with 0–1★. A matched team bypasses the
 star filter and uses its own kill threshold; with two matched teams, the
-lowest threshold wins. A `players` entry overrides the team threshold for that
-round (e.g. a 3k from a specific player), but it does not force a match outside
-the star filter to be recorded. The bot reloads the file on every poll and
+lowest threshold wins. Each team can also have its own star floor
+(`minStars`): the watchlist only records the match below `MIN_STARS` when the
+listing shows at least that many stars (`0` = no floor, i.e. the team is
+recorded at any rating; a match listed with **0★ (unknown)** never satisfies
+a floor above 0). The floor gates the **override as a whole**: when it is not
+met, the team loses its own threshold and follows the general policy (the
+match still gets recorded if it passes the general filter). A `players` entry
+overrides the team threshold for that round (e.g. a 3k from a specific player),
+but it does not force a match outside the star filter to be recorded.
+
+In a match that only qualified because of the watchlist (it did **not** pass
+the general star/top-tier filter), only players of a watched team generate a
+clip — the opponent is not recorded. A `players` entry is an explicit
+exception: that player is recorded even if their team is not watched. In a
+match that also passes the general filter, the opponent follows the general
+policy (`MIN_KILLS` / `MIN_KILLS_NO_STARS`).
+
+The bot reloads the file on every poll and
 wakes up as soon as the file is saved — no restart; changes apply to the next
 round even in a match already being tracked (and to the next matches). If the
 file disappears during an editor save, the last good version is kept for up to
@@ -99,12 +114,12 @@ file disappears during an editor save, the last good version is kept for up to
 {
   "version": 1,
   "enabled": true,
-  "defaults": { "minKills": 4, "clutch": false },
+  "defaults": { "minKills": 4, "minStars": 0, "clutch": false },
   "teams": [
-    { "names": ["FURIA", "FURIA Esports"], "minKills": 3, "enabled": true },
-    { "names": ["Legacy"], "minKills": 4, "enabled": true },
-    { "names": ["Imperial", "Imperial Esports"], "minKills": 5, "enabled": true },
-    { "names": ["paiN", "paiN Gaming"], "minKills": 3, "enabled": true }
+    { "names": ["FURIA", "FURIA Esports"], "minKills": 3, "minStars": 2, "enabled": true },
+    { "names": ["Legacy"], "minKills": 4, "minStars": 0, "enabled": true },
+    { "names": ["Imperial", "Imperial Esports"], "minKills": 5, "minStars": 3, "enabled": true },
+    { "names": ["paiN", "paiN Gaming"], "minKills": 3, "minStars": 0, "enabled": true }
   ],
   "players": []
 }
@@ -112,7 +127,8 @@ file disappears during an editor save, the last good version is kept for up to
 
 Names are case/accent-insensitive; aliases avoid listing mismatches
 (`FURIA` vs `FURIA Esports`). `minKills` is 2–5; omit it to inherit
-`defaults.minKills`. Invalid JSON/values keep the last good version (the panel
+`defaults.minKills`. `minStars` is 0–5; omit it to inherit
+`defaults.minStars`. Invalid JSON/values keep the last good version (the panel
 shows the validation error); a UTF-8 BOM from Notepad/PowerShell is accepted.
 Full example: `docs/watchlist.example.json`.
 Dry-run: `npx tsx scripts/watchlist-check.ts "paiN" "FURIA" --stars=0`.
@@ -394,6 +410,46 @@ npm run publish:shorts -- --publish --allow-no-captions --clip data/clips/...
 # 7. refaz SÓ a legenda dos Shorts que falharam nela (tradução/erro/libass),
 #    ignorando o backoff — sem liberar a janela com posição não confiável
 npm run publish:shorts -- --dry-run --retry-captions
+
+# 8. janela APERTADA só neste clipe (sem mexer no .env do bot):
+#    head/tail em segundos, min/max da duração
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --head-sec 1.5 --tail-sec 6 --min-sec 10 --max-sec 40
+
+# 9. adesivo (sticker) no começo do Short, que some em fade out
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --overlay-text "Furia nos playoffs" --overlay-hold-sec 2 --overlay-fade-sec 0.5
+
+# 9b. adesivo com um dos PRESETS (polex|polex-die|gaules|madhouse|rei|
+#     diecut|pill|custom) e ajustes finos por flag
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --overlay-text "Furia nos playoffs" --overlay-preset madhouse `
+    --overlay-background "#ffd400" --overlay-border-px 8
+
+# 9c. legenda maior e cam menor só nesta execução
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --caption-font-size 64 --cam-height 600
+
+# 10. legenda pelo whisper.cpp LOCAL (timestamp real de cada fala:
+#     a legenda sai sincronizada com o áudio, sem cota de nuvem)
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --caption-order whisper-cpp,gemini,huggingface
+
+# 10b. refaz a legenda (ignora a transcrição guardada no marker) e
+#      republica um Short que já foi publicado (token sem escopo de
+#      update: republicar cria um vídeo NOVO, o antigo sai à mão)
+npm run publish:shorts -- --publish --republish --retranscribe `
+    --clip data/clips/<pasta>
+
+# 10c. legenda com o texto do modelo de linguagem e o tempo do whisper
+#       local (padrão: SHORTS_CAPTION_TIMING=whisper-cpp)
+npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
+    --caption-timing whisper-cpp
+
+# 11. Short com o LINK do clipe 16:9 no rodapé da descrição
+#     (o Short e o clipe longo são dois vídeos: o link é o que amarra os dois)
+npm run publish:shorts -- --publish --clip data/clips/<pasta> `
+    --link-video N3SilLCce64
 ```
 
 O script (`scripts/publish-shorts.ts`):
@@ -417,6 +473,13 @@ O script (`scripts/publish-shorts.ts`):
    um relatório em `data/shorts/report.json` (com o histórico das
    rodadas).
 
+Um Short **já publicado** é pulado no lote (o `youtubeId` fica no marker).
+Para refazer a legenda e subir de novo, use `--republish`: o token atual
+não tem escopo de update, então republicar cria um **vídeo novo** (o
+antigo precisa ser apagado à mão no Studio). `--retranscribe` faz a
+transcrição ser refeita mesmo com a do marker (sem ele, o texto guardado
+é reaproveitado).
+
 O Short só fala das kills que CABEM na janela: se a janela trunca a
 jogada, o título e a descrição contam só as kills do vídeo.
 
@@ -435,8 +498,8 @@ assiste sem som.
 - o **Whisper do HuggingFace** (`HF_TOKEN`) é a reserva (traz os tempos
   reais de cada palavra). O Inference Provider do HF exige créditos na
   conta — sem eles, esse provider falha e o Short sai sem legenda;
-- o **whisper.cpp local** pode entrar na ordem (`SHORTS_CAPTION_AI_ORDER`,
-  ex.: `gemini,whisper-cpp`) — usa o ggml de `.tools/models/ggml`
+- o **whisper.cpp local** abre a ordem (`SHORTS_CAPTION_AI_ORDER`, padrão
+  `whisper-cpp,gemini,huggingface`) — usa o ggml de `.tools/models/ggml`
   (`SHORTS_CAPTION_WHISPER_MODEL`, padrão `large-v3-turbo-q5_0`) e não
   gasta cota. No modo legenda ele roda **sem VAD** e monta os blocos pelo
   tempo de cada palavra: o VAD do whisper.cpp comprime a linha do tempo
@@ -447,6 +510,16 @@ assiste sem som.
   palavra não fica truncada). Medido nesta máquina: **47s** para uma
   janela de 80s (o `small` leva 16s, mas erra mais nome) — o teto de
   `SHORTS_CAPTION_TIMEOUT_MS` (180s) sobra com folga;
+- **quem dá o texto e quem dá o tempo são coisas diferentes**: o modelo de
+  linguagem acerta o texto (e o nome do jogador) mas **inventa o tempo** da
+  fala (medido: até 3,5s adiantado); o whisper local acerta o tempo. Com
+  `SHORTS_CAPTION_TIMING=whisper-cpp` (padrão) o texto do modelo é casado
+  com o tempo do whisper (fuzzy match por palavra: `defusa`=`defuse`) e
+  as falas nunca se sobrepõem; com `off` vale o tempo do próprio modelo;
+- o **silêncio inicial da janela é cortado antes de transcrever**
+  (`silenceremove`): o whisper ancorava a 1ª fala em 0s e a legenda
+  nascia ~10s antes da voz. O corte devolve o deslocamento, que é
+  somado de volta nas falas (a 1ª legenda volta para o tempo real);
 - depois da transcrição, dois passes de IA no texto (Gemini): **tradução**
   (`SHORTS_CAPTION_TRANSLATE`) leva o áudio estrangeiro para PT-BR
   mantendo nomes e gíria, e **revisor** (`SHORTS_CAPTION_REFINE`) corrige
@@ -487,8 +560,10 @@ assiste sem som.
 - a legenda final fica também em texto ao lado do mp4
   (`<name>_legenda.txt`; com tradução, o original em
   `<name>_legenda.orig.txt`) — dá para revisar sem abrir o vídeo. O
-  arquivo é escrito **depois** do render (o que não entrou no vertical
-  não deixa arquivo órfão);
+  **texto também sai no console antes do upload**: o dono lê o que vai
+  queimar no vertical (nome errado, frase furada) e aborta o lote antes
+  de gastar cota do YouTube. O arquivo é escrito **depois** do render (o
+  que não entrou no vertical não deixa arquivo órfão);
 - cada Short re-renderizado gasta **1 chamada de transcrição** (mais os
   passes de tradução/revisão quando eles rodam) — um Short já pronto não
   gasta nada;
@@ -538,6 +613,10 @@ no código):
   "Twistzz" (e "lex", "yuri", "robô"...) em qualquer legenda do canal.
   As regras que dispararam ficam no marker do Short: é como se caça
   falso positivo nas regras;
+- mexer no arquivo de regras **re-renderiza** o vertical que ainda não
+  foi publicado (o hash do arquivo entra na assinatura do render): o
+  texto da legenda é queimado no mp4, então regra nova tem que chegar
+  ao vídeo.
 
 | variável | padrão | efeito |
 | --- | --- | --- |
@@ -547,7 +626,7 @@ no código):
 | `SHORTS_HEAD_SEC` / `SHORTS_TAIL_SEC` | `4` / `4` | folga antes da 1ª kill e depois da última |
 | `SHORTS_WIDTH` / `SHORTS_HEIGHT` | `1080` / `1920` | saída do vertical |
 | `SHORTS_TOP` | `cam` | topo do vertical: `cam`, `text` (faixa com o título) ou `center` (crop 9:16 antigo) |
-| `SHORTS_CAM_HEIGHT` | `660` | altura da faixa da cam em px (o jogo fica com o resto) |
+| `SHORTS_CAM_HEIGHT` | `600` | altura da faixa da cam em px (o jogo fica com o resto) |
 | `SHORTS_CAM_FIT` | `cover` | `cover` = a cam é zoomada até preencher a faixa (sem barras pretas); `blur` = cam inteira sobre fundo desfocado |
 | `SHORTS_CAM_ANCHOR` | `0.35` | âncora vertical do corte da cam (0 = topo, 0.5 = centro, 1 = base) — o corte tem que pegar o rosto |
 | `SHORTS_GAME_CROP` | `0.95` | fração da altura da fonte usada pelo crop do jogo (só no modo `cover`) |
@@ -558,7 +637,8 @@ no código):
 | `SHORTS_CAM_BOX_BY_STREAM` | 4 canais medidos | JSON `{"canal":"x:y:w:h"}`; vence o `SHORTS_CAM_BOX` |
 | `SHORTS_CROP_X` | `0.5` | posição horizontal do crop do jogo (0 = esquerda, 1 = direita) |
 | `SHORTS_CAPTIONS` | `on` | legenda queimada no mp4 (`on`/`off`) |
-| `SHORTS_CAPTION_AI_ORDER` | `gemini,huggingface` | ordem dos providers de transcrição (`gemini`, `huggingface`, `whisper-cpp`) |
+| `SHORTS_CAPTION_AI_ORDER` | `whisper-cpp,gemini,huggingface` | ordem dos providers de transcrição (`gemini`, `huggingface`, `whisper-cpp`) |
+| `SHORTS_CAPTION_TIMING` | `whisper-cpp` | de onde sai o **tempo real** da fala: `whisper-cpp` (texto do modelo de linguagem + tempo do whisper local) ou `off` (o tempo vem do próprio modelo, que o inventa) |
 | `SHORTS_CAPTION_GEMINI_MODEL` | `gemini-3-flash-preview` | modelo do Gemini na transcrição |
 | `SHORTS_CAPTION_HF_MODEL` | `openai/whisper-large-v3-turbo` | modelo do Whisper (reserva) |
 | `SHORTS_CAPTION_WHISPER_MODEL` | `large-v3-turbo-q5_0` | modelo ggml do whisper.cpp local (reserva sem cota) |
@@ -567,9 +647,26 @@ no código):
 | `SHORTS_CAPTION_TIMEOUT_MS` | `180000` | teto de tempo da transcrição |
 | `SHORTS_CAPTION_REFINE` | `on` | passe revisor da legenda (corrige nomes sem reescrever) |
 | `SHORTS_CAPTION_TRANSLATE` | `on` | traduz a legenda para PT-BR quando o áudio não é português |
-| `SHORTS_CAPTION_FONT_SIZE` | `54` | tamanho da fonte da legenda (px) |
+| `SHORTS_CAPTION_FONT_SIZE` | `64` | tamanho da fonte da legenda (px) |
 | `SHORTS_CAPTION_FONT_FAMILY` | `Barlow Condensed` | família da fonte (a padrão vem do repo, em `assets/fonts`) |
 | `SHORTS_CAPTION_POSITION` | `below-crosshair` | `below-crosshair` (abaixo da mira), `game-top` (abaixo da cam) ou `bottom` (rodapé) |
+| `SHORTS_OVERLAY_TEXT` | vazio | adesivo (sticker) no começo do Short, que some em fade out (ex.: `Furia nos playoffs`) |
+| `SHORTS_OVERLAY_HOLD_SEC` | `2` | segundos que o adesivo fica visível |
+| `SHORTS_OVERLAY_FADE_SEC` | `0.5` | duração do fade out do adesivo (começa em `hold - fade`) |
+| `SHORTS_OVERLAY_Y` | `0.54` | posição vertical do adesivo (fração da altura do vertical) |
+| `SHORTS_OVERLAY_PRESET` | `polex` | visual do adesivo: `polex`, `polex-die`, `gaules`, `madhouse`, `rei`, `diecut`, `pill` (o antigo) ou `custom` |
+| `SHORTS_OVERLAY_STYLE` | vazio | formato: vazio = do preset; `capsule` ou `rect` |
+| `SHORTS_OVERLAY_TAG` | vazio | tag pequena no topo do adesivo (vazio = do preset) |
+| `SHORTS_OVERLAY_UPPERCASE` | vazio | vazio = do preset; `true`/`false` força (ou não) a caixa alta |
+| `SHORTS_OVERLAY_BACKGROUND` | vazio | cor de fundo (hex, entre aspas no `.env`); vazio = do preset |
+| `SHORTS_OVERLAY_COLOR` | vazio | cor do texto; vazio = do preset |
+| `SHORTS_OVERLAY_BORDER_COLOR` | vazio | cor da borda; vazio = do preset |
+| `SHORTS_OVERLAY_BORDER_PX` | vazio | espessura da borda (0 = sem borda); vazio = do preset |
+| `SHORTS_OVERLAY_SHADOW_COLOR` | vazio | cor da sombra; vazio = do preset |
+| `SHORTS_OVERLAY_SHADOW_PX` | vazio | deslocamento da sombra (0 = sem sombra); vazio = do preset |
+| `SHORTS_OVERLAY_SHADOW_BLUR_PX` | vazio | blur da sombra (0 = sombra sólida); vazio = do preset |
+| `SHORTS_OVERLAY_TILT_DEG` | vazio | inclinação do adesivo em graus; vazio = do preset |
+| `SHORTS_OVERLAY_FONT` | vazio | fonte do adesivo (`Arial Black`, `Impact`, `Arial`); vazio = do preset |
 | `SHORTS_MIN_KILLS` | `3` | mínimo de kills (o bot também grava 3K/4K) |
 | `SHORTS_PRIVACY` | `unlisted` | visibilidade do Short |
 | `SHORTS_HASHTAG` | `#Shorts` | hashtag de classificação (no `.env`, entre aspas) |
@@ -626,9 +723,9 @@ fica mais largo (840px de cam → 53% da largura; 960px → 60%) e os pixels
 do jogo ficam menores. O `SHORTS_GAME_ASPECT` faz o mesmo sem mexer na
 altura da cam.
 
-Com o default atual (cam 660 + jogo 1:1) o vertical fica: **cam
-1080x660** (~80% da caixa da webcam do gaules no quadro) + **jogo
-1080x1080** (crop quadrado = 53% da largura da transmissão) sobre 90px de
+Com o default atual (cam 600 + jogo 1:1) o vertical fica: **cam
+1080x600** (~80% da caixa da webcam do gaules no quadro) + **jogo
+1080x1080** (crop quadrado = 53% da largura da transmissão) sobre 120px de
 fundo desfocado acima e abaixo.
 
 A cam é procurada só no canto direito da transmissão; para calibrar outro
@@ -700,6 +797,7 @@ src/clipper/shorts.ts (janela 60-90s + render vertical 9:16 atômico)
 src/clipper/shortCaptions.ts (legenda queimada: linhas, .ass, decisão de publicar)
 src/clipper/shortCaptionsAi.ts (transcrição da legenda: gemini/huggingface)
 src/clipper/shortBanner.ts (faixa de texto do topo do Short)
+src/clipper/shortOverlay.ts (adesivo do começo do Short: presets, métricas e PNG)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/clipper/compositeThumbnail.ts (thumb composta determinística: layout, killfeed, textos)
@@ -950,7 +1048,7 @@ npm run check:meta -- --ai --n 3 --json
 - Max `MAX_RECORDINGS=2` by default so as not to overload the PC.
 - No buffer = no clip (the event is saved in sqlite, you can cut it later via VOD — outside the MVP).
 - The tracker only runs while a recorder is up: a match without a stream produces no event row at all. If the last recorder drops, the tracker keeps running for one more poll (to close the round) and then stops.
-- Matches listed as 0★ (no rating in the listing) only yield a clip at `MIN_KILLS_NO_STARS` (default 5 = ACE); a 4★ match yields a clip from `MIN_KILLS` (default 4). The watchlist is the exception: a listed team records even at 0–1★ using its own threshold.
+- Matches listed as 0★ (no rating in the listing) only yield a clip at `MIN_KILLS_NO_STARS` (default 5 = ACE); a 4★ match yields a clip from `MIN_KILLS` (default 4). The watchlist is the exception: a listed team records below `MIN_STARS` using its own threshold, as long as the match meets the team's star floor (`minStars`; 0 = no floor, and a 0★ listing never satisfies a floor above 0).
 - An event whose kills have no footage in the buffer is discarded and recorded in `discarded_events` (sqlite) instead of being deleted silently.
 - No clip queue/quota guard: a watchlist threshold of 2 on a busy match can create more clips/private uploads than the daily YouTube API quota allows.
 - Rights: even an official stream can trigger Content ID. Starting private + reviewing the title/description is intentional.

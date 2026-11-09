@@ -18,6 +18,8 @@
  */
 import { getBrowser, fetchMatchListing } from '../src/monitor/hltvMonitor.js';
 import { getConfig } from '../src/config.js';
+import { defaultWatchlistDoc } from '../src/watchlist.js';
+
 import { closeBrowser } from '../src/monitor/hltvMonitor.js';
 
 interface TimerProbe {
@@ -34,7 +36,7 @@ interface TimerProbe {
   clockTexts: string[];
   /** Timer do ROUND no placar (o que o tracker usa). */
   roundTimerText: string | null;
-  /** Detalhe dos elementos mm:ss: onde est�o no DOM. */
+  /** Detalhe dos elementos mm:ss: onde estão no DOM. */
   clockElements: Array<{
     text: string;
     sel: string;
@@ -51,8 +53,8 @@ async function probePage(url: string): Promise<TimerProbe> {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(8000);
     return (await page.evaluate(() => {
-      // SEM fun��es nomeadas dentro do evaluate: o tsx injeta o helper
-      // __name, que n�o existe no browser (mesma regra do matchTracker).
+      // SEM funções nomeadas dentro do evaluate: o tsx injeta o helper
+      // __name, que não existe no browser (mesma regra do matchTracker).
       const timerLike: Array<{ sel: string; text: string; attrs: string }> = [];
       const all = Array.from(document.querySelectorAll('*'));
       for (const el of all) {
@@ -82,8 +84,8 @@ async function probePage(url: string): Promise<TimerProbe> {
         : [];
       const ct = document.querySelector('.ctScore');
       const t = document.querySelector('.tScore');
-      // Detalhe de cada mm:ss: onde ele est� no DOM (� o timer do round
-      // ou um hor�rio qualquer da p�gina?).
+      // Detalhe de cada mm:ss: onde ele está no DOM (é o timer do round
+      // ou um horário qualquer da página?).
       const clockElements: Array<{
         text: string;
         sel: string;
@@ -141,9 +143,9 @@ async function main(): Promise<void> {
   if (!url) {
     console.log('procurando uma partida live no listing...');
     // Sem os filtros do bot (estrela/tier): o probe quer QUALQUER partida
-    // live � o timer no DOM n�o depende do filtro.
+    // live — o timer no DOM não depende do filtro.
     const listing = await fetchMatchListing(cfg.HLTV_MATCHES_URL, 0, false, {
-      watchlist: { version: 1, enabled: false, defaults: { minKills: cfg.MIN_KILLS, clutch: false }, teams: [], players: [] },
+      watchlist: { ...defaultWatchlistDoc(), enabled: false },
       starredMinKills: cfg.MIN_KILLS,
       unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
     });

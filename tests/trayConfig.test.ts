@@ -149,6 +149,47 @@ describe('validateConfigPatch', () => {
     expect(validateConfigPatch({ STREAM_PREFERRED_COUNTRY: 'BRAZIL' }).ok).toBe(false);
     expect(validateConfigPatch({ STREAM_PRIORITY: '' }).ok).toBe(false);
   });
+
+  it('adesivo: override vazio é aceito (usa o preset) e hex inválido é recusado', () => {
+    const vazio = validateConfigPatch({
+      SHORTS_OVERLAY_BACKGROUND: '',
+      SHORTS_OVERLAY_BORDER_PX: '',
+      SHORTS_OVERLAY_TAG: '',
+    });
+    expect(vazio.ok).toBe(true);
+    const hex = validateConfigPatch({ SHORTS_OVERLAY_BACKGROUND: 'vermelho' });
+    expect(hex.ok).toBe(false);
+  });
+
+  it('adesivo: preset inválido é recusado', () => {
+    const result = validateConfigPatch({ SHORTS_OVERLAY_PRESET: 'sticker' });
+    expect(result.ok).toBe(false);
+  });
+
+  it('trocar o preset do adesivo limpa os ajustes finos', () => {
+    const result = validateConfigPatch(
+      { SHORTS_OVERLAY_PRESET: 'madhouse' },
+      { SHORTS_OVERLAY_PRESET: 'polex' },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.values.SHORTS_OVERLAY_PRESET).toBe('madhouse');
+      expect(result.values.SHORTS_OVERLAY_BACKGROUND).toBe('');
+      expect(result.values.SHORTS_OVERLAY_BORDER_PX).toBe('');
+      expect(result.values.SHORTS_OVERLAY_FONT).toBe('');
+    }
+  });
+
+  it('preset igual ao atual não limpa os ajustes finos', () => {
+    const result = validateConfigPatch(
+      { SHORTS_OVERLAY_PRESET: 'polex' },
+      { SHORTS_OVERLAY_PRESET: 'polex' },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.values.SHORTS_OVERLAY_BACKGROUND).toBeUndefined();
+    }
+  });
 });
 
 describe('metadados do painel', () => {

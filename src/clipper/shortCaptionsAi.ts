@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { getLogger } from '../logger.js';
 import { repoPath } from '../paths.js';
 import { transcribeWav } from '../transcription/transcribe.js';
+import { wavDurationSecFromBytes } from '../transcription/audio.js';
 import { resolveFfmpegBin } from './segmentProbe.js';
 import { normalizeCaptionText, type CaptionLine } from './shortCaptions.js';
 
@@ -54,7 +55,7 @@ export const CS_CAPTION_GLOSSARY = [
   'save',
   'lurk',
   'rotate',
-  'defuse',
+  'defusa',
   'plant',
   'push',
   'rush',
@@ -63,6 +64,8 @@ export const CS_CAPTION_GLOSSARY = [
   'one-tap',
   'spray',
   'site',
+  'DMzinho',
+  'only pistol',
 ] as const;
 
 /** Nomes + gíria que o modelo deve respeitar (sem repetição). */
@@ -670,6 +673,16 @@ export interface CaptionAiOptions {
   vocabularyFile?: string;
   /** Arquivo das correções de texto (default: assets/caption-corrections.txt). */
   correctionsFile?: string;
+  /**
+   * Provider do TEMPO da legenda (`whisper-cpp`).
+   *
+   * O modelo de linguagem acerta o texto e inventa o tempo (a legenda
+   * aparece antes da voz). Com este campo, o texto do modelo é casado
+   * com o tempo real do whisper local.
+   */
+  timingProvider?: 'whisper-cpp' | null;
+  /** Modelo ggml do provider de tempo (o mesmo do `whisperModel`). */
+  timingModel?: string;
 }
 
 export interface ParsedTranscript {
@@ -692,6 +705,16 @@ export type CaptionDegraded = 'translate' | 'refine';
 export interface CaptionTranscript extends ParsedTranscript {
   provider: CaptionProvider;
   /**
+   * Falas ANTES das correções do dono e da revisão da IA (com o tempo do
+   * áudio, sem o `offsetSec` do silêncio inicial).
+   *
+   * É o que o marker guarda: assim uma regra nova (ou uma regra apagada)
+   * vale no re-render — o texto guardado é o CRU, não o já corrigido.
+   */
+  rawLines?: CaptionLine[];
+  /** Falas originais (antes da tradução) antes das correções. */
+  rawOriginalLines?: CaptionLine[];
+  /**
    * Passes que rodaram "pela metade": `translate` (o áudio estrangeiro
    * ficou no idioma original) e/ou `refine` (a revisão não rodou).
    */
@@ -710,17 +733,26 @@ export interface CaptionTranscript extends ParsedTranscript {
   correctionsApplied?: string[];
 }
 
-export type CaptionTranscriber = (
-  audioPath: string,
-  durSec: number,
-  context?: CaptionContext | null,
+export interface CaptionTranscriber {
+  (
+    audioPath: string,
+    durSec: number,
+    context?: CaptionContext | null,
+    /**
+     * Transcrição da rodada anterior (guardada no marker): quando ela
+     * existe, o provider NÃO é chamado — só a tradução/revisão rodam de
+     * novo (é o que retoma do passo que falhou).
+     */
+    cached?: CaptionTranscript | null,
+  ): Promise<CaptionTranscript | null>;
   /**
-   * Transcrição da rodada anterior (guardada no marker): quando ela
-   * existe, o provider NÃO é chamado — só a tradução/revisão rodam de
-   * novo (é o que retoma do passo que falhou).
+   * Provider que respondeu "ninguém falou" na ÚLTIMA chamada (null
+   * quando a legenda saiu). É o que o marker grava: sem isso, não dá
+   * para saber se o clipe ficou sem legenda por silêncio real ou por
+   * falso-negativo do provider local.
    */
-  cached?: CaptionTranscript | null,
-) => Promise<CaptionTranscript | null>;
+  lastNoSpeechFrom?: CaptionProvider | null;
+}
 
 /** Transcritor de um provider (sem o campo `provider` — quem chama põe). */
 export type CaptionProviderFn = (
@@ -1629,6 +1661,306 @@ export async function translateCaptionLines(
 export const DEFAULT_CAPTION_WHISPER_MODEL = 'large-v3-turbo-q5_0';
 
 /**
+ * Palavras de uma fala, para comparar com outra (minúsculas, sem
+ * acento e sem pontuação): "FalleN, né?" → ["fallen", "ne"].
+ */
+export function captionMatchTokens(text: string): string[] {
+  return String(text ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .split(' ')
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Duas palavras são a MESMA palavra?
+ *
+ * O modelo de linguagem escreve o nome do jeito certo ("KSCERATO") e o
+ * whisper local escreve o que ouviu ("Cacerato"): sem essa tolerância,
+ * a fala não casa com o tempo e a legenda cai no chute do modelo.
+ */
+export function captionTokensMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (short.length < 4) return false;
+  if (long.startsWith(short)) return true;
+  // Um erro de digitação/escuta só: "defusa" x "defuse", "molodoy" x
+  // "molodói" (a distância de edição é 1).
+  if (Math.abs(a.length - b.length) > 1) return false;
+  return levenshtein(a, b) <= 1;
+}
+
+/**
+ * Palavras que NÃO distinguem uma fala da outra: "a", "de", "que",
+ * "não"... contadas como acerto, elas inflavam o score e faziam a fala
+ * casar com o trecho errado (a legenda ia para a hora errada).
+ */
+const CAPTION_STOPWORDS = new Set([
+  'a',
+  'ai',
+  'as',
+  'ao',
+  'aqui',
+  'com',
+  'como',
+  'da',
+  'das',
+  'de',
+  'do',
+  'dos',
+  'e',
+  'eh',
+  'ele',
+  'ela',
+  'elao',
+  'em',
+  'eu',
+  'foi',
+  'la',
+  'mais',
+  'mas',
+  'me',
+  'muito',
+  'na',
+  'nao',
+  'nas',
+  'no',
+  'nos',
+  'num',
+  'numa',
+  'o',
+  'os',
+  'ou',
+  'para',
+  'pela',
+  'pelo',
+  'por',
+  'pra',
+  'pro',
+  'que',
+  'quem',
+  'se',
+  'sem',
+  'ser',
+  'seu',
+  'so',
+  'ta',
+  'te',
+  'tem',
+  'ter',
+  'tu',
+  'um',
+  'uma',
+  'vai',
+  'voce',
+  'vos',
+]);
+
+/**
+ * Palavras que DISTINGUEM a fala (para comparar com o whisper): as
+ * stopwords saem e o resto fica. Se a fala for só stopword, ela volta
+ * inteira (melhor um score fraco do que nenhuma casamento).
+ */
+function captionContentTokens(text: string): string[] {
+  const tokens = captionMatchTokens(text);
+  const content = tokens.filter(
+    (token) => !CAPTION_STOPWORDS.has(token) && token.length >= 2,
+  );
+  return content.length > 0 ? content : tokens;
+}
+
+/**
+ * Quantas palavras da fala aparecem no trecho (multiconjunto: a
+ * repetição conta).
+ */
+function tokenOverlap(a: string[], b: string[]): number {
+  const pool = [...b];
+  let hits = 0;
+  for (const token of a) {
+    const index = pool.findIndex((candidate) => captionTokensMatch(token, candidate));
+    if (index < 0) continue;
+    pool.splice(index, 1);
+    hits++;
+  }
+  return hits;
+}
+
+/**
+ * Corta o silêncio do COMEÇO do áudio.
+ *
+ * O whisper ancora a primeira fala no começo do arquivo: com 9s de
+ * silêncio antes da voz, a legenda aparece 9s antes de quem fala (e as
+ * palavras seguintes herdam o atraso). Cortando o silêncio inicial, o
+ * whisper ouve a fala logo no começo — e o tempo cortado volta no
+ * final (o `offsetSec`).
+ */
+export async function trimLeadingSilence(
+  wavPath: string,
+): Promise<{ path: string; offsetSec: number } | null> {
+  try {
+    const originalSec = wavDurationSecFromBytes(fs.statSync(wavPath).size);
+    if (!originalSec || originalSec < 1) return null;
+    const outPath = `${wavPath}.trim.wav`;
+    await execFileAsync(
+      resolveFfmpegBin(),
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostats',
+        '-y',
+        '-i',
+        wavPath,
+        '-af',
+        'silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB',
+        '-c:a',
+        'pcm_s16le',
+        outPath,
+      ],
+      { windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024 * 8 },
+    );
+    const trimmedSec = wavDurationSecFromBytes(fs.statSync(outPath).size);
+    const offsetSec = Math.round((originalSec - trimmedSec) * 1000) / 1000;
+    // Só vale a pena quando cortou silêncio de verdade (e sobrou áudio).
+    if (offsetSec < 0.3 || trimmedSec < 1) {
+      fs.rmSync(outPath, { force: true });
+      return null;
+    }
+    return { path: outPath, offsetSec };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Duração máxima (s) de uma legenda que NÃO casou com o whisper.
+ *
+ * Sem teto, a fala sem par ficava na tela pelo vão inteiro (30s de
+ * silêncio viravam 30s de legenda parada).
+ */
+const MAX_UNPAIRED_CAPTION_SEC = 4;
+
+/**
+ * Pega o TEMPO REAL das falas (o whisper local sabe quando cada
+ * palavra foi dita) e mantém o TEXTO do modelo de linguagem.
+ *
+ * O modelo de linguagem (Gemini) acerta o que foi falado — com o
+ * contexto do clipe na mão, ele escreve "bomb A" e "KSCERATO" — mas
+ * INVENTA o tempo: ele distribui as falas ao longo do áudio, e a
+ * legenda aparece antes da voz (e cada vez mais adiantada). O whisper
+ * local tem o tempo exato de cada palavra, mas erra a grafia.
+ *
+ * A solução é casar os dois: o texto vem do modelo, o tempo vem do
+ * whisper. A fala que não casa com nenhuma do whisper fica no tempo do
+ * modelo, ajeitado no vão entre as falas vizinhas (para não invadir a
+ * fala seguinte).
+ */
+export function alignCaptionTimings(
+  textLines: CaptionLine[],
+  timingLines: CaptionLine[],
+  opts: { minScore?: number } = {},
+): CaptionLine[] {
+  const minScore = opts.minScore ?? 0.34;
+  const lines = textLines ?? [];
+  const timing = (timingLines ?? []).filter(
+    (line) => Number.isFinite(line?.startSec) && Number.isFinite(line?.endSec),
+  );
+  if (lines.length === 0 || timing.length === 0) return lines.map((line) => ({ ...line }));
+
+  const timingTokens = timing.map((line) => captionMatchTokens(line.text));
+  const out: Array<CaptionLine | null> = lines.map(() => null);
+  let pointer = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lineTokens = captionContentTokens(lines[i].text);
+    if (lineTokens.length === 0) continue;
+    // A janela vai até DOIS trechos do whisper: uma fala do modelo
+    // pode ter sido quebrada em dois (e só isso — uma janela maior
+    // inventa a fala vizinha). O salto de 1 trecho cobre o caso do
+    // whisper ter colado duas falas num trecho só: o trecho pulado é
+    // o da fala que o modelo não descreveu.
+    let best: { score: number; from: number; to: number } | null = null;
+    for (const skip of [0, 1]) {
+      const from = pointer + skip;
+      if (from >= timing.length) continue;
+      for (const to of [from, from + 1]) {
+        if (to >= timing.length) continue;
+        const windowTokens = timingTokens.slice(from, to + 1).flat();
+        const score = tokenOverlap(lineTokens, windowTokens) / lineTokens.length;
+        if (!best || score > best.score) best = { score, from, to };
+        if (score >= 1) break;
+      }
+      if (best && best.score >= 1) break;
+    }
+    if (!best || best.score < minScore) continue;
+    out[i] = {
+      startSec: timing[best.from].startSec,
+      endSec: timing[best.to].endSec,
+      text: lines[i].text,
+    };
+    pointer = best.to + 1;
+  }
+
+  // Fala sem par no whisper: fica no vão entre as vizinhas (o tempo do
+  // modelo é chute; o vão é real). Sem vão, a fala é guardada com o
+  // tempo do modelo — a legenda pode sumir, mas ela NUNCA invade a
+  // fala seguinte.
+  for (let i = 0; i < out.length; i++) {
+    if (out[i]) continue;
+    const line = lines[i];
+    const duration = Math.max(0.4, (line.endSec ?? 0) - (line.startSec ?? 0));
+    let prev: CaptionLine | null = null;
+    for (let j = i - 1; j >= 0; j--) {
+      if (out[j]) {
+        prev = out[j];
+        break;
+      }
+    }
+    let next: CaptionLine | null = null;
+    for (let j = i + 1; j < out.length; j++) {
+      if (out[j]) {
+        next = out[j];
+        break;
+      }
+    }
+    let start = line.startSec;
+    let end = line.endSec;
+    if (prev && next && next.startSec - prev.endSec >= 0.3) {
+      // O vão é real, mas uma legenda de 30s na tela é lixo: a fala
+      // sem par ocupa só o começo do vão (o resto é silêncio).
+      start = prev.endSec;
+      end = Math.min(next.startSec, start + Math.min(duration, MAX_UNPAIRED_CAPTION_SEC));
+    } else if (prev && !next) {
+      start = Math.max(prev.endSec, line.startSec ?? prev.endSec);
+      end = start + Math.min(duration, MAX_UNPAIRED_CAPTION_SEC);
+    } else if (next && !prev) {
+      // A fala vem DEPOIS da linha do modelo (o modelo antecipa): a
+      // legenda precisa CABER antes da próxima fala — o fim é o
+      // começo da próxima (nunca depois dela, senão invade a fala).
+      end = next.startSec;
+      start = Math.max(0, end - Math.min(duration, MAX_UNPAIRED_CAPTION_SEC));
+    } else if (prev && next) {
+      // Vão curto: a fala fica logo depois da anterior (e antes da
+      // seguinte).
+      start = prev.endSec;
+      end = Math.max(start + 0.2, next.startSec);
+    }
+    out[i] = { startSec: start, endSec: end, text: line.text };
+  }
+  // As falas não se sobrepõem e não voltam atrás (a legenda queimada
+  // precisa disso: o bloco termina quando o próximo começa).
+  const sorted = out
+    .map((line, i) => line ?? { ...lines[i] })
+    .sort((a, b) => a.startSec - b.startSec);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (sorted[i].endSec > sorted[i + 1].startSec) sorted[i].endSec = sorted[i + 1].startSec;
+  }
+  return sorted;
+}
+
+/**
  * Transcreve a legenda com o whisper.cpp LOCAL, com timestamps por
  * palavra e SEM VAD.
  *
@@ -1657,6 +1989,50 @@ export async function transcribeWithWhisperCpp(
   }
   if (lines.length === 0) return null;
   return { lines, language: result.language ?? null, translated: false };
+}
+
+/**
+ * Casa o texto do modelo de linguagem com o TEMPO real do whisper
+ * local.
+ *
+ * Sem provider de tempo (ou quando ele falha), a legenda sai como o
+ * modelo falou — com o tempo inventado por ele. O provider de tempo é
+ * uma ajuda, não um requisito: falhar nele NÃO pode derrubar a
+ * legenda.
+ */
+async function alignWithTimingProvider(
+  parsed: ParsedTranscript,
+  audioPath: string,
+  opts: {
+    provider: 'whisper-cpp' | null;
+    model: string;
+    timeoutMs: number;
+    transcriber?: CaptionProviderFn;
+  },
+): Promise<ParsedTranscript> {
+  if (!opts.provider) return parsed;
+  const log = getLogger().child({ feature: 'short-captions' });
+  try {
+    const timing = opts.transcriber
+      ? await opts.transcriber(audioPath, 0, null)
+      : await transcribeWithWhisperCpp(audioPath, {
+          model: opts.model,
+          timeoutMs: opts.timeoutMs,
+        });
+    if (!timing || timing.lines.length === 0) return parsed;
+    const lines = alignCaptionTimings(parsed.lines, timing.lines);
+    log.info(
+      { linhas: lines.length, tempo: opts.provider },
+      'legenda alinhada com o tempo real do áudio',
+    );
+    return { ...parsed, lines };
+  } catch (e) {
+    log.warn(
+      { err: String(e).slice(0, 200) },
+      'não deu para alinhar o tempo da legenda — segue com o tempo do modelo',
+    );
+    return parsed;
+  }
 }
 
 /**
@@ -1748,12 +2124,13 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
                 context,
                 vocabulary,
               })));
-  return async (
+  const transcriber: CaptionTranscriber = async (
     audioPath: string,
     durSec: number,
     context?: CaptionContext | null,
     cached?: CaptionTranscript | null,
   ): Promise<CaptionTranscript | null> => {
+    transcriber.lastNoSpeechFrom = null;
     /**
      * Pós-processamento comum a QUALQUER provider, na ordem que não
      * estraga o texto:
@@ -1773,6 +2150,7 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
     const finalize = async (
       parsed: ParsedTranscript,
       provider: CaptionProvider,
+      offsetSec = 0,
     ): Promise<CaptionTranscript> => {
       const degraded: CaptionDegraded[] = [];
       const applied: string[] = [];
@@ -1847,6 +2225,12 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
       // ainda está no idioma original, aplicá-las corromperia o texto
       // estrangeiro ("what a twist" → "what a Twistzz").
       const stillForeign = needsTranslation && !translated;
+      // O texto ANTES das correções e da revisão: é o que o marker
+      // guarda (assim regra nova/alterada vale no re-render).
+      const rawLines = stillForeign ? undefined : lines.map((line) => ({ ...line }));
+      const rawOriginalLines = stillForeign
+        ? undefined
+        : originalLines?.map((line) => ({ ...line }));
       if (!stillForeign) {
         lines = applyCaptionCorrections(lines, corrections, {
           contextNames: captionContextNames(context),
@@ -1901,48 +2285,125 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
       }
       const holdUntranslated =
         untranslated && translateRequested && (translateFailed || !translator);
+      // O tempo cortado no silêncio inicial volta aqui: o tempo da
+      // legenda é sempre do Short, não do áudio trimmed.
+      const shift = (line: CaptionLine): CaptionLine =>
+        offsetSec > 0
+          ? {
+              ...line,
+              startSec: line.startSec + offsetSec,
+              endSec: line.endSec + offsetSec,
+            }
+          : line;
+      const timed = lines.map(shift);
+      // O texto ORIGINAL (antes da tradução) também é do Short: sem o
+      // deslocamento, o `.orig.txt` ficava com os tempos do áudio cortado.
+      const timedOriginal = originalLines?.map(shift);
       return {
-        lines,
+        lines: timed,
         language: parsed.language,
         translated,
         provider,
-        ...(originalLines ? { originalLines } : {}),
+        // O texto CRU (antes das correções e da revisão) é o que o marker
+        // guarda: é ele que permite regra nova/alterada no re-render.
+        ...(rawLines ? { rawLines } : {}),
+        ...(timedOriginal ? { originalLines: timedOriginal } : {}),
+        ...(rawOriginalLines ? { rawOriginalLines } : {}),
         ...(degraded.length ? { degraded } : {}),
         ...(holdUntranslated ? { untranslated: true } : {}),
         ...(applied.length ? { correctionsApplied: applied } : {}),
       };
     };
+    let sawFailure = false;
+    let sawSilence = false;
+    let lastError = '';
+    let lastUnavailable = '';
+    let lastSilentProvider: CaptionProvider | null = null;
+    // O provider LOCAL (whisper.cpp sem VAD) já respondeu (ou falhou) nesta
+    // rodada: chamá-lo de novo para dar o tempo seria rodar o modelo
+    // (~47s) duas vezes no mesmo áudio.
+    let localProviderDone = false;
     /**
      * Retoma do passo que falhou: com a transcrição guardada no marker
      * da rodada anterior, o provider de transcrição NÃO é chamado
      * (economiza cota do Gemini e o tempo do whisper) — só a tradução
      * e a revisão rodam de novo.
+     *
+     * O texto guardado é o CRU (`rawLines`): as correções do dono e a
+     * revisão são aplicadas DE NOVO por cima dele, então uma regra nova
+     * (ou uma regra apagada) vale no re-render.
      */
-    if (cached && Array.isArray(cached.lines) && cached.lines.length > 0) {
-      log.info(
-        { linhas: cached.lines.length, provider: cached.provider },
-        'reaproveitando a transcrição guardada na rodada anterior',
-      );
-      return finalize(
-        {
-          lines: cached.lines,
-          language: cached.language ?? null,
-          translated: cached.translated === true,
-          ...(cached.originalLines?.length
-            ? { originalLines: cached.originalLines }
-            : {}),
-        },
-        captionProviderFrom(cached.provider),
-      );
-    }
-    let sawFailure = false;
-    let sawSilence = false;
-    let lastError = '';
-    let lastUnavailable = '';
-    for (const provider of providers) {
-      const startedAt = Date.now();
-      try {
-        if (provider === 'gemini') {
+    const cachedRaw = cached?.rawLines?.length ? cached.rawLines : null;
+    const cachedLines = cached?.lines?.length ? cached.lines : null;
+    // O silêncio do COMEÇO do áudio sai antes da transcrição: o whisper
+    // ancora a primeira fala no começo do arquivo e a legenda aparece
+    // antes de quem fala. O tempo cortado volta nas falas (offset).
+    //
+    // O corte é DETERMINÍSTICO (mesmo áudio → mesmo offset): por isso
+    // ele vale para o texto CRU guardado no marker (que está no tempo
+    // do áudio, sem o offset).
+    const trimmed =
+      cachedLines && !cachedRaw ? null : await trimLeadingSilence(audioPath);
+    const sourcePath = trimmed?.path ?? audioPath;
+    const offsetSec = trimmed?.offsetSec ?? 0;
+    try {
+      if (cachedLines && cached) {
+        log.info(
+          {
+            linhas: cachedLines.length,
+            provider: cached.provider,
+            cru: cachedRaw ? cachedRaw.length : 0,
+          },
+          'reaproveitando a transcrição guardada na rodada anterior',
+        );
+        return await finalize(
+          {
+            lines: cachedRaw ?? cachedLines,
+            language: cached.language ?? null,
+            translated: cached.translated === true,
+            // O texto ORIGINAL (antes da tradução) vem junto do CRU: sem
+            // ele, o `.orig.txt` do re-render perderia o idioma de fora.
+            ...(cachedRaw
+              ? cached.rawOriginalLines?.length
+                ? { originalLines: cached.rawOriginalLines }
+                : {}
+              : cached.originalLines?.length
+                ? { originalLines: cached.originalLines }
+                : {}),
+          },
+          captionProviderFrom(cached.provider),
+          // O texto CRU está no tempo do áudio (sem o offset): o
+          // deslocamento do silêncio inicial tem que ser aplicado de
+          // novo. O texto já corrigido (marker antigo, sem `rawLines`)
+          // vem com o offset dentro — somar de novo deslocaria a
+          // legenda.
+          cachedRaw ? offsetSec : 0,
+        );
+      }
+      if (trimmed) {
+        log.info(
+          { offsetSec },
+          'silêncio inicial cortado antes da transcrição (a legenda não nasce antes da voz)',
+        );
+      }
+      for (const [providerIndex, provider] of providers.entries()) {
+        const startedAt = Date.now();
+        /**
+         * O silêncio do provider LOCAL (whisper.cpp sem VAD) NÃO é final:
+         * com `-sns` e o filtro de alucinação, um falso-negativo mataria
+         * a legenda do Short inteiro (e o provider seguinte — que OUVE o
+         * áudio — é quem decide se alguém falou).
+         *
+         * O silêncio de um provider remoto (Gemini/HuggingFace) é final:
+         * é ele que sabe se havia fala.
+         */
+        const silenceIsFinal = (): boolean => {
+          if (!silenceFinal) return false;
+          if (provider !== 'whisper-cpp') return true;
+          return providerIndex + 1 >= providers.length;
+        };
+        try {
+          if (provider === 'gemini') {
           if (!opts.geminiApiKey && !opts.transcribers?.gemini) {
             log.info('gemini sem GEMINI_API_KEY — pulando');
             lastUnavailable = 'gemini sem GEMINI_API_KEY';
@@ -1951,8 +2412,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
           let parsed: ParsedTranscript | null = null;
           try {
             parsed = opts.transcribers?.gemini
-              ? await opts.transcribers.gemini(audioPath, durSec, context)
-              : await transcribeWithGemini(audioPath, {
+              ? await opts.transcribers.gemini(sourcePath, durSec, context)
+              : await transcribeWithGemini(sourcePath, {
                   apiKey: opts.geminiApiKey as string,
                   model: geminiModel,
                   timeoutMs,
@@ -1972,8 +2433,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
               'cota do Gemini — usando o modelo dedicado de transcrição',
             );
             parsed = opts.dedicatedTranscriber
-              ? await opts.dedicatedTranscriber(audioPath, durSec, context)
-              : await transcribeWithGeminiDedicated(audioPath, {
+              ? await opts.dedicatedTranscriber(sourcePath, durSec, context)
+              : await transcribeWithGeminiDedicated(sourcePath, {
                   apiKey: opts.geminiApiKey as string,
                   model: dedicatedModel,
                   timeoutMs,
@@ -1988,16 +2449,25 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
             // consultado: um falso-negativo do Gemini (devolveu vazio
             // num áudio com fala) não pode matar a legenda.
             log.warn('gemini devolveu transcrição vazia — o Short sai sem legenda');
-            if (silenceFinal) {
+            lastSilentProvider = provider;
+            if (silenceIsFinal()) {
               // ...mas, se um provider JÁ falhou com erro de verdade, o
               // erro manda: o Short espera a próxima rodada.
               if (sawFailure) break;
+              transcriber.lastNoSpeechFrom = provider;
               return null;
             }
             sawSilence = true;
             continue;
           }
-          const result = await finalize(parsed, provider);
+          const aligned = await alignWithTimingProvider(parsed, sourcePath, {
+            provider:
+              localProviderDone ? null : (opts.timingProvider ?? null),
+            model: opts.timingModel ?? whisperModel,
+            timeoutMs,
+            transcriber: opts.transcribers?.['whisper-cpp'],
+          });
+          const result = await finalize(aligned, provider, offsetSec);
           log.info(
             {
               provider,
@@ -2012,24 +2482,26 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
         }
         if (provider === 'whisper-cpp') {
           const parsed = opts.transcribers?.['whisper-cpp']
-            ? await opts.transcribers['whisper-cpp'](audioPath, durSec, context)
-            : await transcribeWithWhisperCpp(audioPath, {
+            ? await opts.transcribers['whisper-cpp'](sourcePath, durSec, context)
+            : await transcribeWithWhisperCpp(sourcePath, {
                 model: whisperModel,
                 timeoutMs,
               });
+          localProviderDone = true;
           if (!parsed) {
-            // Silêncio é estado FINAL por padrão (ver o caminho do
-            // Gemini); com `silenceFinal: false` o próximo provider é
-            // consultado.
+            // O silêncio do LOCAL não é final (ver `silenceIsFinal`): o
+            // provider seguinte é quem decide se havia fala.
             log.warn('whisper.cpp devolveu transcrição vazia — o Short sai sem legenda');
-            if (silenceFinal) {
+            lastSilentProvider = provider;
+            if (silenceIsFinal()) {
               if (sawFailure) break;
+              transcriber.lastNoSpeechFrom = provider;
               return null;
             }
             sawSilence = true;
             continue;
           }
-          const result = await finalize(parsed, provider);
+          const result = await finalize(parsed, provider, offsetSec);
           log.info(
             {
               provider,
@@ -2048,8 +2520,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
           continue;
         }
         const parsed = opts.transcribers?.huggingface
-          ? await opts.transcribers.huggingface(audioPath, durSec, context)
-          : await transcribeWithHuggingface(audioPath, {
+          ? await opts.transcribers.huggingface(sourcePath, durSec, context)
+          : await transcribeWithHuggingface(sourcePath, {
               token: opts.hfToken as string,
               model: hfModel,
               timeoutMs,
@@ -2059,14 +2531,18 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
           // Gemini); com `silenceFinal: false` o próximo provider é
           // consultado.
           log.warn('huggingface devolveu transcrição vazia — o Short sai sem legenda');
-          if (silenceFinal) {
+          lastSilentProvider = provider;
+          if (silenceIsFinal()) {
             if (sawFailure) break;
+            transcriber.lastNoSpeechFrom = provider;
             return null;
           }
           sawSilence = true;
           continue;
         }
-        const result = await finalize(parsed, provider);
+        // O HuggingFace já devolve o tempo real de cada fala (é um
+        // whisper): realinhar com o whisper local só gastaria tempo.
+        const result = await finalize(parsed, provider, offsetSec);
         log.info(
           {
             provider,
@@ -2079,10 +2555,24 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
       } catch (e) {
         sawFailure = true;
         lastError = String(e).slice(0, 200);
+        // O provider local já foi tentado (falhou): chamá-lo de novo
+        // para dar o tempo seria rodar o modelo duas vezes no mesmo
+        // áudio.
+        if (provider === 'whisper-cpp') localProviderDone = true;
         log.warn(
           { provider, err: lastError },
           'provider de transcrição falhou',
         );
+      }
+      }
+    } finally {
+      // O áudio trimmed é temporário: ele some junto com o WAV.
+      if (trimmed) {
+        try {
+          fs.rmSync(trimmed.path, { force: true });
+        } catch {
+          // best-effort
+        }
       }
     }
     if (sawFailure) {
@@ -2092,10 +2582,14 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
     }
     // Todos os providers responderam "ninguém falou" (e ninguém falhou):
     // silêncio de verdade, estado final — o Short sai sem legenda.
-    if (sawSilence) return null;
+    if (sawSilence) {
+      transcriber.lastNoSpeechFrom = lastSilentProvider;
+      return null;
+    }
     // Nenhum provider respondeu e nenhum calou: nenhum está configurado.
     throw new Error(
       `nenhum provider de transcrição configurado (${lastUnavailable || 'sem chave'})`,
     );
   };
+  return transcriber;
 }

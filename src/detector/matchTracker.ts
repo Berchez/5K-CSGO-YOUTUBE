@@ -10,6 +10,12 @@ export interface ScoreboardPlayer {
   kills: number;
   /** Coluna D do scoreboard — alimenta as vítimas dos kills sintetizados. */
   deaths?: number;
+  /**
+   * Time do jogador, lido do cabeçalho da tabela do placar. As duas
+   * tabelas (CT e T) trocam de lado no halftime: o nome vem do próprio
+   * cabeçalho, nunca da ordem das tabelas.
+   */
+  team?: string;
 }
 
 export interface RoundSnapshot {
@@ -117,8 +123,18 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
       const ct = Number.parseInt(((ctEl && ctEl.textContent) || '0').trim(), 10) || 0;
       const t = Number.parseInt(((tEl && tEl.textContent) || '0').trim(), 10) || 0;
 
-      const players: Array<{ name: string; kills: number; deaths?: number }> = [];
+      const players: Array<{ name: string; kills: number; deaths?: number; teamHeader?: string }> = [];
       for (const tbl of Array.from(document.querySelectorAll('table.team'))) {
+        // Nome do time no cabeçalho da própria tabela (CT/T trocam no
+        // halftime): é o que amarra o jogador ao time. Sem nome no
+        // cabeçalho, o jogador fica sem time (fail-closed na watchlist).
+        const headName =
+          tbl.querySelector('thead .teamName') || tbl.querySelector('.teamName');
+        const headCell = headName ? null : tbl.querySelector('thead .identityColumns');
+        const team = (((headName && headName.textContent) || (headCell && headCell.textContent) || '')
+          .trim()
+          .replace(/\s+/g, ' ')
+          .slice(0, 60));
         for (const tr of Array.from(tbl.querySelectorAll('tr'))) {
           if (tr.closest('thead')) continue;
           const nameEl = tr.querySelector('.identityColumns');
@@ -132,7 +148,34 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
             name: name.slice(0, 40),
             kills: Number.parseInt(kText, 10),
             deaths: /^\d+$/.test(dText) ? Number.parseInt(dText, 10) : undefined,
+            teamHeader: team ? team : undefined,
           });
+        }
+      }
+
+      /**
+       * Tabela de stats da página (o placar live NÃO traz o nome do time
+       * em todo formato): ela amarra o jogador ao time pelo cabeçalho
+       * `tr.header-row` + `a.teamName`. Os dados saem daqui CRU: a lógica
+       * (rótulo genérico, casar o jogador) roda no Node, fora do
+       * page.evaluate (lá não dá para chamar função importada).
+       */
+      const statsTeams: Array<{ team: string; players: string[] }> = [];
+      for (const tbl of Array.from(document.querySelectorAll('table.totalstats, table.stats'))) {
+        let current: { team: string; players: string[] } | null = null;
+        for (const tr of Array.from(tbl.querySelectorAll('tr'))) {
+          const header = tr.querySelector('a.teamName, .teamName');
+          if (header) {
+            const team = ((header.textContent) || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+            current = { team, players: [] };
+            statsTeams.push(current);
+            continue;
+          }
+          if (!current) continue;
+          const link = tr.querySelector('td.players a[href*="/player/"], a[href*="/player/"]');
+          if (!link) continue;
+          const name = ((link.textContent) || '').trim().replace(/\s+/g, ' ');
+          if (name) current.players.push(name.slice(0, 40));
         }
       }
 
@@ -160,14 +203,105 @@ export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | nul
         document.querySelector('.scoreboard [class*="timeText"]') ||
         document.querySelector('.timeText');
       const timerText = ((timerEl && timerEl.textContent) || '').replace(/\s+/g, ' ').trim();
-      return { players, ctScore: ct, tScore: t, map, round, timerText };
+      return { players, statsTeams, ctScore: ct, tScore: t, map, round, timerText };
     });
     if (!snap) return null;
     const timer = parseRoundTimer(snap.timerText);
-    return { ...snap, timerSec: timer.sec, timerState: timer.state };
+    // O time do jogador é resolvido NO NODE (rótulo genérico + tabela de
+    // stats): o page.evaluate não pode chamar função importada.
+    const players = snap.players.map((player) => ({
+      name: player.name,
+      kills: player.kills,
+      deaths: player.deaths,
+      team: resolvePlayerTeam(player.teamHeader, player.name, snap.statsTeams),
+    }));
+    return { players, ctScore: snap.ctScore, tScore: snap.tScore, map: snap.map, round: snap.round, timerSec: timer.sec, timerState: timer.state };
   } catch {
     return null;
   }
+}
+
+/**
+ * Rótulos GENÉRICOS que o placar pode trazer no lugar do nome do time
+ * ("Players" é o cabeçalho padrão da tabela de stats). Um rótulo genérico
+ * não pode virar o "time" do jogador: o round seria creditado ao time
+ * errado (ou a nenhum) e a watchlist fail-closed deixaria o clipe de fora.
+ */
+const GENERIC_TEAM_LABELS = new Set([
+  'player',
+  'players',
+  'team',
+  'teams',
+  'jogador',
+  'jogadores',
+  'time',
+  'times',
+  '-',
+  '—',
+  'n/a',
+  'na',
+]);
+
+/** O rótulo é genérico (não é o nome de um time)? */
+export function isGenericTeamLabel(label: string | null | undefined): boolean {
+  const value = (label ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (!value) return true;
+  return GENERIC_TEAM_LABELS.has(value);
+}
+
+/** Bloco de um time na tabela de stats da página (jogadores + nome). */
+export interface StatsTeamBlock {
+  team: string;
+  players: string[];
+}
+
+/**
+ * Time do jogador (puro):
+ * 1. o cabeçalho da tabela do placar, quando NÃO é rótulo genérico;
+ * 2. senão, a tabela de stats da página (amarra o jogador ao time);
+ * 3. senão, undefined (desconhecido → fail-closed na watchlist).
+ */
+export function resolvePlayerTeam(
+  header: string | null | undefined,
+  playerName: string,
+  blocks: StatsTeamBlock[],
+): string | undefined {
+  const head = (header ?? '').trim().replace(/\s+/g, ' ');
+  if (!isGenericTeamLabel(head)) return head;
+  const key = playerTeamKey(playerName);
+  if (!key) return undefined;
+  for (const block of blocks) {
+    const team = (block.team ?? '').trim().replace(/\s+/g, ' ');
+    if (!team || isGenericTeamLabel(team)) continue;
+    for (const name of block.players) {
+      if (playerTeamKey(name) === key) return team;
+    }
+  }
+  return undefined;
+}
+
+/** Chave de comparação dos nomes de jogador (mesmo formato do placar). */
+export function playerTeamKey(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Índice jogador → time (puro). Mescla no mapa anterior: um jogador que
+ * some do placar num poll (ou um cabeçalho que atrasa) não perde o time
+ * já conhecido.
+ */
+export function indexPlayerTeams(
+  players: Iterable<ScoreboardPlayer>,
+  into: Map<string, string> = new Map(),
+): Map<string, string> {
+  for (const player of players) {
+    const team = (player.team ?? '').trim();
+    if (!team) continue;
+    const key = playerTeamKey(player.name);
+    if (!key) continue;
+    into.set(key, team);
+  }
+  return into;
 }
 
 export interface TrackerCallbacks {
@@ -343,6 +477,13 @@ export function processPoll(
 }
 
 /**
+ * Limiar por killer: recebe o jogador e o time dele (do placar). O
+ * watchlist usa o time para decidir se o round é do time monitorado ou
+ * do adversário.
+ */
+export type MinKillsPolicy = (player: string, team: string | null) => number;
+
+/**
  * Polling por partida. Detecta virada de round via soma dos placares
  * (CS2 MR12: termina em 13, com OT — não mais 16).
  */
@@ -350,7 +491,7 @@ export async function trackMatch(
   matchPageUrl: string,
   matchId: string,
   cb: TrackerCallbacks,
-  minKills: MinKillsRule = 3,
+  minKills: MinKillsPolicy = () => 3,
 ): Promise<void> {
   const log = getLogger().child({ matchId });
   const { newTrackedPage } = await import('../monitor/hltvMonitor.js');
@@ -379,6 +520,8 @@ export async function trackMatch(
     let lastSnap: RoundSnapshot | null = null;
     let lastSeenRound = -1;
     let lastGoodAt = 0;
+    /** jogador (normalizado) → time, lido do placar. Sobrevive a polls. */
+    const teamByPlayer = new Map<string, string>();
     /**
      * Instante (wall) em que o placar mostrou "Round over", AMARRADO ao
      * round: o fim REAL do round no relógio do jogo. É a referência que
@@ -465,11 +608,16 @@ export async function trackMatch(
       }
       lastSeenRound = snap.round;
       lastGoodAt = nowMs;
+      // Time de cada jogador (do cabeçalho do placar): amarra o killer ao
+      // time para a política da watchlist.
+      indexPlayerTeams(snap.players, teamByPlayer);
+      const minKillsForPoll: MinKillsRule = (player) =>
+        minKills(player, teamByPlayer.get(playerTeamKey(player)) ?? null);
       const { event, dropped, roundClosed, lastTotal: next } = processPoll(
         tracker,
         snap,
         lastTotal,
-        minKills,
+        minKillsForPoll,
         getConfig().SCOREBOARD_DELAY_MS,
         lastSnap,
         roundOver,

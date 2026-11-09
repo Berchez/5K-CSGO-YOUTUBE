@@ -8,6 +8,7 @@ import {
   divergentLatencyEnvs,
   getConfig,
   invalidBoolEnvs,
+  invalidShortsOverlayEnvs,
 } from './config.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
@@ -19,6 +20,7 @@ import {
   closeBrowser,
   fetchMatchListing,
   fetchMatchStreams,
+  matchPassesFilter,
   minKillsForStars,
   selectNextUpcoming,
   selectStream,
@@ -53,7 +55,7 @@ import {
 import type { LatencySample } from './monitor/streamLatency.js';
 import { loadLatencyState, saveLatencyState } from './monitor/latencyStore.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
-import { loadWatchlistFile, resolveMatchRule, resolvePlayerRule } from './watchlist.js';
+import { loadWatchlistFile, resolveRoundPolicy } from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
 import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
@@ -2447,16 +2449,48 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
     } else if (!activeTrackers.has(m.matchId)) {
       const baseMinKills =
         m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
-      // Recalcula a cada round: hot-reload da watchlist vale para partidas já
-      // em andamento. Jogador listado vence o limiar do time/default.
-      const minKillsFor = (player: string): number => {
-        const live = activeWatchlist;
-        const base = resolveMatchRule(
-          live,
-          [m.team1, m.team2],
-          minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
-        ).minKills;
-        return resolvePlayerRule(live, player)?.minKills ?? base;
+      // A partida passa na política geral (estrelas/top-tier)? Se não passa
+      // (entrou só pelo override da watchlist), só geram clipe os jogadores
+      // do time monitorado — ou quem estiver listado em players.
+      const passesGeneral = matchPassesFilter(
+        m.stars,
+        m.isTopTierGuess,
+        cfg.MIN_STARS,
+        cfg.TOP_TIER_ONLY,
+      );
+      const generalMinKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
+      let warnedUnknownTeam = false;
+      const minKillsFor = (player: string, team: string | null): number => {
+        // Recalcula a CADA round: o hot-reload da watchlist vale para a
+        // partida em andamento (o doc é lido do arquivo, não do início do
+        // tracking) e o piso é POR TIME (cada time da lista tem o seu).
+        // O time do killer vem do placar e é canonicalizado para o nome do
+        // LISTING (o placar pode dizer "Team Vitality" e o card
+        // "Vitality"); jogador listado vence o limiar do time.
+        const policy = resolveRoundPolicy({
+          doc: activeWatchlist,
+          stars: m.stars,
+          teams: [m.team1, m.team2],
+          passesGeneral,
+          generalMinKills,
+        });
+        const resolved = policy.killer(player, team);
+        // Time do killer DESCONHECIDO (o placar não casou com o listing) e
+        // round bloqueado: se o jogador for do time monitorado, o clipe foi
+        // perdido em silêncio. Avisa UMA vez por partida (log + toast).
+        if (resolved.source === 'blocked' && !team && !warnedUnknownTeam) {
+          warnedUnknownTeam = true;
+          log.warn(
+            { matchId: m.matchId, player, team1: m.team1, team2: m.team2 },
+            'time do killer não resolvido no placar — round bloqueado sem clipe (o nome do placar não casou com o listing)',
+          );
+          notifyWindows(
+            '5K Bot: time do killer não resolvido',
+            `${m.team1} vs ${m.team2}: o placar não deixou descobrir de qual time é ${player}. O round foi bloqueado sem clipe.`,
+          );
+        }
+        // null = bloqueado (adversário em partida só da watchlist).
+        return resolved.minKills ?? Number.POSITIVE_INFINITY;
       };
       const token = Symbol(m.matchId);
       activeTrackers.set(m.matchId, token);
@@ -2465,6 +2499,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
           matchId: m.matchId,
           stars: m.stars,
           minKills: baseMinKills,
+          passaGeral: passesGeneral,
           watchlisted: m.watchlisted ?? false,
           teams: m.watchlistedTeams?.join(', ') || undefined,
         },
@@ -2731,6 +2766,15 @@ async function main(): Promise<void> {
     log.warn(
       { vars: invalidBools },
       'valor de env não reconhecido (ligado/desligado) — usando o default',
+    );
+  }
+  // Adesivo do Short: config inválida no `.env` NÃO derruba o bot (o
+  // adesivo é do script offline) — o campo cai no preset e o dono avisa.
+  const invalidOverlay = invalidShortsOverlayEnvs();
+  if (invalidOverlay.length > 0) {
+    log.warn(
+      { vars: invalidOverlay },
+      'config do adesivo do Short inválida — usando o preset/default (o bot segue normal)',
     );
   }
   // Mapa de latência por canal: JSON inválido era aceitado em silêncio

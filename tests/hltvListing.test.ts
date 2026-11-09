@@ -6,10 +6,12 @@ import {
   extractListingCards,
   shouldStopRecorder,
   type ListingCards,
+  type MatchCard,
   type UpcomingCard,
   type UpcomingMatch,
 } from '../src/monitor/hltvMonitor.js';
 import { computePollDecision } from '../src/monitor/pollSchedule.js';
+import { validateWatchlistDoc } from '../src/watchlist.js';
 
 /**
  * Fixtures do layout 2026 do /matches (copiado do HTML real do HLTV).
@@ -437,6 +439,137 @@ describe('buildListing (confiabilidade da agenda)', () => {
       false,
     );
     expect(listing.scheduleReliable).toBe(false);
+  });
+});
+
+describe('buildListing (piso de estrelas da watchlist)', () => {
+  function rawLive(matchId: string, team1: string, team2: string, stars: number): MatchCard {
+    return {
+      matchId,
+      href: `/matches/${matchId}/x-vs-y`,
+      teamNames: [team1, team2],
+      event: 'Evento',
+      stage: '',
+      isLive: true,
+      stars,
+    };
+  }
+
+  function watchlist(input: unknown) {
+    const result = validateWatchlistDoc(input);
+    expect(result.ok).toBe(true);
+    return result.value!;
+  }
+
+  const wl = watchlist({
+    defaults: { minKills: 4, minStars: 0 },
+    teams: [
+      { names: ['FURIA'], minKills: 3, minStars: 2 },
+      { names: ['Legacy'], minKills: 4 },
+    ],
+  });
+
+  it('time da lista entra pelo override quando o piso é atendido', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 2)] }),
+      4, // MIN_STARS: a partida não passa no filtro geral
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].watchlisted).toBe(true);
+    expect(listing.live[0].minKills).toBe(3);
+  });
+
+  it('piso não atendido: partida não entra (nem pelo watchlist)', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 1)] }),
+      4,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(0);
+  });
+
+  it('partida sem estrelas (0 = desconhecido) não satisfaz piso acima de 0', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 0)] }),
+      4,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(0);
+  });
+
+  it('piso 0 (herdado) mantém o override em qualquer partida', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'Legacy', 'MIBR', 0)] }),
+      4,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].watchlisted).toBe(true);
+  });
+
+  it('piso atendido: entra pelo override mesmo passando no filtro geral', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 4)] }),
+      2,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].watchlisted).toBe(true);
+    expect(listing.live[0].minKills).toBe(3);
+  });
+
+  it('piso NÃO atendido: entra pela política geral, mas SEM o override', () => {
+    // 1★ com MIN_STARS=1: a partida passa na política geral, mas o piso
+    // do time (2) não é atendido — o override NÃO vale (o time volta ao
+    // limiar geral) e o descarte fica registrado.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 1)] }),
+      1,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].watchlisted).toBe(false);
+    expect(listing.live[0].watchlistedTeams).toEqual(['FURIA']);
+    // O limiar EFETIVO é o geral: o do time (3) não vale com o piso
+    // barrado — mostrar 3 no log faria o bot cortar no limiar errado.
+    expect(listing.live[0].minKills).toBe(5);
+    expect(listing.discarded).toEqual([
+      { section: 'live', team: 'FURIA', stars: 1, minStars: 2, enteredByGeneral: true },
+    ]);
+  });
+
+  it('piso por time: quem não atendeu o piso não dá o limiar dele', () => {
+    // 1★: FURIA (piso 2) NÃO atende; Legacy (piso 0) atende → o limiar
+    // efetivo é o do Legacy (4), não o 3 do FURIA.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'Legacy', 1)] }),
+      1,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].watchlisted).toBe(true);
+    expect(listing.live[0].minKills).toBe(4);
+  });
+
+  it('piso não atendido e fora da política geral: a partida não entra', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'MIBR', 1)] }),
+      4,
+      false,
+      { watchlist: wl, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(0);
+    expect(listing.discarded).toEqual([
+      { section: 'live', team: 'FURIA', stars: 1, minStars: 2, enteredByGeneral: false },
+    ]);
   });
 });
 

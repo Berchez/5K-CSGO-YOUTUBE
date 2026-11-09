@@ -19,6 +19,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig } from '../src/config.js';
+import { defaultWatchlistDoc } from '../src/watchlist.js';
 import { fetchMatchListing, fetchMatchStreams } from '../src/monitor/hltvMonitor.js';
 import { closeBrowser } from '../src/monitor/hltvMonitor.js';
 import {
@@ -42,7 +43,7 @@ async function main(): Promise<void> {
   if (!streamUrl) {
     console.log('procurando uma partida live com stream...');
     const listing = await fetchMatchListing(cfg.HLTV_MATCHES_URL, cfg.MIN_STARS, cfg.TOP_TIER_ONLY, {
-      watchlist: { version: 1, enabled: false, defaults: { minKills: cfg.MIN_KILLS, clutch: false }, teams: [], players: [] },
+      watchlist: { ...defaultWatchlistDoc(), enabled: false },
       starredMinKills: cfg.MIN_KILLS,
       unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
     });
@@ -109,14 +110,14 @@ async function main(): Promise<void> {
       );
       console.log(
         shifts.length === 0
-          ? 'saltos de atraso na timeline de origem: nenhum (rel�gio da origem acompanha o conte�do)'
+          ? 'saltos de atraso na timeline de origem: nenhum (relógio da origem acompanha o conteúdo)'
           : `saltos de atraso na timeline de origem: ${shifts
               .map((shift) => `${shift.shiftSec}s em ${new Date(shift.atPdtMs).toISOString()}`)
               .join(', ')}`,
       );
-      console.log('\nRESULTADO: a playlist traz PDT � d� para medir a lat�ncia sem OCR.');
+      console.log('\nRESULTADO: a playlist traz PDT — dá para medir a latência sem OCR.');
     } else {
-      console.log('\nRESULTADO: a playlist N�O traz PROGRAM-DATE-TIME (lat�ncia tem que vir do OCR).');
+      console.log('\nRESULTADO: a playlist NÃO traz PROGRAM-DATE-TIME (latência tem que vir do OCR).');
     }
   } catch (e) {
     console.log(`falha ao ler a playlist: ${String(e).slice(0, 200)}`);

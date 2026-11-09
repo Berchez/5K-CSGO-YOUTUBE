@@ -262,7 +262,7 @@
     .watchlist-field .input { max-width: none; }
     .watchlist-list { display: grid; gap: 10px; }
     .watchlist-row {
-      display: grid; grid-template-columns: minmax(0, 1fr) 132px auto auto;
+      display: grid; grid-template-columns: minmax(0, 1fr) 132px 112px auto auto;
       gap: 10px; align-items: end; padding: 12px;
       border: 1px solid var(--line); border-radius: 12px; background: rgba(15, 23, 42, .5);
     }
@@ -412,7 +412,11 @@
               <span>Limiar padrão (times sem regra própria)</span>
               <select class="input" id="watchlistDefaultMinKills"></select>
             </label>
-            <p class="tiny">Também é o mínimo de entradas sem valor próprio. Jogadores fora da watchlist usam o limiar da partida.</p>
+            <label class="watchlist-field" style="max-width:220px">
+              <span>Mín. estrelas (padrão)</span>
+              <select class="input" id="watchlistDefaultMinStars"></select>
+            </label>
+            <p class="tiny">Também é o mínimo de entradas sem valor próprio. O piso de estrelas vale só para o override da watchlist: 0 = sem piso (time entra em qualquer partida, inclusive 0★); acima de 0, a partida precisa ter essa quantidade de estrelas no listing. Em partida que entrou só pela watchlist, só geram clipe os jogadores do time monitorado (ou quem estiver na lista de jogadores).</p>
           </div>
           <div class="watchlist-list" id="watchlistTeams"><div class="empty">Carregando watchlist...</div></div>
         </article>
@@ -838,20 +842,36 @@
         return parts.join('');
       }
 
+      function watchlistMinStarsOptions(selected, withInherit, defaultStars) {
+        const parts = [];
+        if (withInherit) {
+          parts.push('<option value=""' + (selected === '' ? ' selected' : '') + '>Herdar (' + defaultStars + ')</option>');
+        }
+        for (let n = 0; n <= 5; n++) {
+          const label = n === 0 ? '0 (sem piso)' : n + '★';
+          parts.push('<option value="' + n + '"' + (String(selected) === String(n) ? ' selected' : '') + '>' + label + '</option>');
+        }
+        return parts.join('');
+      }
+
       function watchlistFromDoc(doc) {
         const source = doc && typeof doc === 'object' ? doc : {};
         const defaults = source.defaults && typeof source.defaults === 'object' ? source.defaults : {};
         const defaultMinKills = Number.isInteger(defaults.minKills) && defaults.minKills >= 2 && defaults.minKills <= 5
           ? defaults.minKills
           : 4;
+        const defaultMinStars = Number.isInteger(defaults.minStars) && defaults.minStars >= 0 && defaults.minStars <= 5
+          ? defaults.minStars
+          : 0;
         const teams = Array.isArray(source.teams) ? source.teams : [];
         return {
           enabled: source.enabled !== false,
-          defaults: { minKills: defaultMinKills },
+          defaults: { minKills: defaultMinKills, minStars: defaultMinStars },
           defaultClutch: defaults.clutch === true,
           teams: teams.map((team) => ({
             namesText: team && Array.isArray(team.names) ? team.names.join(', ') : '',
             minKills: team && Number.isInteger(team.minKills) ? String(team.minKills) : '',
+            minStars: team && Number.isInteger(team.minStars) ? String(team.minStars) : '',
             enabled: !(team && team.enabled === false),
             clutch: team && typeof team.clutch === 'boolean' ? team.clutch : undefined,
           })),
@@ -888,6 +908,7 @@
         }
         $('#watchlistEnabled').checked = wl.enabled !== false;
         $('#watchlistDefaultMinKills').innerHTML = watchlistMinKillsOptions(wl.defaults.minKills, false, wl.defaults.minKills);
+        $('#watchlistDefaultMinStars').innerHTML = watchlistMinStarsOptions(wl.defaults.minStars, false, wl.defaults.minStars);
         const rows = wl.teams.map((team, index) => (
           '<div class="watchlist-row" data-index="' + index + '">' +
             '<label class="watchlist-field watchlist-names"><span>Nomes (vírgula separa aliases)</span>' +
@@ -895,6 +916,9 @@
             '</label>' +
             '<label class="watchlist-field"><span>Mín. kills</span><select class="input" data-wl="minKills">' +
               watchlistMinKillsOptions(team.minKills, true, wl.defaults.minKills) +
+            '</select></label>' +
+            '<label class="watchlist-field"><span>Mín. estrelas</span><select class="input" data-wl="minStars">' +
+              watchlistMinStarsOptions(team.minStars, true, wl.defaults.minStars) +
             '</select></label>' +
             '<label class="check"><input type="checkbox" data-wl="enabled"' + (team.enabled ? ' checked' : '') + '> Ativo</label>' +
             '<button class="btn ghost small" type="button" data-wl-remove>Remover</button>' +
@@ -972,15 +996,28 @@
           }
           const rule = { names, enabled: team.enabled !== false };
           if (team.minKills !== '') rule.minKills = Number(team.minKills);
+          if (team.minStars !== '') {
+            const minStars = Number(team.minStars);
+            if (!Number.isInteger(minStars) || minStars < 0 || minStars > 5) {
+              errors.push(label + ': mínimo de estrelas deve ser um inteiro entre 0 e 5.');
+            } else {
+              rule.minStars = minStars;
+            }
+          }
           if (team.clutch !== undefined) rule.clutch = team.clutch;
           teams.push(rule);
         });
         if (teams.length > 100) errors.push('Máximo de 100 times.');
+        const defaultMinStars = Number(wl.defaults.minStars);
+        if (!Number.isInteger(defaultMinStars) || defaultMinStars < 0 || defaultMinStars > 5) {
+          errors.push('Mínimo de estrelas padrão deve ser um inteiro entre 0 e 5.');
+        }
         const doc = {
           version: 1,
           enabled: wl.enabled !== false,
           defaults: {
             minKills: Number(wl.defaults.minKills) || 4,
+            minStars: defaultMinStars,
             clutch: wl.defaultClutch === true,
           },
           teams,
@@ -1061,6 +1098,23 @@
         });
       }
 
+      /** Valor do select que casa com uma option (on/1 vira true). */
+      function selectValue(field, value) {
+        const raw = String(value ?? '');
+        const options = field.options || [];
+        if (options.some((option) => String(option.value) === raw)) return raw;
+        const truthy = /^(1|true|on|yes)$/i.test(raw);
+        const falsy = /^(0|false|off|no)$/i.test(raw);
+        if (truthy || falsy) {
+          const match = options.find((option) => {
+            const optionValue = String(option.value);
+            return truthy ? optionValue === 'true' : optionValue === 'false';
+          });
+          if (match) return match.value;
+        }
+        return raw;
+      }
+
       function renderField(field) {
         const value = state.formValues[field.key] ?? '';
         const id = 'cfg_' + field.key;
@@ -1071,7 +1125,12 @@
           const checked = value === 'true' ? ' checked' : '';
           control = '<label class="switch"><input id="' + esc(id) + '" type="checkbox" data-key="' + esc(field.key) + '" data-type="boolean"' + checked + '><span class="switch-track"><span class="switch-thumb"></span></span><span class="switch-label">' + (checked ? 'Ligado' : 'Desligado') + '</span></label>';
         } else if (field.type === 'select') {
-          const options = (field.options || []).map((option) => '<option value="' + esc(option.value) + '"' + (String(option.value) === String(value) ? ' selected' : '') + '>' + esc(option.label) + '</option>').join('');
+          // O valor do `.env` pode ser "on"/"1" (a config aceita) e não
+          // casar com nenhuma option: sem casar, o navegador mostra a
+          // PRIMEIRA option ("Do preset") e o dono acha que está no
+          // preset quando o valor real é "caixa alta".
+          const selected = selectValue(field, value);
+          const options = (field.options || []).map((option) => '<option value="' + esc(option.value) + '"' + (String(option.value) === String(selected) ? ' selected' : '') + '>' + esc(option.label) + '</option>').join('');
           control = '<select id="' + esc(id) + '" class="input" data-key="' + esc(field.key) + '" data-type="select">' + options + '</select>';
         } else {
           const type = field.type === 'number' ? 'number' : 'text';
@@ -1325,6 +1384,14 @@
           const key = event.target.dataset.key;
           if (!key) return;
           state.formValues[key] = event.target.dataset.type === 'boolean' ? (event.target.checked ? 'true' : 'false') : event.target.value;
+          // Campo com `clears` (trocar o preset do adesivo) zera os
+          // ajustes finos na tela: o painel mostra o preset novo.
+          const field = (state.config?.fields || []).find((item) => item.key === key);
+          for (const target of (field?.clears || [])) {
+            state.formValues[target] = '';
+            const input = document.querySelector('[data-key="' + String(target).replace(/"/g, '\\"') + '"]');
+            if (input) input.value = '';
+          }
           updateDirty();
         }
       });
@@ -1348,6 +1415,7 @@
         const team = state.watchlist.teams[index];
         if (!team) return;
         if (field === 'minKills') team.minKills = event.target.value;
+        if (field === 'minStars') team.minStars = event.target.value;
         if (field === 'enabled') team.enabled = event.target.checked;
         markWatchlistDirty();
       });
@@ -1370,8 +1438,13 @@
         markWatchlistDirty();
         renderWatchlist();
       });
+      $('#watchlistDefaultMinStars').addEventListener('change', (event) => {
+        state.watchlist.defaults.minStars = Number(event.target.value) || 0;
+        markWatchlistDirty();
+        renderWatchlist();
+      });
       $('#btnAddTeam').addEventListener('click', () => {
-        state.watchlist.teams.push({ namesText: '', minKills: '', enabled: true, clutch: undefined });
+        state.watchlist.teams.push({ namesText: '', minKills: '', minStars: '', enabled: true, clutch: undefined });
         markWatchlistDirty();
         renderWatchlist();
       });

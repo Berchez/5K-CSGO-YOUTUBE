@@ -24,6 +24,13 @@ export interface ConfigField {
   step?: number;
   unit?: string;
   advanced?: boolean;
+  /** Valor vazio é aceito (o campo usa o default/preset). */
+  optional?: boolean;
+  /**
+   * Chaves que são LIMPAS quando este campo muda (ex.: trocar o preset
+   * do adesivo limpa cor/borda/sombra para o preset novo valer).
+   */
+  clears?: string[];
 }
 
 export interface EnvReadResult {
@@ -374,7 +381,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_CAM_HEIGHT',
     group: 'clips',
     label: 'Altura da faixa do topo',
-    help: 'Quanto da saída é a cam (o resto é o jogo). 660 em 1920: ~80% da caixa da webcam do gaules no quadro e o jogo 1:1 em 1080x1080. Ajuste em 20px.',
+    help: 'Quanto da saída é a cam (o resto é o jogo). 600 em 1920: a cam ocupa ~31% e o jogo ganha 60px. Ajuste em 20px.',
     type: 'number',
     min: 160,
     max: 1800,
@@ -495,7 +502,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_CAPTION_FONT_SIZE',
     group: 'clips',
     label: 'Tamanho da fonte da legenda',
-    help: 'Altura do texto da legenda em px (na saida de 1080 de largura).',
+    help: 'Altura do texto da legenda em px (na saida de 1080 de largura). Padrão 64.',
     type: 'number',
     min: 24,
     max: 160,
@@ -530,6 +537,211 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     label: 'Hashtag do Short',
     help: 'Tag que entra no fim da descrição do Short (o painel grava entre aspas — o # solto seria lido como comentário).',
     type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_TEXT',
+    group: 'clips',
+    label: 'Adesivo do Short',
+    help: 'Texto do adesivo (sticker) que aparece no começo do Short e some em fade out. Vazio = sem adesivo.',
+    type: 'text',
+  },
+  {
+    key: 'SHORTS_OVERLAY_PRESET',
+    group: 'clips',
+    label: 'Visual do adesivo',
+    help: 'Preset do adesivo. Trocar o preset limpa os ajustes finos (cor, borda, sombra) para o visual do preset valer.',
+    type: 'select',
+    options: [
+      { value: 'polex', label: 'Polex (vermelho)' },
+      { value: 'polex-die', label: 'Polex com borda' },
+      { value: 'gaules', label: 'Gaules (azul)' },
+      { value: 'madhouse', label: 'MADHOUSE (amarelo)' },
+      { value: 'rei', label: 'Cortes do Rei (roxo)' },
+      { value: 'diecut', label: 'Die-cut (recortado)' },
+      { value: 'pill', label: 'Pílula (visual antigo)' },
+      { value: 'custom', label: 'Personalizado' },
+    ],
+    clears: [
+      'SHORTS_OVERLAY_STYLE',
+      'SHORTS_OVERLAY_TAG',
+      'SHORTS_OVERLAY_UPPERCASE',
+      'SHORTS_OVERLAY_BACKGROUND',
+      'SHORTS_OVERLAY_COLOR',
+      'SHORTS_OVERLAY_BORDER_COLOR',
+      'SHORTS_OVERLAY_BORDER_PX',
+      'SHORTS_OVERLAY_SHADOW_COLOR',
+      'SHORTS_OVERLAY_SHADOW_PX',
+      'SHORTS_OVERLAY_SHADOW_BLUR_PX',
+      'SHORTS_OVERLAY_TILT_DEG',
+      'SHORTS_OVERLAY_FONT',
+    ],
+  },
+  {
+    key: 'SHORTS_OVERLAY_STYLE',
+    group: 'clips',
+    label: 'Formato do adesivo',
+    help: 'Vazio = formato do preset. Cápsula = ponta redonda; Retângulo = cantos pouco arredondados.',
+    type: 'select',
+    options: [
+      { value: '', label: 'Do preset' },
+      { value: 'capsule', label: 'Cápsula' },
+      { value: 'rect', label: 'Retângulo' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_TAG',
+    group: 'clips',
+    label: 'Tag do adesivo',
+    help: 'Etiqueta pequena no topo do adesivo (ex.: MADHOUSE). Vazio = tag do preset.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_UPPERCASE',
+    group: 'clips',
+    label: 'Adesivo em caixa alta',
+    help: 'Vazio = do preset. Ligado força CAIXA ALTA no texto do adesivo.',
+    type: 'select',
+    options: [
+      { value: '', label: 'Do preset' },
+      { value: 'true', label: 'Caixa alta' },
+      { value: 'false', label: 'Como escrito' },
+    ],
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_HOLD_SEC',
+    group: 'clips',
+    label: 'Tempo do adesivo',
+    help: 'Segundos que o adesivo fica visível antes do fade out.',
+    type: 'number',
+    min: 0.5,
+    max: 20,
+    step: 0.5,
+    unit: 's',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_FADE_SEC',
+    group: 'clips',
+    label: 'Fade out do adesivo',
+    help: 'Duração do fade out no final do tempo do adesivo.',
+    type: 'number',
+    min: 0,
+    max: 10,
+    step: 0.1,
+    unit: 's',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_Y',
+    group: 'clips',
+    label: 'Posição vertical do adesivo',
+    help: '0 = topo, 1 = base do vertical. Padrão 0.54 (um pouco abaixo do centro).',
+    type: 'number',
+    min: 0,
+    max: 1,
+    step: 0.02,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_BACKGROUND',
+    group: 'clips',
+    label: 'Cor de fundo do adesivo',
+    help: 'Hex (#rrggbb). Vazio = cor do preset.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_COLOR',
+    group: 'clips',
+    label: 'Cor do texto do adesivo',
+    help: 'Hex (#rrggbb). Vazio = cor do preset.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_BORDER_COLOR',
+    group: 'clips',
+    label: 'Cor da borda',
+    help: 'Hex (#rrggbb). Vazio = cor do preset.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_BORDER_PX',
+    group: 'clips',
+    label: 'Espessura da borda',
+    help: 'Em px. Vazio = preset; 0 = sem borda.',
+    type: 'number',
+    min: 0,
+    max: 40,
+    step: 1,
+    unit: 'px',
+    optional: true,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_SHADOW_COLOR',
+    group: 'clips',
+    label: 'Cor da sombra',
+    help: 'Hex (#rrggbb). Vazio = cor do preset.',
+    type: 'text',
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_SHADOW_PX',
+    group: 'clips',
+    label: 'Deslocamento da sombra',
+    help: 'Em px. Vazio = preset; 0 = sem sombra.',
+    type: 'number',
+    min: 0,
+    max: 40,
+    step: 1,
+    unit: 'px',
+    optional: true,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_SHADOW_BLUR_PX',
+    group: 'clips',
+    label: 'Blur da sombra',
+    help: 'Em px. Vazio = preset; 0 = sombra sólida (estilo das referências).',
+    type: 'number',
+    min: 0,
+    max: 20,
+    step: 1,
+    unit: 'px',
+    optional: true,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_TILT_DEG',
+    group: 'clips',
+    label: 'Inclinação do adesivo',
+    help: 'Em graus (-15 a 15). Vazio = inclinação do preset.',
+    type: 'number',
+    min: -15,
+    max: 15,
+    step: 0.5,
+    unit: '°',
+    optional: true,
+    advanced: true,
+  },
+  {
+    key: 'SHORTS_OVERLAY_FONT',
+    group: 'clips',
+    label: 'Fonte do adesivo',
+    help: 'Vazio = fonte do preset. Impact/Arial Black precisam estar instaladas no Windows.',
+    type: 'select',
+    options: [
+      { value: '', label: 'Do preset' },
+      { value: 'Arial Black', label: 'Arial Black' },
+      { value: 'Impact', label: 'Impact' },
+      { value: 'Arial', label: 'Arial' },
+    ],
     advanced: true,
   },
   {
@@ -902,7 +1114,8 @@ export function validateConfigPatch(
     }
     const field = fieldByKey.get(key);
     let value = String(raw).trim();
-    if (field?.type === 'number') {
+    // Campo opcional: vazio é um valor VÁLIDO (usa o preset/default).
+    if (field?.type === 'number' && !(field.optional === true && value === '')) {
       const numeric = Number(value);
       if (value === '' || !Number.isFinite(numeric)) {
         errors.push({ key, message: 'Informe um número.' });
@@ -953,6 +1166,29 @@ export function validateConfigPatch(
   }
   if (Object.keys(values).length === 0 && errors.length === 0) {
     errors.push({ key: '_', message: 'Nenhuma alteração informada.' });
+  }
+  /**
+   * Trocar o preset do adesivo LIMPA os ajustes finos (cor, borda,
+   * sombra): sem isso o override antigo continuaria mandando no preset
+   * novo e o painel pareceria quebrado. Só limpa quando o preset REALMENTE
+   * mudou e quando o ajuste não veio no mesmo patch.
+   */
+  for (const [key, value] of Object.entries(values)) {
+    const field = fieldByKey.get(key);
+    if (!field?.clears?.length) continue;
+    // Chave AUSENTE no `.env` = o valor é o DEFAULT do schema: comparar
+    // com '' inventava uma troca de preset (e limpava os ajustes finos
+    // quando o dono só escolheu o preset que já era o default).
+    const before = Object.prototype.hasOwnProperty.call(current, key)
+      ? String(current[key] ?? '').trim()
+      : defaultValueFor(key as keyof AppConfig);
+    if (before === value) continue;
+    for (const target of field.clears) {
+      if (Object.prototype.hasOwnProperty.call(values, target)) continue;
+      const targetField = fieldByKey.get(target);
+      if (!targetField) continue;
+      values[target] = '';
+    }
   }
   // Regras CRUZADAS (dois campos ao mesmo tempo): salvar só o MAX dos
   // Shorts sem o MIN deixaria um .env que o script de Shorts recusa —

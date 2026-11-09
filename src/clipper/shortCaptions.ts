@@ -61,6 +61,17 @@ export interface CaptionTranscriptCache {
   lines: Array<{ startSec: number; endSec: number; text: string }>;
   /** Falas no idioma original (quando houve tradução). */
   originalLines?: Array<{ startSec: number; endSec: number; text: string }>;
+  /**
+   * Falas ANTES das correções do dono e da revisão da IA (tempos do
+   * áudio, sem o deslocamento do silêncio inicial).
+   *
+   * É o que o re-render reaproveita: as regras são aplicadas de novo
+   * por cima do texto CRU (regra nova vale; regra apagada deixa de
+   * valer).
+   */
+  rawLines?: Array<{ startSec: number; endSec: number; text: string }>;
+  /** Falas originais (antes da tradução) antes das correções. */
+  rawOriginalLines?: Array<{ startSec: number; endSec: number; text: string }>;
 }
 
 /** Como a legenda ficou no vertical (o que o marker do Short guarda). */
@@ -76,6 +87,14 @@ export interface CaptionStatus {
    * ficou no idioma original) e/ou `refine` (a revisão não rodou).
    */
   degraded?: Array<'translate' | 'refine'>;
+  /**
+   * Provider que respondeu "ninguém falou" (quando a legenda não saiu).
+   *
+   * Serve para separar "silêncio real" de "falso-negativo do provider
+   * local" — sem isso, o Short fica sem legenda para sempre sem o dono
+   * saber por quê.
+   */
+  noSpeechFrom?: string;
   /**
    * Regras de correção que mexeram na legenda (`molodoij>molodoy`).
    * O dono vê no marker qual regra disparou — é como se caça falso

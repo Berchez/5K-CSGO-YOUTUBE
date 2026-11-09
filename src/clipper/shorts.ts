@@ -5,9 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import { repoPath } from '../paths.js';
+import { shortsCrossFieldErrors } from '../config.js';
 import { resolveFfmpegBin, resolveFfprobeBin } from './segmentProbe.js';
 import { isValidCrop } from './scoreboardSync.js';
 import { renderShortBannerPng, type ShortBannerText } from './shortBanner.js';
+import {
+  renderShortOverlayButtonPng,
+  shortOverlayFilter,
+  shortOverlayVisualsHash,
+  type ShortOverlayButton,
+} from './shortOverlay.js';
 import { escapeAssFilterPath, safeAssName } from './shortCaptions.js';
 
 const execFileAsync = promisify(execFile);
@@ -52,6 +59,61 @@ export interface ShortWindowOptions {
   minSec?: number;
   headSec?: number;
   tailSec?: number;
+}
+
+/** Overrides de janela da execução (null = usa o valor do .env). */
+export interface ShortWindowOverrides {
+  minSec?: number | null;
+  maxSec?: number | null;
+  headSec?: number | null;
+  tailSec?: number | null;
+}
+
+/** Janela resolvida (flags da execução > .env). */
+export interface ShortWindowConfig {
+  minSec: number;
+  maxSec: number;
+  headSec: number;
+  tailSec: number;
+}
+
+/** Resolve a janela: as flags da execução ganham do `.env`. */
+export function resolveShortWindowConfig(
+  cfg: {
+    SHORTS_MIN_SEC: number;
+    SHORTS_MAX_SEC: number;
+    SHORTS_HEAD_SEC: number;
+    SHORTS_TAIL_SEC: number;
+  },
+  overrides: ShortWindowOverrides = {},
+): ShortWindowConfig {
+  return {
+    minSec: overrides.minSec ?? cfg.SHORTS_MIN_SEC,
+    maxSec: overrides.maxSec ?? cfg.SHORTS_MAX_SEC,
+    headSec: overrides.headSec ?? cfg.SHORTS_HEAD_SEC,
+    tailSec: overrides.tailSec ?? cfg.SHORTS_TAIL_SEC,
+  };
+}
+
+/**
+ * Erros da janela resolvida (puro): a mesma checagem cruzada da config,
+ * mas com as flags da execução.
+ *
+ * A checagem acontece ANTES do lote: janela inválida não pode
+ * envenenar o marker/backoff de nenhum clipe (o erro no meio do lote
+ * contava como tentativa de cada clipe e segurava o retry por horas).
+ */
+export function shortWindowConfigErrors(
+  window: ShortWindowConfig,
+  geometry: { width: number; height: number; camHeight: number },
+): string[] {
+  return shortsCrossFieldErrors({
+    minSec: window.minSec,
+    maxSec: window.maxSec,
+    width: geometry.width,
+    height: geometry.height,
+    camHeight: geometry.camHeight,
+  }).map((error) => error.message);
 }
 
 export interface ShortWindow {
@@ -222,8 +284,8 @@ export function planShortWindow(
 
 export interface ShortKillRef {
   /**
-   * Instante da kill no rel�gio do PLACAR (epoch ms). Os sidecars do bot
-   * gravam n�mero; os gerados pelo script de VOD gravam ISO - os dois
+   * Instante da kill no relógio do PLACAR (epoch ms). Os sidecars do bot
+   * gravam número; os gerados pelo script de VOD gravam ISO - os dois
    * sao aceitos.
    */
   at?: number | string | null;
@@ -435,6 +497,11 @@ export interface ShortRenderOptions {
    * grava a legenda no próprio mp4 (sem depender do caption do YouTube).
    */
   captionsAssPath?: string | null;
+  /**
+   * Adesivo (botão) que aparece no começo do vertical e some em fade
+   * out. `null` = sem adesivo.
+   */
+  overlayButton?: ShortOverlayButton | null;
 }
 
 export interface ShortLayoutOptions {
@@ -696,6 +763,38 @@ export interface ShortRenderSignature {
   captionPosition: ShortCaptionPosition;
   /** Família da fonte da legenda. */
   captionFontFamily: string;
+  /**
+   * Hash das regras de correção da legenda (`assets/caption-corrections.txt`).
+   * O texto é queimado no mp4: regra nova = legenda nova = outro vertical.
+   */
+  captionRulesHash: string;
+  /** Texto do adesivo do começo do Short (vazio = sem adesivo). */
+  overlayText: string;
+  /** Segundos que o adesivo fica visível. */
+  overlayHoldSec: number;
+  /** Fade out do adesivo (s). */
+  overlayFadeSec: number;
+  /** Posição vertical do adesivo (fração da altura). */
+  overlayY: number;
+  /** Preset e visual do adesivo (qualquer mudança = outro vertical). */
+  overlayPreset: string;
+  overlayShape: string;
+  overlayBackground: string;
+  overlayColor: string;
+  overlayBorderColor: string;
+  overlayBorderPx: number;
+  overlayShadowColor: string;
+  overlayShadowPx: number;
+  overlayShadowBlurPx: number;
+  overlayTiltDeg: number;
+  overlayFont: string;
+  overlayUppercase: boolean;
+  overlayTag: string;
+  /**
+   * Hash do visual dos presets: mudou o preset no CÓDIGO, o vertical
+   * antigo tem que ser refeito (sem isso o mp4 velho era reaproveitado).
+   */
+  overlayVisuals: string;
 }
 
 export type ShortCaptionMode = 'off' | 'on';
@@ -719,6 +818,30 @@ export function shortRenderSignature(opts: {
   captionFontSize?: number;
   captionPosition?: ShortCaptionPosition;
   captionFontFamily?: string;
+  /**
+   * Hash das regras de correção da legenda (o caller calcula: o arquivo
+   * de regras fica no repo, fora deste módulo).
+   */
+  captionRulesHash?: string;
+  overlayText?: string | null;
+  overlayHoldSec?: number;
+  overlayFadeSec?: number;
+  overlayY?: number;
+  overlayPreset?: string | null;
+  overlayShape?: string | null;
+  overlayBackground?: string | null;
+  overlayColor?: string | null;
+  overlayBorderColor?: string | null;
+  overlayBorderPx?: number;
+  overlayShadowColor?: string | null;
+  overlayShadowPx?: number;
+  overlayShadowBlurPx?: number;
+  overlayTiltDeg?: number;
+  overlayFont?: string | null;
+  overlayUppercase?: boolean;
+  overlayTag?: string | null;
+  /** Hash do visual dos presets (calculado aqui: não depende do caller). */
+  overlayVisuals?: string;
 }): ShortRenderSignature {
   return {
     top: opts.top,
@@ -735,7 +858,7 @@ export function shortRenderSignature(opts: {
     bannerText: opts.bannerText ?? null,
     cropX: Number((opts.cropX ?? 0.5).toFixed(4)),
     captions: opts.captions === 'on' ? 'on' : 'off',
-    captionFontSize: Math.round(opts.captionFontSize ?? 54),
+    captionFontSize: Math.round(opts.captionFontSize ?? 64),
     captionPosition:
       opts.captionPosition === 'bottom'
         ? 'bottom'
@@ -743,6 +866,25 @@ export function shortRenderSignature(opts: {
           ? 'below-crosshair'
           : 'game-top',
     captionFontFamily: String(opts.captionFontFamily ?? 'Segoe UI Black').trim() || 'Segoe UI Black',
+    captionRulesHash: String(opts.captionRulesHash ?? '').trim(),
+    overlayText: String(opts.overlayText ?? '').trim(),
+    overlayHoldSec: Number((opts.overlayHoldSec ?? 0).toFixed(2)),
+    overlayFadeSec: Number((opts.overlayFadeSec ?? 0.5).toFixed(2)),
+    overlayY: Number((opts.overlayY ?? 0.54).toFixed(4)),
+    overlayPreset: String(opts.overlayPreset ?? 'polex').trim() || 'polex',
+    overlayShape: String(opts.overlayShape ?? 'capsule').trim() || 'capsule',
+    overlayBackground: String(opts.overlayBackground ?? '').trim(),
+    overlayColor: String(opts.overlayColor ?? '').trim(),
+    overlayBorderColor: String(opts.overlayBorderColor ?? '').trim(),
+    overlayBorderPx: Number((opts.overlayBorderPx ?? 0).toFixed(2)),
+    overlayShadowColor: String(opts.overlayShadowColor ?? '').trim(),
+    overlayShadowPx: Number((opts.overlayShadowPx ?? 0).toFixed(2)),
+    overlayShadowBlurPx: Number((opts.overlayShadowBlurPx ?? 0).toFixed(2)),
+    overlayTiltDeg: Number((opts.overlayTiltDeg ?? 0).toFixed(2)),
+    overlayFont: String(opts.overlayFont ?? '').trim(),
+    overlayUppercase: opts.overlayUppercase !== false,
+    overlayTag: String(opts.overlayTag ?? '').trim(),
+    overlayVisuals: opts.overlayVisuals ?? shortOverlayVisualsHash(),
   };
 }
 
@@ -757,7 +899,7 @@ export function isStaleRender(
   current: ShortRenderSignature,
 ): boolean {
   if (!previous) return true;
-  return (
+  const layoutChanged =
     previous.top !== current.top ||
     (previous.camBox ?? null) !== (current.camBox ?? null) ||
     previous.camHeight !== current.camHeight ||
@@ -778,7 +920,50 @@ export function isStaleRender(
     previous.captions !== current.captions ||
     previous.captionFontSize !== current.captionFontSize ||
     previous.captionPosition !== current.captionPosition ||
-    previous.captionFontFamily !== current.captionFontFamily
+    previous.captionFontFamily !== current.captionFontFamily;
+  if (layoutChanged) return true;
+  /**
+   * Regras de correção da legenda: o texto é QUEIMADO no mp4, então uma
+   * regra nova (ou uma regra apagada) muda o vertical. A comparação só
+   * vale quando há legenda em algum dos dois lados (marker antigo não
+   * tem o campo e não pode forçar re-render de Short sem legenda).
+   */
+  if (current.captions === 'on' || previous.captions === 'on') {
+    if ((previous.captionRulesHash ?? '') !== (current.captionRulesHash ?? '')) return true;
+  }
+  /**
+   * Adesivo do começo: texto, tempo ou visual diferentes = outro vertical.
+   *
+   * A comparação do adesivo só vale quando EXISTE adesivo em algum dos
+   * dois lados: sem adesivo, mudar o preset/visual não muda o vertical
+   * (e um marker antigo, sem o campo `overlayVisuals`, forçaria um
+   * re-render de todos os clipes sem adesivo).
+   */
+  const previousHasOverlay = (previous.overlayText ?? '').trim().length > 0;
+  const currentHasOverlay = (current.overlayText ?? '').trim().length > 0;
+  if (!previousHasOverlay && !currentHasOverlay) return false;
+  return (
+    previousHasOverlay !== currentHasOverlay ||
+    (previous.overlayText ?? '') !== (current.overlayText ?? '') ||
+    (previous.overlayHoldSec ?? 0) !== (current.overlayHoldSec ?? 0) ||
+    (previous.overlayFadeSec ?? 0) !== (current.overlayFadeSec ?? 0) ||
+    (previous.overlayY ?? 0) !== (current.overlayY ?? 0) ||
+    (previous.overlayPreset ?? '') !== (current.overlayPreset ?? '') ||
+    (previous.overlayShape ?? '') !== (current.overlayShape ?? '') ||
+    (previous.overlayBackground ?? '') !== (current.overlayBackground ?? '') ||
+    (previous.overlayColor ?? '') !== (current.overlayColor ?? '') ||
+    (previous.overlayBorderColor ?? '') !== (current.overlayBorderColor ?? '') ||
+    (previous.overlayBorderPx ?? 0) !== (current.overlayBorderPx ?? 0) ||
+    (previous.overlayShadowColor ?? '') !== (current.overlayShadowColor ?? '') ||
+    (previous.overlayShadowPx ?? 0) !== (current.overlayShadowPx ?? 0) ||
+    (previous.overlayShadowBlurPx ?? 0) !== (current.overlayShadowBlurPx ?? 0) ||
+    (previous.overlayTiltDeg ?? 0) !== (current.overlayTiltDeg ?? 0) ||
+    (previous.overlayFont ?? '') !== (current.overlayFont ?? '') ||
+    previous.overlayUppercase !== current.overlayUppercase ||
+    (previous.overlayTag ?? '') !== (current.overlayTag ?? '') ||
+    // Mudou o visual do preset no CÓDIGO: o vertical antigo tem o visual
+    // velho e precisa ser refeito (marker antigo não tem o campo).
+    (previous.overlayVisuals ?? '') !== (current.overlayVisuals ?? '')
   );
 }
 
@@ -954,7 +1139,7 @@ export async function renderShortClip(
     srcHeight: info.height,
     captionsAssPath: opts.captionsAssPath ?? null,
   });
-  const filter = layout.filter;
+  let filter = layout.filter;
   const withAudio = await hasAudioStream(srcPath);
   if (opts.top === 'cam' && layout.top === 'center') {
     log.warn(
@@ -964,26 +1149,106 @@ export async function renderShortClip(
   }
   let bannerPath: string | null = null;
   let ownBanner = false;
-  if (layout.top === 'text') {
-    bannerPath = opts.bannerPng ? path.resolve(opts.bannerPng) : null;
-    if (!bannerPath) {
-      bannerPath = path.join(
-        os.tmpdir(),
-        `5k-short-banner-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`,
-      );
-      ownBanner = true;
-      await renderShortBannerPng(
-        layout.width,
-        layout.topHeight,
-        opts.banner ?? { title: 'CS2' },
-        bannerPath,
-      );
+  let overlayPath: string | null = null;
+  let assCopyPath: string | null = null;
+  /**
+   * Limpa os temporários do render (banner, adesivo e a cópia do `.ass`).
+   * Vale para TODOS os casos: um render que morre DEPOIS de criar o PNG
+   * do adesivo não pode deixar o arquivo no tmp para sempre.
+   */
+  const cleanupInputs = (): void => {
+    if (ownBanner && bannerPath) {
+      try {
+        fs.rmSync(bannerPath, { force: true });
+      } catch {
+        // best-effort
+      }
     }
+    if (overlayPath) {
+      try {
+        fs.rmSync(overlayPath, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    if (assCopyPath) {
+      try {
+        fs.rmSync(assCopyPath, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+  };
+  try {
+    if (layout.top === 'text') {
+      bannerPath = opts.bannerPng ? path.resolve(opts.bannerPng) : null;
+      if (!bannerPath) {
+        bannerPath = path.join(
+          os.tmpdir(),
+          `5k-short-banner-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`,
+        );
+        ownBanner = true;
+        await renderShortBannerPng(
+          layout.width,
+          layout.topHeight,
+          opts.banner ?? { title: 'CS2' },
+          bannerPath,
+        );
+      }
+    }
+    /**
+     * Adesivo (botão): um PNG transparente composto por cima do vertical
+     * no começo do Short, que some em fade out. O input do PNG entra
+     * DEPOIS da faixa de texto (quando ela existe).
+     */
+    const overlay = opts.overlayButton?.text?.trim() ? opts.overlayButton : null;
+    if (overlay) {
+      overlayPath = path.join(
+        os.tmpdir(),
+        `5k-short-overlay-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`,
+      );
+      const rendered = await renderShortOverlayButtonPng(
+        overlay.text,
+        { outWidth: layout.width, outHeight: layout.height, ...overlay },
+        overlayPath,
+      );
+      // O PNG tem uma margem em volta (espaço da sombra): desconta para o
+      // botão cair na posição pedida. As medidas são as REAIS do PNG (o
+      // texto foi medido no renderizador), não uma nova estimativa.
+      filter = shortOverlayFilter({
+        baseFilter: layout.filter,
+        inputIndex: bannerPath ? 2 : 1,
+        holdSec: overlay.holdSec,
+        fadeSec: overlay.fadeSec,
+        yPx: layout.height * overlay.y - rendered.metrics.margin,
+      });
+    }
+    // A pasta de destino tem que existir ANTES do ffmpeg: o mkdir do caller
+    // vinha depois do render e o ffmpeg abortava com "Error opening output
+    // file" (o Short nunca era gerado para um clipe novo).
+    fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+
+    /**
+     * O nome do `.ass` no filtro é sempre SEGURO (o filtergraph não
+     * aceita apóstrofo): quando o arquivo tem um nome que o filtro não
+     * aceita, o render usa uma cópia com o nome seguro, na mesma pasta
+     * (o ffmpeg roda com o cwd nela).
+     */
+    if (opts.captionsAssPath) {
+      const assPath = path.resolve(opts.captionsAssPath);
+      const safe = safeAssName(assPath);
+      if (path.basename(assPath) !== safe) {
+        assCopyPath = path.join(path.dirname(assPath), safe);
+        fs.copyFileSync(assPath, assCopyPath);
+      }
+    }
+  } catch (e) {
+    // O render nem chegou ao ffmpeg: os temporários criados até aqui
+    // são removidos (o PNG do adesivo era o que vazava).
+    cleanupInputs();
+    throw e;
   }
-  // A pasta de destino tem que existir ANTES do ffmpeg: o mkdir do caller
-  // vinha depois do render e o ffmpeg abortava com "Error opening output
-  // file" (o Short nunca era gerado para um clipe novo).
-  fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+
 
   // Render ATÓMICO: o ffmpeg escreve num `.tmp` e o arquivo final só
   // aparece pronto. Um render interrompido (timeout, disco cheio) deixava
@@ -994,22 +1259,6 @@ export async function renderShortClip(
     fs.rmSync(tmpPath, { force: true });
   } catch {
     // best-effort
-  }
-
-  /**
-   * O nome do `.ass` no filtro é sempre SEGURO (o filtergraph não
-   * aceita apóstrofo): quando o arquivo tem um nome que o filtro não
-   * aceita, o render usa uma cópia com o nome seguro, na mesma pasta
-   * (o ffmpeg roda com o cwd nela).
-   */
-  let assCopyPath: string | null = null;
-  if (opts.captionsAssPath) {
-    const assPath = path.resolve(opts.captionsAssPath);
-    const safe = safeAssName(assPath);
-    if (path.basename(assPath) !== safe) {
-      assCopyPath = path.join(path.dirname(assPath), safe);
-      fs.copyFileSync(assPath, assCopyPath);
-    }
   }
 
   const args = [
@@ -1027,6 +1276,10 @@ export async function renderShortClip(
     // A faixa de texto é uma imagem parada: `-loop 1` + a taxa da fonte
     // para o vstack receber frames no mesmo passo do jogo.
     args.push('-loop', '1', '-framerate', String(info?.fps ?? 60), '-i', bannerPath);
+  }
+  if (overlayPath) {
+    // O adesivo também é uma imagem parada (o `fade` cuida do sumiço).
+    args.push('-loop', '1', '-framerate', String(info?.fps ?? 60), '-i', overlayPath);
   }
   // `-t` é opção de SAÍDA: depois de todos os inputs.
   args.push('-t', durSec.toFixed(2));
@@ -1070,20 +1323,7 @@ export async function renderShortClip(
     }
     throw e;
   } finally {
-    if (ownBanner && bannerPath) {
-      try {
-        fs.rmSync(bannerPath, { force: true });
-      } catch {
-        // best-effort
-      }
-    }
-    if (assCopyPath) {
-      try {
-        fs.rmSync(assCopyPath, { force: true });
-      } catch {
-        // best-effort
-      }
-    }
+    cleanupInputs();
   }
 
   const outDur = await probeDurationSec(tmpPath);

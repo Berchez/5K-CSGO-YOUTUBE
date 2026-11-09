@@ -19,3 +19,7 @@ eng.traineddata
 latencia.txt
 # artefatos de sessão de agente (planos locais)
 .opencode/
+# transcrição de sessão de agente (log de conversa: tem path local e ruído)
+session-*.md
+# scripts descartáveis de diagnóstico (ad-hoc, fora do repo)
+scripts/tmp-*.ts

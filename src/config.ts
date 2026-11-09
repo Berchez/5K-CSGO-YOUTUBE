@@ -51,6 +51,62 @@ function boolEnvField(key: string, defaultValue: boolean) {
 }
 
 /**
+ * Número OPCIONAL de env: vazio = `null` (usa o valor do preset do
+ * adesivo). `0` continua sendo um override válido (ex.: sem borda).
+ */
+function optionalNumberEnv(min: number, max: number, integer = false) {
+  const number = integer ? z.coerce.number().int() : z.coerce.number();
+  return z
+    .preprocess(
+      (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
+      number.min(min).max(max).nullable(),
+    )
+    .default(null);
+}
+
+/**
+ * Cor hex OPCIONAL (`#rrggbb` ou `rrggbb`). Vazio = usa o preset do
+ * adesivo — o `.env` só precisa da cor quando ela foge do preset.
+ *
+ * O valor é NORMALIZADO (`rrggbb` vira `#rrggbb`, minúsculas): sem o `#`
+ * o SVG sairia com `fill="e10600"` (inválido) e o adesivo não apareceria.
+ */
+const optionalHexEnv = z
+  .string()
+  .default('')
+  .transform((v) => v.trim())
+  .refine((v) => v === '' || /^#?[0-9a-f]{6}$/i.test(v), {
+    message: 'use uma cor hex (#rrggbb) ou deixe vazio para usar o preset',
+  })
+  .transform((v) => (v === '' ? '' : `#${v.replace(/^#/, '').toLowerCase()}`));
+
+/**
+ * Booleano OPCIONAL (tri-estado): vazio = preset; aceita o mesmo
+ * vocabulário do restante do `.env` (1/true/on x 0/false/off).
+ */
+const optionalBoolEnv = z
+  .string()
+  .default('')
+  .transform((v) => v.trim())
+  .refine((v) => v === '' || parseBoolEnv(v) !== null, {
+    message: 'use ligado/desligado ou deixe vazio para usar o preset',
+  })
+  .transform((v) => (v === '' ? null : parseBoolEnv(v)));
+
+/** Presets do adesivo do Short (os visuais ficam em shortOverlay.ts). */
+export const SHORTS_OVERLAY_PRESETS = [
+  'custom',
+  'polex',
+  'polex-die',
+  'gaules',
+  'madhouse',
+  'rei',
+  'diecut',
+  'pill',
+] as const;
+export type ShortOverlayPresetId = (typeof SHORTS_OVERLAY_PRESETS)[number];
+
+/**
  * Hashtag de classificação do Shorts.
  *
  * O dotenv trata `#` como início de comentário: `SHORTS_HASHTAG=#Shorts`
@@ -467,11 +523,10 @@ export const ConfigSchema = z.object({
   SHORTS_TOP: z.enum(['cam', 'text', 'center']).default('cam'),
   /**
    * Altura (px) da faixa do topo. O resto da saída é o jogo.
-   * Default 660 (34% de 1920): a cam do streamer ganha altura (com 660
-   * ~80% da caixa da webcam do gaules cabe no quadro) e o jogo, com
-   * proporção 1:1, continua em 1080x1080 sobre o fundo desfocado.
+   * Default 600 (31% de 1920): a cam do streamer ocupa um pouco menos
+   * da altura e o jogo ganha 60px em relação ao desenho antigo (660).
    */
-  SHORTS_CAM_HEIGHT: z.coerce.number().int().min(160).max(1800).default(660),
+  SHORTS_CAM_HEIGHT: z.coerce.number().int().min(160).max(1800).default(600),
   /**
    * Como a cam preenche a faixa do topo:
    * - `cover` (padrão): a cam é ZOOMADA até preencher a faixa (corta o
@@ -525,11 +580,26 @@ export const ConfigSchema = z.object({
    */
   SHORTS_CAPTIONS: boolEnvField('SHORTS_CAPTIONS', true),
   /**
-   * Ordem dos providers de transcrição (`gemini,huggingface`).
-   * O Gemini transcreve e (se o áudio não for português) traduz na mesma
-   * chamada; o Whisper do HuggingFace é a reserva (traz os tempos reais).
+   * Ordem dos providers de transcrição (`whisper-cpp,gemini,huggingface`).
+   *
+   * O whisper.cpp LOCAL abre a lista: ele traz o tempo REAL de cada
+   * fala (o modelo de linguagem inventa o tempo — a legenda aparece
+   * antes da voz) e a revisão do Gemini conserta a grafia (o nome do
+   * jogador, o termo do jogo). Sem o binário/modelo local, a cadeia
+   * cai no Gemini.
    */
-  SHORTS_CAPTION_AI_ORDER: z.string().default('gemini,huggingface'),
+  SHORTS_CAPTION_AI_ORDER: z.string().default('whisper-cpp,gemini,huggingface'),
+  /**
+   * Provider do TEMPO da legenda (`whisper-cpp`).
+   *
+   * O modelo de linguagem acerta o que foi falado e INVENTA o tempo
+   * (a legenda aparece antes da voz, e cada vez mais adiantada). Com
+   * este campo, o texto do modelo é casado com o tempo real do whisper
+   * local (que roda na máquina, sem cota).
+   *
+   * Vazio = a legenda sai com o tempo do modelo.
+   */
+  SHORTS_CAPTION_TIMING: z.enum(['whisper-cpp', '']).default('whisper-cpp'),
   /** Modelo do Gemini usado na transcrição. */
   SHORTS_CAPTION_GEMINI_MODEL: z.string().default('gemini-3-flash-preview'),
   /** Modelo do Whisper (HuggingFace) usado na reserva. */
@@ -556,7 +626,7 @@ export const ConfigSchema = z.object({
   /** Teto de tempo da transcrição (upload do áudio + inferência). */
   SHORTS_CAPTION_TIMEOUT_MS: z.coerce.number().min(10_000).max(600_000).default(180_000),
   /** Tamanho da fonte da legenda (px, na saída de 1080). */
-  SHORTS_CAPTION_FONT_SIZE: z.coerce.number().int().min(24).max(160).default(54),
+  SHORTS_CAPTION_FONT_SIZE: z.coerce.number().int().min(24).max(160).default(64),
   /**
    * Família da fonte da legenda. O padrão é a fonte VERSÃO NO REPO
    * (assets/fonts/BarlowCondensed-Bold.ttf): o libass a acha pelo
@@ -585,6 +655,51 @@ export const ConfigSchema = z.object({
    * (en/es/ru...). O texto original continua no `.orig.txt`.
    */
   SHORTS_CAPTION_TRANSLATE: boolEnvField('SHORTS_CAPTION_TRANSLATE', true),
+  /**
+   * Texto do ADESIVO (sticker) que aparece no começo do Short e some em
+   * fade out. Vazio = sem adesivo.
+   *
+   * Ex.: `Furia nos playoffs` — vira um adesivo por cima do vertical,
+   * visível por `SHORTS_OVERLAY_HOLD_SEC` e apagado no fim. O visual vem
+   * do PRESET abaixo; os campos de estilo são só overrides.
+   */
+  SHORTS_OVERLAY_TEXT: z.string().default(''),
+  /**
+   * Preset visual do adesivo (os valores de cada preset ficam em
+   * `src/clipper/shortOverlay.ts`): `polex`, `polex-die`, `gaules`,
+   * `madhouse`, `rei`, `diecut`, `pill` ou `custom`.
+   */
+  SHORTS_OVERLAY_PRESET: z.enum(SHORTS_OVERLAY_PRESETS).default('polex'),
+  /** Segundos que o adesivo fica visível. */
+  SHORTS_OVERLAY_HOLD_SEC: z.coerce.number().min(0.5).max(20).default(2),
+  /** Duração do fade out do adesivo (começa em `hold - fade`). */
+  SHORTS_OVERLAY_FADE_SEC: z.coerce.number().min(0).max(10).default(0.5),
+  /** Posição vertical do adesivo (fração da altura do vertical). */
+  SHORTS_OVERLAY_Y: z.coerce.number().min(0).max(1).default(0.54),
+  /** Forma do adesivo (vazio = preset). */
+    SHORTS_OVERLAY_STYLE: z.enum(['', 'capsule', 'rect']).default(''),
+  /** Tag pequena no topo do adesivo (vazio = tag do preset, se houver). */
+  SHORTS_OVERLAY_TAG: z.string().default(''),
+  /** Caixa alta forçada (vazio = preset). */
+  SHORTS_OVERLAY_UPPERCASE: optionalBoolEnv,
+  /** Cor de fundo do adesivo (vazio = preset). */
+  SHORTS_OVERLAY_BACKGROUND: optionalHexEnv,
+  /** Cor do texto do adesivo (vazio = preset). */
+  SHORTS_OVERLAY_COLOR: optionalHexEnv,
+  /** Cor da borda (vazio = preset; `0` em BORDER_PX remove a borda). */
+  SHORTS_OVERLAY_BORDER_COLOR: optionalHexEnv,
+  /** Espessura da borda em px (vazio = preset). */
+  SHORTS_OVERLAY_BORDER_PX: optionalNumberEnv(0, 40),
+  /** Cor da sombra deslocada (vazio = preset). */
+  SHORTS_OVERLAY_SHADOW_COLOR: optionalHexEnv,
+  /** Deslocamento da sombra em px (vazio = preset). */
+  SHORTS_OVERLAY_SHADOW_PX: optionalNumberEnv(0, 40),
+  /** Blur da sombra em px (vazio = preset; 0 = sombra sólida). */
+  SHORTS_OVERLAY_SHADOW_BLUR_PX: optionalNumberEnv(0, 20),
+  /** Inclinação do adesivo em graus (vazio = preset). */
+  SHORTS_OVERLAY_TILT_DEG: optionalNumberEnv(-15, 15),
+  /** Fonte do adesivo (vazio = preset). */
+  SHORTS_OVERLAY_FONT: z.enum(['', 'Arial Black', 'Impact', 'Arial']).default(''),
   /**
    * Provider de transcrição usado pelo adapter (`src/transcription`).
    * Local = sem custo e sem enviar o áudio; nuvem = mais preciso/rápido,
@@ -747,6 +862,12 @@ export function shortsCrossFieldErrors(values: {
       message: `SHORTS_MIN_SEC (${values.minSec}) não pode ser maior que SHORTS_MAX_SEC (${values.maxSec})`,
     });
   }
+  if (values.maxSec > 180) {
+    errors.push({
+      key: 'SHORTS_MAX_SEC',
+      message: `SHORTS_MAX_SEC (${values.maxSec}) passa de 180s — o Short do YouTube tem no máximo 3 minutos`,
+    });
+  }
   if (values.width >= values.height) {
     errors.push({
       key: 'SHORTS_WIDTH',
@@ -836,13 +957,81 @@ export function cappedLatencyChannels(params: {
   return out;
 }
 
+/**
+ * Envs do adesivo do Short. Um valor quebrado aqui (digitado à mão no
+ * `.env`) derrubava o bot INTEIRO no boot — o adesivo é do script offline
+ * de Shorts e não pode derrubar o bot ao vivo. O painel continua
+ * validando com o schema estrito; aqui a leitura do `.env` é tolerante.
+ */
+export const SHORTS_OVERLAY_ENV_KEYS = [
+  'SHORTS_OVERLAY_PRESET',
+  'SHORTS_OVERLAY_STYLE',
+  'SHORTS_OVERLAY_FONT',
+  'SHORTS_OVERLAY_UPPERCASE',
+  'SHORTS_OVERLAY_HOLD_SEC',
+  'SHORTS_OVERLAY_FADE_SEC',
+  'SHORTS_OVERLAY_Y',
+  'SHORTS_OVERLAY_BACKGROUND',
+  'SHORTS_OVERLAY_COLOR',
+  'SHORTS_OVERLAY_BORDER_COLOR',
+  'SHORTS_OVERLAY_BORDER_PX',
+  'SHORTS_OVERLAY_SHADOW_COLOR',
+  'SHORTS_OVERLAY_SHADOW_PX',
+  'SHORTS_OVERLAY_SHADOW_BLUR_PX',
+  'SHORTS_OVERLAY_TILT_DEG',
+] as const;
+
+/** Envs do adesivo com valor inválido no ambiente ("KEY=valor"). */
+export function invalidShortsOverlayEnvs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const out: string[] = [];
+  for (const key of SHORTS_OVERLAY_ENV_KEYS) {
+    const raw = env[key];
+    if (raw == null || String(raw).trim() === '') continue;
+    const field = ConfigSchema.shape[key];
+    if (field.safeParse(raw).success) continue;
+    out.push(`${key}=${String(raw).trim()}`);
+  }
+  return out;
+}
+
+/**
+ * Lê a config do ambiente. Env do adesivo INVÁLIDO não derruba o bot: o
+ * campo cai no default (preset do adesivo) e o startup avisa. Erro em
+ * qualquer OUTRO campo continua falhando alto (como antes).
+ */
+export function parseConfigEnv(env: NodeJS.ProcessEnv = process.env): {
+  config: AppConfig;
+  invalidOverlayEnvs: string[];
+} {
+  const direct = ConfigSchema.safeParse(env);
+  if (direct.success) return { config: direct.data, invalidOverlayEnvs: [] };
+  const patched: Record<string, unknown> = { ...env };
+  const invalid: string[] = [];
+  for (const key of SHORTS_OVERLAY_ENV_KEYS) {
+    const raw = env[key];
+    if (raw == null || String(raw).trim() === '') continue;
+    const field = ConfigSchema.shape[key];
+    if (field.safeParse(raw).success) continue;
+    invalid.push(`${key}=${String(raw).trim()}`);
+    patched[key] = undefined;
+  }
+  if (invalid.length === 0) {
+    return { config: ConfigSchema.parse(env), invalidOverlayEnvs: [] };
+  }
+  const retry = ConfigSchema.safeParse(patched);
+  if (!retry.success) {
+    return { config: ConfigSchema.parse(env), invalidOverlayEnvs: invalid };
+  }
+  return { config: retry.data, invalidOverlayEnvs: invalid };
+}
+
 export function getConfig(): AppConfig {
   if (cached) return cached;
   // Sem `validateConfigCrossFields`: a config dos Shorts é opcional e o
   // bot live não pode depender dela (ver shortsCrossFieldErrors).
-  const parsed = ConfigSchema.parse(process.env);
-  cached = parsed;
-  return parsed;
+  const { config } = parseConfigEnv(process.env);
+  cached = config;
+  return config;
 }
 
 /**
