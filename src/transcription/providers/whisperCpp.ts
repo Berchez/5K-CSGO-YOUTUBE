@@ -240,7 +240,9 @@ export function parseWhisperJson(
     // Tudo era alucinação: o resultado é SILÊNCIO. Antes caía no
     // caminho genérico (que não filtra) e a frase inventada entrava
     // na legenda — exatamente o que o filtro existe para impedir.
-    return { language, segments };
+    // As palavras com tempo também ficam disponíveis: a legenda pode
+    // alinhar a fala sem herdar a duração inteira do bloco.
+    return { language, segments, words };
   }
   const segments = sanitizeSegments(
     items.map((item) => {

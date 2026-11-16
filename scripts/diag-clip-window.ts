@@ -35,7 +35,7 @@ import {
   trustedRoundEndVideoMs,
 } from '../src/clipper/clipWindowAudit.js';
 import { ocrClipWindow, summarizeKillfeedOcr } from '../src/clipper/clipWindowOcr.js';
-import type { KillEvent } from '../src/types.js';
+import { readClipSidecar, sidecarToAce } from '../src/clipper/sidecar.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -54,51 +54,6 @@ const DEFAULT_KILLFEED_CROP = '0.70:0.05:0.30:0.25';
 const DEFAULT_REPLAY_CROP = '0.00:0.00:0.35:0.10';
 /** Atraso do placar (ms) — o `at` da kill é o instante do poll. */
 const SCOREBOARD_DELAY_MS = Number(process.env.SCOREBOARD_DELAY_MS ?? 5_000);
-
-interface Sidecar {
-  matchId?: string;
-  map?: string;
-  round?: number;
-  player?: string;
-  clipFile?: string;
-  kills?: KillEvent[];
-  clipStartMs?: number;
-  clipDurationSec?: number;
-  startLatencyMs?: number;
-  endLatencyMs?: number;
-  estimatedStartLatencyMs?: number;
-  latencySource?: string;
-  /** Fim do round rejeitado pelos anchors (implausível). */
-  ocrEndRejected?: boolean | null;
-  streamSync?: {
-    startLatencyMs?: number | null;
-    endLatencyMs?: number | null;
-    estimatedStartLatencyMs?: number | null;
-    latencySource?: string | null;
-    /** Âncora do killfeed: instante no vídeo da 1ª kill. */
-    killfeedFirstKillVideoMs?: number | null;
-    /** Motivo da medição do killfeed. */
-    killfeedReason?: string | null;
-    /** Crop do killfeed que leu a linha. */
-    killfeedCrop?: string | null;
-    /** Leituras do killfeed descartadas por serem reexibição. */
-    killfeedReplayReads?: number | null;
-    /** Fim do round no VÍDEO (ISO 8601) — medido pelo placar. */
-    roundEndAt?: string | null;
-    /** Motivo da medição do placar (confident/after-only/gap-inferred). */
-    reason?: string | null;
-    /** De onde veio a âncora que abriu o clipe. */
-    anchorSource?: string | null;
-  };
-  /** Auditoria da janela gravada pelo bot. */
-  clipWindowAudit?: {
-    action?: string;
-    violations?: string[];
-    reason?: string;
-  };
-  /** Início do material mais antigo disponível quando o clipe foi feito. */
-  bufferOldestMs?: number | null;
-}
 
 /** Data segura (valor inválido não derruba o diagnóstico). */
 const iso = (ms: number | null | undefined): string => {
@@ -128,11 +83,32 @@ function findSidecars(matchId?: string): string[] {
 }
 
 async function auditOne(sidecarPath: string, wantOcr: boolean): Promise<void> {
-  const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Sidecar;
+  const sidecar = readClipSidecar(sidecarPath);
+  if (!sidecar) {
+    console.error(`sidecar inválido: ${sidecarPath}`);
+    return;
+  }
   const folder = path.dirname(sidecarPath);
-  const video = path.join(folder, sidecar.clipFile ?? path.basename(sidecarPath).replace(/\.json$/, '.mp4'));
-  const sync = sidecar.streamSync ?? {};
-  const kills = sidecar.kills ?? [];
+  const video = path.join(
+    folder,
+    sidecar.clip.file ?? path.basename(sidecarPath).replace(/\.json$/, '.mp4'),
+  );
+  const sync = sidecar.sync;
+  const kills = sidecarToAce(sidecar).kills;
+  const clipStartMs = sidecar.clip.startMs;
+  const clipDurationSec = sidecar.clip.durationSec;
+  const startLatencyMs = sync?.latency.startMs ?? null;
+  const estimatedStartLatencyMs = sync?.latency.estimatedStartMs ?? null;
+  const endLatencyMs = sync?.latency.endMs ?? null;
+  const latencySource = sync?.latency.source ?? null;
+  const killfeedFirstKillVideoMs = sync?.killfeed.firstKillVideoMs ?? null;
+  const killfeedReason = sync?.killfeed.reason ?? null;
+  const killfeedCrop = sync?.killfeed.crop ?? null;
+  const killfeedReplayReads = sync?.killfeed.replayReads ?? null;
+  const roundEndAt = sync?.roundEndAt ?? null;
+  const roundEndReason = sync?.reason ?? null;
+  const ocrEndRejected = sidecar.window?.end.ocrRejected ?? null;
+  const bufferOldestMs = sidecar.window?.bufferOldestMs ?? null;
 
   /**
    * Fim do round CONFIAVEL: só `confident` (placar com o antes e o
@@ -140,44 +116,44 @@ async function auditOne(sidecarPath: string, wantOcr: boolean): Promise<void> {
    * medida do fim do round (o `gap-inferred` é um limite INFERIDO).
    */
   const roundEndVideoMs = trustedRoundEndVideoMs({
-    reason: sync.reason,
-    roundEndAt: sync.roundEndAt,
-    ocrEndRejected: sidecar.ocrEndRejected,
+    reason: roundEndReason,
+    roundEndAt,
+    ocrEndRejected,
   });
-  const roundEndRaw = sync.roundEndAt != null ? Date.parse(sync.roundEndAt) : null;
+  const roundEndRaw = roundEndAt != null ? Date.parse(roundEndAt) : null;
 
   const verdict = auditClipWindow({
     kills,
-    clipStartMs: sidecar.clipStartMs ?? null,
-    clipDurationSec: sidecar.clipDurationSec ?? null,
-    startLatencyMs: sidecar.startLatencyMs ?? sync.startLatencyMs ?? null,
-    estimatedStartLatencyMs: sidecar.estimatedStartLatencyMs ?? sync.estimatedStartLatencyMs ?? null,
-    endLatencyMs: sidecar.endLatencyMs ?? sync.endLatencyMs ?? null,
-    latencySource: sidecar.latencySource ?? sync.latencySource ?? null,
+    clipStartMs,
+    clipDurationSec,
+    startLatencyMs,
+    estimatedStartLatencyMs,
+    endLatencyMs,
+    latencySource,
     scoreboardDelayMs: SCOREBOARD_DELAY_MS,
-    killfeedFirstKillVideoMs: sync.killfeedFirstKillVideoMs ?? null,
-    killfeedReason: sync.killfeedReason ?? null,
+    killfeedFirstKillVideoMs,
+    killfeedReason,
     roundEndVideoMs,
-    bufferOldestMs: sidecar.bufferOldestMs ?? null,
+    bufferOldestMs,
     killsSpreadMaxMs: Number(process.env.CLIP_KILLS_SPREAD_MAX_SEC ?? 120) * 1000,
     killsGapMaxMs: Number(process.env.CLIP_KILLS_GAP_MAX_SEC ?? 90) * 1000,
   });
 
   console.log('='.repeat(78));
-  console.log(`${path.basename(folder)}  (${sidecar.matchId ?? '?'} ${sidecar.map ?? '?'} r${sidecar.round ?? '?'} ${sidecar.player ?? '?'})`);
+  console.log(`${path.basename(folder)}  (${sidecar.match.id || '?'} ${sidecar.round.map || '?'} r${sidecar.round.number || '?'} ${sidecar.player.name || '?'})`);
   console.log('-'.repeat(78));
   console.log(
     `kills            : ${kills.length} (spread ${Math.round((killSpreadMs(kills) ?? 0) / 1000)}s, maior intervalo ${Math.round((killMaxGapMs(kills) ?? 0) / 1000)}s)`,
   );
-  console.log(`latência         : ${Math.round((sidecar.startLatencyMs ?? 0) / 1000)}s aplicada, ${Math.round((sidecar.estimatedStartLatencyMs ?? 0) / 1000)}s estimada, fonte=${sidecar.latencySource ?? sync.latencySource ?? '?'}`);
-  console.log(`clipe            : ${iso(sidecar.clipStartMs)} → +${Math.round(sidecar.clipDurationSec ?? 0)}s (fim ${iso((sidecar.clipStartMs ?? 0) + (sidecar.clipDurationSec ?? 0) * 1000)})`);
+  console.log(`latência         : ${Math.round((startLatencyMs ?? 0) / 1000)}s aplicada, ${Math.round((estimatedStartLatencyMs ?? 0) / 1000)}s estimada, fonte=${latencySource ?? '?'}`);
+  console.log(`clipe            : ${iso(clipStartMs)} → +${Math.round(clipDurationSec ?? 0)}s (fim ${iso((clipStartMs ?? 0) + (clipDurationSec ?? 0) * 1000)})`);
   console.log(`1ª kill esperada : ${iso(verdict.expectedFirstKillVideoMs)}   última: ${iso(verdict.expectedLastKillVideoMs)}`);
-  console.log(`killfeed         : âncora ${iso(sync.killfeedFirstKillVideoMs)} motivo=${sync.killfeedReason ?? '—'} replay lidos=${sync.killfeedReplayReads ?? '—'}`);
-  console.log(`âncora do corte  : ${sync.anchorSource ?? '—'}`);
+  console.log(`killfeed         : âncora ${iso(killfeedFirstKillVideoMs)} motivo=${killfeedReason ?? '—'} replay lidos=${killfeedReplayReads ?? '—'}`);
+  console.log(`âncora do corte  : ${sync?.anchorSource ?? '—'}`);
   console.log(
-    `fim do round     : ${iso(roundEndVideoMs)}${roundEndVideoMs == null && roundEndRaw != null ? ` (medido: ${iso(roundEndRaw)}, motivo=${sync.reason ?? '—'} — NÃO confiável para descarte)` : ` (motivo=${sync.reason ?? '—'})`}`,
+    `fim do round     : ${iso(roundEndVideoMs)}${roundEndVideoMs == null && roundEndRaw != null ? ` (medido: ${iso(roundEndRaw)}, motivo=${roundEndReason ?? '—'} — NÃO confiável para descarte)` : ` (motivo=${roundEndReason ?? '—'})`}`,
   );
-  console.log(`material antigo  : ${iso(sidecar.bufferOldestMs)}`);
+  console.log(`material antigo  : ${iso(bufferOldestMs)}`);
   console.log(
     `invariantes      : 1ª kill dentro=${verdict.coversFirstKill}  última dentro=${verdict.coversLastKill}  abre após fim do round=${verdict.startsAfterRoundEnd}  material ao vivo=${verdict.liveMaterialAvailable}`,
   );
@@ -188,14 +164,14 @@ async function auditOne(sidecarPath: string, wantOcr: boolean): Promise<void> {
    * do killfeed e sem o fim do round medido, o veredito é
    * INCONCLUSIVO — "OK" aqui só quer dizer "não há violação visível".
    */
-  if (sync.killfeedFirstKillVideoMs == null && sync.roundEndAt == null) {
+  if (killfeedFirstKillVideoMs == null && roundEndAt == null) {
     console.log(
       'atenção          : sidecar sem evidência de janela (gerado antes das correções) — o veredito é inconclusivo; use --ocr',
     );
   }
 
   if (wantOcr && fs.existsSync(video)) {
-    const crop = sync.killfeedCrop ?? DEFAULT_KILLFEED_CROP;
+    const crop = killfeedCrop ?? DEFAULT_KILLFEED_CROP;
     const ocr = await ocrClipWindow({
       file: video,
       killfeedCrop: crop,
@@ -204,12 +180,12 @@ async function auditOne(sidecarPath: string, wantOcr: boolean): Promise<void> {
     });
     console.log(`OCR              : ${summarizeKillfeedOcr(ocr)} (crop ${crop})`);
     for (const hit of ocr.hits) {
-      const absolute = (sidecar.clipStartMs ?? 0) + hit.atSec * 1000;
+      const absolute = (clipStartMs ?? 0) + hit.atSec * 1000;
       console.log(`   t=${hit.atSec}s (${iso(absolute)}) kills#${hit.killIndexes.map((i) => i + 1).join(',')} | ${hit.text}`);
     }
     if (ocr.hits.length > 0) {
       const first = ocr.hits[0];
-      const firstAt = (sidecar.clipStartMs ?? 0) + first.atSec * 1000;
+      const firstAt = (clipStartMs ?? 0) + first.atSec * 1000;
       const beforeFirst = verdict.expectedFirstKillVideoMs != null ? firstAt <= verdict.expectedFirstKillVideoMs + 15_000 : null;
       console.log(
         `   leitura       : 1ª linha do ace em ${iso(firstAt)} (${beforeFirst === true ? 'dentro da janela esperada' : beforeFirst === false ? 'TARDE para a janela esperada' : 'janela estimada desconhecida'})`,

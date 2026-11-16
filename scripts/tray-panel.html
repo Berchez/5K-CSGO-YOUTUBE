@@ -746,8 +746,8 @@
           $('#configSummary').innerHTML =
             '<div class="chips">' +
               '<span class="chip">Estrelas <b>' + esc(config.minStars) + '★+</b></span>' +
-              '<span class="chip">Kills <b>' + esc(config.minKills) + ' com estrela</b></span>' +
-              '<span class="chip">Kills <b>' + esc(config.minKillsNoStars) + ' sem estrela</b></span>' +
+              '<span class="chip" title="Limiar das partidas com avaliação no listing (1★ ou mais)">Kills <b>' + esc(config.minKills) + 'k em partidas avaliadas</b></span>' +
+              '<span class="chip" title="Limiar das partidas sem avaliação (0★ ou não avaliada) — normalmente 5k">Kills <b>' + esc(config.minKillsNoStars) + 'k sem avaliação</b></span>' +
               '<span class="chip">Gravações <b>' + esc(config.maxRecordings) + '</b></span>' +
               '<span class="chip">Stream <b>' + esc(country) + (config.streamPreferredCountry ? ' &ge; ' + esc(config.streamPreferredMinViewers) : '') + '</b></span>' +
               '<span class="chip">Upload <b>' + (config.upload ? 'ligado' : 'desligado') + '</b></span>' +
@@ -807,7 +807,7 @@
           '</div>' +
           '<div class="match-meta">' +
             '<span class="stars" title="Estrelas do evento">' + esc(starsLabel(match.stars)) + '</span>' +
-            '<span>Mín. <b>' + esc(match.minKills) + ' kills</b></span>' +
+            '<span title="Limiar de kills e de onde ele veio">Limiar <b>' + esc(match.minKillsLabel || match.minKills + 'k') + '</b></span>' +
             stream + tracker + recorder +
           '</div>' +
           (compact ? '' : '<div class="match-foot"><span class="tiny">match ' + esc(match.matchId) + '</span>' + link + '</div>') +

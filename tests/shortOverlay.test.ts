@@ -1,13 +1,53 @@
 import { describe, expect, it } from 'vitest';
 import { SHORTS_OVERLAY_PRESETS } from '../src/config.js';
 import {
+  defaultShortOverlayText,
+  fillShortOverlayTemplate,
   overlayTextWidth,
   resolveShortOverlayStyle,
+  resolveShortOverlayText,
   shortOverlayButtonSvg,
   shortOverlayFilter,
   shortOverlayMetrics,
   wrapOverlayTextByWidth,
 } from '../src/clipper/shortOverlay.js';
+
+describe('texto automático do adesivo (vem dos fatos do clipe)', () => {
+  const ctx = {
+    player: 'kyousuke',
+    killCount: 5,
+    map: 'Anubis',
+    round: 13,
+    team: 'Falcons',
+    opponent: 'G2',
+    event: 'BLAST Rivals 2026 Season 2',
+  };
+
+  it('5 kills viram ACE com o nome do jogador', () => {
+    expect(defaultShortOverlayText(ctx)).toBe('ACE kyousuke');
+  });
+
+  it('4 kills viram 4K com o nome do jogador', () => {
+    expect(defaultShortOverlayText({ ...ctx, killCount: 4 })).toBe('4K kyousuke');
+  });
+
+  it('auto deriva do clipe e none/vazio desligam', () => {
+    expect(resolveShortOverlayText('auto', ctx)).toBe('ACE kyousuke');
+    expect(resolveShortOverlayText('none', ctx)).toBe('');
+    expect(resolveShortOverlayText('off', ctx)).toBe('');
+    expect(resolveShortOverlayText('', ctx)).toBe('');
+  });
+
+  it('texto literal é preservado', () => {
+    expect(resolveShortOverlayText('Furia nos playoffs', ctx)).toBe('Furia nos playoffs');
+  });
+
+  it('tokens opcionais são preenchidos com os dados do clipe', () => {
+    expect(
+      fillShortOverlayTemplate('{label} de {player} em {map} R{round}', ctx),
+    ).toBe('ACE de kyousuke em Anubis R13');
+  });
+});
 
 describe('shortOverlayMetrics (o botão cabe no vertical?)', () => {
   it('o botão é compacto e proporcional à largura do vertical', () => {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   aceKey,
   closeDb,
+  countPublishedClips,
   findPublishedShorts,
   getAceId,
   getDb,
@@ -225,5 +226,49 @@ describe('banco: clips (migração + Shorts)', () => {
       .prepare("SELECT id FROM clips WHERE ace_id=? AND COALESCE(format, '')=?")
       .all(aceId, 'shorts');
     expect(rows.length).toBe(1);
+  });
+});
+
+describe('cota: contagem de publicações do dia', () => {
+  it('conta o upload entre 00:00Z e a meia-noite do Pacífico', () => {
+    const file = tmpDb();
+    const aceId = insertAce(file, makeAce());
+    // 2026-11-14T00:30Z = 13/11 16:30 em Los Angeles: é o dia ANTERIOR
+    // no Pacífico, então NÃO conta no dia do Pacífico de 14/11.
+    insertClip(file, aceId, 'data/clips/doc.mp4', 'private', 'vid-ontem', {
+      publishedAt: '2026-11-14T00:30:00.000Z',
+    });
+    // 2026-11-14T20:00Z = 14/11 12:00 em Los Angeles: conta.
+    insertClip(file, aceId, 'data/shorts/doc/short.mp4', 'private', 'vid-hoje', {
+      format: 'shorts',
+      publishedAt: '2026-11-14T20:00:00.000Z',
+    });
+    // Início do dia do Pacífico (14/11 00:00 local = 14/11 08:00Z).
+    const inicioPacifico = '2026-11-14 08:00:00';
+    expect(countPublishedClips(file, inicioPacifico)).toBe(1);
+    // No dia UTC (14/11 00:00Z), as duas contariam.
+    expect(countPublishedClips(file, '2026-11-14 00:00:00')).toBe(2);
+  });
+
+  it('o ISO com "T" e o created_at com espaço são comparados como data', () => {
+    const file = tmpDb();
+    const aceId = insertAce(file, makeAce());
+    // `published_at` ISO com T: comparação por texto ('T' > ' ') contava
+    // errado no dia da fronteira.
+    insertClip(file, aceId, 'data/clips/doc.mp4', 'private', 'vid-iso', {
+      publishedAt: '2026-11-14T09:00:00.000Z',
+    });
+    expect(countPublishedClips(file, '2026-11-14 08:00:00')).toBe(1);
+    expect(countPublishedClips(file, '2026-11-14 10:00:00')).toBe(0);
+  });
+
+  it('clip sem published_at conta pelo created_at', () => {
+    const file = tmpDb();
+    const aceId = insertAce(file, makeAce());
+    insertClip(file, aceId, 'data/clips/doc.mp4', 'private', 'vid-sem-data');
+    const db = getDb(file);
+    db.prepare("UPDATE clips SET created_at='2026-11-14 12:00:00' WHERE youtube_video_id=?")
+      .run('vid-sem-data');
+    expect(countPublishedClips(file, '2026-11-14 08:00:00')).toBe(1);
   });
 });

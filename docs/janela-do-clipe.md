@@ -210,22 +210,36 @@ linha a linha.
 ### 5.3 O sidecar
 
 `data/clips/<pasta>/<pasta>.json` é o registro que **sobrevive ao
-restart**. Campos que descrevem a janela:
+restart**. Desde o schema **v2** (`schemaVersion: 2`) os campos são
+aninhados; sidecars antigos (v1, achatados) continuam legíveis — quem lê
+usa `readClipSidecar` (`src/clipper/sidecar.ts`), que normaliza os dois
+formatos no mesmo modelo.
 
-| Campo | O que é |
+| Campo (v2) | O que é |
 |---|---|
-| `clipStartMs`, `clipDurationSec` | a janela real do MP4 |
-| `startLatencyMs`, `estimatedStartLatencyMs`, `latencySource` | a latência aplicada e a estimada |
-| `streamSync.anchorSource` | `placar` / `killfeed` / `killfeed+placar` |
-| `streamSync.killfeedFirstKillVideoMs` | a âncora lida no killfeed |
-| `streamSync.killfeedReason` | `confident` / `first-kill-only` / ... |
-| `streamSync.killfeedReplayReads` | quantas leituras eram REPLAY (descartadas) |
-| `streamSync.roundEndAt` | o fim do round **medido no vídeo** (ISO 8601) |
-| `streamSync.reason` | o motivo da medição (`confident` é a única evidência forte) |
-| `killsSpreadMs` | a dispersão da lista de kills |
-| `bufferOldestMs` | o início do material mais antigo disponível |
-| `clipWindowAudit` | o veredito da auditoria (ação + violações) |
-| `truncatedStart` | a âncora precede o buffer (abertura incompleta) |
+| `clip.startMs`, `clip.durationSec` | a janela real do MP4 |
+| `clip.file`, `clip.thumbnailFile` | os arquivos gravados |
+| `sync.latency.startMs` / `.estimatedStartMs` / `.source` | a latência aplicada e a estimada |
+| `sync.latency.configuredMs` | a latência configurada do canal |
+| `sync.anchorSource` | `placar` / `killfeed` / `killfeed+placar` |
+| `sync.killfeed.firstKillVideoMs` | a âncora lida no killfeed |
+| `sync.killfeed.reason` | `confident` / `first-kill-only` / ... |
+| `sync.killfeed.replayReads` | quantas leituras eram REPLAY (descartadas) |
+| `sync.roundEndAt` | o fim do round **medido no vídeo** (ISO 8601) |
+| `sync.reason` | o motivo da medição (`confident` é a única evidência forte) |
+| `sync.killVideoOffsetMs` | `atMs + offset` = o instante da kill no vídeo |
+| `window.killsSpreadMs` | a dispersão da lista de kills |
+| `window.bufferOldestMs` | o início do material mais antigo disponível |
+| `window.audit` | o veredito da auditoria (ação + violações) |
+| `window.truncatedStart` | a âncora precede o buffer (abertura incompleta) |
+| `window.end.minMs` / `.floorMs` / `.pinnedBy` / `.ocrRejected` | o fim do clipe e por que foi ancorado |
+| `kills[]` | `atMs` (relógio do placar), `videoSec` (posição no clipe), `weapon`, `headshot` |
+| `stats` | `killCount`, `weapons`, `headshots` (`null` = desconhecido), `mainWeapon` |
+| `match`, `player`, `round` | confronto, jogador (com time/oponente) e round |
+
+No v1 os mesmos dados vivem achatados (`clipStartMs`, `streamSync.*`,
+`killsSpreadMs`, `clipWindowAudit`, `summary.*`); a normalização mapeia
+um para o outro.
 
 ## 6. Decisões de projeto (para não discutir de novo)
 

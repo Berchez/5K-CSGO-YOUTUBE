@@ -4,7 +4,9 @@ import {
   buildCaptionsAss,
   canPublishShortWithCaptions,
   captionCrosshairTopY,
+  captionErrorStatus,
   captionMaxChars,
+  captionTextDump,
   escapeAssFilterPath,
   escapeAssText,
   fitCaptionLines,
@@ -23,6 +25,7 @@ import {
   captionContextFromAce,
   alignReferenceWords,
   alignCaptionTimings,
+  alignCaptionTimingsDetailed,
   applyCaptionCorrections,
   buildCaptionPrompt,
   buildRefinePrompt,
@@ -46,6 +49,8 @@ import {
   parseGeminiTranscript,
   parseCaptionCorrections,
   parseLineFixes,
+  projectCaptionTiming,
+  salvagedCaptionTranscript,
   usableTranscriptLines,
 } from '../src/clipper/shortCaptionsAi.js';
 import {
@@ -803,6 +808,312 @@ describe('createCaptionTranscriber (silêncio é estado final; falta de chave n�
     });
     await transcriber('audio.wav', 30, { player: 'molodoy', players: ['cobrazera'] });
     expect(recebido).toEqual({ player: 'molodoy', players: ['cobrazera'] });
+  });
+
+  it('whisper local que falhou volta como provider de tempo do Gemini', async () => {
+    let chamadasWhisper = 0;
+    const transcriber = createCaptionTranscriber({
+      order: 'whisper-cpp,gemini',
+      timingProvider: 'whisper-cpp',
+      transcribers: {
+        'whisper-cpp': async () => {
+          chamadasWhisper++;
+          if (chamadasWhisper === 1) return null;
+          return {
+            lines: [{ startSec: 5, endSec: 6, text: 'que jogada' }],
+            words: [
+              { text: 'que', startSec: 5, endSec: 5.3 },
+              { text: 'jogada', startSec: 5.3, endSec: 6 },
+            ],
+            language: 'pt-BR',
+            translated: false,
+          };
+        },
+        gemini: async () => ({
+          lines: [{ startSec: 0, endSec: 1, text: 'que jogada' }],
+          language: 'pt-BR',
+          translated: false,
+        }),
+      },
+    });
+    const result = await transcriber('audio.wav', 30);
+    expect(chamadasWhisper).toBe(2);
+    expect(result?.provider).toBe('gemini');
+    expect(result?.timingSource).toBe('whisper');
+    expect(result?.lines[0].startSec).toBe(5);
+    expect(result?.lines[0].endSec).toBe(6);
+  });
+
+  it('sem tempo real a legenda segue com o tempo do modelo (o Short não se perde)', async () => {
+    // O whisper local mudo NÃO é final: o Gemini ouviu a fala. O
+    // provider de tempo devolveu vazio — o tempo do modelo (imperfeito)
+    // é melhor do que segurar o Short até o limite das tentativas.
+    const transcriber = createCaptionTranscriber({
+      order: 'whisper-cpp,gemini',
+      timingProvider: 'whisper-cpp',
+      transcribers: {
+        'whisper-cpp': async () => null,
+        gemini: async () => ({
+          lines: [{ startSec: 20, endSec: 40, text: 'que jogada' }],
+          language: 'pt-BR',
+          translated: false,
+        }),
+      },
+    });
+    const result = await transcriber('audio.wav', 30);
+    expect(result?.provider).toBe('gemini');
+    expect(result?.timingSource).toBe('model');
+    expect(result?.lines[0].text).toBe('que jogada');
+  });
+
+  it('tempo que NÃO casa com o texto: o Short espera — mas a transcrição paga é salva', async () => {
+    // O whisper devolveu tempo, mas de OUTRA fala: usar esse tempo seria
+    // legenda fora de sincronia. O Short espera a próxima rodada — e a
+    // transcrição (cota do Gemini) viaja no erro para não ser refeita.
+    let chamadasWhisper = 0;
+    const transcriber = createCaptionTranscriber({
+      order: 'whisper-cpp,gemini',
+      timingProvider: 'whisper-cpp',
+      transcribers: {
+        'whisper-cpp': async () => {
+          chamadasWhisper++;
+          // 1ª chamada: provider de transcrição (silêncio local NÃO é
+          // final). 2ª chamada: provider de TEMPO (a fala não casa).
+          if (chamadasWhisper === 1) return null;
+          return {
+            lines: [{ startSec: 5, endSec: 6, text: 'outra coisa' }],
+            language: 'pt-BR',
+            translated: false,
+          };
+        },
+        gemini: async () => ({
+          lines: [{ startSec: 20, endSec: 40, text: 'que jogada' }],
+          language: 'pt-BR',
+          translated: false,
+        }),
+      },
+    });
+    const error = await transcriber('audio.wav', 30).catch((e) => e);
+    expect(String(error?.message ?? error)).toMatch(
+      /provider de tempo casou só 0\/1 falas/,
+    );
+    const salvo = salvagedCaptionTranscript(error);
+    expect(salvo?.provider).toBe('gemini');
+    expect(salvo?.lines[0]?.text).toBe('que jogada');
+    expect(salvo?.timingSource).toBe('model');
+    // O texto CRU é o que o re-render reaproveita (regra nova vale).
+    expect(salvo?.rawLines?.[0]?.text).toBe('que jogada');
+  });
+});
+
+describe('legenda traduzida: o tempo vem do idioma ORIGINAL da fala', () => {
+  it('projeta o tempo casada no original na fala traduzida', () => {
+    const out = projectCaptionTiming(
+      {
+        lines: [
+          { startSec: 0, endSec: 2, text: 'Que jogada!' },
+          { startSec: 2, endSec: 4, text: 'Mano, que的值' },
+        ],
+        originalLines: [
+          { startSec: 0, endSec: 2, text: 'what a play' },
+          { startSec: 2, endSec: 4, text: 'bro what a play' },
+        ],
+        translated: true,
+      },
+      [
+        { startSec: 10, endSec: 12, text: 'what a play' },
+        { startSec: 12, endSec: 14, text: 'bro what a play' },
+      ],
+    );
+    expect(out.projected).toBe(true);
+    expect(out.anchoredLines).toBe(2);
+    // O TEXTO traduzido continua; o TEMPO é o do áudio.
+    expect(out.lines[0].text).toBe('Que jogada!');
+    expect(out.lines[0].startSec).toBe(10);
+    expect(out.lines[0].endSec).toBe(12);
+    expect(out.lines[1].startSec).toBe(12);
+    expect(out.lines[1].endSec).toBe(14);
+  });
+
+  it('sem o original, texto traduzido NÃO casa com o áudio (o bug antigo)', () => {
+    const out = projectCaptionTiming(
+      {
+        lines: [
+          { startSec: 0, endSec: 2, text: 'Que jogada!' },
+          { startSec: 2, endSec: 4, text: 'Mano, que的值' },
+          { startSec: 4, endSec: 6, text: 'Incrível esse treino' },
+        ],
+        translated: true,
+      },
+      [
+        { startSec: 10, endSec: 12, text: 'what a play' },
+        { startSec: 12, endSec: 14, text: 'bro what a play' },
+        { startSec: 14, endSec: 16, text: 'incredible training' },
+      ],
+    );
+    // 0 âncoras = o provider de tempo teria rejeitado a legenda
+    // (matchRatio < 0.25) e o Short ficaria preso.
+    expect(out.anchoredLines).toBe(0);
+    expect(out.projected).toBe(false);
+  });
+
+  it('original com quantidade diferente de falas: não projeta (sem inventar índice)', () => {
+    const out = projectCaptionTiming(
+      {
+        lines: [
+          { startSec: 0, endSec: 2, text: 'Que jogada!' },
+          { startSec: 2, endSec: 4, text: 'Mano, que的值' },
+        ],
+        originalLines: [{ startSec: 0, endSec: 2, text: 'what a play' }],
+        translated: true,
+      },
+      [{ startSec: 10, endSec: 12, text: 'what a play' }],
+    );
+    expect(out.projected).toBe(false);
+  });
+
+  it('legenda que NÃO foi traduzida: alinha o texto do modelo direto', () => {
+    const out = projectCaptionTiming(
+      {
+        lines: [{ startSec: 0, endSec: 2, text: 'que jogada' }],
+        translated: false,
+      },
+      [{ startSec: 7, endSec: 9, text: 'que jogada' }],
+    );
+    expect(out.projected).toBe(false);
+    expect(out.lines[0].startSec).toBe(7);
+    expect(out.lines[0].endSec).toBe(9);
+  });
+
+  it('a projeção respeita a ORDEM das falas (o alinhamento ordena pelo tempo)', () => {
+    // O alinhamento devolve as linhas em ordem CRONOLÓGICA; o índice de
+    // cada fala na ENTRADA vem no `order`. Sem esse mapa, a projeção
+    // trocava o tempo entre duas falas (a legenda aparecia antes da
+    // voz).
+    const original = [
+      { startSec: 0, endSec: 2, text: 'churrasco' },
+      { startSec: 2.88, endSec: 4.88, text: 'banana' },
+      { startSec: 6.61, endSec: 8.61, text: 'que fala que' },
+      { startSec: 11.35, endSec: 13.35, text: 'fala' },
+    ];
+    const audio = [
+      { startSec: 0, endSec: 2, text: 'jogada molodoy' },
+      { startSec: 4, endSec: 6, text: 'jogada fala' },
+    ];
+    const alinhamento = alignCaptionTimingsDetailed(original, audio);
+    // A ordem do alinhamento NÃO é a ordem de entrada (é por tempo).
+    expect(alinhamento.order).not.toEqual(original.map((_, i) => i));
+
+    const traduzidas = original.map((line) => ({ ...line, text: `${line.text} pt` }));
+    const out = projectCaptionTiming(
+      { lines: traduzidas, originalLines: original, translated: true },
+      audio,
+    );
+    // Cada fala traduzida fica com o tempo da SUA fala original.
+    for (const [i] of original.entries()) {
+      const esperado = alinhamento.lines[alinhamento.order.indexOf(i)];
+      expect(out.lines[i].startSec).toBe(esperado.startSec);
+      expect(out.lines[i].endSec).toBe(esperado.endSec);
+    }
+    // E o tempo NÃO é o da posição no alinhamento (o bug antigo).
+    const trocou = out.lines.some((line, i) => line.startSec !== alinhamento.lines[i].startSec);
+    expect(trocou).toBe(true);
+  });
+});
+
+describe('cache da transcrição (não gastar provider de novo)', () => {
+  const cache = (timingSource?: 'whisper' | 'model') => ({
+    provider: 'gemini' as const,
+    language: 'pt-BR',
+    translated: false,
+    ...(timingSource ? { timingSource } : {}),
+    lines: [{ startSec: 0, endSec: 2, text: 'que jogada' }],
+    rawLines: [{ startSec: 0, endSec: 2, text: 'que jogada' }],
+  });
+
+  it('com o tempo do whisper já gravado, o whisper NÃO roda de novo', async () => {
+    let chamadasWhisper = 0;
+    const transcriber = createCaptionTranscriber({
+      timingProvider: 'whisper-cpp',
+      transcribers: {
+        'whisper-cpp': async () => {
+          chamadasWhisper++;
+          return {
+            lines: [{ startSec: 7, endSec: 9, text: 'que jogada' }],
+            language: 'pt-BR',
+            translated: false,
+          };
+        },
+      },
+    });
+    const result = await transcriber('audio-inexistente.wav', 30, null, cache('whisper'));
+    expect(chamadasWhisper).toBe(0);
+    expect(result?.timingSource).toBe('whisper');
+  });
+
+  it('sem o tempo gravado, o whisper roda (o tempo real ainda não existe)', async () => {
+    let chamadasWhisper = 0;
+    const transcriber = createCaptionTranscriber({
+      timingProvider: 'whisper-cpp',
+      transcribers: {
+        'whisper-cpp': async () => {
+          chamadasWhisper++;
+          return {
+            lines: [{ startSec: 7, endSec: 9, text: 'que jogada' }],
+            language: 'pt-BR',
+            translated: false,
+          };
+        },
+      },
+    });
+    const result = await transcriber('audio-inexistente.wav', 30, null, cache());
+    expect(chamadasWhisper).toBe(1);
+    expect(result?.timingSource).toBe('whisper');
+    expect(result?.lines[0].startSec).toBe(7);
+  });
+});
+
+describe('falha da legenda: a transcrição guardada continua no marker', () => {
+  it('sem cache: só o erro', () => {
+    const status = captionErrorStatus(null);
+    expect(status.applied).toBe(false);
+    expect(status.reason).toBe('error');
+    expect(status.transcript).toBeUndefined();
+  });
+
+  it('com cache: a transcrição CRU é preservada (a próxima rodada não transcri)', () => {
+    const status = captionErrorStatus({
+      provider: 'gemini',
+      language: 'en',
+      translated: true,
+      timingSource: 'whisper',
+      lines: [{ startSec: 1, endSec: 2, text: 'que jogada' }],
+      originalLines: [{ startSec: 1, endSec: 2, text: 'what a play' }],
+      rawLines: [{ startSec: 1, endSec: 2, text: 'que jogada' }],
+      rawOriginalLines: [{ startSec: 1, endSec: 2, text: 'what a play' }],
+    });
+    expect(status.applied).toBe(false);
+    expect(status.reason).toBe('error');
+    expect(status.transcript?.provider).toBe('gemini');
+    expect(status.transcript?.translated).toBe(true);
+    expect(status.transcript?.timingSource).toBe('whisper');
+    expect(status.transcript?.rawLines).toHaveLength(1);
+    expect(status.transcript?.rawOriginalLines).toHaveLength(1);
+  });
+});
+
+describe('despejo da legenda em texto (a copy do canal)', () => {
+  it('aplica a copy PT no texto traduzido', () => {
+    const dump = captionTextDump([{ startSec: 1, endSec: 2, text: '4K no Dust2' }]);
+    expect(dump).toContain('4K na Dust2');
+  });
+
+  it('NÃO aplica a copy PT no texto no idioma original', () => {
+    const dump = captionTextDump([{ startSec: 1, endSec: 2, text: '4K no Dust2' }], {
+      applyCopy: false,
+    });
+    expect(dump).toContain('4K no Dust2');
+    expect(dump).not.toContain('na Dust2');
   });
 });
 
@@ -1600,6 +1911,70 @@ describe('tempo real da legenda (whisper local) com o texto do modelo', () => {
   it('sem provider de tempo, a legenda sai como o modelo falou', () => {
     const lines = [{ startSec: 0, endSec: 1, text: 'A USP dele é envenenada, Gal.' }];
     expect(alignCaptionTimings(lines, [])).toEqual(lines);
+  });
+
+  it('regressão do kyousuke: tem nada fica em 39s e não herda o bloco bigode', () => {
+    const aligned = alignCaptionTimingsDetailed(
+      [
+        { startSec: 13, endSec: 16, text: 'olha a Falcons aí' },
+        { startSec: 16, endSec: 18, text: 'kyousuke na frente' },
+        { startSec: 18, endSec: 20, text: 'é o segundo na base' },
+        { startSec: 20.2, endSec: 40, text: 'Heavy God, tem nada' },
+        { startSec: 40, endSec: 45, text: 'ace ace' },
+      ],
+      [
+        { startSec: 15, endSec: 16, text: 'olha falcons aí' },
+        { startSec: 20.2, endSec: 38.99, text: 'bigode' },
+        { startSec: 39, endSec: 40, text: 'tem nada aqui' },
+        { startSec: 40, endSec: 42, text: 'ace ace' },
+      ],
+      {
+        words: [
+          { text: 'olha', startSec: 15, endSec: 15.3 },
+          { text: 'falcons', startSec: 15.3, endSec: 15.7 },
+          { text: 'aí', startSec: 15.7, endSec: 16 },
+          { text: 'bigode', startSec: 20.2, endSec: 38.99 },
+          { text: 'tem', startSec: 39, endSec: 39.21 },
+          { text: 'nada', startSec: 39.21, endSec: 39.46 },
+          { text: 'aqui', startSec: 39.46, endSec: 40 },
+          { text: 'ace', startSec: 40, endSec: 41 },
+          { text: 'ace', startSec: 41, endSec: 42 },
+        ],
+      },
+    );
+    const out = aligned.lines;
+    expect(aligned.anchoredLines).toBe(3);
+    expect(aligned.totalLines).toBe(5);
+    const temNada = out.find((line) => line.text === 'Heavy God, tem nada');
+    expect(temNada?.startSec).toBeCloseTo(39, 3);
+    expect(temNada?.endSec).toBeCloseTo(39.46, 3);
+    expect(temNada?.startSec).not.toBeCloseTo(20.2, 1);
+
+    // `Heavy`/`God` não podem herdar o tempo de `bigode`/`a`: sem
+    // semelhança real, o fallback posicional deixa a palavra solta.
+    const semPar = out.filter(
+      (line) =>
+        line.text === 'kyousuke na frente' ||
+        line.text === 'é o segundo na base',
+    );
+    expect(semPar).toHaveLength(2);
+    for (const line of semPar) {
+      expect(line.endSec - line.startSec).toBeLessThanOrEqual(2.01);
+      expect(line.endSec).toBeLessThanOrEqual(20.01);
+    }
+  });
+
+  it('sem timestamps por palavra, o fallback distribui as palavras dentro do bloco', () => {
+    const out = alignCaptionTimings(
+      [{ startSec: 20.2, endSec: 40, text: 'tem nada' }],
+      [
+        { startSec: 20.2, endSec: 39, text: 'bigode' },
+        { startSec: 39, endSec: 40, text: 'tem nada aqui' },
+      ],
+    );
+    expect(out[0].startSec).toBeGreaterThanOrEqual(39);
+    expect(out[0].endSec).toBeLessThanOrEqual(40);
+    expect(out[0].startSec).not.toBeCloseTo(20.2, 1);
   });
 });
 

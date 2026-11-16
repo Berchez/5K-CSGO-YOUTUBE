@@ -18,6 +18,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import {
+  buildClipSidecar,
+  readClipSidecar,
+  writeClipSidecar,
+} from '../src/clipper/sidecar.js';
+import type { AceEvent, KillEvent } from '../src/types.js';
 
 const require = createRequire(import.meta.url);
 const { parseEvent, parseHeader } = require('@laihoe/demoparser2') as {
@@ -35,6 +41,8 @@ const execFileAsync = promisify(execFile);
 const TMP = String(process.env.TEMP ?? '.');
 const YT_URL = 'https://www.youtube.com/watch?v=E4_UQcOVpKc';
 const YT_ID = 'E4_UQcOVpKc';
+const MATCH_ID = '2399759';
+const MATCH_URL = `https://www.hltv.org/matches/${MATCH_ID}`;
 /** Cache por VÍDEO: a chave só pelo itag/sq reaproveitava fragmentos de
  * outro vídeo (o itag se repete entre VODs). */
 const PROBE = path.join(TMP, `vodprobe_${YT_ID}`);
@@ -685,9 +693,11 @@ async function main(): Promise<void> {
     const botSidecarPath = findBotSidecar('2399759', round, player);
     let seedSec: number | null = null;
     if (botSidecarPath) {
-      const side = JSON.parse(fs.readFileSync(botSidecarPath, 'utf8'));
-      const clipStartMs = Number(side.clipStartMs);
-      if (Number.isFinite(clipStartMs)) seedSec = (clipStartMs - VOD_START_MS) / 1000;
+      const side = readClipSidecar(botSidecarPath);
+      const clipStartMs = side?.clip.startMs ?? null;
+      if (clipStartMs != null && Number.isFinite(clipStartMs)) {
+        seedSec = (clipStartMs - VOD_START_MS) / 1000;
+      }
     }
     if (seedSec == null) {
       // Sem a semente do bot a posição no VOD é só uma ESTIMATIVA (26,4s
@@ -848,20 +858,16 @@ async function main(): Promise<void> {
     // demo (mesmas vítimas, mesma ordem); senão, aproxima da aparição − delta.
     let hltvAt: number[] | null = null;
     if (botSidecarPath) {
-      try {
-        const botSide = JSON.parse(fs.readFileSync(botSidecarPath, 'utf8'));
-        const list = Array.isArray(botSide.kills) ? botSide.kills : [];
-        if (
-          list.length === timed.length &&
-          list.every((k: { victim?: string }, i: number) => String(k.victim ?? '').toLowerCase() === String(timed[i].victim).toLowerCase())
-        ) {
-        const parsed: number[] = list
-          .map((k: { at?: string | number }) => (typeof k.at === 'number' ? k.at : Date.parse(String(k.at))))
-          .filter(Number.isFinite);
+      const botSide = readClipSidecar(botSidecarPath);
+      const list = botSide?.kills ?? [];
+      if (
+        list.length === timed.length &&
+        list.every((k, i) => k.victim.toLowerCase() === String(timed[i].victim).toLowerCase())
+      ) {
+        const parsed = list
+          .map((k) => k.atMs)
+          .filter((v): v is number => v != null && Number.isFinite(v));
         if (parsed.length === timed.length) hltvAt = parsed;
-        }
-      } catch {
-        /* sidecar inutilizável — usa a aproximação */
       }
     }
     const gameToVodDeltaSec =
@@ -879,9 +885,30 @@ async function main(): Promise<void> {
     const killVideoOffsetMs = Math.round(
       VOD_START_MS + killInstantSec(timed[0]) * 1000 - firstKillAtMs,
     );
-    const side = {
-      matchId: '2399759',
-      map: cap(map),
+    const mapName = cap(map);
+    const clipStartMs = Math.round(VOD_START_MS + startSec * 1000);
+    const killEvents: KillEvent[] = timed.map((k, i) => ({
+      killer: k.attacker,
+      victim: k.victim,
+      round,
+      map: mapName,
+      at: hltvAt != null ? hltvAt[i] : atMs(k),
+      atSource: hltvAt != null ? 'hltv-live' : 'estimado (killfeed ocr)',
+      atVodSec: Math.round(k.appearSec * 1000) / 1000,
+      appearEstimated: k.estimated,
+      weapon: k.weapon,
+      headshot: k.headshot,
+    }));
+    const weaponCounts = new Map<string, number>();
+    for (const k of killEvents) {
+      const weapon = k.weapon ?? '';
+      weaponCounts.set(weapon, (weaponCounts.get(weapon) ?? 0) + 1);
+    }
+    const mainWeapon = [...weaponCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+    const ace: AceEvent = {
+      matchId: MATCH_ID,
+      matchUrl: MATCH_URL,
+      map: mapName,
       round,
       player: playerName,
       // Os dois times do confronto vêm da demo (clãs). O do jogador é o
@@ -889,62 +916,62 @@ async function main(): Promise<void> {
       // outro lado.
       team1: opponentTeam || 'Nemiga',
       team2: playerTeam || 'FURIA',
-      // O lado do JOGADOR vem da demo (o clã, não CT/TERRORIST): sem isso
-      // o upload assumia team2 e publicava "contra X" do lado errado.
-      playerTeam,
-      opponentTeam,
       event: 'PGL Masters Bucharest 2026',
-      generatedAt: iso(Date.now()),
-      clipSource: 'youtube-vod (live do gaules)',
-      vod: {
-        videoId: YT_ID,
-        url: YT_URL,
-        vodStartIso: iso(VOD_START_MS),
-        startSec: Math.round(startSec * 1000) / 1000,
-        endSec: Math.round(endSec * 1000) / 1000,
-        videoItag: finalItag(),
-        endAnchor: endSource,
-        gameToVodDeltaSec: Math.round(gameToVodDeltaSec * 100) / 100,
-      },
-      kills: timed.map((k, i) => ({
-        killer: k.attacker,
-        victim: k.victim,
-        weapon: k.weapon,
-        headshot: k.headshot,
-        at: iso(hltvAt != null ? hltvAt[i] : atMs(k)),
-        atSource: hltvAt != null ? 'hltv-live' : 'estimado (killfeed ocr)',
-        atVodSec: Math.round(k.appearSec * 1000) / 1000,
-        appearEstimated: k.estimated,
-      })),
-      roundKills: r.kills.map((k) => ({ killer: k.attacker, victim: k.victim, weapon: k.weapon, headshot: k.headshot })),
-      roundWinner: r.winner,
-      killVideoOffsetMs,
-      clipStartMs: Math.round(VOD_START_MS + startSec * 1000),
+      detectedAt: iso(Date.now()),
+      kills: killEvents,
+      clipStartMs,
       clipDurationSec: Math.round((endSec - startSec) * 1000) / 1000,
-      clipFile: `${name}.mp4`,
-      thumbnailFile: `${name}.jpg`,
-      streamName: 'gaules',
-      note: 'clipado do VOD do YouTube (live do gaules) com âncoras de killfeed/placar por OCR; timings `at` aproximados (±3s)',
+      summary: {
+        round,
+        map: mapName,
+        player: playerName,
+        team: playerTeam,
+        opponents: opponentTeam,
+        kills: killEvents,
+        victims: killEvents.map((k) => k.victim),
+        weapons: killEvents.map((k) => k.weapon ?? ''),
+        headshots: killEvents.filter((k) => k.headshot).length,
+        headshotsKnown: true,
+        assists: [],
+        flashAssists: [],
+        grenades: [],
+        mainWeapon,
+      },
     };
+    const side = buildClipSidecar({
+      ace,
+      clip: {
+        file: `${name}.mp4`,
+        thumbnailFile: `${name}.jpg`,
+        startMs: clipStartMs,
+        durationSec: Math.round((endSec - startSec) * 1000) / 1000,
+        captureMode: 'vod',
+        streamName: 'gaules',
+      },
+      killVideoOffsetMs,
+      team: playerTeam,
+      opponent: opponentTeam,
+      vod: {
+        url: YT_URL,
+        startIso: iso(VOD_START_MS),
+        atSec: Math.round(startSec * 1000) / 1000,
+        gameToVodDeltaSec: Math.round(gameToVodDeltaSec * 100) / 100,
+        note: `videoId=${YT_ID}; itag=${finalItag()}; endAnchor=${endSource}`,
+      },
+      note: 'clipado do VOD do YouTube (live do gaules) com âncoras de killfeed/placar por OCR; timings `at` aproximados (±3s)',
+    });
     // Merge com o sidecar anterior: regerar o clipe NÃO pode apagar o
     // `youtubeId` (o clipe já publicado) nem o caminho da thumb.
     const sidecarPath = path.join(outDir, `${name}.json`);
-    let previous: Record<string, unknown> = {};
-    if (fs.existsSync(sidecarPath)) {
-      try {
-        previous = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
-      } catch {
-        previous = {};
-      }
+    const previous = readClipSidecar(sidecarPath);
+    if (previous) {
+      side.publication = previous.publication;
+      if (previous.clip.thumbnailFile) side.clip.thumbnailFile = previous.clip.thumbnailFile;
     }
-    const merged = {
-      ...previous,
-      ...side,
-      youtubeId: previous.youtubeId ?? null,
-      thumbnailFile: previous.thumbnailFile ?? side.thumbnailFile,
-      thumbnailAi: previous.thumbnailAi ?? false,
-    };
-    fs.writeFileSync(sidecarPath, JSON.stringify(merged, null, 2) + '\n');
+    // Escrita atômica (`.tmp` + rename) e com backup do v1: regerar o
+    // clipe não pode deixar um JSON pela metade (o leitor devolveria
+    // `null` e o `youtubeId` se perderia).
+    writeClipSidecar(sidecarPath, side);
     const size = fs.statSync(mp4).size;
     console.log(`  ✓ ${mp4} (${(size / 1e6).toFixed(1)} MB) + ${name}.jpg + ${name}.json`);
   }

@@ -20,10 +20,58 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
 - One-off: `npx tsx scripts/x.ts --flag` (no Windows `npm run x -- --flag` às
   vezes engole as flags).
 
+## Killfeed do scorebot (dado, não relógio)
+
+- O placar do DOM é o **relógio do round** (placar/round/timer). O killfeed do
+  scorebot **só enriquece**: arma, headshot, assistência e a vítima.
+- Campo ausente no feed fica `undefined` — **nunca** `false`.
+- O placar pareia a vítima pela coluna de mortes e às vezes **erra** (outro
+  jogador matou no mesmo round). O feed tem a verdade.
+- Round fechado continua vivo por carência (`SCOREBOT_LATE_ENRICH_SEC`,
+  default 60s) para o enrich tardio; o sidecar é escrito depois.
+- Backfill de clipe já gravado: `npx tsx scripts/enrich-clip.ts --clip <pasta>`
+  (dry-run; `--apply` grava). O filtro é **estrito**: kill sem round (`round: 0`)
+  ou sem mapa NÃO entra.
+
+## Sidecar (v2 em disco)
+
+- Grave SEMPRE por `writeClipSidecar()`/`writeShortMarker()`
+  (`src/clipper/sidecar.ts`): escrita atômica (`.tmp`+`rename`) nos dois.
+  O **sidecar** ainda guarda o backup do v1 (`.v1.bak`) na 1ª migração;
+  o **marker** do Short não tem backup (não existe v1 dele).
+  **Não** use `fs.writeFileSync` direto no sidecar/marker.
+- `stats` (armas/vítimas/headshots) é **derivado das `kills[]`**, não do
+  `summary` do round (ele fica obsoleto quando o killfeed chega depois).
+- `kills[].atVodSec` + `vod.atSec` dão a posição da kill no clipe mesmo sem
+  epoch do VOD; `anchorConfidence` é o diagnóstico da âncora de início.
+- O placar do round no sidecar é **CT-T** (`round.scoreOrder: 'ct-t'`), não
+  team1-team2: os times trocam de lado no halftime. O `round.winner` só é
+  preenchido quando a origem sabe (VOD/demo) — não derive do placar CT-T.
+
+## Shorts
+
+- Adesivo (sticker) por clipe: `config/shorts-overlays.json` (chave = pasta do
+  clipe). Precedência: **flag da CLI > arquivo > marker gravado > `.env`**. O
+  marker guarda o spec **pedido** (`auto`, `preset: ...`), não o texto resolvido:
+  `auto` resolve de novo e o visual do preset vem do código. A CLI NÃO é
+  gravada (texto de teste de dry-run não vira adesivo). Marker sem adesivo
+  (`render.overlayText` vazio) não manda nada.
+  **O marker NÃO persiste campos de origem `.env`** (só `file`/`marker`):
+  mudar o `.env` continua valendo para os clipes já renderizados
+  (`overlaySpecForMarker`).
+- Cota do YouTube: dia do Pacífico (`YT_QUOTA_TIMEZONE`), teto
+  (`YT_QUOTA_UNITS_PER_DAY`), cálculo em `quotaDecision`/`startOfDaySql`. Elevar
+  o teto só durante a publicação — **reverter depois** (é MANUAL: o código
+  só lê o `.env`, não escreve nele).
+- Retry do Gemini: só 5xx/`UNAVAILABLE`/"high demand" repetem; **429 de cota
+  não**. `SHORTS_CAPTION_GEMINI_RETRIES` = tentativas no TOTAL (default 3).
+
 ## Regras do projeto
 
 - **Comentários, logs e mensagens em português.** Código (funções/variáveis)
   em inglês.
+- **Copy em português:** é "na Dust2" (com A), não "no Dust2" — vale para
+  adesivo, título, descrição e legenda.
 - **Funções puras + teste.** Regra de negócio em função pura testável; o
   efeito colateral fica no chamador. Testes são puros (sem rede, credenciais
   ou binários externos).
@@ -55,6 +103,7 @@ Harness (use antes de opinar):
 ```bash
 npm run diag:clip -- data/clips/<pasta>
 npm run diag:clip -- --match <matchId> --ocr
+npm run explain -- --match <matchId>   # política de kills + o que faltou em cada round (só log)
 ```
 
 ## Ambiente

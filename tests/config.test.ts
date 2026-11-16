@@ -423,9 +423,9 @@ describe('layout dos Shorts (cam no topo)', () => {
 });
 
 describe('adesivo do Short (preset + overrides)', () => {
-  it('default: preset polex, sem texto e overrides vazios', () => {
+  it('default: preset polex, texto automático e overrides vazios', () => {
     const cfg = ConfigSchema.parse({});
-    expect(cfg.SHORTS_OVERLAY_TEXT).toBe('');
+    expect(cfg.SHORTS_OVERLAY_TEXT).toBe('auto');
     expect(cfg.SHORTS_OVERLAY_PRESET).toBe('polex');
     expect(cfg.SHORTS_OVERLAY_STYLE).toBe('');
     expect(cfg.SHORTS_OVERLAY_TAG).toBe('');
@@ -446,6 +446,14 @@ describe('adesivo do Short (preset + overrides)', () => {
     expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_PRESET: 'madhouse' }).success).toBe(true);
   });
 
+  it('texto vazio desliga o adesivo; texto longo é inválido sem derrubar o bot', () => {
+    expect(ConfigSchema.parse({ SHORTS_OVERLAY_TEXT: '' }).SHORTS_OVERLAY_TEXT).toBe('');
+    expect(ConfigSchema.safeParse({ SHORTS_OVERLAY_TEXT: 'x'.repeat(121) }).success).toBe(false);
+    expect(
+      invalidShortsOverlayEnvs({ SHORTS_OVERLAY_TEXT: 'x'.repeat(121) }),
+    ).toContain(`SHORTS_OVERLAY_TEXT=${'x'.repeat(121)}`);
+  });
+
   it('override numérico: vazio = preset e 0 é override válido', () => {
     const empty = ConfigSchema.parse({ SHORTS_OVERLAY_BORDER_PX: '' });
     expect(empty.SHORTS_OVERLAY_BORDER_PX).toBeNull();
@@ -462,5 +470,15 @@ describe('adesivo do Short (preset + overrides)', () => {
     expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: '' }).SHORTS_OVERLAY_UPPERCASE).toBeNull();
     expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: 'on' }).SHORTS_OVERLAY_UPPERCASE).toBe(true);
     expect(ConfigSchema.parse({ SHORTS_OVERLAY_UPPERCASE: 'off' }).SHORTS_OVERLAY_UPPERCASE).toBe(false);
+  });
+});
+
+describe('cota: fuso do dia', () => {
+  it('fuso inválido é recusado pelo schema (não estoura no meio do lote)', () => {
+    expect(ConfigSchema.safeParse({ YT_QUOTA_TIMEZONE: 'Mars/Phobos' }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ YT_QUOTA_TIMEZONE: 'America/Los_Angeles' }).success).toBe(
+      true,
+    );
+    expect(ConfigSchema.parse({}).YT_QUOTA_TIMEZONE).toBe('America/Los_Angeles');
   });
 });

@@ -40,6 +40,12 @@ export interface TranscriptResult {
   /** Idioma detectado/pedido (ISO-639-1 quando conhecido). */
   language: string | null;
   segments: TranscriptionSegment[];
+  /**
+   * Palavras com tempo, quando o provider devolveu timestamps por
+   * PALAVRA. É o dado que permite alinhar a legenda sem esticar uma
+   * fala pelo bloco inteiro do provider.
+   */
+  words?: TimedWord[];
   /** Duração do WAV enviado ao provider (s). */
   audioSec: number;
   /** Tempo de parede só da transcrição (ms), sem extrair o áudio. */

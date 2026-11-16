@@ -11,8 +11,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
-import type { AceEvent } from '../src/types.js';
 import { buildCompositeThumbnail, compositeLayout } from '../src/clipper/compositeThumbnail.js';
+import { readClipSidecar, sidecarToAce } from '../src/clipper/sidecar.js';
 import { extractFrame } from '../src/clipper/thumbnail.js';
 
 function arg(name: string, def?: string): string | undefined {
@@ -72,7 +72,12 @@ async function main(): Promise<void> {
     console.error(`clipe não encontrado: ${clipPath}`);
     process.exit(1);
   }
-  const ace = JSON.parse(fs.readFileSync(clipPath, 'utf-8')) as AceEvent;
+  const side = readClipSidecar(clipPath);
+  if (!side) {
+    console.error(`sidecar inválido: ${clipPath}`);
+    process.exit(1);
+  }
+  const ace = sidecarToAce(side);
   const refsDir = path.join('./data/clips/refs', ace.matchId);
   const refs = {
     player: path.join(refsDir, `ref-player-${ace.player}.jpg`),
@@ -84,7 +89,10 @@ async function main(): Promise<void> {
 
   // Fundo: frame real do clipe (sem IA). Cai para um fundo escuro.
   let background: Buffer;
-  const video = path.join(path.dirname(clipPath), `${path.basename(clipPath, '.json')}.mp4`);
+  const video = path.join(
+    path.dirname(clipPath),
+    side.clip.file ?? `${path.basename(clipPath, '.json')}.mp4`,
+  );
   if (fs.existsSync(video)) {
     let frame = '';
     try {

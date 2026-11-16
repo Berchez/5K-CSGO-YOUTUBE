@@ -134,11 +134,19 @@ export async function transcribeWav(
     maxSegmentChars: opts.maxSegmentChars,
   });
   const segments = sanitizeSegments(raw.segments, audioSec);
+  const words = raw.words?.length
+    ? sanitizeSegments(raw.words, audioSec).map((word) => ({
+        startSec: word.startSec,
+        endSec: word.endSec,
+        text: word.text,
+      }))
+    : undefined;
   return {
     provider: resolved.provider,
     model: resolved.model,
     language: raw.language ?? resolved.language,
     segments,
+    ...(words?.length ? { words } : {}),
     audioSec,
     elapsedMs: Date.now() - startedAt,
   };

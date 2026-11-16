@@ -20,7 +20,8 @@ import { createRequire } from 'node:module';
 import type { BrowserContext } from 'playwright';
 import { launchStealthContext } from '../src/clipper/stealthBrowser.js';
 import { waitForClearance } from '../src/monitor/hltvMonitor.js';
-import { upscaleClip, buildSidecar } from '../src/clipper/clipBuilder.js';
+import { upscaleClip } from '../src/clipper/clipBuilder.js';
+import { buildClipSidecar, writeClipSidecar } from '../src/clipper/sidecar.js';
 import { buildRoundSummary } from '../src/detector/aceDetector.js';
 import type { AceEvent, KillEvent } from '../src/types.js';
 
@@ -195,7 +196,7 @@ interface MultiKill {
   kills: KillEvent[];
 }
 
-function findMultiKills(file: string, minKills: number): MultiKill[] {
+function findMultiKills(file: string, minKills: number, vodStartSec: number): MultiKill[] {
   const map = String(parseHeader(file).map_name ?? 'unknown');
   const b = buildBoundaries(file);
   const deaths = parseEvent(file, 'player_death', ['team_name']);
@@ -230,6 +231,8 @@ function findMultiKills(file: string, minKills: number): MultiKill[] {
       weapon: String(d.weapon ?? ''),
       headshot: Boolean(d.headshot),
       assistBy: (d.assister_name as string | null) || undefined,
+      atVodSec: vodStartSec + (tick - b.realStart) / TICKRATE,
+      atSource: 'vod',
     });
     groups.set(key, g);
   }
@@ -300,7 +303,7 @@ async function main(): Promise<void> {
       console.warn(`  [${map}] sem VOD — pulando ${path.basename(demo)}`);
       continue;
     }
-    const mks = findMultiKills(demo, minKills);
+    const mks = findMultiKills(demo, minKills, vod.startSec);
     console.log(`  [${map}] ${mks.length} multikill(s) >= ${minKills}`);
     for (const mk of mks) {
       const { team, opponent } = teamOf(mk.player, teams);
@@ -341,6 +344,7 @@ async function main(): Promise<void> {
       fs.renameSync(tmpPath, finalPath);
       const ace: AceEvent = {
         matchId,
+        matchUrl,
         map,
         round: mk.round,
         player: mk.player,
@@ -349,11 +353,39 @@ async function main(): Promise<void> {
         event,
         detectedAt: new Date().toISOString(),
         kills: mk.kills,
-        summary: buildRoundSummary(mk.player, team, opponent || teams.filter((t) => t !== team).join(' / '), mk.kills),
+        summary: buildRoundSummary({
+          player: mk.player,
+          team: team || null,
+          opponent: opponent || null,
+          opponents: opponent || teams.filter((t) => t !== team).join(' / '),
+          map,
+          round: mk.round,
+          kills: mk.kills,
+        }),
       };
-      fs.writeFileSync(
+      // Escrita atômica (`.tmp` + rename) e com backup do v1: um crash
+      // no meio da escrita deixaria um JSON pela metade (e o leitor
+      // devolveria `null` — o clipe pareceria "sem sidecar").
+      writeClipSidecar(
         path.join(outDir, `${name}.json`),
-        JSON.stringify(buildSidecar(ace, { clipFile: path.basename(finalPath), vodUrl: vod.vodUrl, vodAt: fmt(startSec) }), null, 2),
+        buildClipSidecar({
+          ace,
+          clip: {
+            file: path.basename(finalPath),
+            // `startMs` é epoch ms (relógio do jogo): o VOD não tem epoch
+            // (`vod.startIso` é null), então fica desconhecido.
+            startMs: null,
+            durationSec: Math.round((endSec - startSec) * 1000) / 1000,
+            captureMode: 'vod',
+          },
+          vod: {
+            url: vod.vodUrl,
+            startIso: null,
+            atSec: startSec,
+            gameToVodDeltaSec: null,
+            note: null,
+          },
+        }),
       );
       const mb = (fs.statSync(finalPath).size / 1024 / 1024).toFixed(1);
       console.log(`      OK: ${path.basename(finalPath)} (${mb} MB)`);

@@ -12,7 +12,7 @@ import {
   createChallengeStreakTracker,
   thumbWindowMode,
 } from '../src/clipper/aiThumbnail.js';
-import { buildSidecar } from '../src/clipper/clipBuilder.js';
+import { buildClipSidecar } from '../src/clipper/sidecar.js';
 import { makeSmartThumbnail } from '../src/clipper/thumbnail.js';
 
 const ace = {
@@ -248,7 +248,7 @@ describe('aiThumbnail', () => {
     ).rejects.toThrow();
   });
 
-  it('buildSidecar não duplica kills no summary', () => {
+  it('buildClipSidecar não duplica kills no summary', () => {
     const full = {
       ...ace,
       kills: [{ killer: 'a', victim: 'b', round: 1, map: 'm', weapon: 'ak47' }],
@@ -268,14 +268,14 @@ describe('aiThumbnail', () => {
         mainWeapon: 'ak47',
       },
     };
-    const json = JSON.parse(JSON.stringify(buildSidecar(full))) as {
+    const json = JSON.parse(JSON.stringify(buildClipSidecar({ ace: full, clip: {} }))) as {
       kills: unknown[];
-      summary: Record<string, unknown>;
+      stats: Record<string, unknown>;
     };
     expect(json.kills).toHaveLength(1);
-    expect(json.summary.kills).toBeUndefined();
-    expect(json.summary.killCount).toBe(1);
-    expect(json.summary.mainWeapon).toBe('ak47');
+    expect(json.stats.kills).toBeUndefined();
+    expect(json.stats.killCount).toBe(1);
+    expect(json.stats.mainWeapon).toBe('ak47');
   });
 });
 

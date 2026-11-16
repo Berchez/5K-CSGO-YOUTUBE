@@ -133,6 +133,47 @@ shows the validation error); a UTF-8 BOM from Notepad/PowerShell is accepted.
 Full example: `docs/watchlist.example.json`.
 Dry-run: `npx tsx scripts/watchlist-check.ts "paiN" "FURIA" --stars=0`.
 
+## Who decides the kill threshold
+
+The threshold is resolved per round **per killer**, in this order (first hit wins):
+
+| # | Rule | Where it comes from |
+|---|------|---------------------|
+| 1 | Player in the watchlist | `players[].minKills` |
+| 2 | Team in the watchlist **and** the team's star floor is met | `teams[].minKills` (or `defaults.minKills`) |
+| 3 | Player in the watchlist (outside a watched team) | `players[].minKills` |
+| 4 | General policy | `MIN_KILLS` when the match has ≥ 1★, `MIN_KILLS_NO_STARS` when it has 0★ |
+| 5 | Nothing matches | **blocked** — the round never becomes a clip |
+
+Two details that look like bugs but are not:
+
+- **`0★` means two things.** HLTV either rated the match 0 stars or did not
+  expose a rating at all; the listing cannot tell them apart. With `MIN_STARS=0`
+  the match enters anyway; with `MIN_STARS≥1` it only enters when the event name
+  looks top-tier (`major`, `blast`, `iem`, `katowice`, `cologne`, `esl pro`,
+  `pgl`, `starladder`, `ewc`, `epl`, …). So `MIN_KILLS_NO_STARS` never *widens*
+  the scope — it only sets the bar for the 0★ matches that already got in.
+- **`defaults.minKills` is not `MIN_KILLS`.** It is a fixed number used for a
+  watched team that has no `minKills` of its own; changing `MIN_KILLS` in the
+  panel does not move it.
+
+To see the resolved policy for a real match (and what happened in each round),
+read the bot's own log — no network, no browser:
+
+```bash
+npm run explain -- --match 2400208          # last match of the log if --match is omitted
+npx tsx scripts/explain.ts --match 2400208 --log logs/bot.log
+```
+
+It prints the stars, the effective threshold, the general-filter verdict, the
+watchlist override (if any), every round with the best candidate and how many
+kills it needed (`4k de donk < 5k exigidos`), and the clips already on disk with
+how many kills got a weapon from the scorebot killfeed.
+
+The same information is in the panel: each match card shows the threshold with
+its **origin** (`4k · 3★`, `5k · watchlist (Imperial)`, `4k · só times da lista
+(paiN)` — the last one means the opponent does not generate clips).
+
 ## Adaptive polling (idle backoff)
 
 The HLTV listing already carries the scheduled start time of every upcoming
@@ -351,6 +392,7 @@ medição; a aplicação só acontece com `CLIP_STREAM_SYNC=auto`.
 | `CLIP_KILLFEED_CROP` | `0.70:0.05:0.30:0.25` | crop do killfeed (canto direito) |
 | `CLIP_KILLFEED_CROP_BY_STREAM` | vazio | crop do killfeed por canal |
 | `CLIP_KILLFEED_CROP_FALLBACKS` | vazio | crops alternativos do killfeed |
+| `SCOREBOT_LATE_ENRICH_SEC` | `60` | carência (s) para o killfeed do scorebot completar um round já fechado; 0 = desliga |
 
 O relatório por canal sai de `npx tsx scripts/sync-report.ts` (lê o log + o estado
 persistido): n de medições, min/med/máx, maior salto, taxa de acerto do OCR e os saltos
@@ -417,8 +459,10 @@ npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
     --head-sec 1.5 --tail-sec 6 --min-sec 10 --max-sec 40
 
 # 9. adesivo (sticker) no começo do Short, que some em fade out
+#    `auto` deriva o texto das kills dentro da janela (ex.: ACE kyousuke);
+#    `none` desliga; um texto literal é usado como está.
 npm run publish:shorts -- --dry-run --clip data/clips/<pasta> --force `
-    --overlay-text "Furia nos playoffs" --overlay-hold-sec 2 --overlay-fade-sec 0.5
+    --overlay-text auto --overlay-hold-sec 2 --overlay-fade-sec 0.5
 
 # 9b. adesivo com um dos PRESETS (polex|polex-die|gaules|madhouse|rei|
 #     diecut|pill|custom) e ajustes finos por flag
@@ -452,18 +496,84 @@ npm run publish:shorts -- --publish --clip data/clips/<pasta> `
     --link-video N3SilLCce64
 ```
 
+### Adesivo por clipe (`config/shorts-overlays.json`)
+
+O adesivo do começo do Short é uma decisão de **cara**: cada clipe tem o
+seu ("4K DO KSCERATO", "YEKINDAR 4K NA DUST2"). Com só `.env`/flags, todo
+Short do lote sai igual — e rodar o script de novo **sem** as flags
+revertia o adesivo para o `auto` (o texto saía errado, sem aviso).
+
+O arquivo `config/shorts-overlays.json` (caminho em `SHORTS_OVERLAY_CONFIG`)
+guarda o adesivo **por clipe**, com a chave sendo a **pasta** do clipe em
+`data/clips/` (sem o `.mp4`):
+
+```json
+{
+  "2400207_Dust2_r17_YEKINDAR": {
+    "text": "YEKINDAR 4K NA DUST2",
+    "preset": "polex-die"
+  },
+  "2400205_Anubis_r13_kyousuke": {
+    "text": "5K KYOUSUKE",
+    "preset": "gaules",
+    "holdSec": 2.5,
+    "fadeSec": 0.8
+  }
+}
+```
+
+Campos aceitos: `text` (`auto`, `none` ou texto literal), `preset`
+(`polex`, `polex-die`, `gaules`, `madhouse`, `rei`, `diecut`, `pill`,
+`custom`), `holdSec`, `fadeSec`, `y`, `style`, `tag`, `uppercase`,
+`background`, `color`, `borderColor`, `borderPx`, `shadowColor`,
+`shadowPx`, `shadowBlurPx`, `tiltDeg` e `font`. Valor inválido é
+**ignorado** (não vira `0`/`false` e não sobrescreve o `.env`). O arquivo
+aceita BOM (Notepad/PowerShell) e um `preset` inválido avisa no console
+(vira `polex`).
+
+Precedência (campo a campo, do mais forte para o mais fraco):
+
+```text
+flag da CLI  >  config/shorts-overlays.json  >  marker gravado  >  .env
+```
+
+O marker entra na fila porque ele descreve o vertical que **já está em
+disco** — reusar é o que impede o adesivo de "voltar" ao padrão quando o
+dono roda o script de novo. O marker guarda o spec **pedido** (`auto`,
+`preset: gaules`...), não o texto/estilo já resolvido: o `auto` resolve de
+novo a cada rodada (o adesivo não mente quando a janela muda de 5K para
+4K) e o visual do preset vem sempre do código atual. A **flag da CLI**
+fica de fora do marker (um texto de teste de dry-run não pode virar o
+adesivo do `--publish` seguinte). Marker **sem adesivo** (o
+`short.render.overlayText` vazio) não manda nada — os zeros da
+assinatura (`holdSec` 0, `y` 0, sem borda/sombra) não viram override.
+
+**O marker NÃO congela o `.env`**: só o que veio do
+`config/shorts-overlays.json` (e o que o marker já tinha) é gravado.
+Os campos vindos do `.env` (`SHORTS_OVERLAY_TEXT`, preset, `holdSec`,
+`y`...) continuam valendo a cada rodada — mudar o `.env` afeta os clipes
+já renderizados. A flag da CLI também não é gravada (é decisão de UMA
+rodada).
+
 O script (`scripts/publish-shorts.ts`):
 
-1. lê os sidecars em `data/clips/` (precisa de `clipStartMs` e de
-   `killVideoOffsetMs` — sem o offset as posições das kills ficam
-   deslocadas e o clipe é pulado);
+1. lê os sidecars em `data/clips/` pelo `readClipSidecar` (schema v2;
+   sidecars v1 são normalizados). Precisa do início do clipe
+   (`clip.startMs`) e da posição das kills (`kills[].videoSec` ou
+   `sync.killVideoOffsetMs` — sem isso as posições ficam deslocadas e o
+   clipe é pulado);
 2. calcula a **janela do Short** (60–90s): da 1ª à última kill. Quando a
    jogada não cabe, ele prioriza o **clímax** (a última kill) e reporta as
    kills que ficaram de fora;
 3. renderiza o vertical em `data/shorts/<pasta>/` (cam no topo + jogo
    embaixo; render atômico: só vira `.mp4` final quando termina inteiro). O
-   marker guarda a assinatura do layout (`render`) — se ele mudar (envs ou
-   caixa da cam), o vertical é re-renderizado mesmo com marcador;
+   marker (`<pasta>_short.json`, schema v2) guarda a assinatura do layout
+   (`short.render`) — se ele mudar (envs ou caixa da cam), o vertical é
+   re-renderizado mesmo com marcador. **Atenção**: o adesivo entra na
+   assinatura; como o `SHORTS_OVERLAY_TEXT` tem default `auto`, quem não
+   tinha a chave no `.env` passa a ver os verticais **ainda não publicados**
+   re-renderizados com adesivo (o `auto` deriva o texto das kills da
+   janela).
 4. transcreve a legenda da janela (IA) e queima no `.mp4` — só quando o
    vertical vai ser refeito (um Short pronto não gasta IA);
 5. gera os metadados no formato Shorts (título ≤70 chars, `#Shorts` no
@@ -473,12 +583,12 @@ O script (`scripts/publish-shorts.ts`):
    um relatório em `data/shorts/report.json` (com o histórico das
    rodadas).
 
-Um Short **já publicado** é pulado no lote (o `youtubeId` fica no marker).
-Para refazer a legenda e subir de novo, use `--republish`: o token atual
-não tem escopo de update, então republicar cria um **vídeo novo** (o
-antigo precisa ser apagado à mão no Studio). `--retranscribe` faz a
-transcrição ser refeita mesmo com a do marker (sem ele, o texto guardado
-é reaproveitado).
+Um Short **já publicado** é pulado no lote (o `publication.youtubeId` fica
+no marker). Para refazer a legenda e subir de novo, use `--republish`: o
+token atual não tem escopo de update, então republicar cria um **vídeo
+novo** (o antigo precisa ser apagado à mão no Studio). `--retranscribe`
+faz a transcrição ser refeita mesmo com a do marker (sem ele, o texto
+guardado é reaproveitado).
 
 O Short só fala das kills que CABEM na janela: se a janela trunca a
 jogada, o título e a descrição contam só as kills do vídeo.
@@ -515,7 +625,12 @@ assiste sem som.
   fala (medido: até 3,5s adiantado); o whisper local acerta o tempo. Com
   `SHORTS_CAPTION_TIMING=whisper-cpp` (padrão) o texto do modelo é casado
   com o tempo do whisper (fuzzy match por palavra: `defusa`=`defuse`) e
-  as falas nunca se sobrepõem; com `off` vale o tempo do próprio modelo;
+  as falas nunca se sobrepõem; com `off` vale o tempo do próprio modelo.
+  **Áudio estrangeiro**: o casamento é feito no texto **ORIGINAL** (o
+  mesmo idioma da fala — o whisper transcreve com `-l auto`) e o tempo é
+  projetado na fala traduzida pelo índice (as duas listas são 1:1).
+  Sem isso, texto PT contra áudio EN não casa com nada e o Short ficaria
+  preso esperando a próxima rodada;
 - o **silêncio inicial da janela é cortado antes de transcrever**
   (`silenceremove`): o whisper ancorava a 1ª fala em 0s e a legenda
   nascia ~10s antes da voz. O corte devolve o deslocamento, que é
@@ -533,6 +648,16 @@ assiste sem som.
   tradução (`text_pt` na mesma resposta do Gemini). O free tier do
   Gemini é de 20 `generate_content`/dia — dá para ~6 Shorts por dia com
   os três passes;
+- **erro transitório do Gemini é repetido**: 5xx, `UNAVAILABLE` e
+  "high demand" voltam (`SHORTS_CAPTION_GEMINI_RETRIES`, default 3
+  tentativas **no total**, com espera dobrando a cada repetição —
+  `SHORTS_CAPTION_GEMINI_RETRY_MS`). A **cota (429) NÃO é repetida**
+  (esperar não devolve cota): ela sobe na hora e o Short fica marcado
+  para a próxima rodada;
+- **legenda degradada** (`degraded: ["refine"]`/`["translate"]`) é
+  best-effort: a falha da revisão não segura o Short (a legenda foi
+  queimada), mas o `--retry-captions` **pega** as degradadas também
+  (refaz só o passe que falhou, sem retranscrever);
 - o **idioma é conferido pelo texto**, não só pelo provider: gíria em
   inglês ("clutch", "one-tap") não faz o áudio ser inglês, e provider que
   não diz o idioma (HuggingFace) tem o texto como resposta. Aí o áudio
@@ -551,7 +676,19 @@ assiste sem som.
   FALHOU (tradução/libass), a próxima rodada **retoma do passo que
   falhou** — o provider de transcrição não é chamado de novo (economiza
   cota e o tempo do whisper). A transcrição só é refeita se a janela do
-  Short mudar;
+  Short mudar. O mesmo vale para o **tempo**: com `timingSource: whisper`
+  gravado no marker, o whisper local **não roda de novo** (uns 47s
+  economizados por Short);
+- o **provider de tempo mudo não segura o Short**: se o whisper local
+  não acha fala no áudio (e o Gemini ouviu), a legenda sai com o tempo
+  do modelo (`timingSource: model`) e um aviso no log. Perder o Short
+  por causa do tempo é pior do que um tempo imperfeito. O caso oposto
+  (o provider devolveu tempo, mas o texto não se parece com o áudio)
+  **segura** o Short — usar esse tempo seria legenda fora de
+  sincronia. Nesse caso a transcrição que JÁ foi paga viaja no erro
+  (`CaptionTranscriptError`) e é guardada no marker: a próxima rodada
+  refaz **só o tempo**, sem chamar o Gemini de novo (a cota não se
+  repete);
 - o **silêncio de um provider é estado final** (o provider local não é
   chamado depois: sem VAD ele "alucina" fala onde não tem). Com
   `SHORTS_CAPTION_SILENCE_FINAL=off` o próximo provider é consultado
@@ -560,6 +697,9 @@ assiste sem som.
 - a legenda final fica também em texto ao lado do mp4
   (`<name>_legenda.txt`; com tradução, o original em
   `<name>_legenda.orig.txt`) — dá para revisar sem abrir o vídeo. O
+  `.orig.txt` sai **sem** a copy do canal (a regra é escrita em português
+  e corromperia o texto estrangeiro: "no Dust2" em inglês viraria "na
+  Dust2"). O
   **texto também sai no console antes do upload**: o dono lê o que vai
   queimar no vertical (nome errado, frase furada) e aborta o lote antes
   de gastar cota do YouTube. O arquivo é escrito **depois** do render (o
@@ -643,6 +783,8 @@ no código):
 | `SHORTS_CAPTION_HF_MODEL` | `openai/whisper-large-v3-turbo` | modelo do Whisper (reserva) |
 | `SHORTS_CAPTION_WHISPER_MODEL` | `large-v3-turbo-q5_0` | modelo ggml do whisper.cpp local (reserva sem cota) |
 | `SHORTS_CAPTION_DEDICATED_MODEL` | `gemini-3.5-transcribe` | modelo dedicado de transcrição (cota separada, usado quando a cota do Gemini de texto acaba) |
+| `SHORTS_CAPTION_GEMINI_RETRIES` | `3` | tentativas **no total** de cada chamada do Gemini (transcrição, tradução e revisão) |
+| `SHORTS_CAPTION_GEMINI_RETRY_MS` | `2000` | espera base (ms) entre as tentativas — dobra a cada repetição |
 | `SHORTS_CAPTION_SILENCE_FINAL` | `on` | `on` = o silêncio de um provider é final; `off` = o próximo provider é consultado |
 | `SHORTS_CAPTION_TIMEOUT_MS` | `180000` | teto de tempo da transcrição |
 | `SHORTS_CAPTION_REFINE` | `on` | passe revisor da legenda (corrige nomes sem reescrever) |
@@ -650,7 +792,7 @@ no código):
 | `SHORTS_CAPTION_FONT_SIZE` | `64` | tamanho da fonte da legenda (px) |
 | `SHORTS_CAPTION_FONT_FAMILY` | `Barlow Condensed` | família da fonte (a padrão vem do repo, em `assets/fonts`) |
 | `SHORTS_CAPTION_POSITION` | `below-crosshair` | `below-crosshair` (abaixo da mira), `game-top` (abaixo da cam) ou `bottom` (rodapé) |
-| `SHORTS_OVERLAY_TEXT` | vazio | adesivo (sticker) no começo do Short, que some em fade out (ex.: `Furia nos playoffs`) |
+| `SHORTS_OVERLAY_TEXT` | `auto` | texto do adesivo: `auto` deriva das kills na janela (`ACE kyousuke`, `4K FalleN`); vazio/none desliga; texto literal é usado como está |
 | `SHORTS_OVERLAY_HOLD_SEC` | `2` | segundos que o adesivo fica visível |
 | `SHORTS_OVERLAY_FADE_SEC` | `0.5` | duração do fade out do adesivo (começa em `hold - fade`) |
 | `SHORTS_OVERLAY_Y` | `0.54` | posição vertical do adesivo (fração da altura do vertical) |
@@ -667,6 +809,7 @@ no código):
 | `SHORTS_OVERLAY_SHADOW_BLUR_PX` | vazio | blur da sombra (0 = sombra sólida); vazio = do preset |
 | `SHORTS_OVERLAY_TILT_DEG` | vazio | inclinação do adesivo em graus; vazio = do preset |
 | `SHORTS_OVERLAY_FONT` | vazio | fonte do adesivo (`Arial Black`, `Impact`, `Arial`); vazio = do preset |
+| `SHORTS_OVERLAY_CONFIG` | `./config/shorts-overlays.json` | adesivo por clipe (a chave é a pasta do clipe) |
 | `SHORTS_MIN_KILLS` | `3` | mínimo de kills (o bot também grava 3K/4K) |
 | `SHORTS_PRIVACY` | `unlisted` | visibilidade do Short |
 | `SHORTS_HASHTAG` | `#Shorts` | hashtag de classificação (no `.env`, entre aspas) |
@@ -693,7 +836,18 @@ de copyright ativo): se os Shorts estiverem sendo barrados, baixe o
 
 A cota do YouTube é do **projeto de API** (10 000 units/dia, 1600 por
 `videos.insert`) e é dividida com o bot: o script conta os vídeos já
-enviados no dia e recusa o lote quando a cota estourar.
+enviados no dia e recusa o lote quando a cota estourar. O dia da cota é o
+do **Pacífico** (`YT_QUOTA_TIMEZONE`, default `America/Los_Angeles`) — é
+lá que a cota zera, não em UTC — e o teto é configurável
+(`YT_QUOTA_UNITS_PER_DAY`, default `10 000`; o projeto pode subir para
+`100 000`).
+
+O cálculo é puro (`src/uploader/quota.ts` + `src/timeZone.ts`): a guarda
+libera o upload enquanto ele **cabe** na cota (o limite é inclusivo) e
+**recusa** o lote quando estoura. O teto vem do `.env`
+(`YT_QUOTA_UNITS_PER_DAY`) — **a guarda não altera o `.env`**: subir o
+teto para a publicação e voltar ao valor normal é um procedimento
+MANUAL do dono (o código só lê o valor).
 
 O YouTube aceita Shorts de **até 3 minutos** (180s) desde 15/out/2024 (vertical
 ou quadrado). Mas **acima de 1 minuto um Short com claim de copyright ativo
@@ -786,6 +940,8 @@ src/monitor/pollSchedule.ts (puro: quanto tempo dormir até o próximo poll)
 src/monitor/pollSleep.ts (puro: deadline, wake e debounce da watchlist)
 src/monitor/liveTelemetry.ts (puro: latência de detecção da live)
 src/detector/aceDetector.ts + aceCoverage.ts + killParse.ts (puros, testados) + matchTracker.ts (poll MR12: 13 pts + timer do round)
+src/detector/scorebotLog.ts + scorebotFeed.ts (killfeed do scorebot do HLTV: parse do log + socket.io dentro da página)
+src/detector/killfeedEnrich.ts (puro: casa as kills do sidecar com as do killfeed e completa arma/HS/assistência)
 src/monitor/streamLatency.ts + latencyStore.ts (latência por canal: prior, round, persistência)
 src/recorder/streamRecorder.ts (buffer circular + playlist HLS)
 src/recorder/hlsTimeline.ts (puro: PDT e saltos do relógio de origem)
@@ -793,17 +949,22 @@ src/clipper/scoreboardSync.ts (OCR da virada de round no vídeo; crop por canal)
 src/clipper/killfeedSync.ts (OCR do killfeed: instante exato da 1ª kill)
 src/clipper/clipAnchors.ts (puro: âncoras de início/fim do clipe)
 src/clipper/clipBuilder.ts (concat + sidecar json)
+src/clipper/sidecar.ts (sidecar v2 do clipe: kills, stats, bloco killfeed e marker do Short)
+src/clipper/copyRules.ts (puro: copy do canal — "na Dust2", nunca "no Dust2")
 src/clipper/shorts.ts (janela 60-90s + render vertical 9:16 atômico)
 src/clipper/shortCaptions.ts (legenda queimada: linhas, .ass, decisão de publicar)
-src/clipper/shortCaptionsAi.ts (transcrição da legenda: gemini/huggingface)
+src/clipper/shortCaptionsAi.ts (transcrição da legenda: gemini/huggingface + retry do Gemini)
 src/clipper/shortBanner.ts (faixa de texto do topo do Short)
 src/clipper/shortOverlay.ts (adesivo do começo do Short: presets, métricas e PNG)
+src/clipper/shortOverlayConfig.ts (puro: adesivo por clipe em config/shorts-overlays.json + precedência)
 src/clipper/thumbnail.ts (thumb 1280x720: frame real + selo ACE!/jogador/confronto via sharp; aplicada no upload via thumbnails.set)
 src/clipper/aiThumbnail.ts (opcional: fundo IA — huggingface grátis c/ token, gemini pago, pollinations legado; sempre com fallback p/ composta)
 src/clipper/compositeThumbnail.ts (thumb composta determinística: layout, killfeed, textos)
 src/clipper/thumbText.ts (fontes versionadas em assets/fonts: texto em path)
 src/clipper/thumbCutout.ts + thumbCutoutWorker.ts (recorte do jogador em processo isolado)
 src/transcription/ (adapter de transcrição: registry, providers, export srt/vtt/txt)
+src/timeZone.ts (puro: dia da cota no fuso configurado)
+src/uploader/quota.ts (puro: cota do YouTube do dia — usado/limite/unidades)
 src/uploader/youtubeUploader.ts (private)
 src/uploader/videoMetadata.ts (título/descrição: IA com guarda anti-alucinação + gerador determinístico)
 src/uploader/metadataAi.ts (prompt + parse da resposta da IA)
@@ -811,8 +972,10 @@ src/main.ts (supervisor asyncio-like)
 scripts/auth-youtube.ts
 scripts/sync-report.ts (latência por canal: log + estado persistido)
 scripts/publish-shorts.ts (Shorts verticais: render, metadados, upload, dedupe)
+scripts/enrich-clip.ts (backfill: completa/corrige as kills de um clipe com o killfeed do scorebot)
 scripts/clip-from-vod.ts (one-off: clipe a partir do VOD do YouTube, com OCR)
 scripts/upload-vod-clips.ts (one-off: envia os clipes do VOD pelo pipeline do bot)
+config/shorts-overlays.json (adesivo do Short por clipe)
 tests/
 ```
 
@@ -937,12 +1100,139 @@ the kill-by-kill description, the thumb text and the AI background prompt.
 
 Fidelity per source (live first, the rest later):
 
-| Data | Live (HLTV killfeed) | GOTV demo (phase 2) |
+| Data | Live (HLTV scorebot killfeed) | GOTV demo (phase 2) |
 |---|---|---|
 | killer/victim | ✅ always | ✅ |
-| weapon/HS | ⚠️ best-effort (icon/text in the DOM) | ✅ exact |
-| assist/flash-assist | ❌ (killfeed does not show it) | ✅ exact |
+| weapon/HS | ✅ `log` do scorebot (`weapon`, `headShot`) | ✅ exact |
+| assist/flash-assist | ✅ `Assist` (por `killEventId`) e `flasherNick` | ✅ exact |
 | grenades thrown (smoke/flash without a kill) | ❌ | ✅ exact |
+
+The live path subscribes to HLTV's scorebot (`https://scorebot-lb.hltv.org`,
+Engine.IO v4 polling) from inside the match page — Node direct is blocked by
+Cloudflare. The `log` event carries weapon, headshot, wallbang, through-smoke,
+no-scope, flash-assist and a separate `Assist` linked by `killEventId`. The DOM
+scoreboard still owns the round clock (score/round/timer); the killfeed only
+completes each kill (weapon/HS/assist and the victim, which the scoreboard
+matches by order and often gets wrong). `SCOREBOT_KILLFEED=0` disables it.
+
+O scoreboard "vê" a vítima pela **coluna de mortes**: quando outro jogador
+mata no mesmo round, a ordem das mortes não é a ordem das kills do autor e o
+placar acaba pareando a vítima **errada** (o caso real: kyousuke no Anubis
+r13 matou HeavyGod, mas o sidecar dizia TeSeS — o HeavyGod tinha matado o
+TeSeS um instante antes). O killfeed do scorebot tem a verdade: arma,
+headshot, assistência e a vítima certa.
+
+### Enriquecimento tardio e backfill do killfeed
+
+- **Ao vivo**: o killfeed só **enriquece** as kills do placar (nunca as
+  substitui) e o placar continua sendo o relógio do round. Campo ausente
+  no feed fica `undefined` — nunca vira `false`;
+- **tardio**: o round fecha antes do killfeed chegar (a morte do jogador
+  é observada pelo placar antes de o scorebot publicar). O round fechado
+  continua **vivo por carência** (`SCOREBOT_LATE_ENRICH_SEC`, default 60s):
+  a killfeed que chega depois completa as kills **no mesmo objeto**, e o
+  sidecar é escrito minutos depois já com o detalhe;
+- **telemetria**: o sidecar grava um bloco `killfeed` (schema v2) com
+  quantas kills do placar receberam detalhe (`paired`), quantas o feed
+  tinha (`feedKills`), os `eventId`s do scorebot e o `roundDrift`
+  (quantas kills ficaram com o round do feed **divergente** do round do
+  placar) — é o que mostra quanto do round o placar leu sozinho e se a
+  falta de detalhe foi "atraso do feed" ou "os rounds não batem";
+- **resumo recalculado**: o `summary` do round nasce como snapshot do
+  fechamento; quando o killfeed completa as kills depois (arma, headshot,
+  vítima corrigida), o resumo é **recalculado** (`refreshRoundSummary`)
+  antes de virar título, descrição, thumbnail e sidecar — senão o texto
+  sairia com a arma e o headshot velhos;
+- **backfill** (`scripts/enrich-clip.ts`): corrige clipes já gravados. O
+  script busca o replay do scorebot da partida (o log vem do mais novo
+  para o mais antigo), casa mapa/round/jogador e reescreve `kills`,
+  `stats` e o bloco `killfeed` do sidecar. O pareamento é pela **vítima**
+  (âncoras por LCS) e, no que sobra, pela **ordem** — mas só quando os
+  dois vãos têm o **mesmo tamanho** (com vãos diferentes, casar pela
+  ordem seria chute e a vítima sairia errada). O que sobra sem par fica
+  sem par (nada é inventado). **Por padrão é dry-run** (mostra o que
+  mudaria, sem escrever); só grava com `--apply`:
+
+```powershell
+# mostra o que mudaria (não grava)
+npx tsx scripts/enrich-clip.ts --clip data/clips/2400205_Anubis_r13_kyousuke
+
+# grava a correção
+npx tsx scripts/enrich-clip.ts --clip data/clips/2400205_Anubis_r13_kyousuke --apply
+
+# com um log do scorebot SALVO (sem rede)
+npx tsx scripts/enrich-clip.ts --log C:/tmp/log-2400205.json --clip <pasta> --apply
+
+# vários clipes (últimos N / todos)
+npx tsx scripts/enrich-clip.ts --last 5
+npx tsx scripts/enrich-clip.ts --all --apply
+
+# com outro perfil do Chrome (o bot pode estar rodando com o mesmo)
+npx tsx scripts/enrich-clip.ts --clip <pasta> --profile ./data/hltv-profile-enrich --apply
+```
+
+O filtro do backfill é **estrito**: kill sem round (`round: 0`, o backlog
+antes do 1º `RoundStart`) ou sem mapa **não** entra — casar uma kill de
+outro round escreveria a vítima errada no sidecar.
+
+O `--apply` também invalida os **metadados** do marker do Short (título e
+descrição): com a vítima/headshot corrigidos, o título antigo passaria a
+mentir. Só o título/descrição é invalidado, e **só quando o dado que ele
+descreve mudou** (vítima, arma ou headshot) — uma correção de assistência
+não joga fora o texto revisado pelo dono. O script abre o **próprio**
+browser (fecha no fim) e espera o clearance do Cloudflare. Ele não usa o
+browser do bot (perfil em lock) — use `--profile` para apontar outro
+diretório de perfil.
+
+### Sidecar do clipe: v1 → v2 (e como reverter)
+
+O sidecar (`data/clips/<pasta>/<pasta>.json`) é gravado no **schema v2**
+(`schemaVersion: 2`); a leitura ainda aceita o v1 flat (ele é normalizado
+na leitura). Na **1ª migração** de um arquivo v1, o script deixa uma cópia
+`<arquivo>.v1.bak` ao lado — o writer é sempre v2 e o modelo não guarda
+todo campo do v1 (`roundKills`, `vod.videoId`...), então o original fica
+preservado.
+
+A escrita é **atômica** (`.tmp` + `rename`): um crash no meio da escrita
+não deixa um JSON pela metade (o leitor devolveria `null` e o clipe
+pareceria "sem sidecar"). O backup do v1 e a escrita atômica valem para
+**todos** os caminhos que gravam sidecar (bot, `enrich-clip`,
+`clip-from-vod`, `clips-from-vod`, `test-vod`, `upload-vod-clips`) — é o
+`writeClipSidecar()` de `src/clipper/sidecar.ts`. O marker do Short
+(`<pasta>_short.json`) é escrito do mesmo jeito (`writeShortMarker()`),
+porque ele guarda o `youtubeId`.
+
+O v2 guarda alguns dados que o v1 não tinha:
+
+- `kills[].atVodSec` — o instante da kill no relógio do VOD (s). Com
+  `vod.atSec` (o início do clipe no VOD), a posição da kill dentro do
+  clipe (`kills[].videoSec`) é calculada mesmo quando o VOD não tem epoch
+  (`vod.startIso` = null, caso do `clips-from-vod`);
+- `anchorConfidence` — a confiança na âncora de início (o tracker entrou
+  no meio do round? resetou a base? a 1ª kill veio da janela de
+  assentamento?). É o dado que o `docs/janela-do-clipe.md` usa para
+  diagnosticar "a 1ª kill pode não ser a 1ª real";
+- `stats` **derivado das `kills[]`**: quando o killfeed completa as kills
+  depois (arma/headshot/vítima), o `summary` do round continua obsoleto —
+  o sidecar grava a arma, a vítima e a contagem de headshots **das
+  kills**, não do resumo;
+- `round.scoreOrder: 'ct-t'` — o placar do tracker é **CT-T** (o lado CT
+  e o lado T), **não** team1-team2: os times trocam de lado no halftime,
+  e ler o placar como team1-team2 nomeava o time errado. Pelo mesmo
+  motivo o `round.winner` só é preenchido quando a origem sabe (o VOD,
+  pelo demo): o placar CT-T não diz qual time estava no CT, então
+  derivar o vencedor seria chute;
+- `killfeed.roundDrift` — quantas kills do scorebot ficaram com o round
+  **divergente** do round do placar (o feed conta o round pelos
+  `RoundStart`, o placar usa `ct+t+1`). Sem esse contador, uma kill que
+  não pareou parecia um bug do killfeed; com ele, o log diz se foi
+  "atraso do feed" ou "os rounds não batem".
+
+Para **reverter** um arquivo v2 para o v1: renomeie o `.v1.bak` de volta
+para o `.json` (o código antigo lê o flat) — não basta mudar a constante
+`SIDECAR_VERSION`, porque o writer está fixo em v2. O marker do Short
+(`<pasta>_short.json`) também é v2: o `youtubeId` passou de
+`short.youtubeId` para `publication.youtubeId`.
 
 Phase 2 = download the finished match demo and parse it with a `.dem` parser
 (`demofile`): completes 100% of the list (weapons, assists, HE/flash/smoke/molotov).
@@ -953,6 +1243,17 @@ Missing fields come as `undefined` and the text degrades on its own.
 Every upload gets a title and description built from the round data. The
 generation runs **in parallel with the clip render**, so it costs no extra
 latency on the upload.
+
+**Copy do canal**: o mapa Dust2 é feminino — é **"na Dust2"**, nunca
+"no Dust2". A regra (`src/clipper/copyRules.ts`, puro) vale para o
+**título**, a **descrição**, o **adesivo** do Short, a **legenda**
+queimada e o arquivo de texto que vai ao lado do mp4. Ela é aplicada
+depois da geração (inclusive no texto que a IA devolveu) e é
+idempotente; "no mapa Dust2" continua "no mapa Dust2" (o artigo é do
+MAPA). O mesmo vale para os outros artigos e contrações antes do mapa
+feminino: "do Dust2" → "da Dust2", "o Dust2" → "a Dust2", "pelo
+Dust2" → "pela Dust2", "num Dust2" → "numa Dust2" e "ao Dust2" → "à
+Dust2" (a capitalização do artigo é preservada).
 
 | `YT_META_MODE` | What happens |
 |---|---|

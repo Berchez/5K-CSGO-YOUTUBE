@@ -805,15 +805,17 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
         expect(out.thumbnailPath).toBeUndefined();
         expect(fs.existsSync(out.sidecarPath)).toBe(true);
         const sidecar = JSON.parse(fs.readFileSync(out.sidecarPath, 'utf8')) as {
-          captureMode?: string;
-          freezeDetection?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] };
+          schemaVersion?: number;
+          clip?: { captureMode?: string };
+          window?: { freeze?: { thresholdDb?: number; minDurationSec?: number; intervals?: unknown[] } };
         };
-        expect(sidecar.captureMode).toBe('muxed');
-        expect(sidecar.freezeDetection).toMatchObject({
+        expect(sidecar.schemaVersion).toBe(2);
+        expect(sidecar.clip?.captureMode).toBe('muxed');
+        expect(sidecar.window?.freeze).toMatchObject({
           thresholdDb: -50,
           minDurationSec: 0.5,
         });
-        expect(Array.isArray(sidecar.freezeDetection?.intervals)).toBe(true);
+        expect(Array.isArray(sidecar.window?.freeze?.intervals)).toBe(true);
         // saída precisa ter vídeo E áudio (emenda realinhada)
         let err = '';
         try {
@@ -910,10 +912,12 @@ describe.skipIf(!ffmpegOk)('makeClipThumbnail (F4: thumb depois do upload)', () 
 
       const sidecar = path.join(dir, 'clipe.json');
       fs.writeFileSync(sidecar, JSON.stringify({ clipFile: 'clipe.mp4' }, null, 2));
+      const readSidecar = (): { clip?: { thumbnailFile?: string | null } } =>
+        JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { clip?: { thumbnailFile?: string | null } };
       patchSidecarThumbnail(sidecar, thumb);
-      expect((JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { thumbnailFile?: string }).thumbnailFile).toBe('clipe.jpg');
+      expect(readSidecar().clip?.thumbnailFile).toBe('clipe.jpg');
       patchSidecarThumbnail(sidecar, null);
-      expect((JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { thumbnailFile?: string | null }).thumbnailFile).toBeNull();
+      expect(readSidecar().clip?.thumbnailFile).toBeUndefined();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

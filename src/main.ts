@@ -55,9 +55,14 @@ import {
 import type { LatencySample } from './monitor/streamLatency.js';
 import { loadLatencyState, saveLatencyState } from './monitor/latencyStore.js';
 import { detectionEvents } from './monitor/liveTelemetry.js';
-import { loadWatchlistFile, resolveRoundPolicy } from './watchlist.js';
+import {
+  loadWatchlistFile,
+  matchTeamAlias,
+  normalizeName,
+  resolveRoundPolicy,
+} from './watchlist.js';
 import { trackMatch } from './detector/matchTracker.js';
-import { buildRoundSummary, describeAce, isAnchorLowConfidence } from './detector/aceDetector.js';
+import { buildRoundSummary, describeAce, isAnchorLowConfidence, refreshRoundSummary } from './detector/aceDetector.js';
 import { evaluateAceCoverage } from './detector/aceCoverage.js';
 import { StreamRecorder, MuxedFormatUnavailableError } from './recorder/streamRecorder.js';
 import { buildClip, detectTruncatedStart, makeClipThumbnail, newestSegmentEndMs, oldestSegmentStartMs, patchSidecarAudit, patchSidecarThumbnail, pickSegments } from './clipper/clipBuilder.js';
@@ -73,6 +78,7 @@ import { createMetadataAi } from './uploader/metadataAi.js';
 import type { MetadataAiFn } from './uploader/videoMetadata.js';
 import { getFreeBytes } from './diskSpace.js';
 import {
+  describeMinKillsPolicy,
   initTrayStatus,
   patchTrayStatus,
   publishTraySnapshot,
@@ -386,13 +392,34 @@ function trayMatchesFrom(
     const recorders = activeRecorders.get(m.matchId);
     const stream = selectedStreams.get(m.matchId);
     const state = trayMatchState(m);
+    const minKills =
+      m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
+    // A fonte do limiar vai junto do número: o painel precisa dizer se o
+    // 5 veio da watchlist, da política por estrelas ou de uma partida
+    // que só entrou pela lista (adversário bloqueado).
+    const policy = {
+      minKills,
+      stars: m.stars,
+      minKillsSource: (m.watchlisted ? 'watchlist' : 'general') as 'general' | 'watchlist',
+      passesGeneralFilter: matchPassesFilter(
+        m.stars,
+        m.isTopTierGuess,
+        cfg.MIN_STARS,
+        cfg.TOP_TIER_ONLY,
+      ),
+      watchlistedTeams: m.watchlistedTeams,
+    };
     return {
       matchId: m.matchId,
       team1: m.team1,
       team2: m.team2,
       event: m.event,
       stars: m.stars,
-      minKills: m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS),
+      minKills,
+      minKillsSource: policy.minKillsSource,
+      passesGeneralFilter: policy.passesGeneralFilter,
+      watchlistedTeams: policy.watchlistedTeams,
+      minKillsLabel: describeMinKillsPolicy(policy),
       matchPageUrl: m.matchPageUrl,
       state,
       stream: stream
@@ -933,7 +960,9 @@ async function handleAce(
       freezer,
     );
     ace.streamSync = streamSync;
-    if (streamSync.scoreBefore) ace.score = streamSync.scoreBefore;
+    // O placar do OCR usa outra ordem de lados (team1/team2 do vídeo) e
+    // sobrescrever `ace.score` misturava coordenadas no sidecar. O score do
+    // tracker fica intocado; o do vídeo vive em `streamSync.scoreBefore`.
     /** Fim REAL do round no relógio do jogo (timer do HLTV) ou null. */
     const roundEndedAtMs = ace.roundEndedAt ? Date.parse(ace.roundEndedAt) : null;
     const roundEndReference =
@@ -1350,7 +1379,10 @@ async function handleAce(
      * exatamente o caso do teto (com âncora medida o teto não age).
      */
     if (startLatencyCapped) {
-      ace.kills = ace.kills.map((kill) => ({ ...kill, estimated: true }));
+      // No lugar dos objetos (não uma cópia): o killfeed pode completar a
+      // kill depois do fechamento do round, e uma cópia aqui ficaria
+      // sem arma/headshot no sidecar.
+      for (const kill of ace.kills) kill.estimated = true;
     }
     /**
      * A fonte reportada tem que ser a que foi APLICADA: em shadow
@@ -1528,6 +1560,39 @@ async function handleAce(
         'virada do placar no vídeo implausível (round posterior ou antes do fim real) — fim estimado aplicado',
       );
     }
+    /**
+     * O `summary` nasce no fechamento do round (SNAPSHOT). O killfeed do
+     * scorebot completa as kills DEPOIS (arma, headshot, a vítima
+     * corrigida): sem recalcular, o título, a descrição e a thumbnail
+     * saíam com o dado velho.
+     *
+     * O recálculo é feito aqui (um ponto só) e de novo antes do corte:
+     * os metadados saem em paralelo ao corte, e o killfeed pode
+     * chegar entre os dois.
+     */
+    const refreshSummary = (): void => {
+      if (!ace.summary) return;
+      const antes = ace.summary;
+      ace.summary = refreshRoundSummary(ace.summary, ace.kills);
+      if (
+        antes.mainWeapon !== ace.summary.mainWeapon ||
+        antes.headshots !== ace.summary.headshots ||
+        antes.victims.join('|') !== ace.summary.victims.join('|')
+      ) {
+        log.info(
+          {
+            matchId,
+            round: ace.round,
+            armaPrincipal: antes.mainWeapon || null,
+            armaPrincipalAgora: ace.summary.mainWeapon || null,
+            headshots: antes.headshots,
+            headshotsAgora: ace.summary.headshots,
+          },
+          'resumo do round recalculado com o enriquecimento do killfeed',
+        );
+      }
+    };
+    refreshSummary();
     // Metadados: a CHAMADA da IA começa aqui (EM PARALELO ao corte do
     // clipe — só ela depende da rede, então não soma latência no
     // upload). A composição final espera o clipe real: o sidecar sabe o
@@ -1742,6 +1807,10 @@ async function handleAce(
       }
       const clipAce: AceEvent = {
         ...ace,
+        // O killfeed pode ter completado as kills durante a espera pelo
+        // material do buffer: o resumo vai junto, senão o sidecar e a
+        // thumbnail saem com o dado velho.
+        summary: ace.summary ? refreshRoundSummary(ace.summary, ace.kills) : ace.summary,
         endedAt: sourceEndMs != null ? new Date(sourceEndMs).toISOString() : undefined,
         truncatedStart: detectTruncatedStart(sourceSegments, {
           segmentTimeSec: cfg.SEGMENT_TIME_SEC,
@@ -2508,13 +2577,31 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       trackMatch(m.matchPageUrl, m.matchId, {
         shouldStop: () => stopping || activeTrackers.get(m.matchId) !== token,
         onAce: (a) => {
-          // Time do autor desconhecido no live: resumo com confronto completo.
-          const summary = buildRoundSummary(
-            a.player,
-            '',
-            `${m.team1} vs ${m.team2}`,
-            a.kills,
-          );
+          // O placar agora entrega o time do autor. Sem ele, o resumo cai no
+          // confronto completo (nunca inventa um lado).
+          //
+          // O nome do placar é o do CABEÇALHO da tabela ("Team Vitality") e
+          // o do listing é o do card ("Vitality"): sem casar os dois, o
+          // adversário ficava vazio (o título saía sem o rival).
+          const rawTeam = a.team ?? '';
+          const canonicalTeam = matchTeamAlias(rawTeam, [m.team1, m.team2]);
+          const playerTeam = canonicalTeam ?? rawTeam;
+          const teamKey = normalizeName(playerTeam);
+          const opponent =
+            teamKey && teamKey === normalizeName(m.team1)
+              ? m.team2
+              : teamKey && teamKey === normalizeName(m.team2)
+                ? m.team1
+                : '';
+          const summary = buildRoundSummary({
+            player: a.player,
+            team: playerTeam || null,
+            opponent: opponent || null,
+            opponents: `${m.team1} vs ${m.team2}`,
+            map: a.map,
+            round: a.round,
+            kills: a.kills,
+          });
           log.info(
             { summary: describeAce(summary, m.event).split('\n')[0] },
             'resumo do ace',
@@ -2528,9 +2615,18 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
               team1: m.team1,
               team2: m.team2,
               event: m.event,
+              matchUrl: m.matchPageUrl,
               detectedAt: new Date().toISOString(),
               startedAt: a.startedAt,
-              kills: a.kills.map((kk) => ({ ...kk, map: a.map })),
+              // As kills são os MESMOS objetos do tracker: o enriquecimento
+              // tardio (killfeed que chega depois do fechamento do round)
+              // atualiza estes objetos — copiar aqui perderia arma/headshot
+              // e a vítima corrigida.
+              kills: a.kills.map((kk) => {
+                kk.map = a.map;
+                return kk;
+              }),
+              killfeed: a.killfeed,
               anchorConfidence: a.anchorConfidence,
               roundEndedAt: a.roundEndedAt,
               scoreBefore: a.scoreBefore,

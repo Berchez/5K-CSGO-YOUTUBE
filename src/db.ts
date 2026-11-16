@@ -401,17 +401,30 @@ export function findPublishedShorts(dbFile: string): Map<string, string> {
 /**
  * Vídeos já enviados (com `youtube_video_id`) registrados desde `sinceSql`.
  *
- * `sinceSql` no formato do SQLite ('YYYY-MM-DD HH:MM:SS', UTC) — o
- * `created_at` da tabela `clips` usa esse formato. Serve para a guarda
- * de cota: cada `videos.insert` custa 1600 units do limite diário de
- * 10000 do YouTube, e o bot live e o script de Shorts dividem a mesma
- * cota do projeto de API.
+ * `sinceSql` no formato do SQLite ('YYYY-MM-DD HH:MM:SS') — o mesmo
+ * formato de `created_at`/`published_at` da tabela `clips`. Serve para a
+ * guarda de cota: cada `videos.insert` custa 1600 units do limite diário
+ * do YouTube, e o bot live e o script de Shorts dividem a mesma cota do
+ * projeto de API.
+ *
+ * A contagem é pelo `published_at` (quando o vídeo SUBIU), não pelo
+ * `created_at` (quando o clipe foi gravado): um clipe antigo publicado
+ * hoje consumiu a cota de HOJE, e um clipe de hoje publicado ontem não
+ * consumiu a de hoje. `COALESCE` cobre as linhas antigas (sem
+ * `published_at`) sem perder a contagem.
+ *
+ * `datetime(...)` nos DOIS lados: `published_at` é gravado como ISO
+ * (`2026-11-14T03:00:00.000Z`) e `created_at` como `datetime('now')`
+ * (`2026-11-14 03:00:00`). Comparar texto direto contra o limite
+ * (`YYYY-MM-DD HH:MM:SS`) faz `'T' > ' '` e todo upload do dia UTC da
+ * fronteira contar — superestimando a cota e bloqueando upload legítimo.
  */
 export function countPublishedClips(dbFile: string, sinceSql: string): number {
   const row = getDb(dbFile)
     .prepare(
       `SELECT COUNT(*) AS n FROM clips
-       WHERE youtube_video_id IS NOT NULL AND created_at >= ?`,
+       WHERE youtube_video_id IS NOT NULL
+         AND datetime(COALESCE(published_at, created_at)) >= datetime(?)`,
     )
     .get(sinceSql) as { n: number } | undefined;
   return Number(row?.n ?? 0);

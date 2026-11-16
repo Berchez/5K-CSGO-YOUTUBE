@@ -9,6 +9,7 @@
  * e do render.
  */
 import path from 'node:path';
+import { fixMapPrepositions } from './copyRules.js';
 
 /** Uma linha de legenda (tempos relativos ao INÍCIO do Short). */
 export interface CaptionLine {
@@ -57,6 +58,8 @@ export interface CaptionTranscriptCache {
   language?: string | null;
   /** A legenda já saiu traduzida? */
   translated?: boolean;
+  /** De onde veio o tempo queimado no vídeo. */
+  timingSource?: 'whisper' | 'model';
   /** Falas (tempos relativos ao início do Short). */
   lines: Array<{ startSec: number; endSec: number; text: string }>;
   /** Falas no idioma original (quando houve tradução). */
@@ -81,6 +84,8 @@ export interface CaptionStatus {
   language?: string | null;
   lines?: number;
   translated?: boolean;
+  /** De onde veio o tempo queimado no vídeo. */
+  timingSource?: 'whisper' | 'model';
   reason?: CaptionSkipReason;
   /**
    * Passes que rodaram "pela metade": `translate` (o áudio estrangeiro
@@ -109,6 +114,36 @@ export interface CaptionStatus {
 }
 
 /**
+ * Status de FALHA da legenda que PRESERVA a transcrição guardada.
+ *
+ * Quando a transcrição/ASS quebra, o marker recebe `reason: 'error'` —
+ * mas a transcrição CRU que já está no cache continua nele. Sem isso, a
+ * próxima rodada gastaria o provider de novo (a cota do Gemini + os
+ * ~47s do whisper local) só para chegar no mesmo ponto.
+ */
+export function captionErrorStatus(
+  cached?: CaptionTranscriptCache | null,
+): CaptionStatus {
+  const status: CaptionStatus = { applied: false, reason: 'error' };
+  if (!cached) return status;
+  return {
+    ...status,
+    transcript: {
+      provider: cached.provider,
+      language: cached.language ?? null,
+      translated: cached.translated === true,
+      ...(cached.timingSource ? { timingSource: cached.timingSource } : {}),
+      lines: cached.lines,
+      ...(cached.originalLines?.length ? { originalLines: cached.originalLines } : {}),
+      ...(cached.rawLines?.length ? { rawLines: cached.rawLines } : {}),
+      ...(cached.rawOriginalLines?.length
+        ? { rawOriginalLines: cached.rawOriginalLines }
+        : {}),
+    },
+  };
+}
+
+/**
  * A falha é TÉCNICA (vale tentar de novo) ou FINAL?
  *
  * `no-audio`/`no-speech` são finais: repetir a transcrição não muda nada.
@@ -123,6 +158,24 @@ export function isRetryableCaptionFailure(
     status?.reason === 'failed' ||
     status?.reason === 'untranslated'
   );
+}
+
+/**
+ * A legenda saiu DEGRADADA (algum passe rodou "pela metade")?
+ *
+ * Passes degradados: `translate` (o áudio estrangeiro ficou no idioma
+ * original) e `refine` (a revisão do texto não rodou). A legenda foi
+ * queimada no vídeo, então o Short NÃO está quebrado — mas o texto
+ * pode estar no idioma errado ou com nome errado.
+ *
+ * Isso NÃO muda a decisão de PUBLICAÇÃO (`isRetryableCaptionFailure`):
+ * um Short degradado pode ir ao ar. O que muda é o `--retry-captions`:
+ * ele precisa pegar também estes (refazer a tradução/revisão sem
+ * transcrever de novo).
+ */
+export function hasDegradedCaptions(status: CaptionStatus | null | undefined): boolean {
+  const degraded = status?.degraded;
+  return Array.isArray(degraded) && degraded.length > 0;
 }
 
 /**
@@ -457,7 +510,9 @@ export function buildCaptionLines(
   const out: CaptionLine[] = [];
 
   for (const item of raw ?? []) {
-    const text = normalizeCaptionText(item?.text ?? '');
+    // Copy do canal: "na Dust2", nunca "no Dust2" (vale para a legenda
+    // queimada também).
+    const text = fixMapPrepositions(normalizeCaptionText(item?.text ?? ''));
     if (!text) continue;
     const start = clamp(Number(item.startSec) || 0, 0, dur);
     const end = clamp(Number(item.endSec) || 0, 0, dur);
@@ -553,6 +608,39 @@ export function escapeAssFilterPath(filePath: string): string {
   const normalized = String(filePath ?? '').replace(/\\/g, '/');
   const escaped = normalized.replace(/:/g, '\\:').replace(/'/g, "\\'");
   return `'${escaped}'`;
+}
+
+/**
+ * Despeja a legenda no arquivo de texto (`.txt`/`.orig.txt`).
+ *
+ * A fala é quebrada em uma linha por bloco: se o modelo devolveu uma
+ * quebra de linha no meio, ela viraria uma linha sem tempo no arquivo.
+ *
+ * A copy do canal ("na Dust2") é aplicada aqui: o arquivo tem que bater
+ * com o texto que foi QUEIMADO no vídeo (a regra entra em
+ * `buildCaptionLines`).
+ *
+ * O `.orig.txt` é o texto NO IDIOMA ORIGINAL da fala: a regra é escrita
+ * em português e corromperia o texto estrangeiro ("no Dust2" em inglês
+ * viraria "na Dust2") — por isso ele é despejado SEM a copy
+ * (`applyCopy: false`).
+ */
+export function captionTextDump(
+  lines: CaptionLine[],
+  opts: { applyCopy?: boolean } = {},
+): string {
+  const applyCopy = opts.applyCopy !== false;
+  return (
+    (lines ?? [])
+      .map((line) => {
+        const raw = String(line.text ?? '')
+          .replace(/[\r\n]+/g, ' ')
+          .trim();
+        const text = applyCopy ? fixMapPrepositions(raw) : raw;
+        return `[${line.startSec.toFixed(2)} → ${line.endSec.toFixed(2)}] ${text}`;
+      })
+      .join('\n') + '\n'
+  );
 }
 
 /**

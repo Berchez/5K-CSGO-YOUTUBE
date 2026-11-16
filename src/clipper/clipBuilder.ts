@@ -8,6 +8,11 @@ import type { AceEvent, ClipResult } from '../types.js';
 import { getLogger } from '../logger.js';
 import { makeSmartThumbnail, type SmartThumbOptions } from './thumbnail.js';
 import { describeAce, killLabel, prettyWeapon } from '../detector/aceDetector.js';
+import {
+  buildClipSidecar,
+  updateClipSidecar,
+  writeClipSidecar,
+} from './sidecar.js';
 import { killStale, track, untrack } from '../procRegistry.js';
 
 const execFileAsync = promisify(execFile);
@@ -1213,50 +1218,53 @@ export async function buildClip(
   // Sidecar ANTES da thumbnail (F4): o .json nasce junto com o vídeo —
   // a geração da thumb (IA, até minutos) NÃO pode impedir o registro do
   // clipe (caso 2399755_Dust2_r21_zorte, que ficou sem .json).
-  fs.writeFileSync(
+  //
+  // A escrita é ATÔMICA (`.tmp` + `rename`, via `writeClipSidecar`): um
+  // crash no meio deixaria um JSON pela metade e o clipe voltaria a
+  // parecer "sem sidecar".
+  writeClipSidecar(
     sidecarPath,
-    JSON.stringify(
-      buildSidecar(ace, {
-        clipFile: path.basename(outPath),
+    buildClipSidecar({
+      ace,
+      clip: {
+        file: path.basename(outPath),
+        startMs: clipStartMs,
+        durationSec: outDurSec,
         captureMode: 'muxed',
         sourceHeight,
         outputHeight,
-        streamName: opts.streamName,
-        streamLatencyMs: opts.streamLatencyMs,
-        killVideoOffsetMs: opts.killVideoOffsetMs,
-        startLatencyMs: opts.startLatencyMs,
-        endLatencyMs: opts.endLatencyMs,
-        latencySource: opts.latencySource,
-        latencyChanged: opts.latencyChanged,
-        timelineDiscontinuity: opts.timelineDiscontinuity,
-        freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
+        streamName: opts.streamName ?? null,
         segmentsUsed: usable.map((p) => path.basename(p)),
-        createdAt: new Date().toISOString(),
-        clipStartMs,
-        clipDurationSec: outDurSec,
         avIssues: avIssuesCount,
         avSegmentIssues,
-        timelineMode: timeline.mode,
-        concatLenSec: Math.round(concatLenSec * 100) / 100,
-        replayAwareEndMs,
-        actionResume,
-        minEndMs: opts.minEndMs ?? null,
-        endFloorMs: opts.endFloorMs ?? null,
-        endPinnedBy: opts.endPinnedBy ?? null,
-        ocrEndRejected: opts.ocrEndRejected ?? null,
-        scoreboardEndReason: opts.scoreboardEndReason ?? null,
-        killsSpreadMs: opts.killsSpreadMs ?? null,
-        /**
-         * Início do material mais antigo disponível no buffer (epoch ms):
-         * se for DEPOIS do round, o clipe só pode mostrar o replay. É o
-         * que distingue "o clipe abre tarde" de "o material ao vivo não
-         * existia".
-         */
-        bufferOldestMs: opts.bufferOldestMs ?? null,
-      }),
-      null,
-      2,
-    ),
+      },
+      createdAt: new Date().toISOString(),
+      streamLatencyMs: opts.streamLatencyMs ?? null,
+      killVideoOffsetMs: opts.killVideoOffsetMs ?? null,
+      startLatencyMs: opts.startLatencyMs ?? null,
+      endLatencyMs: opts.endLatencyMs ?? null,
+      latencySource: opts.latencySource ?? null,
+      latencyChanged: opts.latencyChanged,
+      timelineDiscontinuity: opts.timelineDiscontinuity,
+      freezeDetection: { thresholdDb: -50, minDurationSec: 0.5, intervals: freezeIntervals },
+      timelineMode: timeline.mode,
+      concatLenSec: Math.round(concatLenSec * 100) / 100,
+      replayAwareEndMs,
+      actionResume,
+      minEndMs: opts.minEndMs ?? null,
+      endFloorMs: opts.endFloorMs ?? null,
+      endPinnedBy: opts.endPinnedBy ?? null,
+      ocrEndRejected: opts.ocrEndRejected ?? null,
+      scoreboardEndReason: opts.scoreboardEndReason ?? null,
+      killsSpreadMs: opts.killsSpreadMs ?? null,
+      /**
+       * Início do material mais antigo disponível no buffer (epoch ms):
+       * se for DEPOIS do round, o clipe só pode mostrar o replay. É o
+       * que distingue "o clipe abre tarde" de "o material ao vivo não
+       * existia".
+       */
+      bufferOldestMs: opts.bufferOldestMs ?? null,
+    }),
   );
 
   return {
@@ -1296,16 +1304,10 @@ export function buildDescription(ace: AceEvent, tags: string): string {
 }
 
 /**
- * Payload do sidecar .json: kills UMA vez (top-level) + summary SEM a cópia
- * dos kills (só metadados agregados). Evita o array duplicado.
+ * Payload do sidecar .json (v2): kills UMA vez, metadados agregados em
+ * `stats`. A compatibilidade com v1 fica no leitor (`normalizeClipSidecar`).
  */
-export function buildSidecar(ace: AceEvent, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  // JSON.stringify omite chaves undefined: kills aparece 1x (top-level).
-  const summary = ace.summary
-    ? { ...ace.summary, kills: undefined, killCount: ace.summary.kills.length }
-    : undefined;
-  return { ...ace, summary, ...extra };
-}
+export { buildClipSidecar } from './sidecar.js';
 
 export interface ClipThumbnailOptions {
   /** Jpg de saída (default: mesmo nome do mp4, ao lado). */
@@ -1348,13 +1350,12 @@ export async function makeClipThumbnail(
  * para o clipe nunca ficar sem registro se a thumb falhar).
  */
 export function patchSidecarThumbnail(sidecarPath: string, thumbnailPath: string | null): void {
-  try {
-    const doc = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
-    doc.thumbnailFile = thumbnailPath != null ? path.basename(thumbnailPath) : null;
-    fs.writeFileSync(sidecarPath, JSON.stringify(doc, null, 2));
-  } catch (e) {
+  const ok = updateClipSidecar(sidecarPath, (side) => {
+    side.clip.thumbnailFile = thumbnailPath != null ? path.basename(thumbnailPath) : null;
+  });
+  if (!ok) {
     getLogger().warn(
-      { err: String(e).slice(0, 200) },
+      { sidecar: sidecarPath },
       'falha ao anotar a thumbnail no sidecar',
     );
   }
@@ -1378,13 +1379,31 @@ export function patchSidecarAudit(
     liveMaterialAvailable?: boolean | null;
   },
 ): void {
-  try {
-    const doc = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
-    doc.clipWindowAudit = audit;
-    fs.writeFileSync(sidecarPath, JSON.stringify(doc, null, 2));
-  } catch (e) {
+  const ok = updateClipSidecar(sidecarPath, (side) => {
+    side.window ??= {
+      truncatedStart: false,
+      timelineDiscontinuity: false,
+      timelineMode: null,
+      concatLenSec: null,
+      killsSpreadMs: null,
+      bufferOldestMs: null,
+      replayAwareEndMs: null,
+      end: {
+        minMs: null,
+        floorMs: null,
+        pinnedBy: null,
+        ocrRejected: null,
+        scoreboardReason: null,
+      },
+      actionResume: null,
+      freeze: null,
+      audit: null,
+    };
+    side.window.audit = audit;
+  });
+  if (!ok) {
     getLogger().warn(
-      { err: String(e).slice(0, 200) },
+      { sidecar: sidecarPath },
       'falha ao anotar a auditoria da janela no sidecar',
     );
   }

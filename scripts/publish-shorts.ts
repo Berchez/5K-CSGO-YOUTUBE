@@ -34,8 +34,9 @@
  *                      teto de latência — as posições das kills não são
  *                      confiáveis)
  *   --retry-captions   processa SÓ os Shorts que falharam na legenda
- *                      (tradução/erro/libass): os que estão OK ficam de
- *                      fora, e o backoff é ignorado — sem liberar a
+ *                      (tradução/erro/libass) ou saíram DEGRADADOS
+ *                      (refine/translate falhou): os que estão OK ficam
+ *                      de fora, e o backoff é ignorado — sem liberar a
  *                      janela com posição não confiável
  *   --retranscribe    refaz a transcrição do zero (ignora a transcrição
  *                      guardada no marker) — o jeito de trocar o provider
@@ -58,7 +59,10 @@
  *                      do próprio modelo (que o inventa).
  *   --overlay-text <texto>
  *                      adesivo (botão) no começo do Short, que some em
- *                      fade out. Ex.: `Furia nos playoffs`
+ *                      fade out. `auto` deriva das kills (`ACE kyousuke`);
+ *                      `none` desliga; texto literal é usado como está.
+ *                      Precedência: flag > `config/shorts-overlays.json`
+ *                      (por clipe) > adesivo já gravado no marker > .env
  *   --overlay-hold-sec <n>  segundos que o adesivo fica visível (default: .env)
  *   --overlay-fade-sec <n>  duração do fade out do adesivo (default: .env)
  *   --overlay-preset <id>  visual do adesivo: polex|polex-die|gaules|
@@ -115,7 +119,6 @@ import {
   shortRenderSignature,
   shortWindowConfigErrors,
   hasAudioStream,
-  type ShortRenderSignature,
   type ShortTopMode,
   type ShortWindowConfig,
 } from '../src/clipper/shorts.js';
@@ -126,11 +129,13 @@ import {
   buildCaptionsAss,
   captionCrosshairTopY,
   captionMaxChars,
+  captionTextDump,
+  captionErrorStatus,
   canPublishShortWithCaptions,
+  hasDegradedCaptions,
   isCaptionFilterError,
   isRetryableCaptionFailure,
   shortRetryDecision,
-  type CaptionLine,
   type CaptionStatus,
 } from '../src/clipper/shortCaptions.js';
 import {
@@ -138,47 +143,49 @@ import {
   captionProviderFrom,
   createCaptionTranscriber,
   extractAudioWindow,
+  salvagedCaptionTranscript,
   type CaptionContext,
   type CaptionTranscript,
   type CaptionTranscriber,
 } from '../src/clipper/shortCaptionsAi.js';
-import { resolveShortOverlayStyle } from '../src/clipper/shortOverlay.js';
+import {
+  isShortOverlayPreset,
+  resolveShortOverlayStyle,
+  resolveShortOverlayText,
+} from '../src/clipper/shortOverlay.js';
+import {
+  markerOverlaySpec,
+  mergeShortOverlaySources,
+  overlaySpecForMarker,
+  parseShortOverlayConfig,
+  shortOverlaySpecForClip,
+  type ShortOverlayConfig,
+  type ShortOverlaySpec,
+} from '../src/clipper/shortOverlayConfig.js';
+import { quotaDecision, QUOTA_UNITS_PER_UPLOAD } from '../src/uploader/quota.js';
+import { startOfDaySql } from '../src/timeZone.js';
 import { loadThumbFont, measureThumbText } from '../src/clipper/thumbText.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe, relatedVideoUrl, type VideoMetadata } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
 import type { MetadataAiFn } from '../src/uploader/videoMetadata.js';
-import type { AceEvent, KillEvent, RoundSummary } from '../src/types.js';
-
-interface Sidecar {
-  matchId: string;
-  map: string;
-  round: number;
-  player: string;
-  team1: string;
-  team2: string;
-  event: string;
-  detectedAt: string;
-  kills: KillEvent[];
-  summary?: RoundSummary;
-  score?: string;
-  scoreBefore?: string;
-  scoreAfter?: string;
-  clipFile?: string;
-  clipStartMs?: number;
-  clipDurationSec?: number;
-  killVideoOffsetMs?: number;
-  streamName?: string;
-  createdAt?: string;
-  [key: string]: unknown;
-}
+import {
+  buildShortMarker,
+  readClipSidecar,
+  readShortMarker,
+  sidecarToAce,
+  stringifyJsonWithoutNulls,
+  writeShortMarker,
+  type ClipSidecarV2,
+  type ShortMarkerV2,
+} from '../src/clipper/sidecar.js';
 
 interface Candidate {
   dir: string;
   name: string;
   sidecarPath: string;
   mp4Path: string;
-  sidecar: Sidecar;
+  sidecar: ClipSidecarV2;
 }
 
 interface Args {
@@ -279,10 +286,6 @@ function parseOnOff(raw: string, flag: string): boolean {
   if (['0', 'false', 'off', 'no', 'nao', 'não'].includes(value)) return false;
   throw new Error(`${flag} aceita on/off (recebido: ${raw})`);
 }
-
-/** Cota diária do YouTube (units do projeto de API). */
-const QUOTA_UNITS_PER_UPLOAD = 1600;
-const QUOTA_UNITS_PER_DAY = 10_000;
 
 /**
  * Hash das regras de correção da legenda (`assets/caption-corrections.txt`).
@@ -468,75 +471,32 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-/**
- * Reconstrói o ace a partir do sidecar (o sidecar É o ace gravado).
- *
- * A lista de kills é a DO VÍDEO: quando a janela do Short corta a
- * jogada, o resumo é refeito com as kills que ficaram (o título de um
- * Short com 4 kills não pode dizer "5 kills").
- */
-function sidecarToAce(side: Sidecar, truncated = false): AceEvent {
-  const kills = side.kills ?? [];
-  const summary = side.summary
-    ? {
-        ...side.summary,
-        kills,
-        victims: kills.map((k) => k.victim),
-        weapons: kills.map((k) => k.weapon ?? ''),
-        headshots: kills.filter((k) => k.headshot).length,
-        mainWeapon: mostUsedWeapon(kills) || side.summary.mainWeapon,
-        // Assistências e cegadas são POSICIONADAS por kill: sem o
-        // timestamp de cada uma, não dá para saber se caíram dentro da
-        // janela do Short. Com a janela truncada, cites fora da janela
-        // seriam informação falsa → saem.
-        assists: truncated ? [] : side.summary.assists,
-        flashAssists: truncated ? [] : side.summary.flashAssists,
-      }
-    : undefined;
-  return {
-    matchId: side.matchId,
-    map: side.map,
-    round: side.round,
-    player: side.player,
-    team1: side.team1,
-    team2: side.team2,
-    event: side.event,
-    detectedAt: side.detectedAt,
-    kills,
-    score: side.score,
-    scoreBefore: side.scoreBefore,
-    scoreAfter: side.scoreAfter,
-    summary,
-  };
-}
-
-/** Arma mais usada na lista de kills. */
-function mostUsedWeapon(kills: KillEvent[]): string {
-  const counts = new Map<string, number>();
-  for (const k of kills) counts.set(k.weapon ?? '', (counts.get(k.weapon ?? '') ?? 0) + 1);
-  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
-}
-
-function readSidecar(dir: string): { sidecarPath: string; side: Sidecar } | null {
+function readSidecar(dir: string): { sidecarPath: string; side: ClipSidecarV2 } | null {
   const name = path.basename(dir);
   // O sidecar novo é `<pasta>.json`; o antigo (muxed) é `<pasta>_muxed.json`.
   const candidates = [path.join(dir, `${name}.json`), path.join(dir, `${name}_muxed.json`)];
   for (const p of candidates) {
     if (!fs.existsSync(p)) continue;
-    try {
-      const side = JSON.parse(fs.readFileSync(p, 'utf8')) as Sidecar;
-      if (side && Array.isArray(side.kills)) return { sidecarPath: p, side };
-    } catch {
-      // sidecar quebrado: o próximo candidato (ou a pasta) é ignorado
-    }
+    // `readClipSidecar` normaliza v1 -> v2. Sem kills não há Short.
+    const side = readClipSidecar(p);
+    if (side && side.kills.length > 0) return { sidecarPath: p, side };
   }
   return null;
 }
 
+/**
+ * Antes de 2000 = o sidecar NÃO tem data real (o normalizador usa
+ * `new Date(0)` como fallback). A data de 1970 é "válida" e por isso
+ * enganava a ordenação: o clipe ia para o fim da fila.
+ */
+const SEM_DATA_REAL_MS = Date.UTC(2000, 0, 1);
+
 /** Instante do clipe (ms): `createdAt` do sidecar ou mtime do arquivo. */
 function candidateTime(candidate: Candidate): number {
-  const created = candidate.sidecar.createdAt ? Date.parse(String(candidate.sidecar.createdAt)) : NaN;
-  if (Number.isFinite(created)) return created;
+  const created = candidate.sidecar.createdAt
+    ? Date.parse(String(candidate.sidecar.createdAt))
+    : NaN;
+  if (Number.isFinite(created) && created >= SEM_DATA_REAL_MS) return created;
   try {
     return fs.statSync(candidate.mp4Path).mtimeMs;
   } catch {
@@ -559,7 +519,7 @@ function discoverCandidates(clipsDir: string, args: Args): Candidate[] {
     if (!found) continue;
     const { sidecarPath, side } = found;
     const name = path.basename(dir);
-    const mp4 = path.join(dir, side.clipFile ?? `${name}.mp4`);
+    const mp4 = path.join(dir, side.clip.file ?? `${name}.mp4`);
     if (!fs.existsSync(mp4)) continue;
     out.push({ dir, name, sidecarPath, mp4Path: mp4, sidecar: side });
   }
@@ -569,42 +529,6 @@ function discoverCandidates(clipsDir: string, args: Args): Candidate[] {
   // antigo pode ter `createdAt` ausente e a ordenação virava alfabética.
   out.sort((a, b) => candidateTime(b) - candidateTime(a));
   return out;
-}
-
-interface ShortMarker {
-  youtubeId?: string;
-  publishedAt?: string;
-  /** Janela que o vertical já gravado cobre. */
-  shortWindow?: { startSec?: number; durSec?: number };
-  /** Layout/geometria com que o vertical gravado foi gerado. */
-  render?: ShortRenderSignature;
-  /** Legenda queimada no vertical gravado. */
-  captionInfo?: CaptionInfo | null;
-  /** Kills dentro da janela que o vertical gravado cobre. */
-  kills?: KillEvent[];
-  clipStartMs?: number;
-  clipDurationSec?: number;
-  /** Metadados já gerados (reaproveitados na publicação). */
-  metadata?: {
-    title: string;
-    description: string;
-    tags: string[];
-    source: string;
-    privacy: string;
-  };
-  /** Quantas vezes a publicação já falhou (tente de novo depois). */
-  attempts?: number;
-  /** Quando foi a última tentativa que falhou (ISO). */
-  lastAttemptAt?: string | null;
-}
-
-function readShortMarker(file: string): ShortMarker | null {
-  if (!fs.existsSync(file)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as ShortMarker;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -631,7 +555,7 @@ function writeReport(
   runs.push({ at, published: publishedCount, items });
   fs.writeFileSync(
     reportPath,
-    JSON.stringify({ at, published: publishedCount, items, runs }, null, 2) + '\n',
+    stringifyJsonWithoutNulls({ at, published: publishedCount, items, runs }) + '\n',
   );
   return reportPath;
 }
@@ -697,11 +621,118 @@ function isQuotaError(error: unknown): boolean {
   );
 }
 
-/** Início do dia (UTC) no formato do SQLite. */
-function startOfUtcDaySql(): string {
-  const now = new Date();
-  const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  return day.toISOString().slice(0, 19).replace('T', ' ');
+/**
+ * Adesivo por clipe (`config/shorts-overlays.json`).
+ *
+ * Arquivo ausente = nenhum adesivo por clipe (o `.env`/flag mandam) —
+ * mas o dono precisa saber que ele sumiu: sem o arquivo, o adesivo
+ * gravado no marker é a única memória do visual de cada clipe.
+ */
+function loadOverlayConfig(file: string): ShortOverlayConfig {
+  if (!file) return {};
+  if (!fs.existsSync(file)) {
+    console.warn(
+      `⚠ arquivo de adesivos por clipe não encontrado (${file}) — o adesivo vem do .env/flag`,
+    );
+    return {};
+  }
+  try {
+    // BOM do Notepad/PowerShell quebra o JSON.parse e o arquivo caía em
+    // silêncio para o `.env` (o adesivo do clipe "sumia" sem aviso).
+    const raw = JSON.parse(
+      fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''),
+    );
+    const config = parseShortOverlayConfig(raw);
+    const total = Object.keys(config).length;
+    if (total > 0) {
+      console.log(
+        `adesivos por clipe: ${total} entrada(s) em ${path.relative(process.cwd(), file)}`,
+      );
+    }
+    return config;
+  } catch (e) {
+    console.warn(
+      `⚠ arquivo de adesivos por clipe inválido (${file}: ${String(e).slice(0, 120)}) — o adesivo vem do .env/flag`,
+    );
+    return {};
+  }
+}
+
+/**
+ * O adesivo de cada clipe, na precedência:
+ * flag da CLI > arquivo por clipe > marker gravado > `.env`.
+ *
+ * `persisted` é o mesmo merge SEM a CLI: é o spec que vai para o marker.
+ * A flag é decisão de UMA rodada (o texto de teste de um dry-run não pode
+ * virar o adesivo do `--publish` seguinte), e o marker guarda o pedido —
+ * `auto` resolve de novo a cada rodada.
+ */
+function resolveClipOverlay(input: {
+  cfg: AppConfig;
+  args: Args;
+  /** Entrada do arquivo por clipe (null = não tem). */
+  fileSpec: ShortOverlaySpec | null;
+  /** O `short` do marker do Short (null = sem marker). */
+  markerShort: ShortMarkerV2['short'] | null;
+}): { spec: ShortOverlaySpec; persisted: ShortOverlaySpec; source: string } {
+  const { cfg, args } = input;
+  const cli: ShortOverlaySpec = {
+    text: args.overlayText,
+    preset: args.overlayPreset,
+    holdSec: args.overlayHoldSec,
+    fadeSec: args.overlayFadeSec,
+    y: args.overlayY,
+    style: args.overlayStyle,
+    tag: args.overlayTag,
+    uppercase: args.overlayUppercase,
+    background: args.overlayBackground,
+    color: args.overlayColor,
+    borderColor: args.overlayBorderColor,
+    borderPx: args.overlayBorderPx,
+    shadowColor: args.overlayShadowColor,
+    shadowPx: args.overlayShadowPx,
+    shadowBlurPx: args.overlayShadowBlurPx,
+    tiltDeg: args.overlayTiltDeg,
+    font: args.overlayFont,
+  };
+  const env: ShortOverlaySpec = {
+    text: cfg.SHORTS_OVERLAY_TEXT,
+    preset: cfg.SHORTS_OVERLAY_PRESET,
+    holdSec: cfg.SHORTS_OVERLAY_HOLD_SEC,
+    fadeSec: cfg.SHORTS_OVERLAY_FADE_SEC,
+    y: cfg.SHORTS_OVERLAY_Y,
+    style: cfg.SHORTS_OVERLAY_STYLE,
+    tag: cfg.SHORTS_OVERLAY_TAG,
+    uppercase: cfg.SHORTS_OVERLAY_UPPERCASE,
+    background: cfg.SHORTS_OVERLAY_BACKGROUND,
+    color: cfg.SHORTS_OVERLAY_COLOR,
+    borderColor: cfg.SHORTS_OVERLAY_BORDER_COLOR,
+    borderPx: cfg.SHORTS_OVERLAY_BORDER_PX,
+    shadowColor: cfg.SHORTS_OVERLAY_SHADOW_COLOR,
+    shadowPx: cfg.SHORTS_OVERLAY_SHADOW_PX,
+    shadowBlurPx: cfg.SHORTS_OVERLAY_SHADOW_BLUR_PX,
+    tiltDeg: cfg.SHORTS_OVERLAY_TILT_DEG,
+    font: cfg.SHORTS_OVERLAY_FONT,
+  };
+  const markerSpec = markerOverlaySpec(input.markerShort);
+  // O marker só vale se o vertical em disco TEM adesivo (`overlayText`
+  // não vazio) e se gravou o spec pedido: marker sem adesivo não manda
+  // nada (os zeros da assinatura viravam override) e marker legado
+  // (que gravou o texto resolvido) não congela o adesivo.
+  const merged = mergeShortOverlaySources({
+    cli,
+    file: input.fileSpec,
+    marker: markerSpec,
+    env,
+  });
+  const persisted = overlaySpecForMarker(
+    mergeShortOverlaySources({
+      file: input.fileSpec,
+      marker: markerSpec,
+      env,
+    }),
+  );
+  return { spec: merged.spec, persisted, source: merged.source };
 }
 
 interface BatchContext {
@@ -720,6 +751,8 @@ interface BatchContext {
   window: ShortWindowConfig;
   /** Hash das regras de correção da legenda (o texto é queimado no mp4). */
   captionRulesHash: string;
+  /** Adesivo por clipe (`config/shorts-overlays.json`). */
+  overlayConfig: ShortOverlayConfig;
 }
 
 interface CandidateResult {
@@ -745,29 +778,6 @@ function captionAvgCharWidth(fontFamily: string): number {
   const sample = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz0123456789,.!?';
   const width = measureThumbText(font, sample, 100);
   return width > 0 ? width / sample.length / 100 : 0.62;
-}
-
-/**
- * Despejo da legenda em texto (`[início → fim] fala`), um por linha.
- *
- * Fica ao lado do mp4 (`<name>_legenda.txt`) para o dono revisar o que
- * foi ao ar e (`<name>_legenda.orig.txt`) guardar o idioma original
- * quando a fala foi traduzida.
- *
- * A fala é quebrada em uma linha por bloco: se o modelo devolveu uma
- * quebra de linha no meio, ela viraria uma linha sem tempo no arquivo.
- */
-function captionTextDump(lines: CaptionLine[]): string {
-  return (
-    (lines ?? [])
-      .map((line) => {
-        const text = String(line.text ?? '')
-          .replace(/[\r\n]+/g, ' ')
-          .trim();
-        return `[${line.startSec.toFixed(2)} → ${line.endSec.toFixed(2)}] ${text}`;
-      })
-      .join('\n') + '\n'
-  );
 }
 
 /** Apaga o despejo de texto de uma legenda anterior (órfão). */
@@ -846,6 +856,7 @@ async function buildCaptionsForShort(
         language: transcript.language,
         lines: lines.length,
         translated: transcript.translated,
+        ...(transcript.timingSource ? { timingSource: transcript.timingSource } : {}),
         ...(transcript.degraded?.length ? { degraded: transcript.degraded } : {}),
         ...(transcript.untranslated ? { reason: 'untranslated' as const } : {}),
         ...(transcript.correctionsApplied?.length
@@ -858,6 +869,9 @@ async function buildCaptionsForShort(
           provider: transcript.provider,
           language: transcript.language,
           translated: transcript.translated,
+          ...(transcript.timingSource
+            ? { timingSource: transcript.timingSource }
+            : {}),
           lines: transcript.lines,
           ...(transcript.originalLines?.length
             ? { originalLines: transcript.originalLines }
@@ -875,7 +889,7 @@ async function buildCaptionsForShort(
       text: captionTextDump(lines),
       originalText:
         transcript.translated && transcript.originalLines?.length
-          ? captionTextDump(transcript.originalLines)
+          ? captionTextDump(transcript.originalLines, { applyCopy: false })
           : null,
     };
   } catch (e) {
@@ -902,23 +916,37 @@ async function processCandidate(
 ): Promise<CandidateResult | null> {
   const { cfg, args, privacy, published, shortsDir } = ctx;
   const { sidecar: side, name, mp4Path } = candidate;
-  const kills = side.kills?.length ?? 0;
+  const clipStartMs = side.clip.startMs;
+  const clipDurationSec = side.clip.durationSec;
+  const killVideoOffsetMs = side.sync?.killVideoOffsetMs ?? null;
+  const kills = side.kills.length;
   if (kills < cfg.SHORTS_MIN_KILLS) return null;
-  if (side.clipStartMs == null || side.clipDurationSec == null) {
+  if (clipStartMs == null || clipDurationSec == null) {
     console.log(`- ${name}: ignorado (sidecar sem âncora — clipe anterior ao clipStartMs)`);
     return null;
   }
-  if (side.killVideoOffsetMs == null || !Number.isFinite(Number(side.killVideoOffsetMs))) {
+  const hasVideoPositions = side.kills.some((k) => k.videoSec != null);
+  if (
+    (killVideoOffsetMs == null || !Number.isFinite(Number(killVideoOffsetMs))) &&
+    !hasVideoPositions
+  ) {
     console.log(
       `- ${name}: ignorado (sidecar sem killVideoOffsetMs — as posições das kills ficariam deslocadas)`,
     );
     return null;
   }
-  const positioned = killPositionsByKill(side.kills ?? [], {
-    clipStartMs: side.clipStartMs,
-    clipDurationSec: side.clipDurationSec,
-    killVideoOffsetMs: side.killVideoOffsetMs,
-  });
+  const positioned = killPositionsByKill(
+    side.kills.map((k) => ({
+      at: k.atMs,
+      videoSec: k.videoSec,
+      estimated: k.estimated,
+    })),
+    {
+      clipStartMs,
+      clipDurationSec,
+      killVideoOffsetMs,
+    },
+  );
   if (positioned.length < cfg.SHORTS_MIN_KILLS) {
     console.log(
       `- ${name}: ignorado (${positioned.length} kill(s) dentro do clipe — mínimo ${cfg.SHORTS_MIN_KILLS})`,
@@ -940,7 +968,7 @@ async function processCandidate(
     console.log(`- ${name}: ignorado (janela inválida: ${windowErrors.join(' ')})`);
     return null;
   }
-  const plan = planShortWindow(positions, side.clipDurationSec, windowOpts);
+  const plan = planShortWindow(positions, clipDurationSec, windowOpts);
   if (plan.durSec < 5) {
     console.log(`- ${name}: ignorado (janela de ${plan.durSec}s)`);
     return null;
@@ -964,17 +992,17 @@ async function processCandidate(
   const outSidecar = path.join(outDir, `${name}_short.json`);
 
   const previous = readShortMarker(outSidecar);
-  const key = aceKey(side.matchId, side.map, side.round, side.player);
+  const key = aceKey(side.match.id, side.round.map, side.round.number, side.player.name);
   const publishedId = published.get(key);
-  if ((previous?.youtubeId || publishedId) && !args.republish) {
+  if ((previous?.publication.youtubeId || publishedId) && !args.republish) {
     console.log(
-      `- ${name}: já publicado (${previous?.youtubeId ?? publishedId}) — pulando`,
+      `- ${name}: já publicado (${previous?.publication.youtubeId ?? publishedId}) — pulando`,
     );
     return null;
   }
-  if ((previous?.youtubeId || publishedId) && args.republish) {
+  if ((previous?.publication.youtubeId || publishedId) && args.republish) {
     console.log(
-      `  ATENÇÃO (--republish): o Short já foi publicado (${previous?.youtubeId ?? publishedId}) — este upload é um NOVO vídeo; o antigo continua no canal`,
+      `  ATENÇÃO (--republish): o Short já foi publicado (${previous?.publication.youtubeId ?? publishedId}) — este upload é um NOVO vídeo; o antigo continua no canal`,
     );
   }
   /**
@@ -987,7 +1015,12 @@ async function processCandidate(
    * que falharam nela (tradução/erro/libass) e NÃO libera a janela
    * limitada pelo teto de latência (que o `--force` libera).
    */
-  const captionFailure = isRetryableCaptionFailure(previous?.captionInfo);
+  // Degradação (`degraded`: refine/translate falhou) ALSO entra no retry:
+  // a legenda queimou, mas o texto pode estar no idioma errado ou com o
+  // nome errado — refazer só a legenda (sem transcrever de novo) resolve.
+  const captionFailure =
+    isRetryableCaptionFailure(previous?.short.captions) ||
+    hasDegradedCaptions(previous?.short.captions);
   // `--retry-captions` é SÓ para quem falhou na legenda: os Shorts sem
   // falha de legenda ficam de fora (o help promete "refaz SÓ a legenda
   // dos que falharam").
@@ -1016,9 +1049,7 @@ async function processCandidate(
    * Publicar assim é afirmar horários que ninguém mediu: o Short só sai
    * com `--force` (a decisão é do dono).
    */
-  const capped =
-    (side.streamSync as { startLatencyCapped?: boolean } | undefined)?.startLatencyCapped ===
-    true;
+  const capped = side.sync?.latency.startCapped === true;
   if (capped && !args.force) {
     console.log(
       `- ${name}: ignorado (abertura limitada pelo teto de latência — as posições das kills não são confiáveis; use --force para publicar assim)`,
@@ -1049,7 +1080,7 @@ async function processCandidate(
   // O `SHORTS_TOP` manda; no `cam` sem caixa mapeada, o título assume em
   // vez de cortar uma região qualquer do quadro.
   let durSec = plan.durSec;
-  const streamName = typeof side.streamName === 'string' ? side.streamName : '';
+  const streamName = side.clip.streamName ?? '';
   const camCrop =
     configuredCropForStream(cfg.SHORTS_CAM_BOX_BY_STREAM, streamName) ??
     (cfg.SHORTS_CAM_BOX.trim() || null);
@@ -1085,11 +1116,11 @@ async function processCandidate(
     console.log(`  topo: ${topMode}`);
   }
 
-  const ace = sidecarToAce({ ...side, kills: includedKills }, plan.truncated);
+  const ace = sidecarToAce(side, includedKills);
   // O vertical só serve se cobrir A MESMA janela E tiver sido gerado com
   // o MESMO layout: com a folga/limite/topo mudados no .env, o mp4 antigo
   // é de outro trecho/corte (e ia ao ar com o título da janela nova).
-  const staleWindow = isStaleWindow(previous?.shortWindow, plan, fs.existsSync(outMp4));
+  const staleWindow = isStaleWindow(previous?.short.window, plan, fs.existsSync(outMp4));
   // A faixa mostra o título do vídeo; ele é gerado ANTES do render para
   // a imagem não sair com texto velho (o marker guarda o texto usado).
   // Os metadados já gerados (dry-run) são REUTILIZADOS: publicar o que
@@ -1119,9 +1150,9 @@ async function processCandidate(
         shortsHashtag: cfg.SHORTS_HASHTAG,
         // O Short começa no meio do clipe 16:9: os timestamps (se houver)
         // contam a partir do INÍCIO do Short, não do clipe original.
-        clipStartMs: side.clipStartMs + Math.round(plan.startSec * 1000),
+        clipStartMs: clipStartMs + Math.round(plan.startSec * 1000),
         clipDurationSec: durSec,
-        killTimeOffsetMs: side.killVideoOffsetMs,
+        killTimeOffsetMs: killVideoOffsetMs ?? undefined,
         // O link do clipe 16:9 entra no rodapé da descrição (o Short e o
         // clipe longo são dois vídeos: o link é o que amarra os dois).
         relatedVideoId: args.linkVideo ?? undefined,
@@ -1142,36 +1173,64 @@ async function processCandidate(
       ? {
           title:
             metadata?.title ??
-            `${side.player} — ${side.map} R${side.round} | ${side.event}`,
-          subtitle: `${side.team1} vs ${side.team2} • ${side.event}`,
+            `${side.player.name} — ${side.round.map} R${side.round.number} | ${side.match.event}`,
+          subtitle: `${side.match.team1} vs ${side.match.team2} • ${side.match.event}`,
         }
       : null;
   const captionsOn = cfg.SHORTS_CAPTIONS === true && !args.noCaptions;
   /**
-   * Adesivo (botão) no começo do Short: texto vem da flag (esta
-   * execução) ou do `.env`; preset, visual e tempo também podem ser
-   * sobrescritos por flag.
+   * Adesivo (botão) no começo do Short: `auto` deriva o texto das kills
+   * dentro da janela; vazio/none desliga; um texto literal é usado como
+   * está.
+   *
+   * A PRECEDÊNCIA é flag > arquivo por clipe > marker gravado > `.env`:
+   * rodar o script de novo sem as flags não pode reverter o adesivo
+   * que já foi ao ar (o marker é a memória do que foi gravado).
    */
-  const overlayText = (args.overlayText ?? cfg.SHORTS_OVERLAY_TEXT).trim();
+  const overlay = resolveClipOverlay({
+    cfg,
+    args,
+    fileSpec: shortOverlaySpecForClip(ctx.overlayConfig, name, side.clip.file),
+    markerShort: previous?.short ?? null,
+  });
+  if (overlay.spec.preset && !isShortOverlayPreset(overlay.spec.preset)) {
+    console.warn(
+      `⚠ preset de adesivo desconhecido (${overlay.spec.preset}) — usando "polex"`,
+    );
+  }
+  const overlayText = resolveShortOverlayText(overlay.spec.text ?? '', {
+    player: side.player.name,
+    killCount: includedKills.length,
+    map: side.round.map,
+    round: side.round.number,
+    team: side.player.team,
+    opponent: side.player.opponent,
+    event: side.match.event,
+  });
+  console.log(
+    overlayText
+      ? `  adesivo: "${overlayText}" (fonte: ${overlay.source})`
+      : '  adesivo: desligado (sem texto)',
+  );
   const overlayButton = resolveShortOverlayStyle({
-    preset: args.overlayPreset ?? cfg.SHORTS_OVERLAY_PRESET,
+    preset: overlay.spec.preset ?? 'polex',
     text: overlayText,
-    holdSec: args.overlayHoldSec ?? cfg.SHORTS_OVERLAY_HOLD_SEC,
-    fadeSec: args.overlayFadeSec ?? cfg.SHORTS_OVERLAY_FADE_SEC,
-    y: args.overlayY ?? cfg.SHORTS_OVERLAY_Y,
+    holdSec: overlay.spec.holdSec ?? cfg.SHORTS_OVERLAY_HOLD_SEC,
+    fadeSec: overlay.spec.fadeSec ?? cfg.SHORTS_OVERLAY_FADE_SEC,
+    y: overlay.spec.y ?? cfg.SHORTS_OVERLAY_Y,
     overrides: {
-      shape: args.overlayStyle ?? cfg.SHORTS_OVERLAY_STYLE,
-      tag: args.overlayTag ?? cfg.SHORTS_OVERLAY_TAG,
-      uppercase: args.overlayUppercase ?? cfg.SHORTS_OVERLAY_UPPERCASE,
-      background: args.overlayBackground ?? cfg.SHORTS_OVERLAY_BACKGROUND,
-      color: args.overlayColor ?? cfg.SHORTS_OVERLAY_COLOR,
-      borderColor: args.overlayBorderColor ?? cfg.SHORTS_OVERLAY_BORDER_COLOR,
-      borderPx: args.overlayBorderPx ?? cfg.SHORTS_OVERLAY_BORDER_PX,
-      shadowColor: args.overlayShadowColor ?? cfg.SHORTS_OVERLAY_SHADOW_COLOR,
-      shadowPx: args.overlayShadowPx ?? cfg.SHORTS_OVERLAY_SHADOW_PX,
-      shadowBlurPx: args.overlayShadowBlurPx ?? cfg.SHORTS_OVERLAY_SHADOW_BLUR_PX,
-      tiltDeg: args.overlayTiltDeg ?? cfg.SHORTS_OVERLAY_TILT_DEG,
-      font: args.overlayFont ?? cfg.SHORTS_OVERLAY_FONT,
+      shape: overlay.spec.style ?? cfg.SHORTS_OVERLAY_STYLE,
+      tag: overlay.spec.tag ?? cfg.SHORTS_OVERLAY_TAG,
+      uppercase: overlay.spec.uppercase ?? cfg.SHORTS_OVERLAY_UPPERCASE,
+      background: overlay.spec.background ?? cfg.SHORTS_OVERLAY_BACKGROUND,
+      color: overlay.spec.color ?? cfg.SHORTS_OVERLAY_COLOR,
+      borderColor: overlay.spec.borderColor ?? cfg.SHORTS_OVERLAY_BORDER_COLOR,
+      borderPx: overlay.spec.borderPx ?? cfg.SHORTS_OVERLAY_BORDER_PX,
+      shadowColor: overlay.spec.shadowColor ?? cfg.SHORTS_OVERLAY_SHADOW_COLOR,
+      shadowPx: overlay.spec.shadowPx ?? cfg.SHORTS_OVERLAY_SHADOW_PX,
+      shadowBlurPx: overlay.spec.shadowBlurPx ?? cfg.SHORTS_OVERLAY_SHADOW_BLUR_PX,
+      tiltDeg: overlay.spec.tiltDeg ?? cfg.SHORTS_OVERLAY_TILT_DEG,
+      font: overlay.spec.font ?? cfg.SHORTS_OVERLAY_FONT,
     },
   });
   const signature = shortRenderSignature({
@@ -1211,17 +1270,17 @@ async function processCandidate(
     overlayUppercase: overlayButton?.uppercase ?? false,
     overlayTag: overlayButton?.tag ?? '',
   });
-  const staleLayout = isStaleRender(previous?.render, signature);
+  const staleLayout = isStaleRender(previous?.short.render, signature);
   // A legenda pedida NÃO entrou no arquivo (a transcrição ou o libass
   // falharam na rodada anterior): o vertical precisa ser refeito — senão
   // o Short ficaria sem legenda para sempre.
   const staleCaptions =
     captionsOn &&
-    ((previous?.captionInfo?.applied !== true &&
-      isRetryableCaptionFailure(previous?.captionInfo)) ||
+    ((previous?.short.captions?.applied !== true &&
+      isRetryableCaptionFailure(previous?.short.captions)) ||
       // A legenda queimada ficou no idioma original: ela tem que ser
       // refeita (traduzida) antes do Short ir ao ar.
-      previous?.captionInfo?.reason === 'untranslated') &&
+      previous?.short.captions?.reason === 'untranslated') &&
     fs.existsSync(outMp4);
   const rendered =
     args.force ||
@@ -1252,22 +1311,25 @@ async function processCandidate(
   const cachedTranscript: CaptionTranscript | null =
     !args.retranscribe &&
     !staleWindow &&
-    previous?.captionInfo?.transcript?.lines?.length
+    previous?.short.captions?.transcript?.lines?.length
       ? {
-          provider: captionProviderFrom(previous.captionInfo.transcript.provider),
-          language: previous.captionInfo.transcript.language ?? null,
-          translated: previous.captionInfo.transcript.translated === true,
-          lines: previous.captionInfo.transcript.lines,
-          ...(previous.captionInfo.transcript.originalLines?.length
-            ? { originalLines: previous.captionInfo.transcript.originalLines }
+          provider: captionProviderFrom(previous.short.captions.transcript.provider),
+          language: previous.short.captions.transcript.language ?? null,
+          translated: previous.short.captions.transcript.translated === true,
+          ...(previous.short.captions.transcript.timingSource
+            ? { timingSource: previous.short.captions.transcript.timingSource }
+            : {}),
+          lines: previous.short.captions.transcript.lines,
+          ...(previous.short.captions.transcript.originalLines?.length
+            ? { originalLines: previous.short.captions.transcript.originalLines }
             : {}),
           // O texto CRU (antes das correções/revisão) é o que vale
           // re-render: as regras são aplicadas de novo por cima dele.
-          ...(previous.captionInfo.transcript.rawLines?.length
-            ? { rawLines: previous.captionInfo.transcript.rawLines }
+          ...(previous.short.captions.transcript.rawLines?.length
+            ? { rawLines: previous.short.captions.transcript.rawLines }
             : {}),
-          ...(previous.captionInfo.transcript.rawOriginalLines?.length
-            ? { rawOriginalLines: previous.captionInfo.transcript.rawOriginalLines }
+          ...(previous.short.captions.transcript.rawOriginalLines?.length
+            ? { rawOriginalLines: previous.short.captions.transcript.rawOriginalLines }
             : {}),
         }
       : null;
@@ -1305,12 +1367,12 @@ async function processCandidate(
             // O contexto (nomes do clipe + gíria) segura a grafia:
             // sem ele o modelo escreve "molodoij" e "é quinho".
             captionContextFromAce({
-              player: side.player,
-              team1: side.team1,
-              team2: side.team2,
-              event: side.event,
-              map: side.map,
-              round: side.round,
+              player: side.player.name,
+              team1: side.match.team1,
+              team2: side.match.team2,
+              event: side.match.event,
+              map: side.round.map,
+              round: side.round.number,
               kills: includedKills,
             }),
             cachedTranscript,
@@ -1348,7 +1410,22 @@ async function processCandidate(
           }
         } catch (e) {
           console.log(`  legenda: falha na transcrição/ASS — o Short sai sem ela (${String(e).slice(0, 200)})`);
-          captionInfo = { applied: false, reason: 'error' };
+          // A transcrição guardada no marker CONTINUA no marker: sem
+          // isso, a próxima rodada gastaria o provider de novo (cota do
+          // Gemini + os ~47s do whisper local) só para chegar no mesmo
+          // ponto.
+          //
+          // A transcrição FRESCA (o Gemini já respondeu, mas o
+          // alinhamento do tempo falhou) vale MAIS que a guardada: ela
+          // é o texto que ainda não passou por nenhum passe. Perder
+          // essa chamada queimava a cota do Gemini a cada retry.
+          const fresh = salvagedCaptionTranscript(e);
+          if (fresh) {
+            console.log(
+              '  legenda: a transcrição foi salva — a próxima rodada refaz só o tempo',
+            );
+          }
+          captionInfo = captionErrorStatus(fresh ?? cachedTranscript);
         }
       }
     }
@@ -1454,7 +1531,7 @@ async function processCandidate(
   // O status da legenda que DESCREVE o arquivo que vai subir: quando o
   // vertical foi refeito agora, é o de agora; quando já existia, é o do
   // marker anterior (o mp4 não mudou).
-  const captionStatus = rendered ? captionInfo : (previous?.captionInfo ?? null);
+  const captionStatus = rendered ? captionInfo : (previous?.short.captions ?? null);
   const verdict = canPublishShortWithCaptions({
     captionsOn,
     status: captionStatus,
@@ -1477,12 +1554,14 @@ async function processCandidate(
     );
   } else if (args.publish) {
     // Guarda de cota: cada `videos.insert` custa 1600 units do limite
-    // diário (10000) do projeto de API — o mesmo que o bot live usa.
-    const units = ctx.quotaUsed + QUOTA_UNITS_PER_UPLOAD;
-    if (units > QUOTA_UNITS_PER_DAY) {
-      throw new Error(
-        `cota diária do YouTube esgotada (${ctx.quotaUsed} units usados; cada upload custa ${QUOTA_UNITS_PER_UPLOAD} de ${QUOTA_UNITS_PER_DAY})`,
-      );
+    // diário do projeto de API — o mesmo que o bot live usa. O teto e o
+    // dia (fuso do Pacífico) vêm da config.
+    const quota = quotaDecision({
+      used: ctx.quotaUsed,
+      limit: cfg.YT_QUOTA_UNITS_PER_DAY,
+    });
+    if (!quota.allowed) {
+      throw new Error(quota.reason ?? 'cota diária do YouTube esgotada');
     }
     videoId = await uploadClip(ace, outMp4, {
       clientSecretsPath: cfg.YT_CLIENT_SECRETS,
@@ -1495,56 +1574,62 @@ async function processCandidate(
       shortsHashtag: cfg.SHORTS_HASHTAG,
       madeForKids: false,
     });
-    ctx.quotaUsed = units;
+    ctx.quotaUsed = quota.units;
     console.log(`  ✓ https://youtu.be/${videoId} (${privacy})`);
   } else {
     console.log('  (dry-run: nada publicado)');
   }
 
-  const marker = {
-    ...side,
+  const marker = buildShortMarker({
     // O marker descreve o ARQUIVO GRAVADO: quando o vertical não foi
     // re-renderizado, a janela e as kills continuam as do mp4 em disco
     // (reescrever com a janela nova faria o marker mentir).
-    ...(rendered
-      ? {
-          kills: includedKills,
-          clipStartMs: side.clipStartMs + Math.round(plan.startSec * 1000),
-          clipDurationSec: durSec,
-          shortWindow: {
+    source: {
+      clipFile: path.basename(mp4Path),
+      sidecarFile: path.basename(candidate.sidecarPath),
+      matchId: side.match.id,
+      map: side.round.map,
+      round: side.round.number,
+      player: side.player.name,
+      clipStartMs,
+      clipDurationSec,
+    },
+    short: {
+      file: path.basename(outMp4),
+      width: cfg.SHORTS_WIDTH,
+      height: cfg.SHORTS_HEIGHT,
+      startSec: rendered ? plan.startSec : (previous?.short.startSec ?? plan.startSec),
+      durationSec: rendered ? durSec : (previous?.short.durationSec ?? durSec),
+      window: rendered
+        ? {
             startSec: plan.startSec,
             endSec: plan.endSec,
             durSec: plan.durSec,
             includedKills: plan.includedKills,
             droppedKills: plan.droppedKills,
-          },
-        }
-      : {
-          kills: previous?.kills ?? includedKills,
-          clipStartMs: previous?.clipStartMs ?? side.clipStartMs + Math.round(plan.startSec * 1000),
-          clipDurationSec: previous?.clipDurationSec ?? durSec,
-          shortWindow: previous?.shortWindow ?? {
+          }
+        : (previous?.short.window ?? {
             startSec: plan.startSec,
             endSec: plan.endSec,
             durSec: plan.durSec,
             includedKills: plan.includedKills,
             droppedKills: plan.droppedKills,
-          },
-        }),
-    clipFile: path.basename(outMp4),
-    sourceClip: path.basename(mp4Path),
-    format: 'shorts',
-    width: cfg.SHORTS_WIDTH,
-    height: cfg.SHORTS_HEIGHT,
-    // O marker descreve o ARQUIVO em disco: quando não houve render, o
-    // layout é o do marker anterior (o mp4 não mudou).
-    render: rendered ? signature : (previous?.render ?? signature),
-    // A legenda queimada descreve o ARQUIVO em disco: quando não houve
-    // render, é a do vertical anterior.
-    captionInfo: rendered
-      ? (captionInfo ?? { applied: false })
-      : (previous?.captionInfo ?? { applied: false }),
-    title: metadata?.title ?? null,
+          }),
+      kills: rendered ? includedKills : (previous?.short.kills ?? includedKills),
+      // O marker descreve o ARQUIVO em disco: quando não houve render, o
+      // layout é o do marker anterior (o mp4 não mudou).
+      render: rendered ? signature : (previous?.short.render ?? signature),
+      // A legenda queimada descreve o ARQUIVO em disco: quando não houve
+      // render, é a do vertical anterior.
+      captions: rendered
+        ? (captionInfo ?? { applied: false })
+        : (previous?.short.captions ?? { applied: false }),
+      // Spec PEDIDO do adesivo (sem a CLI): `auto` resolve de novo e o
+      // visual do preset vem do código. Sem render, vale o do marker.
+      overlaySpec: rendered
+        ? overlay.persisted
+        : (previous?.short.overlaySpec ?? null),
+    },
     metadata: {
       title: metadata?.title ?? '',
       description: metadata?.description ?? '',
@@ -1552,8 +1637,13 @@ async function processCandidate(
       source: metadata?.source ?? 'template',
       privacy,
     },
-    youtubeId: videoId ?? previous?.youtubeId ?? null,
-    publishedAt: videoId ? new Date().toISOString() : previous?.publishedAt ?? null,
+    publication: {
+      youtubeId: videoId ?? previous?.publication.youtubeId ?? null,
+      publishedAt: videoId
+        ? new Date().toISOString()
+        : (previous?.publication.publishedAt ?? null),
+      privacy: videoId ? privacy : (previous?.publication.privacy ?? privacy),
+    },
     /**
      * Contador de tentativas: uma legenda que quebrou (ou um render que
      * falhou) conta como tentativa — a próxima rodada espera o backoff
@@ -1561,12 +1651,12 @@ async function processCandidate(
      */
     attempts: failedNow ? (previous?.attempts ?? 0) + 1 : 0,
     lastAttemptAt: failedNow ? new Date().toISOString() : null,
-  };
+  });
   // A pasta do Short só nasce quando há algo para gravar nela.
   fs.mkdirSync(outDir, { recursive: true });
   // O marker é gravado ANTES do banco: se o insert falhar, o youtubeId
   // já está no disco e o script não republica o Short.
-  fs.writeFileSync(outSidecar, JSON.stringify(marker, null, 2) + '\n');
+  writeShortMarker(outSidecar, marker);
 
   if (videoId) {
     // `insertAce` é idempotente: registra o ace se ainda não existir e
@@ -1610,24 +1700,43 @@ function metadataMode(cfg: AppConfig, args: Args): 'ai' | 'template' | 'legacy' 
  * o backoff). Um marker que não existe ainda é criado: a falha aconteceu
  * antes do marker ser gravado.
  */
-function recordFailedAttempt(shortsDir: string, name: string): void {
+function recordFailedAttempt(shortsDir: string, candidate: Candidate): void {
   try {
-    const outDir = path.join(shortsDir, name);
-    const markerPath = path.join(outDir, `${name}_short.json`);
-    const marker = readShortMarker(markerPath) ?? {};
+    const outDir = path.join(shortsDir, candidate.name);
+    const markerPath = path.join(outDir, `${candidate.name}_short.json`);
+    const now = new Date().toISOString();
+    const previous = readShortMarker(markerPath);
+    const marker: ShortMarkerV2 = previous
+      ? { ...previous, attempts: previous.attempts + 1, lastAttemptAt: now }
+      : buildShortMarker({
+          source: {
+            clipFile: path.basename(candidate.mp4Path),
+            sidecarFile: path.basename(candidate.sidecarPath),
+            matchId: candidate.sidecar.match.id,
+            map: candidate.sidecar.round.map,
+            round: candidate.sidecar.round.number,
+            player: candidate.sidecar.player.name,
+            clipStartMs: candidate.sidecar.clip.startMs,
+            clipDurationSec: candidate.sidecar.clip.durationSec,
+          },
+          short: {
+            file: null,
+            width: null,
+            height: null,
+            startSec: 0,
+            durationSec: null,
+            window: null,
+            kills: [],
+            render: null,
+            captions: null,
+          },
+          metadata: null,
+          publication: { youtubeId: null, publishedAt: null, privacy: null },
+          attempts: 1,
+          lastAttemptAt: now,
+        });
     fs.mkdirSync(outDir, { recursive: true });
-    fs.writeFileSync(
-      markerPath,
-      JSON.stringify(
-        {
-          ...marker,
-          attempts: (marker.attempts ?? 0) + 1,
-          lastAttemptAt: new Date().toISOString(),
-        },
-        null,
-        2,
-      ) + '\n',
-    );
+    writeShortMarker(markerPath, marker);
   } catch {
     // best-effort: sem contador, o clipe é tentado de novo (o pior caso
     // é repetir uma tentativa).
@@ -1662,7 +1771,7 @@ async function runBatch(
         report.push({ name: candidate.name, error: message });
         // A falha conta como tentativa: o backoff segura o clipe nas
         // próximas rodadas (e o `--last N` não fica preso nele).
-        recordFailedAttempt(shortsDir, candidate.name);
+        recordFailedAttempt(shortsDir, candidate);
         if (isQuotaError(e)) {
           console.error('  (cota do YouTube esgotada — o lote para aqui)');
           break;
@@ -1762,20 +1871,24 @@ async function main(): Promise<void> {
       ? all
           .filter((candidate) => {
             const key = aceKey(
-              candidate.sidecar.matchId,
-              candidate.sidecar.map,
-              candidate.sidecar.round,
-              candidate.sidecar.player,
+              candidate.sidecar.match.id,
+              candidate.sidecar.round.map,
+              candidate.sidecar.round.number,
+              candidate.sidecar.player.name,
             );
             if (published.has(key)) return false;
             const marker = readShortMarker(
               path.join(shortsDir, candidate.name, `${candidate.name}_short.json`),
             );
-            if (marker?.youtubeId) return false;
+            if (marker?.publication.youtubeId) return false;
             // `--retry-captions`: só entram os Shorts que falharam na
-            // legenda — e o backoff NÃO vale (é o que o flag promete).
+            // legenda (ou saíram DEGRADADOS) — e o backoff NÃO vale (é
+            // o que o flag promete).
             if (args.retryCaptions) {
-              return isRetryableCaptionFailure(marker?.captionInfo);
+              return (
+                isRetryableCaptionFailure(marker?.short.captions) ||
+                hasDegradedCaptions(marker?.short.captions)
+              );
             }
             if (args.force) return true;
             return !shortRetryDecision({
@@ -1810,6 +1923,10 @@ async function main(): Promise<void> {
       silenceFinal: cfg.SHORTS_CAPTION_SILENCE_FINAL,
       refine: cfg.SHORTS_CAPTION_REFINE,
       translate: cfg.SHORTS_CAPTION_TRANSLATE,
+      // Erro transitório do Gemini (503/"high demand") repete; a cota
+      // (429) não — ela é final para o modelo de texto.
+      geminiAttempts: cfg.SHORTS_CAPTION_GEMINI_RETRIES,
+      geminiRetryMs: cfg.SHORTS_CAPTION_GEMINI_RETRY_MS,
       // O tempo real da legenda vem do whisper local; o texto continua
       // do modelo de linguagem (que acerta a grafia).
       timingProvider: (args.captionTiming ?? cfg.SHORTS_CAPTION_TIMING ?? null) as
@@ -1826,9 +1943,16 @@ async function main(): Promise<void> {
       metadataAi,
       captionTranscriber,
       shortsDir,
-      quotaUsed: countPublishedClips(cfg.DB_PATH, startOfUtcDaySql()) * QUOTA_UNITS_PER_UPLOAD,
+      // O dia da cota é o do Pacífico (a cota do YouTube zera lá), não
+      // o dia UTC — a guarda antiga bloqueava publicação legítima.
+      quotaUsed:
+        countPublishedClips(
+          cfg.DB_PATH,
+          startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE),
+        ) * QUOTA_UNITS_PER_UPLOAD,
       window,
       captionRulesHash: captionRulesHash(),
+      overlayConfig: loadOverlayConfig(cfg.SHORTS_OVERLAY_CONFIG),
     };
     if (ctx.quotaUsed > 0) {
       console.log(

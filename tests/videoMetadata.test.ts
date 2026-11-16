@@ -95,6 +95,58 @@ describe('contexto dos metadados', () => {
     expect(ctx.rival).toBe('MOUZ');
     expect(ctx.team).toBe('Spirit');
   });
+
+  it('headshot vem das KILLS (o summary do round está obsoleto)', () => {
+    // O summary foi fechado antes do killfeed: headshots=0 e arma vazia.
+    // Usar o summary fazia a IA ser REJEITADA ("contagem de headshots
+    // contraditória") porque o contexto dizia 0 e a fala dizia 3.
+    const kills = makeKills(5);
+    const ace = makeAce({
+      kills,
+      summary: {
+        round: 12,
+        map: 'Mirage',
+        player: 'donk',
+        team: 'Spirit',
+        opponents: 'MOUZ',
+        kills,
+        victims: [],
+        weapons: [],
+        headshots: 0,
+        assists: [],
+        flashAssists: [],
+        grenades: [],
+        mainWeapon: '',
+      },
+    });
+    const ctx = buildMetadataContext(ace);
+    expect(ctx.headshots).toBe(2);
+    expect(ctx.mainWeapon).toBe('AK-47');
+  });
+
+  it('sem headshot nas kills, o summary ainda manda (ausência ≠ zero)', () => {
+    const kills = makeKills(5).map((k) => ({ ...k, headshot: undefined }));
+    const ace = makeAce({
+      kills,
+      summary: {
+        round: 12,
+        map: 'Mirage',
+        player: 'donk',
+        team: 'Spirit',
+        opponents: 'MOUZ',
+        kills,
+        victims: [],
+        weapons: [],
+        headshots: 3,
+        assists: [],
+        flashAssists: [],
+        grenades: [],
+        mainWeapon: 'ak47',
+      },
+    });
+    const ctx = buildMetadataContext(ace);
+    expect(ctx.headshots).toBe(3);
+  });
 });
 
 describe('título determinístico', () => {
@@ -167,7 +219,7 @@ describe('descrição determinística', () => {
       desc
         .trim()
         .endsWith(
-          'Corte automático no Mirage. Vídeo não listado: aparece só para quem tem o link.',
+          'Corte automático na Mirage. Vídeo não listado: aparece só para quem tem o link.',
         ),
     ).toBe(true);
   });

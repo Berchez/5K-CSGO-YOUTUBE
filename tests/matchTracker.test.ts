@@ -37,6 +37,17 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.lastTotal).toBe(7);
   });
 
+  it('REGRESSÃO: o 1o poll ancora mapa e round no placar (nada de "unknown")', () => {
+    // O tracker nasce sem mapa e com round 1: sem ancorar no 1o poll, o
+    // 1o multikill saia com map "unknown" e round errado.
+    const tr = new RoundTracker();
+    let r = processPoll(tr, snap(3, 3, [{ name: 'rain', kills: 10 }]), -1, 3);
+    r = processPoll(tr, snap(4, 3, [{ name: 'rain', kills: 13 }]), r.lastTotal, 3);
+    expect(r.event?.player).toBe('rain');
+    expect(r.event?.round).toBe(7);
+    expect(r.event?.kills[0]?.map).toBe('inferno');
+  });
+
   it('REGRESSÃO: setContext antes do close esvaziava tudo (nada disparava)', () => {
     const tr = new RoundTracker('inferno', 7);
     // simula o loop BUGGY antigo: setContext (limpa!) e só depois closeRound
@@ -212,7 +223,55 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
       3,
     );
     expect(r.dropped).toBeNull();
-    expect(r.roundClosed).toEqual({ map: 'Nuke', round: 2, score: '1-0' });
+    expect(r.roundClosed).toEqual({
+      map: 'Nuke',
+      // Round que TERMINOU (o placar já virou para o 2) + diagnóstico vazio.
+      round: 1,
+      score: '1-0',
+      bestPlayer: null,
+      bestKills: 0,
+      required: null,
+      blocked: false,
+    });
+  });
+
+  it('round fechado sem multikill registra o melhor candidato e o limiar', () => {
+    const tr = new RoundTracker('Mirage', 1);
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'donk', kills: 0 }], 'Mirage'), last, 5);
+    last = r.lastTotal;
+    // 4 kills no round: abaixo do limiar de ACE (5).
+    r = processPoll(tr, snap(0, 0, [{ name: 'donk', kills: 4 }], 'Mirage'), last, 5);
+    last = r.lastTotal;
+    expect(r.event).toBeNull();
+    // Placar vira com a coluna K ainda no valor do round (sem reset de stats).
+    r = processPoll(tr, snap(1, 0, [{ name: 'donk', kills: 4 }], 'Mirage'), last, 5);
+    expect(r.event).toBeNull();
+    expect(r.roundClosed).toMatchObject({
+      map: 'Mirage',
+      round: 1,
+      bestPlayer: 'donk',
+      bestKills: 4,
+      required: 5,
+      blocked: false,
+    });
+  });
+
+  it('candidato bloqueado (só watchlist) sai como blocked, sem limiar numérico', () => {
+    const tr = new RoundTracker('Mirage', 1);
+    const bloqueado = () => Number.POSITIVE_INFINITY;
+    let last = -1;
+    let r = processPoll(tr, snap(0, 0, [{ name: 'adversario', kills: 0 }], 'Mirage'), last, bloqueado);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(0, 0, [{ name: 'adversario', kills: 3 }], 'Mirage'), last, bloqueado);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(1, 0, [{ name: 'adversario', kills: 3 }], 'Mirage'), last, bloqueado);
+    expect(r.roundClosed).toMatchObject({
+      bestPlayer: 'adversario',
+      bestKills: 3,
+      required: null,
+      blocked: true,
+    });
   });
 
   it('resolver NaN não descarta um 5k válido (usa o máximo)', () => {
@@ -296,13 +355,16 @@ describe('roundOverObservation (instante do fim do round)', () => {
 describe('roundEndedAt (fim real do round no relógio do jogo)', () => {
   it('o evento carrega o instante do "Round over" quando o placar o mostrou', () => {
     const tr = new RoundTracker('inferno', 7);
+    // 5-2 = 7 rounds jogados: o round EM ANDAMENTO é o 8 (ct+t+1). O
+    // tracker nasce desatualizado e se ancora no placar no 1o poll.
     const before = snap(5, 2, [{ name: 'nilo', kills: 10 }]);
     const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
     let r = processPoll(tr, before, -1, 3, 10_000, before);
     r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, {
-      round: 7,
+      round: 8,
       atMs: 1_700_000_000_000,
     });
+    expect(r.event?.round).toBe(8);
     expect(r.event?.roundEndedAt).toBe(new Date(1_700_000_000_000).toISOString());
   });
 
@@ -312,7 +374,7 @@ describe('roundEndedAt (fim real do round no relógio do jogo)', () => {
     const after = snap(6, 2, [{ name: 'nilo', kills: 13 }]);
     let r = processPoll(tr, before, -1, 3, 10_000, before);
     r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, {
-      round: 6,
+      round: 7,
       atMs: 1_700_000_000_000,
     });
     expect(r.event?.roundEndedAt).toBeUndefined();

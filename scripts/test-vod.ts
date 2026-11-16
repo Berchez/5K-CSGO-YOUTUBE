@@ -202,7 +202,9 @@ async function main(): Promise<void> {
   }
   const { parseKillList } = await import('../src/detector/killParse.js');
   const { buildRoundSummary, describeAce } = await import('../src/detector/aceDetector.js');
-  const { buildSidecar } = await import('../src/clipper/clipBuilder.js');
+  const { buildClipSidecar, writeClipSidecar } = await import(
+    '../src/clipper/sidecar.js'
+  );
   const kills = killsSpec ? parseKillList(killsSpec, round, map) : [];
   const opponents = pteam
     ? (pteam === team1 ? team2 : team1)
@@ -218,7 +220,18 @@ async function main(): Promise<void> {
     detectedAt: new Date().toISOString(),
     kills,
     score: score || undefined,
-    summary: kills.length >= 3 ? buildRoundSummary(player, pteam, opponents, kills) : undefined,
+    summary:
+      kills.length >= 3
+        ? buildRoundSummary({
+            player,
+            team: pteam || null,
+            opponent: pteam ? (pteam === team1 ? team2 : team1) : null,
+            opponents,
+            map,
+            round,
+            kills,
+          })
+        : undefined,
   };
   if (ace.summary) {
     console.log('--- RESUMO DO ACE ---');
@@ -270,9 +283,28 @@ async function main(): Promise<void> {
   } catch {
     log.warn('thumb falhou (ok p/ teste)');
   }
-  fs.writeFileSync(
+  // Escrita atômica (`.tmp` + rename) e com backup do v1.
+  writeClipSidecar(
     path.join(clipDir, `${base}.json`),
-    JSON.stringify(buildSidecar(ace, { clipFile: path.basename(outPath), vodUrl: url, aceAt: fmt(at) }), null, 2),
+    buildClipSidecar({
+      ace,
+      clip: {
+        file: path.basename(outPath),
+        // `startMs` é epoch ms (relógio do jogo). O VOD não tem epoch
+        // (`vod.startIso` é null aqui): gravar o offset do VOD fazia o
+        // leitor interpretar ~1970.
+        startMs: null,
+        durationSec: Math.round((parseTs(end) - parseTs(start)) * 1000) / 1000,
+        captureMode: 'vod',
+      },
+      vod: {
+        url,
+        startIso: null,
+        atSec: parseTs(start),
+        gameToVodDeltaSec: null,
+        note: null,
+      },
+    }),
   );
   getDb(cfg.DB_PATH);
   if (!hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player)) {

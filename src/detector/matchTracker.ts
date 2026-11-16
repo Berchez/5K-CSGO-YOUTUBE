@@ -1,7 +1,8 @@
 import type { Page } from 'playwright';
 import { waitForClearance } from '../monitor/hltvMonitor.js';
 import { requiredKills, RoundTracker, type MinKillsRule } from './aceDetector.js';
-import type { AnchorConfidence, KillEvent } from '../types.js';
+import { startScorebotFeed, type ScorebotFeed } from './scorebotFeed.js';
+import type { AnchorConfidence, KillEvent, KillfeedTelemetry } from '../types.js';
 import { getLogger } from '../logger.js';
 import { getConfig } from '../config.js';
 
@@ -107,7 +108,8 @@ export function roundOverObservation(
  * Não há killfeed no DOM (só tabela de stats) — a detecção usa diff da
  * coluna K por jogador (ver RoundTracker.syncBaseline). Vítimas/armas NÃO
  * vêm no placar: kills sintetizados carregam victim '' (honesto: "?" nos
- * textos) e `at` do momento observado.
+ * textos) e `at` do momento observado. O detalhe (arma/headshot/assistência)
+ * chega pelo killfeed do scorebot e é pareado em RoundTracker.noteFeedKill.
  */
 export async function readMatchSnapshot(page: Page): Promise<RoundSnapshot | null> {
     try {
@@ -309,6 +311,8 @@ export interface TrackerCallbacks {
     player: string;
     map: string;
     round: number;
+    /** Time do autor lido do placar; null = desconhecido. */
+    team?: string | null;
     kills: KillEvent[];
     /** ISO do 1º kill — ancora o início do clipe. */
     startedAt?: string;
@@ -319,6 +323,8 @@ export interface TrackerCallbacks {
     scoreAfter?: string;
     /** Fim real do round no relógio do jogo ("Round over" no placar). */
     roundEndedAt?: string;
+    /** Telemetria do pareamento com o killfeed do scorebot. */
+    killfeed?: KillfeedTelemetry;
   }) => void;
   shouldStop: () => boolean;
 }
@@ -327,6 +333,8 @@ export interface PollEvent {
   player: string;
   map: string;
   round: number;
+  /** Time do autor lido do placar; null = desconhecido. */
+  team?: string | null;
   kills: KillEvent[];
   startedAt?: string;
   /** Confiança da âncora de início (1ª kill pode não ser a 1ª real). */
@@ -340,6 +348,11 @@ export interface PollEvent {
    * "detecção − atraso do placar" vale).
    */
   roundEndedAt?: string;
+  /**
+   * Telemetria do pareamento com o killfeed do scorebot (arma/headshot/
+   * assistência): quantas kills do round receberam o detalhe.
+   */
+  killfeed?: KillfeedTelemetry;
 }
 
 /** Máximo de kills possíveis num round (5 adversários). Acima = dado corrompido (gap). */
@@ -372,6 +385,26 @@ export function shouldResetTracker(
 }
 
 /**
+ * Round que fechou sem multikill — com o diagnóstico de QUANTO faltou.
+ *
+ * Sem estes campos o log só dizia "round fechado sem multikill": não dava
+ * para separar "ninguém chegou perto" de "fez 4 e o limiar era 5" (política
+ * por estrelas) nem de "o time está bloqueado" (partida só da watchlist).
+ */
+export interface RoundClosedSummary {
+  map: string;
+  round: number;
+  score: string;
+  /** Quem fez mais kills no round (ignorando o limiar). */
+  bestPlayer?: string | null;
+  bestKills?: number;
+  /** Limiar exigido do candidato; null quando ele está bloqueado. */
+  required?: number | null;
+  /** true = candidato de time bloqueado (a partida só entrou pela watchlist). */
+  blocked?: boolean;
+}
+
+/**
  * Compensação do delay do placar live (~placar atualiza segundos depois
  * do kill): ancora o clipe esse tanto antes do 1º kill observado. O valor
  * vem de SCOREBOARD_DELAY_MS (config) — padrão 10s, calibrável.
@@ -384,16 +417,30 @@ export function processPoll(
   delayCompMs = 10_000,
   lastSnapshot?: RoundSnapshot | null,
   roundEnded?: RoundOverObservation | null,
-): { event: PollEvent | null; dropped: string | null; roundClosed: { map: string; round: number; score: string } | null; lastTotal: number } {
+  teamByPlayer?: ReadonlyMap<string, string>,
+): {
+  event: PollEvent | null;
+  dropped: string | null;
+  roundClosed: RoundClosedSummary | null;
+  lastTotal: number;
+  /** Telemetria do killfeed do round que acabou de fechar. */
+  killfeed?: KillfeedTelemetry;
+} {
   const total = snap.ctScore + snap.tScore;
   let event: PollEvent | null = null;
   let dropped: string | null = null;
-  let roundClosed: { map: string; round: number; score: string } | null = null;
-  // Estreia com placar > 0 = tracking começou no meio da partida (round já
-  // em andamento): kills anteriores a este poll são invisíveis — a próxima
-  // âncora deste round nasce suspeita.
-  if (lastTotal < 0 && total > 0) {
-    tracker.markJoinedBlind();
+  let roundClosed: RoundClosedSummary | null = null;
+  /** Telemetria do killfeed do round fechado (quem chamou loga). */
+  let closedKillfeed: KillfeedTelemetry | undefined;
+  // Primeiro poll: o tracker nasce em 'unknown' e só recebia o mapa na
+  // virada do round seguinte - o 1o multikill saia com map 'unknown'.
+  // Ancorar o contexto aqui também é o que permite o startedBlind valer.
+  if (lastTotal < 0) {
+    tracker.setContext(snap.map, snap.round);
+    // Estreia com placar > 0 = tracking começou no meio da partida (round
+    // já em andamento): kills anteriores a este poll são invisíveis - a
+    // próxima âncora deste round nasce suspeita.
+    if (total > 0) tracker.markJoinedBlind();
   }
   // Virada de round = placar mudou (ou OT: total >= 24 continua valendo).
   if (lastTotal >= 0 && total !== lastTotal) {
@@ -415,7 +462,12 @@ export function processPoll(
     const flags = tracker.anchorFlags();
     // Fecha o round: no máximo UM evento por round/jogador, sempre na
     // contagem máxima (3k→4k→5k não duplica). kills = SÓ os do autor.
-    const { player, kills } = tracker.closeRound(minKills);
+    const { player, kills, killfeed } = tracker.closeRound(minKills);
+    closedKillfeed = killfeed;
+    // Kills do placar que NÃO receberam arma/headshot do killfeed: o
+    // detalhe vai chegar depois (carência) ou não chega (feed fora).
+    // Fica registrado no sidecar — sem isso o `null` só apareceria meses
+    // depois, no thumb.
     // Mesma regra usada na detecção: resolver inválido exige 5, não NaN.
     const required = requiredKills(minKills, player ?? '');
     if (player && kills.length >= required) {
@@ -439,11 +491,18 @@ export function processPoll(
           lastSnapshot && lastSnapshot.map === snap.map
             ? `${lastSnapshot.ctScore}-${lastSnapshot.tScore}`
             : undefined;
+        const playerKey = playerTeamKey(player);
+        const team =
+          teamByPlayer?.get(playerKey) ??
+          snap.players.find((p) => playerTeamKey(p.name) === playerKey)?.team ??
+          null;
         event = {
           player,
           map: snap.map,
           round: trueRound,
           kills,
+          team,
+          killfeed,
           startedAt: firstAt ? new Date(firstAt - delayCompMs).toISOString() : undefined,
           anchorConfidence,
           scoreBefore,
@@ -460,7 +519,23 @@ export function processPoll(
         };
       }
     } else {
-      roundClosed = { map: snap.map, round: snap.round, score: `${snap.ctScore}-${snap.tScore}` };
+      // Diagnóstico do round vazio: quem chegou mais perto e qual era o
+      // limiar DELE (a política é por jogador/time — watchlist × estrelas).
+      const best = tracker.lastRoundBest;
+      const bestRequired = best ? requiredKills(minKills, best.player) : null;
+      const blocked = bestRequired === Number.POSITIVE_INFINITY;
+      // O round que TERMINOU: o placar já virou, então `snap.round` é o
+      // seguinte. Sem isto o log saía um round à frente do evento.
+      const closedAt = tracker.lastClosedRound;
+      roundClosed = {
+        map: closedAt?.map ?? snap.map,
+        round: closedAt?.round ?? snap.round,
+        score: `${snap.ctScore}-${snap.tScore}`,
+        bestPlayer: best?.player ?? null,
+        bestKills: best?.kills ?? 0,
+        required: blocked ? null : bestRequired,
+        blocked,
+      };
     }
     // Contexto do round novo (baselines já ancoradas pelo sync acima —
     // diffs do round novo só contam a partir dos PRÓXIMOS polls).
@@ -473,7 +548,7 @@ export function processPoll(
     // montado com stats do mapa anterior).
     if (tracker.syncBaseline(snap.players)) tracker.discardPending();
   }
-  return { event, dropped, roundClosed, lastTotal: total };
+  return { event, dropped, roundClosed, lastTotal: total, killfeed: closedKillfeed };
 }
 
 /**
@@ -496,7 +571,14 @@ export async function trackMatch(
   const log = getLogger().child({ matchId });
   const { newTrackedPage } = await import('../monitor/hltvMonitor.js');
   const page = await newTrackedPage();
-  const tracker = new RoundTracker();
+  // Carência do enriquecimento tardio: o killfeed que chega depois do
+  // fechamento do round ainda completa arma/headshot/vítima.
+  const tracker = new RoundTracker('unknown', 1, {
+    lateEnrichMs: getConfig().SCOREBOT_LATE_ENRICH_SEC * 1000,
+  });
+  /** Killfeed do scorebot: arma/headshot/assist das kills do round. */
+  let feed: ScorebotFeed | null = null;
+  let feedStarted = false;
   const startedAt = Date.now();
   try {
     await page.goto(matchPageUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -613,7 +695,7 @@ export async function trackMatch(
       indexPlayerTeams(snap.players, teamByPlayer);
       const minKillsForPoll: MinKillsRule = (player) =>
         minKills(player, teamByPlayer.get(playerTeamKey(player)) ?? null);
-      const { event, dropped, roundClosed, lastTotal: next } = processPoll(
+      const { event, dropped, roundClosed: closed, lastTotal: next, killfeed } = processPoll(
         tracker,
         snap,
         lastTotal,
@@ -621,9 +703,55 @@ export async function trackMatch(
         getConfig().SCOREBOARD_DELAY_MS,
         lastSnap,
         roundOver,
+        teamByPlayer,
       );
       lastTotal = next;
       lastSnap = snap;
+      // Kills do placar que NÃO receberam arma/headshot do killfeed: o
+      // detalhe pode chegar depois (carência) ou não chega (feed fora).
+      // O aviso deixa o dono saber que o clipe vai sair com `null` sem
+      // esperar o thumb para descobrir.
+      //
+      // Com o killfeed LIGADO: sem ele, `paired` é sempre 0 e o aviso
+      // disparava em todo round (ruído que cansa e esconde o problema
+      // real).
+      if (
+        getConfig().SCOREBOT_KILLFEED &&
+        killfeed &&
+        killfeed.total > 0 &&
+        killfeed.paired < killfeed.total
+      ) {
+        log.warn(
+          {
+            player: event?.player ?? null,
+            round: closed?.round ?? null,
+            paired: killfeed.paired,
+            total: killfeed.total,
+            feedKills: killfeed.feedKills,
+          },
+          'parte das kills do round ainda não foi completada pelo killfeed do scorebot (pode chegar na carência)',
+        );
+      }
+      /**
+       * DRIFT de round entre o feed e o placar: o round do feed é
+       * contado por `RoundStart` e o do placar é `ct+t+1`. Quando eles
+       * divergem, a kill não pareia (ou fica na fila esperando o round
+       * seguinte) — o contador diz QUANTAS kills foram afetadas, que é
+       * o que separa "o feed atrasou" de "os rounds não batem".
+       */
+      if (getConfig().SCOREBOT_KILLFEED && killfeed?.roundDrift) {
+        const drift = tracker.lastDrift();
+        log.warn(
+          {
+            player: event?.player ?? null,
+            round: closed?.round ?? null,
+            drift: killfeed.roundDrift,
+            roundFeed: drift?.feedRound ?? null,
+            roundPlacar: drift?.placarRound ?? null,
+          },
+          'o round do killfeed divergiu do round do placar (as kills afetadas podem não ter pareado)',
+        );
+      }
       if (event) {
         log.info(
           { player: event.player, kills: event.kills.length, map: event.map, round: event.round },
@@ -632,8 +760,22 @@ export async function trackMatch(
         cb.onAce(event);
       } else if (dropped) {
         log.warn({ dropped, map: snap.map, round: snap.round }, 'multikill descartado');
-      } else if (roundClosed) {
-        log.info(roundClosed, 'round fechado sem multikill');
+      } else if (closed) {
+        log.info(closed, 'round fechado sem multikill');
+      }
+
+      // Killfeed do scorebot (fonte de arma/headshot/assistência). Começa
+      // só DEPOIS do 1º poll: assim o tracker já sabe se entrou no meio do
+      // round, e o backlog do replay não é pareado com kills que ele não
+      // viu (o pareamento é por ordem).
+      if (!feedStarted && getConfig().SCOREBOT_KILLFEED) {
+        feedStarted = true;
+        feed = await startScorebotFeed(page, matchId, (kills) => {
+          for (const kill of kills) tracker.noteFeedKill(kill);
+        }).catch((e) => {
+          log.warn({ err: String(e) }, 'killfeed do scorebot indisponível');
+          return null;
+        });
       }
 
       // Fim de mapa melhor-de: MR12 → 13 wins; OT vai além de 24 rounds
@@ -646,6 +788,7 @@ export async function trackMatch(
       await page.waitForTimeout(3000);
     }
   } finally {
+    feed?.stop();
     await page.close().catch(() => undefined);
   }
 }

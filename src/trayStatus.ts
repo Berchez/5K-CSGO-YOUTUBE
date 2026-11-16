@@ -14,6 +14,26 @@ export interface TrayStatusMatch {
   event: string;
   stars: number;
   minKills: number;
+  /**
+   * De onde veio o limiar: `general` (política por estrelas) ou `watchlist`
+   * (override de time/jogador). O painel mostra a fonte junto do número —
+   * sem isso "Mín. 5 kills" não diz se o 5 é do time da lista ou do 0★.
+   */
+  minKillsSource?: 'general' | 'watchlist';
+  /**
+   * false = a partida NÃO passa na política geral (entrou só pela
+   * watchlist): os jogadores do adversário são bloqueados e não geram
+   * clipe, mesmo batendo o número de kills.
+   */
+  passesGeneralFilter?: boolean;
+  /** Times da watchlist que casaram com a partida. */
+  watchlistedTeams?: string[];
+  /**
+   * Rótulo pronto do limiar ("5k · watchlist (Imperial)"), calculado por
+   * `describeMinKillsPolicy`. O painel só renderiza — a regra fica numa
+   * fonte só (o HTML não duplica a decisão).
+   */
+  minKillsLabel?: string;
   matchPageUrl: string;
   state: TrayMatchState;
   stream?: {
@@ -116,6 +136,37 @@ export function summarizeTrayMatches(matches: TrayStatusMatch[]): TrayStatus['to
 
 export function phaseForMatches(matches: TrayStatusMatch[]): TrayPhase {
   return summarizeTrayMatches(matches).recording > 0 ? 'recording' : 'monitoring';
+}
+
+/**
+ * Rótulo do limiar de kills da partida (painel/tray): número + ORIGEM.
+ *
+ * POR QUE: o painel mostrava só "Mín. 5 kills" e o dono não sabia se o 5
+ * vinha da política por estrelas, de um time da watchlist ou de uma
+ * partida que só entrou pela lista (onde o adversário é bloqueado). É a
+ * pergunta que mais volta — "está 5, então todo 5k vira clipe?".
+ */
+export function describeMinKillsPolicy(match: {
+  minKills: number;
+  stars: number;
+  minKillsSource?: 'general' | 'watchlist';
+  passesGeneralFilter?: boolean;
+  watchlistedTeams?: string[];
+}): string {
+  const teams = (match.watchlistedTeams ?? [])
+    .map((team) => team.trim())
+    .filter((team) => team.length > 0);
+  const suffix = teams.length > 0 ? ` (${teams.join(', ')})` : '';
+  // Partida que NÃO passa na política geral: entrou pela watchlist e o
+  // adversário não gera clipe nenhum.
+  if (match.passesGeneralFilter === false) {
+    return `${match.minKills}k · só times da lista${suffix}`;
+  }
+  if (match.minKillsSource === 'watchlist') {
+    return `${match.minKills}k · watchlist${suffix}`;
+  }
+  const origem = match.stars >= 1 ? `${match.stars}★` : 'sem avaliação';
+  return `${match.minKills}k · ${origem}`;
 }
 
 function writeStatusTo(target: string): void {

@@ -1,6 +1,7 @@
 import type { AceEvent } from '../types.js';
 import { killLabel, prettyWeapon } from '../detector/aceDetector.js';
 import { killAtMs } from '../clipper/shorts.js';
+import { fixMapPrepositions, mapWithArticle } from '../clipper/copyRules.js';
 import { getLogger } from '../logger.js';
 
 export type MetadataMode = 'ai' | 'template' | 'legacy';
@@ -271,15 +272,25 @@ export function buildMetadataContext(
   const team2 = ace.team2 ?? '';
   const matchup = team1 && team2 ? `${team1} vs ${team2}` : team1 || team2;
   const rival = team && team1 && team2 ? (team === team1 ? team2 : team === team2 ? team1 : '') : '';
-  const headshots = summary?.headshots ?? feed.filter((f) => f.headshot).length;
+  /**
+   * O `summary` é calculado no FECHAMENTO do round; o killfeed completa
+   * as kills depois (arma/headshot/vítima corrigida) e os escalares dele
+   * ficam obsoletos. As kills valem mais — usar o `summary` aqui fazia o
+   * texto da IA ser REJEITADO ("contagem de headshots contraditória")
+   * porque o contexto dizia 0 e a fala dizia 3.
+   */
+  const killsSabemHeadshot = rawKills.some((k) => k.headshot != null);
+  const headshots = killsSabemHeadshot
+    ? rawKills.filter((k) => k.headshot === true).length
+    : (summary?.headshots ?? feed.filter((f) => f.headshot).length);
   const weaponCounts = new Map<string, number>();
   for (const row of feed) {
     if (!row.weapon) continue;
     weaponCounts.set(row.weapon, (weaponCounts.get(row.weapon) ?? 0) + 1);
   }
   const mainWeapon =
-    (summary?.mainWeapon ? prettyWeapon(summary.mainWeapon) : '') ||
     [...weaponCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ||
+    (summary?.mainWeapon ? prettyWeapon(summary.mainWeapon) : '') ||
     '';
   const assists = [
     ...new Set(
@@ -348,6 +359,8 @@ export function sanitizeTitle(raw: string): string {
   s = s.replace(/#\S+/g, ' ');
   // O YouTube rejeita título/descrição com < ou > (invalidTitle).
   s = s.replace(/[<>]/g, ' ');
+  // Copy do canal: "na Dust2", nunca "no Dust2".
+  s = fixMapPrepositions(s);
   // O seletor de emoji não cobre o variation selector (U+FE0F): ele
   // sobrava na string como lixo invisível depois do replace.
   s = s.replace(/\uFE0F/g, '');
@@ -375,6 +388,8 @@ export function sanitizeDescription(raw: string): string {
   s = s.replace(/\r\n?/g, '\n');
   s = s.replace(URL_RE, ' ');
   s = s.replace(EMOJI_RE, '');
+  // Copy do canal: "na Dust2", nunca "no Dust2".
+  s = fixMapPrepositions(s);
   // Resíduo do variation selector (U+FE0F) depois do replace do emoji.
   s = s.replace(/\uFE0F/g, '');
   // O YouTube rejeita descrição com < ou > (invalidDescription).
@@ -531,7 +546,7 @@ interface TitleTemplate {
 const TITLE_TEMPLATES: TitleTemplate[] = [
   {
     id: 'kills-map-event',
-    build: (c) => `${c.player} fez ${c.kills} kills no ${c.map} | ${c.event} R${c.round}`,
+    build: (c) => `${c.player} fez ${c.kills} kills ${mapWithArticle(c.map)} | ${c.event} R${c.round}`,
   },
   {
     id: 'label-weapon-matchup',
@@ -541,7 +556,7 @@ const TITLE_TEMPLATES: TitleTemplate[] = [
   {
     id: 'dominated-map-matchup',
     when: (c) => !!c.matchup,
-    build: (c) => `${c.player} dominou o ${c.map}: ${c.kills} kills — ${c.matchup}`,
+    build: (c) => `${c.player} dominou ${mapWithArticle(c.map)}: ${c.kills} kills — ${c.matchup}`,
   },
   {
     id: 'highlight',
@@ -549,25 +564,25 @@ const TITLE_TEMPLATES: TitleTemplate[] = [
   },
   {
     id: 'streak',
-    build: (c) => `${c.player} marcou ${c.kills} kills em sequência no ${c.map} | ${c.event}`,
+    build: (c) => `${c.player} marcou ${c.kills} kills em sequência ${mapWithArticle(c.map)} | ${c.event}`,
   },
   {
     id: 'no-space',
-    build: (c) => `${c.player} não deu espaço: ${c.kills} kills no ${c.map} | ${c.event}`,
+    build: (c) => `${c.player} não deu espaço: ${c.kills} kills ${mapWithArticle(c.map)} | ${c.event}`,
   },
   {
     id: 'kills-label',
-    build: (c) => `${c.player} ${c.kills} KILLS no ${c.map} — ${c.label}! ${c.event} R${c.round}`,
+    build: (c) => `${c.player} ${c.kills} KILLS ${mapWithArticle(c.map)} — ${c.label}! ${c.event} R${c.round}`,
   },
   {
     id: 'cleaned-round',
-    build: (c) => `${c.player} limpou o round ${c.round}: ${c.kills} kills no ${c.map} | ${c.event}`,
+    build: (c) => `${c.player} limpou o round ${c.round}: ${c.kills} kills ${mapWithArticle(c.map)} | ${c.event}`,
   },
   {
     id: 'headshots',
     when: (c) => c.headshots >= 2,
     build: (c) =>
-      `${c.player} com ${c.kills} kills e ${c.headshots} headshots no ${c.map} | ${c.event}`,
+      `${c.player} com ${c.kills} kills e ${c.headshots} headshots ${mapWithArticle(c.map)} | ${c.event}`,
   },
   {
     id: 'event-round',
@@ -575,7 +590,7 @@ const TITLE_TEMPLATES: TitleTemplate[] = [
   },
   {
     id: 'map-event-round',
-    build: (c) => `${c.player} marca ${c.kills} no ${c.map} — ${c.event} R${c.round}`,
+    build: (c) => `${c.player} marca ${c.kills} ${mapWithArticle(c.map)} — ${c.event} R${c.round}`,
   },
   {
     id: 'same-round',
@@ -584,20 +599,20 @@ const TITLE_TEMPLATES: TitleTemplate[] = [
   {
     id: 'crushed-map',
     when: (c) => !!c.matchup,
-    build: (c) => `${c.player} arrasou o ${c.map}: ${c.kills} kills — ${c.matchup}`,
+    build: (c) => `${c.player} arrasou ${mapWithArticle(c.map)}: ${c.kills} kills — ${c.matchup}`,
   },
   {
     id: 'label-map',
-    build: (c) => `${c.player} ${c.label} no ${c.map}: ${c.kills} kills | ${c.event}`,
+    build: (c) => `${c.player} ${c.label} ${mapWithArticle(c.map)}: ${c.kills} kills | ${c.event}`,
   },
   {
     id: 'flash',
     when: (c) => c.flashAssists.length > 0,
-    build: (c) => `${c.player} cegou e matou: ${c.kills} kills no ${c.map} | ${c.event}`,
+    build: (c) => `${c.player} cegou e matou: ${c.kills} kills ${mapWithArticle(c.map)} | ${c.event}`,
   },
   {
     id: 'on-fire',
-    build: (c) => `${c.player} on fire no ${c.map}: ${c.kills} kills em ${c.event}`,
+    build: (c) => `${c.player} on fire ${mapWithArticle(c.map)}: ${c.kills} kills em ${c.event}`,
   },
   {
     id: 'team-matchup',
@@ -608,17 +623,17 @@ const TITLE_TEMPLATES: TitleTemplate[] = [
   {
     id: 'wiped-rival',
     when: (c) => !!c.rival,
-    build: (c) => `${c.player} deletou ${c.rival} no ${c.map} — ${c.kills} kills`,
+    build: (c) => `${c.player} deletou ${c.rival} ${mapWithArticle(c.map)} — ${c.kills} kills`,
   },
   {
     id: 'dominated-rival',
     when: (c) => !!c.rival,
-    build: (c) => `${c.player} dominou ${c.rival} no ${c.map}: ${c.kills} kills`,
+    build: (c) => `${c.player} dominou ${c.rival} ${mapWithArticle(c.map)}: ${c.kills} kills`,
   },
   {
     id: 'passed-rival',
     when: (c) => !!c.rival,
-    build: (c) => `${c.player} passou por ${c.rival} e fez ${c.kills} no ${c.map}`,
+    build: (c) => `${c.player} passou por ${c.rival} e fez ${c.kills} ${mapWithArticle(c.map)}`,
   },
 ];
 
@@ -742,7 +757,7 @@ export function shortenTitleForShorts(
   title: string,
   ctx: MetadataContext,
 ): string | null {
-  if (title.length <= SHORTS_TITLE_MAX) return title;
+  if (title.length <= SHORTS_TITLE_MAX) return fixMapPrepositions(title);
   const cut = title.slice(0, SHORTS_TITLE_MAX);
   const lastSpace = cut.lastIndexOf(' ');
   const candidate = sanitizeTitle(lastSpace > 20 ? cut.slice(0, lastSpace) : cut);
@@ -754,24 +769,24 @@ export function shortenTitleForShorts(
 const OPENINGS: Array<(ctx: MetadataContext) => string> = [
   (c) =>
     `${c.label} de ${c.player}${c.team ? ` (${c.team})` : ''} no round ${c.round} (${c.map}) — ${c.event}`,
-  (c) => `${c.player} pegou o round ${c.round} no ${c.map} — ${c.event}`,
+  (c) => `${c.player} pegou o round ${c.round} ${mapWithArticle(c.map)} — ${c.event}`,
   (c) => `${c.label}! ${c.player} no round ${c.round} (${c.map}) — ${c.event}`,
   (c) => `Round ${c.round}, ${c.map}: ${c.player} marcou ${c.kills} — ${c.event}`,
 ];
 
 const PARAGRAPHS: Array<(ctx: MetadataContext) => string> = [
   (c) =>
-    `${c.player} marcou ${c.kills} eliminações${c.rival ? ` contra ${c.rival}` : ''} no ${c.map}, ` +
-    `${c.headshots > 0 ? `com ${c.headshots} headshot${c.headshots > 1 ? 's' : ''} e ` : ''}` +
-    `${c.mainWeapon ? `a ${c.mainWeapon} como arma principal` : 'sem trocar de arma'}.`,
+    `${c.player} marcou ${c.kills} eliminações${c.rival ? ` contra ${c.rival}` : ''} ${mapWithArticle(c.map)}` +
+    `${c.headshots > 0 ? `, com ${c.headshots} headshot${c.headshots > 1 ? 's' : ''}` : ''}` +
+    `${c.mainWeapon ? `, usando ${c.mainWeapon} como arma principal` : ''}.`,
   (c) =>
     `${c.kills} eliminações no mesmo round${c.rival ? ` contra ${c.rival}` : ''}: ` +
-    `${c.player} não deu espaço no ${c.map}${c.headshots > 0 ? ` e acertou ${c.headshots} headshot${c.headshots > 1 ? 's' : ''}` : ''}.`,
+    `${c.player} não deu espaço ${mapWithArticle(c.map)}${c.headshots > 0 ? ` e acertou ${c.headshots} headshot${c.headshots > 1 ? 's' : ''}` : ''}.`,
   (c) =>
     `No ${c.map}, ${c.player} apareceu para fechar o round ${c.round}: ${c.kills} eliminações` +
     `${c.mainWeapon ? ` com a ${c.mainWeapon}` : ''}${c.headshots > 0 ? ` e ${c.headshots} headshot${c.headshots > 1 ? 's' : ''}` : ''}.`,
   (c) =>
-    `O round ${c.round} no ${c.map} virou espetáculo: ${c.player} somou ${c.kills} kills` +
+    `O round ${c.round} ${mapWithArticle(c.map)} virou espetáculo: ${c.player} somou ${c.kills} kills` +
     `${c.flashAssists.length > 0 ? `, com flash de ${c.flashAssists.join(', ')}` : ''}.`,
 ];
 
@@ -997,7 +1012,7 @@ export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): s
   // O rodapé diz O QUE é o vídeo (vertical ou não), ONDE (mapa) e COMO
   // ele está publicado.
   const what = isShorts ? 'Corte vertical' : 'Corte';
-  const where = ctx.map ? ` no ${ctx.map}` : '';
+  const where = ctx.map ? ` ${mapWithArticle(ctx.map)}` : '';
   const who = ctx.player ? ` de ${ctx.player}` : '';
   let base: string;
   if (privacy === 'private') {
@@ -1014,7 +1029,8 @@ export function buildFooter(ctx: MetadataContext, opts: MetadataOptions = {}): s
   // O rodapé entra DEPOIS do sanitize do corpo (o CTA pode ter URL, e
   // link é aceito na descrição), mas < e > o YouTube rejeita com
   // invalidDescription — então a limpeza é aplicada aqui.
-  return footer.replace(/[<>]/g, ' ');
+  // A copy do canal ("na Dust2") vale também no rodapé.
+  return fixMapPrepositions(footer.replace(/[<>]/g, ' '));
 }
 
 /**
@@ -1120,8 +1136,10 @@ export function buildTemplateMetadata(
     .filter(Boolean);
   const isShorts = opts.format === 'shorts';
   return {
-    title: isShorts ? buildShortTitle(ctx) : buildTemplateTitle(ctx),
-    description: buildTemplateDescription(ctx, opts),
+    // Copy do canal: "na Dust2", nunca "no Dust2" (o gerador determinístico
+    // escreve "no {mapa}").
+    title: fixMapPrepositions(isShorts ? buildShortTitle(ctx) : buildTemplateTitle(ctx)),
+    description: fixMapPrepositions(buildTemplateDescription(ctx, opts)),
     tags: buildTags(ctx, defaults, { shorts: isShorts }),
     source: 'template',
   };
@@ -1171,21 +1189,24 @@ export async function buildVideoMetadata(
     // que o autor escreveu. Encurta (mantendo jogador + evento/time) ou
     // descarta o título da IA.
     const shortCandidate = isShorts ? shortenTitleForShorts(candidate, ctx) : candidate;
-    if (shortCandidate == null) {
+    // O corte do título acontece DEPOIS do sanitize: a copy do canal
+    // ("na Dust2") é reaplicada aqui para o título final.
+    const finalCandidate = shortCandidate == null ? null : fixMapPrepositions(shortCandidate);
+    if (finalCandidate == null) {
       if (!titleReason) titleReason = 'título longo demais para o Short';
       continue;
     }
-    const check = validateTitle(shortCandidate, ctx);
+    const check = validateTitle(finalCandidate, ctx);
     if (!check.ok) {
       if (!titleReason) titleReason = check.reason ?? 'inválido';
-      log.warn({ motivo: check.reason, titulo: shortCandidate.slice(0, 120) }, 'título da IA rejeitado');
+      log.warn({ motivo: check.reason, titulo: finalCandidate.slice(0, 120) }, 'título da IA rejeitado');
       continue;
     }
-    if (isUsedTitle(shortCandidate)) {
+    if (isUsedTitle(finalCandidate)) {
       if (!titleReason) titleReason = 'título repetido';
       continue;
     }
-    title = shortCandidate;
+    title = finalCandidate;
     break;
   }
   let description = '';

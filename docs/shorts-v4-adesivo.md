@@ -115,11 +115,23 @@ Tabela canônica (implementar em `src/clipper/shortOverlay.ts`):
 
 Precedência: **CLI > campo do `.env` (não vazio) > preset > base**.
 
+> Nota (revisão do marker): a precedência do **marker** (adesivo por clipe)
+> é `flag da CLI > config/shorts-overlays.json > marker > .env`, e o marker
+> guarda o spec **pedido** (`auto`, `preset: ...`) — não o texto/estilo
+> resolvido. O `auto` resolve de novo a cada rodada e o visual do preset vem
+> do código; a CLI não é gravada (teste de dry-run não vira adesivo) e um
+> marker sem adesivo (`render.overlayText` vazio) não manda nada.
+> Implementação: `src/clipper/shortOverlayConfig.ts` (`mergeShortOverlaySources`,
+> `markerOverlaySpec`) + `short.overlaySpec` no marker v2.
+
 - `SHORTS_OVERLAY_PRESET=custom` → começa da base neutra (`BASE`: cápsula, cor
   chapada, sombra sólida, `Arial Black`, caixa alta) e aplica só os campos.
 - Campos de override vazios (`''`/`null`) = "usa o preset".
 - `0` é override válido (ex.: sem borda, tilt 0).
-- Texto vazio → **sem adesivo** (`null`), independentemente do preset.
+- Texto `auto` → deriva o texto das kills dentro da janela (`ACE kyousuke`, `4K FalleN`).
+- Texto vazio/`none`/`off` → **sem adesivo** (`null`), independentemente do preset.
+- Texto literal → usado como está; aceita os tokens `{kills}`, `{label}`,
+  `{player}`, `{map}`, `{round}`, `{team}`, `{opponent}` e `{event}`.
 
 Função sugerida (em `src/clipper/shortOverlay.ts`):
 
@@ -169,7 +181,7 @@ Bloco atual em ~linhas 588-605. Alterar/adicionar:
 | `SHORTS_CAPTION_FONT_SIZE` | `64` (era 54) | |
 | `SHORTS_CAM_HEIGHT` | `600` (era 660) | |
 | `SHORTS_OVERLAY_PRESET` | enum acima, default `polex` | |
-| `SHORTS_OVERLAY_TEXT` | `''` | vazio = sem adesivo |
+| `SHORTS_OVERLAY_TEXT` | `'auto'` | automático pelas kills; vazio/none desliga; literal aceita tokens |
 | `SHORTS_OVERLAY_HOLD_SEC` | `2` | |
 | `SHORTS_OVERLAY_FADE_SEC` | `0.5` | |
 | `SHORTS_OVERLAY_Y` | `0.54` | |

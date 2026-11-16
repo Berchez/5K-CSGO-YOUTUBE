@@ -1,5 +1,7 @@
 import sharp from 'sharp';
+import { killLabel } from '../detector/aceDetector.js';
 import { escapeXml, stripUnsupportedGlyphs } from './shortBanner.js';
+import { fixMapPrepositions } from './copyRules.js';
 
 /**
  * Adesivo (sticker) que aparece no COMEÇO do Short e some em fade out.
@@ -202,6 +204,11 @@ function isPreset(value: string): value is Exclude<ShortOverlayPreset, 'custom'>
   return Object.hasOwn(SHORT_OVERLAY_PRESET_VISUALS, value);
 }
 
+/** O nome é um preset conhecido (`custom` incluso)? */
+export function isShortOverlayPreset(value: string): boolean {
+  return value === 'custom' || isPreset(value);
+}
+
 /** Texto "limpo" (sem emoji/controle) e em caixa alta quando pedido. */
 function cleanText(text: string, uppercase: boolean): string {
   const clean = stripUnsupportedGlyphs(String(text ?? ''));
@@ -232,6 +239,80 @@ function pickColor(value: string | null | undefined, fallback: string): string {
 
 function pickNumber(value: number | null | undefined, fallback: number): number {
   return value == null || !Number.isFinite(value) ? fallback : value;
+}
+
+/** Dados do clipe usados para montar o texto automático do adesivo. */
+export interface ShortOverlayTextContext {
+  /** Jogador do multikill mostrado no Short. */
+  player: string;
+  /** Quantidade de kills DENTRO da janela do Short. */
+  killCount: number;
+  map?: string | null;
+  round?: number | null;
+  team?: string | null;
+  opponent?: string | null;
+  event?: string | null;
+}
+
+/**
+ * Texto automático do adesivo, derivado dos fatos do próprio clipe.
+ *
+ * O preset define o VISUAL; ele nunca inventa a frase. O texto padrão
+ * segue a mesma convenção do resto do canal: `ACE` para 5+ kills e `4K`
+ * para quatro.
+ */
+export function defaultShortOverlayText(ctx: ShortOverlayTextContext): string {
+  const count = Math.max(0, Math.floor(Number(ctx?.killCount) || 0));
+  const label = killLabel(count);
+  const player = String(ctx?.player ?? '').trim();
+  if (player) return `${label} ${player}`;
+  const map = String(ctx?.map ?? '').trim();
+  return map ? `${label} ${map}` : label;
+}
+
+/**
+ * Preenche os tokens de um texto de adesivo com os dados do clipe.
+ *
+ * Tokens desconhecidos ficam como estão: erro de digitação aparece no
+ * vídeo em vez de sumir silenciosamente.
+ */
+export function fillShortOverlayTemplate(
+  template: string,
+  ctx: ShortOverlayTextContext,
+): string {
+  const count = Math.max(0, Math.floor(Number(ctx?.killCount) || 0));
+  const values: Record<string, string> = {
+    kills: String(count),
+    label: killLabel(count),
+    player: String(ctx?.player ?? '').trim(),
+    map: String(ctx?.map ?? '').trim(),
+    round: String(ctx?.round ?? '').trim(),
+    team: String(ctx?.team ?? '').trim(),
+    opponent: String(ctx?.opponent ?? '').trim(),
+    event: String(ctx?.event ?? '').trim(),
+  };
+  return String(template ?? '').replace(/\{(kills|label|player|map|round|team|opponent|event)\}/g, (_, key: string) =>
+    values[key] ?? '',
+  );
+}
+
+/**
+ * Resolve o texto pedido para o adesivo.
+ *
+ * - `auto`: deriva do clipe (`ACE kyousuke`, `4K FalleN`);
+ * - vazio/`none`/`off`: desliga o adesivo;
+ * - qualquer outro texto: literal, com os tokens de
+ *   {@link fillShortOverlayTemplate} opcionais.
+ */
+export function resolveShortOverlayText(
+  spec: string | null | undefined,
+  ctx: ShortOverlayTextContext,
+): string {
+  const raw = String(spec ?? '').trim();
+  if (!raw) return '';
+  if (/^(none|off)$/i.test(raw)) return '';
+  if (/^auto$/i.test(raw)) return fixMapPrepositions(defaultShortOverlayText(ctx));
+  return fixMapPrepositions(fillShortOverlayTemplate(raw, ctx).trim());
 }
 
 /**

@@ -420,6 +420,22 @@ export const ConfigSchema = z.object({
    */
   SCOREBOARD_DELAY_MS: z.coerce.number().min(0).max(120_000).default(5_000),
   /**
+   * Killfeed do scorebot do HLTV (socket.io): fonte de arma, headshot,
+   * assistência e flash de cada kill. O placar só conta K/D — sem isso o
+   * sidecar/metadados ficam com arma nula e vítima casada por ordem.
+   * Best-effort: se o scorebot não responder, o tracking do placar segue
+   * exatamente como antes (só sem o detalhe).
+   */
+  SCOREBOT_KILLFEED: boolEnvField('SCOREBOT_KILLFEED', true),
+  /**
+   * Carência (s) para enriquecer as kills de um round que JÁ FECHOU.
+   *
+   * O killfeed chega perto do placar, mas às vezes atrasa: sem esta
+   * carência a última kill do round ficaria sem arma/headshot para
+   * sempre (o sidecar é escrito minutos depois — dá para corrigir).
+   */
+  SCOREBOT_LATE_ENRICH_SEC: z.coerce.number().min(0).max(600).default(60),
+  /**
    * Atraso do VÍDEO gravado em relação ao jogo (ms). O recorder consome
    * HLS: o conteúdo de um segmento chega ~20-30s depois de ter acontecido,
    * e o mtime do arquivo marca QUANDO ele foi escrito — não quando foi
@@ -602,6 +618,16 @@ export const ConfigSchema = z.object({
   SHORTS_CAPTION_TIMING: z.enum(['whisper-cpp', '']).default('whisper-cpp'),
   /** Modelo do Gemini usado na transcrição. */
   SHORTS_CAPTION_GEMINI_MODEL: z.string().default('gemini-3-flash-preview'),
+  /**
+   * Quantas TENTATIVAS no TOTAL uma chamada do Gemini faz quando falha
+   * por indisponibilidade (503/"high demand").
+   *
+   * A cota (429) NÃO entra no retry: ela é final para o modelo de
+   * texto — o reservatório (modelo dedicado) assume.
+   */
+  SHORTS_CAPTION_GEMINI_RETRIES: z.coerce.number().int().min(1).max(5).default(3),
+  /** Espera base entre as tentativas (ms; dobra a cada repetição). */
+  SHORTS_CAPTION_GEMINI_RETRY_MS: z.coerce.number().min(0).max(60_000).default(2000),
   /** Modelo do Whisper (HuggingFace) usado na reserva. */
   SHORTS_CAPTION_HF_MODEL: z.string().default('openai/whisper-large-v3-turbo'),
   /**
@@ -657,13 +683,14 @@ export const ConfigSchema = z.object({
   SHORTS_CAPTION_TRANSLATE: boolEnvField('SHORTS_CAPTION_TRANSLATE', true),
   /**
    * Texto do ADESIVO (sticker) que aparece no começo do Short e some em
-   * fade out. Vazio = sem adesivo.
+   * fade out.
    *
-   * Ex.: `Furia nos playoffs` — vira um adesivo por cima do vertical,
-   * visível por `SHORTS_OVERLAY_HOLD_SEC` e apagado no fim. O visual vem
-   * do PRESET abaixo; os campos de estilo são só overrides.
+   * `auto` (padrão) deriva o texto dos kills dentro da janela (`ACE
+   * kyousuke`, `4K FalleN`). Texto vazio desliga o adesivo; um texto
+   * literal vira o adesivo por cima do vertical. O visual vem do PRESET
+   * abaixo; os campos de estilo são só overrides.
    */
-  SHORTS_OVERLAY_TEXT: z.string().default(''),
+  SHORTS_OVERLAY_TEXT: z.string().max(120).default('auto'),
   /**
    * Preset visual do adesivo (os valores de cada preset ficam em
    * `src/clipper/shortOverlay.ts`): `polex`, `polex-die`, `gaules`,
@@ -677,11 +704,22 @@ export const ConfigSchema = z.object({
   /** Posição vertical do adesivo (fração da altura do vertical). */
   SHORTS_OVERLAY_Y: z.coerce.number().min(0).max(1).default(0.54),
   /** Forma do adesivo (vazio = preset). */
-    SHORTS_OVERLAY_STYLE: z.enum(['', 'capsule', 'rect']).default(''),
+  SHORTS_OVERLAY_STYLE: z.enum(['', 'capsule', 'rect']).default(''),
   /** Tag pequena no topo do adesivo (vazio = tag do preset, se houver). */
   SHORTS_OVERLAY_TAG: z.string().default(''),
   /** Caixa alta forçada (vazio = preset). */
   SHORTS_OVERLAY_UPPERCASE: optionalBoolEnv,
+  /**
+   * Arquivo JSON com o adesivo POR CLIPE (texto e visual de cada).
+   *
+   * Sem ele, todo Short do lote sai com o mesmo adesivo — e rodar o
+   * script de novo sem as flags de adesivo REVERTIA o adesivo para o
+   * `auto` (o texto saía errado sem aviso). A precedência é:
+   * flag > arquivo por clipe > adesivo já gravado no marker > `.env`.
+   *
+   * Formato: `{"<pasta do clipe>": {"text": "...", "preset": "polex-die"}}`.
+   */
+  SHORTS_OVERLAY_CONFIG: z.string().default('./config/shorts-overlays.json'),
   /** Cor de fundo do adesivo (vazio = preset). */
   SHORTS_OVERLAY_BACKGROUND: optionalHexEnv,
   /** Cor do texto do adesivo (vazio = preset). */
@@ -772,6 +810,35 @@ export const ConfigSchema = z.object({
   YT_CLIENT_SECRETS: z.string().default('./client_secrets.json'),
   YT_TOKEN_PATH: z.string().default('./token.json'),
   YT_CATEGORY_ID: z.string().default('20'),
+  /**
+   * Teto da cota diária do YouTube (units do projeto de API).
+   *
+   * O padrão do YouTube é 10000 (6 uploads), mas o projeto pode ter
+   * cota ampliada — por isso é configurável. A guarda local usava o
+   * valor fixo e o dia UTC: ela bloqueava publicações legítimas.
+   */
+  YT_QUOTA_UNITS_PER_DAY: z.coerce.number().min(1000).max(1_000_000).default(10_000),
+  /**
+   * Fuso do dia de cota. A cota do YouTube zera à meia-noite do
+   * Pacífico, não à meia-noite UTC.
+   *
+   * Validado aqui: um fuso inválido estourava `RangeError` do `Intl` no
+   * MEIO do lote (depois de render e antes do upload).
+   */
+  YT_QUOTA_TIMEZONE: z
+    .string()
+    .default('America/Los_Angeles')
+    .refine(
+      (tz) => {
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: tz });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      'fuso horário inválido (ex.: America/Los_Angeles)',
+    ),
   YT_DEFAULT_TAGS: z.string().default('cs2,ace,5k,counter-strike,highlights'),
   /**
    * Metadados do YouTube: 'ai' = IA (com fallback determinístico), 'template'
@@ -964,6 +1031,7 @@ export function cappedLatencyChannels(params: {
  * validando com o schema estrito; aqui a leitura do `.env` é tolerante.
  */
 export const SHORTS_OVERLAY_ENV_KEYS = [
+  'SHORTS_OVERLAY_TEXT',
   'SHORTS_OVERLAY_PRESET',
   'SHORTS_OVERLAY_STYLE',
   'SHORTS_OVERLAY_FONT',

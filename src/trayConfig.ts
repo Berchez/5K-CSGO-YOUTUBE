@@ -61,8 +61,8 @@ export const EDITABLE_FIELDS: ConfigField[] = [
   {
     key: 'MIN_STARS',
     group: 'capture',
-    label: 'Estrelas mínimas',
-    help: '0 = qualquer partida; 2 = somente 2★ ou mais. Partidas sem estrela continuam sujeitas ao mínimo de kills.',
+    label: 'Estrelas mínimas (filtro de entrada)',
+    help: '0 = qualquer partida; 2 = somente 2★ ou mais. Sem estrela no listing (0★) a partida só entra se o evento parecer top-tier (major, BLAST, IEM, ESL Pro, PGL, EWC...).',
     type: 'number',
     min: 0,
     max: 5,
@@ -71,8 +71,8 @@ export const EDITABLE_FIELDS: ConfigField[] = [
   {
     key: 'MIN_KILLS',
     group: 'capture',
-    label: 'Kills mínimas com estrela',
-    help: '4 = 4k/5k; 5 = somente ACE.',
+    label: 'Kills mínimas — partidas avaliadas (1★+)',
+    help: '4 = 4k/5k; 5 = somente ACE. Vale para partida com pelo menos 1★ e para quem não tem regra própria na watchlist.',
     type: 'number',
     min: 2,
     max: 5,
@@ -81,8 +81,8 @@ export const EDITABLE_FIELDS: ConfigField[] = [
   {
     key: 'MIN_KILLS_NO_STARS',
     group: 'capture',
-    label: 'Kills mínimas sem estrela',
-    help: 'Partidas com 0★ no listing usam este limite (normalmente 5 = ACE).',
+    label: 'Kills mínimas — partidas sem avaliação',
+    help: '0★ no listing pode ser "sem estrela" ou "o HLTV não avaliou". Normalmente 5 = ACE. NÃO amplia o escopo: quem decide se a partida entra é o filtro de estrelas acima.',
     type: 'number',
     min: 2,
     max: 5,
@@ -543,7 +543,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'SHORTS_OVERLAY_TEXT',
     group: 'clips',
     label: 'Adesivo do Short',
-    help: 'Texto do adesivo (sticker) que aparece no começo do Short e some em fade out. Vazio = sem adesivo.',
+    help: 'Texto do adesivo (sticker) que aparece no começo do Short e some em fade out. `auto` deriva das kills (ex.: ACE kyousuke); vazio desliga; texto literal é usado como está.',
     type: 'text',
   },
   {

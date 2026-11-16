@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '../src/config.js';
 import {
+  describeMinKillsPolicy,
   initTrayStatus,
   patchTrayStatus,
   phaseForMatches,
@@ -75,6 +76,45 @@ describe('summarizeTrayMatches', () => {
   it('detecta fase de gravação', () => {
     expect(phaseForMatches([makeMatch()])).toBe('recording');
     expect(phaseForMatches([makeMatch({ state: 'tracking', tracker: false })])).toBe('monitoring');
+  });
+});
+
+describe('describeMinKillsPolicy (origem do limiar no painel)', () => {
+  it('política geral usa as estrelas da partida', () => {
+    expect(describeMinKillsPolicy({ minKills: 4, stars: 3 })).toBe('4k · 3★');
+    expect(describeMinKillsPolicy({ minKills: 5, stars: 0, minKillsSource: 'general' })).toBe(
+      '5k · sem avaliação',
+    );
+  });
+
+  it('watchlist mostra o número e os times que casaram', () => {
+    expect(
+      describeMinKillsPolicy({
+        minKills: 5,
+        stars: 2,
+        minKillsSource: 'watchlist',
+        passesGeneralFilter: true,
+        watchlistedTeams: ['Imperial'],
+      }),
+    ).toBe('5k · watchlist (Imperial)');
+  });
+
+  it('partida que só entrou pela watchlist avisa que o adversário está bloqueado', () => {
+    expect(
+      describeMinKillsPolicy({
+        minKills: 4,
+        stars: 1,
+        minKillsSource: 'watchlist',
+        passesGeneralFilter: false,
+        watchlistedTeams: ['paiN'],
+      }),
+    ).toBe('4k · só times da lista (paiN)');
+  });
+
+  it('sem times, o sufixo não aparece', () => {
+    expect(
+      describeMinKillsPolicy({ minKills: 5, stars: 0, minKillsSource: 'watchlist' }),
+    ).toBe('5k · watchlist');
   });
 });
 

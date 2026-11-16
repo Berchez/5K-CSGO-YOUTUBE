@@ -31,6 +31,8 @@ export interface ProviderRequest {
 export interface ProviderTranscript {
   language: string | null;
   segments: TranscriptionSegment[];
+  /** Palavras com tempo, quando o provider as devolveu separadamente. */
+  words?: TimedWord[];
 }
 
 /** `withTimeout` sem depender de AbortSignal do DOM. */

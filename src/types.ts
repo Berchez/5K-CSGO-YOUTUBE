@@ -34,6 +34,12 @@ export interface KillEvent {
   map: string;
   /** Wall-clock (epoch ms) da detecção — ancora o início do clipe. */
   at?: number;
+  /** Posicao da kill na timeline do VOD (segundos); so scripts de VOD usam. */
+  atVodSec?: number;
+  /** Origem do timestamp (`placar`, `killfeed`, `vod`...). */
+  atSource?: string;
+  /** A kill foi vista no replay (posicao estimada, nao ao vivo). */
+  appearEstimated?: boolean;
   /**
    * A posição da kill foi ESTIMADA (não medida no vídeo): a descrição
    * não pode afirmar um horário que ninguém mediu — e o Short não pode
@@ -77,6 +83,35 @@ export interface AnchorConfidence {
   settleKills: number;
 }
 
+/**
+ * Telemetria do pareamento entre o placar e o killfeed do scorebot.
+ *
+ * O placar do DOM só conta K/D: arma, headshot e assistência vêm do
+ * scorebot. Esta contagem diz quanto do round foi de fato completado —
+ * sem ela, uma kill sem par (nome divergente, feed atrasado) só aparece
+ * como `null` no sidecar, meses depois.
+ */
+export interface KillfeedTelemetry {
+  /** Kills do placar que receberam o detalhe do killfeed. */
+  paired: number;
+  /** Total de kills do round (todos os jogadores — o mesmo universo de `paired`). */
+  total: number;
+  /** Kills do killfeed que chegaram para este round. */
+  feedKills: number;
+  /** `eventId`s do scorebot que entraram no round (depuração). */
+  eventIds: string[];
+  /**
+   * Kills do feed cujo round NÃO bateu com o round do placar.
+   *
+   * O round do feed é contado pelos `RoundStart` do scorebot e o do
+   * placar é `ct+t+1`: quando os dois divergem (reconexão, restart de
+   * round, OT), a kill não pareia — ou fica na fila esperando o round
+   * seguinte. Sem este contador, o detalhe que faltou na kill parecia
+   * um bug do killfeed.
+   */
+  roundDrift?: number;
+}
+
 /** Resumo completo do round do ace — alimenta título, descrição, thumb e prompt IA. */
 export interface RoundSummary {
   round: number;
@@ -89,6 +124,12 @@ export interface RoundSummary {
   /** Armas na ordem dos kills, ex: ['ak47','ak47','awp','hegrenade','ak47'] */
   weapons: string[];
   headshots: number;
+  /**
+   * `false` quando nenhuma kill trouxe a informacao de headshot: o valor
+   * em `headshots` e 0 por ausencia, nao porque o placar mediu 0. Sidecars
+   * v2 gravam `stats.headshots = null` nesse caso.
+   */
+  headshotsKnown?: boolean;
   assists: Array<{ by: string; killIndex: number }>;
   flashAssists: Array<{ by: string; killIndex: number }>;
   grenades: GrenadeUse[];
@@ -104,6 +145,8 @@ export interface AceEvent {
   team1: string;
   team2: string;
   event: string;
+  /** URL da partida na HLTV (fonte canônica do confronto). */
+  matchUrl?: string;
   detectedAt: string;
   kills: KillEvent[];
   /** ISO do 1º kill da sequência — o clipe começa ~10s antes dele. */
@@ -216,11 +259,19 @@ export interface AceEvent {
    * sabidamente incompleta, nunca silenciosa.
    */
   truncatedStart?: boolean;
+  /**
+   * Offset (ms) que converte o relogio do placar (`kill.at`) para o relogio
+   * do video: `at + killVideoOffsetMs` = instante da kill no video. No
+   * sidecar v2 vive em `sync.killVideoOffsetMs`.
+   */
+  killVideoOffsetMs?: number | null;
   /** Placar no momento do ace, ex "6-3" (team1-team2). Opcional. */
   score?: string;
   /** Placar antes/depois do fechamento do round, ex "5-2" / "6-2". Opcional. */
   scoreBefore?: string;
   scoreAfter?: string;
+  /** Time que venceu o round, quando o placar permite derivar com segurança. */
+  roundWinner?: string;
   /**
    * Início REAL do clipe (epoch ms) — gravado no sidecar pelo clipBuilder.
    * Difere da estimativa (1ª kill − contexto) quando a abertura foi
@@ -231,6 +282,12 @@ export interface AceEvent {
   clipDurationSec?: number;
   /** Resumo rico (armas, vítimas, assists, granadas). Ausente em modos sem detalhe (ex: VOD). */
   summary?: RoundSummary;
+  /**
+   * Telemetria do pareamento com o killfeed do scorebot (arma/headshot/
+   * assistência). Grava no sidecar quanto do round foi completado — é o
+   * que revela uma kill sem par (feed atrasado, nome divergente).
+   */
+  killfeed?: KillfeedTelemetry | null;
 }
 
 export interface ClipResult {

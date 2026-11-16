@@ -289,6 +289,8 @@ export interface ShortKillRef {
    * sao aceitos.
    */
   at?: number | string | null;
+  /** Posicao da kill dentro do clipe (s) no sidecar v2; dispensa o offset. */
+  videoSec?: number | null;
   /**
    * A posição da kill foi ESTIMADA (não medida no vídeo) — o mesmo
    * sentido de `KillEvent.estimated`: a descrição não pode afirmar um
@@ -326,19 +328,22 @@ export function killAtMs(at: number | string | null | undefined): number | null 
  * depois. Kill fora do clipe (antes do início ou depois do fim) é
  * descartada — o Short não pode prometer um timestamp mentiroso.
  *
- * O offset é OBRIGATÓRIO: sem ele a posição fica ~20s deslocada (a
- * latência da stream menos o atraso do placar) e a janela escolhida
- * aponta para o pedaço errado do vídeo. Melhor devolver nada (e o
- * chamador pular o clipe) do que cortar a jogada errada.
+ * O offset é o que alinha a kill no vídeo: sem ele a posição fica ~20s
+ * deslocada (a latência da stream menos o atraso do placar) e a janela
+ * escolhida aponta para o pedaço errado do vídeo. Por isso a kill é
+ * DESCARTADA (sem posição) quando o offset falta — melhor devolver nada
+ * (e o chamador pular o clipe) do que cortar a jogada errada. O v2
+ * grava a posição já no clipe (`videoSec`) e não depende do offset.
  */
 export function killPositionsByKill(
   kills: ShortKillRef[],
   info: ShortClipInfo,
 ): Array<{ index: number; sec: number }> {
   const { clipStartMs, clipDurationSec, killVideoOffsetMs } = info;
-  if (clipStartMs == null || !Number.isFinite(clipStartMs)) return [];
-  if (killVideoOffsetMs == null || !Number.isFinite(killVideoOffsetMs)) return [];
-  const offset = Number(killVideoOffsetMs);
+  const offset =
+    killVideoOffsetMs != null && Number.isFinite(killVideoOffsetMs)
+      ? Number(killVideoOffsetMs)
+      : null;
   const duration = Number.isFinite(clipDurationSec) ? Number(clipDurationSec) : null;
   const out: Array<{ index: number; sec: number }> = [];
   kills.forEach((kill, index) => {
@@ -346,9 +351,17 @@ export function killPositionsByKill(
     // e o título prometeria kills que o vídeo não mostra no horário
     // dito. A kill continua na lista, mas sem posição.
     if (kill.estimated === true) return;
-    const at = killAtMs(kill.at);
-    if (at == null) return;
-    const sec = (at + offset - clipStartMs) / 1000;
+    let sec: number | null = null;
+    // v2 grava a posição já no clipe: não depende do offset (VOD/Short).
+    if (kill.videoSec != null && Number.isFinite(kill.videoSec)) {
+      sec = Number(kill.videoSec);
+    } else {
+      if (clipStartMs == null || !Number.isFinite(clipStartMs)) return;
+      if (offset == null) return;
+      const at = killAtMs(kill.at);
+      if (at == null) return;
+      sec = (at + offset - clipStartMs) / 1000;
+    }
     if (!Number.isFinite(sec) || sec < 0) return;
     if (duration != null && sec > duration + 1) return;
     out.push({ index, sec });

@@ -6,7 +6,11 @@ import { repoPath } from '../paths.js';
 import { transcribeWav } from '../transcription/transcribe.js';
 import { wavDurationSecFromBytes } from '../transcription/audio.js';
 import { resolveFfmpegBin } from './segmentProbe.js';
-import { normalizeCaptionText, type CaptionLine } from './shortCaptions.js';
+import {
+  normalizeCaptionText,
+  type CaptionLine,
+  type CaptionTranscriptCache,
+} from './shortCaptions.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -299,6 +303,86 @@ export function isQuotaError(err: unknown): boolean {
     return true;
   }
   return /\b429\b/.test(msg);
+}
+
+/**
+ * O erro do Gemini é TRANSITÓRIO (vale repetir a chamada)?
+ *
+ * Repetem só: 5xx, `UNAVAILABLE` e "high demand" — o modelo estava
+ * sobrecarregado e a próxima chamada costuma passar.
+ *
+ * NÃO repetem:
+ * - 429/cota (`quota`, `rate limit`, `resource_exhausted`): a cota do
+ *   dia acabou — repetir só gasta tempo; o modelo DEDICADO assume;
+ * - erro de conteúdo (JSON inválido, resposta truncada): repetir dá o
+ *   mesmo resultado (é um problema do prompt, não da rede);
+ * - timeout: pode ser a chamada presa; a política é do chamador.
+ */
+export function isTransientGeminiError(err: unknown): boolean {
+  // A cota vence SEMPRE: um 429 nunca vira retry.
+  if (isQuotaError(err)) return false;
+  const obj = (err ?? {}) as {
+    status?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  const status = Number(obj.status ?? obj.code);
+  if (Number.isFinite(status) && status >= 500 && status <= 599) return true;
+  const msg = String(obj.message ?? err ?? '').toLowerCase();
+  if (msg.includes('unavailable') || msg.includes('high demand')) return true;
+  if (msg.includes('overloaded') || msg.includes('try again later')) return true;
+  if (/\b(500|502|503|504)\b/.test(msg)) return true;
+  return false;
+}
+
+export interface GeminiRetryOptions {
+  /**
+   * Quantas TENTATIVAS no total (1 = sem retry). O default (3) são três
+   * chamadas: a original + duas repetições.
+   */
+  attempts?: number;
+  /** Espera base entre as tentativas (ms; dobra a cada repetição). */
+  retryDelayMs?: number;
+  /** Injetável (testes): a espera entre as tentativas. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Rótulo para o log ("gemini-transcricao", ...). */
+  label?: string;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Repete uma chamada do Gemini quando ela falhou por erro TRANSITÓRIO.
+ *
+ * A espera dobra a cada repetição (2s → 4s): o modelo sobrecarregado
+ * precisa de um respiro. Erro final (cota, conteúdo) sobe na hora.
+ */
+export async function withGeminiRetry<T>(
+  fn: () => Promise<T>,
+  opts: GeminiRetryOptions = {},
+): Promise<T> {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelay = Math.max(0, Math.floor(opts.retryDelayMs ?? 2000));
+  const sleep = opts.sleep ?? defaultSleep;
+  const label = opts.label ?? 'gemini';
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= attempts || !isTransientGeminiError(err)) throw err;
+      const delay = baseDelay * 2 ** (attempt - 1);
+      getLogger()
+        .child({ feature: 'short-captions' })
+        .warn(
+          { label, attempt, attempts, delayMs: delay, err: String(err).slice(0, 200) },
+          'chamada do Gemini falhou com erro transitório — repetindo',
+        );
+      if (delay > 0) await sleep(delay);
+    }
+  }
+  throw new Error(`${label}: o retry do Gemini terminou sem resultado`);
 }
 
 /**
@@ -608,6 +692,10 @@ export interface CaptionLineFixOptions {
   timeoutMs: number;
   context?: CaptionContext | null;
   vocabulary?: string[];
+  /** Tentativas no total da chamada (erro transitório repete). */
+  attempts?: number;
+  /** Espera base entre as tentativas (ms). */
+  retryDelayMs?: number;
 }
 
 /** Revisor injetável (testes): devolve as falas corrigidas ou null. */
@@ -643,6 +731,15 @@ export interface CaptionAiOptions {
   whisperModel?: string;
   /** Modelo dedicado de transcrição (cota separada da de texto). */
   dedicatedModel?: string;
+  /**
+   * Tentativas no TOTAL das chamadas do Gemini (default: 3).
+   *
+   * Só erros TRANSITÓRIOS (5xx/"high demand") repetem — cota (429) não:
+   * ela é final para o modelo de texto.
+   */
+  geminiAttempts?: number;
+  /** Espera base entre as tentativas do Gemini (ms; dobra a cada repetição). */
+  geminiRetryMs?: number;
   /**
    * O silêncio de um provider é FINAL? (default: sim)
    *
@@ -687,9 +784,13 @@ export interface CaptionAiOptions {
 
 export interface ParsedTranscript {
   lines: CaptionLine[];
+  /** Palavras com tempo (quando o provider entrega essa granularidade). */
+  words?: CaptionWord[];
   language: string | null;
   /** A legenda saiu traduzida para português? */
   translated: boolean;
+  /** De onde veio o tempo das falas. */
+  timingSource?: 'whisper' | 'model';
   /** Falas no idioma ORIGINAL (quando houve tradução). */
   originalLines?: CaptionLine[];
   /**
@@ -1420,13 +1521,17 @@ export async function transcribeWithGemini(
      * Desligado, o modelo devolve só o idioma original.
      */
     translate?: boolean;
+    /** Tentativas no total da chamada (erro transitório repete). */
+    attempts?: number;
+    /** Espera base entre as tentativas (ms). */
+    retryDelayMs?: number;
   },
 ): Promise<ParsedTranscript | null> {
   const { GoogleGenAI, Type } = await import('@google/genai');
   const audio = fs.readFileSync(audioPath);
   const ai = new GoogleGenAI({ apiKey: opts.apiKey });
   const translate = opts.translate !== false;
-  const run = (async () => {
+  const run = async (): Promise<string> => {
     const res = await ai.models.generateContent({
       model: opts.model,
       contents: [
@@ -1471,8 +1576,15 @@ export async function transcribeWithGemini(
       throw new Error(`resposta truncada (finishReason=${String(finish)})`);
     }
     return res.text ?? '';
-  })();
-  const raw = await withTimeout(run, opts.timeoutMs, 'gemini-transcricao');
+  };
+  const raw = await withGeminiRetry(
+    () => withTimeout(run(), opts.timeoutMs, 'gemini-transcricao'),
+    {
+      attempts: opts.attempts,
+      retryDelayMs: opts.retryDelayMs,
+      label: 'gemini-transcricao',
+    },
+  );
   const parsed = parseGeminiTranscript(raw);
   if (!parsed) {
     // A resposta crua no log: sem ela, "transcrição vazia" não diz o que
@@ -1565,7 +1677,7 @@ async function askGeminiLines(
 ): Promise<string> {
   const { GoogleGenAI, Type } = await import('@google/genai');
   const ai = new GoogleGenAI({ apiKey: opts.apiKey });
-  const run = (async () => {
+  const run = async (): Promise<string> => {
     const res = await ai.models.generateContent({
       model: opts.model,
       contents: [{ text: prompt }],
@@ -1595,8 +1707,12 @@ async function askGeminiLines(
       throw new Error(`${label}: resposta truncada (finishReason=${String(finish)})`);
     }
     return res.text ?? '';
-  })();
-  return withTimeout(run, opts.timeoutMs, label);
+  };
+  return withGeminiRetry(() => withTimeout(run(), opts.timeoutMs, label), {
+    attempts: opts.attempts,
+    retryDelayMs: opts.retryDelayMs,
+    label,
+  });
 }
 
 /**
@@ -1675,6 +1791,39 @@ export function captionMatchTokens(text: string): string[] {
     .filter(Boolean);
 }
 
+/** Número por extenso que o caster também usa na fala. */
+const CAPTION_NUMBER_WORDS: Record<string, string> = {
+  um: '1',
+  uma: '1',
+  dois: '2',
+  duas: '2',
+  tres: '3',
+  quatro: '4',
+  cinco: '5',
+  seis: '6',
+  sete: '7',
+  oito: '8',
+  nove: '9',
+  dez: '10',
+};
+
+/**
+ * Forma comparável de uma palavra ouvida.
+ *
+ * Números por extenso casam com o algarismo (`dois` = `2`) e o `1` de um
+ * gamertag pode ser a letra `i` (`r1nkle` = `rinkle`). O resto fica como
+ * está: a tolerância de erro de escuta continua sendo medida pela
+ * distância de edição.
+ */
+function comparableCaptionToken(value: string): string {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (CAPTION_NUMBER_WORDS[raw]) return CAPTION_NUMBER_WORDS[raw];
+  if (/[\p{L}]/u.test(raw) && /\d/u.test(raw)) {
+    return raw.replace(/1/g, 'i').replace(/0/g, 'o');
+  }
+  return raw;
+}
+
 /**
  * Duas palavras são a MESMA palavra?
  *
@@ -1683,14 +1832,34 @@ export function captionMatchTokens(text: string): string[] {
  * a fala não casa com o tempo e a legenda cai no chute do modelo.
  */
 export function captionTokensMatch(a: string, b: string): boolean {
-  if (a === b) return true;
-  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  const left = comparableCaptionToken(a);
+  const right = comparableCaptionToken(b);
+  if (left === right) return true;
+  const [short, long] = left.length <= right.length ? [left, right] : [right, left];
   if (short.length < 4) return false;
   if (long.startsWith(short)) return true;
   // Um erro de digitação/escuta só: "defusa" x "defuse", "molodoy" x
   // "molodói" (a distância de edição é 1).
-  if (Math.abs(a.length - b.length) > 1) return false;
-  return levenshtein(a, b) <= 1;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  return levenshtein(left, right) <= 1;
+}
+
+/**
+ * Duas palavras são próximas o bastante para o fallback posicional?
+ *
+ * O fallback só serve para preencher uma palavra que NÃO encontrou
+ * âncora. Ele precisa exigir semelhança real: `Heavy` não pode herdar o
+ * tempo de `bigode`, nem `God` o de `a`. Um erro de escuta ainda vale
+ * (`Gau` x `Gal`), desde que a distância de edição seja no máximo 1.
+ */
+function captionTokenNear(a: string, b: string): boolean {
+  const left = comparableCaptionToken(a);
+  const right = comparableCaptionToken(b);
+  if (left === right) return true;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  // Palavras muito curtas geram falso-positivo ("a" x "o", "e" x "é").
+  if (Math.min(left.length, right.length) < 3) return false;
+  return levenshtein(left, right) <= 1;
 }
 
 /**
@@ -1761,31 +1930,64 @@ const CAPTION_STOPWORDS = new Set([
 
 /**
  * Palavras que DISTINGUEM a fala (para comparar com o whisper): as
- * stopwords saem e o resto fica. Se a fala for só stopword, ela volta
- * inteira (melhor um score fraco do que nenhuma casamento).
+ * stopwords saem e o resto fica.
+ *
+ * Uma fala feita só de stopwords fica sem par: `a`, `em` e `tem` aparecem
+ * em qualquer frase e casariam com o trecho errado.
  */
 function captionContentTokens(text: string): string[] {
-  const tokens = captionMatchTokens(text);
-  const content = tokens.filter(
-    (token) => !CAPTION_STOPWORDS.has(token) && token.length >= 2,
+  return captionMatchTokens(text).filter(
+    (token) =>
+      !CAPTION_STOPWORDS.has(token) &&
+      (token.length >= 2 || /^\d+$/.test(token)),
   );
-  return content.length > 0 ? content : tokens;
+}
+
+/** Palavra com tempo usada no alinhamento do texto com o áudio. */
+interface CaptionAlignmentWord extends CaptionWord {
+  /** Índice da fala de origem (necessário no fallback por blocos). */
+  sourceLine: number;
 }
 
 /**
- * Quantas palavras da fala aparecem no trecho (multiconjunto: a
- * repetição conta).
+ * Converte blocos do whisper em palavras com tempo.
+ *
+ * É o plano B quando o provider não devolve timestamps por palavra. As
+ * palavras são distribuídas dentro do bloco; o importante é não herdar
+ * o bloco INTEIRO quando só uma palavra da legenda casou com ele.
  */
-function tokenOverlap(a: string[], b: string[]): number {
-  const pool = [...b];
-  let hits = 0;
-  for (const token of a) {
-    const index = pool.findIndex((candidate) => captionTokensMatch(token, candidate));
-    if (index < 0) continue;
-    pool.splice(index, 1);
-    hits++;
+function timingWordsFromLines(lines: CaptionLine[]): CaptionAlignmentWord[] {
+  const out: CaptionAlignmentWord[] = [];
+  for (const [sourceLine, line] of (lines ?? []).entries()) {
+    const words = captionMatchTokens(line.text);
+    if (words.length === 0) continue;
+    const start = Number(line.startSec);
+    const end = Number(line.endSec);
+    const step = Math.max(0.05, (end - start) / words.length);
+    words.forEach((text, index) => {
+      const wordStart = start + step * index;
+      const wordEnd = index === words.length - 1 ? end : wordStart + step;
+      out.push({
+        text,
+        startSec: wordStart,
+        endSec: Math.max(wordStart + 0.05, wordEnd),
+        sourceLine,
+      });
+    });
   }
-  return hits;
+  return out;
+}
+
+/** Token do texto do modelo ou do áudio, pronto para o alinhamento global. */
+interface CaptionAlignmentToken {
+  text: string;
+  lineIndex: number;
+}
+
+/** Par entre um token do modelo e uma palavra do áudio. */
+interface CaptionAlignmentPair {
+  modelIndex: number;
+  timingIndex: number;
 }
 
 /**
@@ -1844,6 +2046,27 @@ export async function trimLeadingSilence(
 const MAX_UNPAIRED_CAPTION_SEC = 4;
 
 /**
+ * Resultado do alinhamento do texto do modelo com o áudio.
+ */
+export interface CaptionAlignment {
+  /** Linhas alinhadas, em ordem CRONOLÓGICA (pelo tempo real). */
+  lines: CaptionLine[];
+  /**
+   * Índice (na ENTRADA) de cada linha devolvida.
+   *
+   * As linhas saem ordenadas pelo tempo; quem casa por posição (a
+   * tradução projeta o tempo do original no traduzido) precisa deste
+   * mapa: sem ele, um empate de tempo ou um fallback não monotônico
+   * troca o tempo de uma fala por outra.
+   */
+  order: number[];
+  /** Falas que casaram com o áudio. */
+  anchoredLines: number;
+  /** Total de falas do texto. */
+  totalLines: number;
+}
+
+/**
  * Pega o TEMPO REAL das falas (o whisper local sabe quando cada
  * palavra foi dita) e mantém o TEXTO do modelo de linguagem.
  *
@@ -1858,50 +2081,232 @@ const MAX_UNPAIRED_CAPTION_SEC = 4;
  * modelo, ajeitado no vão entre as falas vizinhas (para não invadir a
  * fala seguinte).
  */
-export function alignCaptionTimings(
+export function alignCaptionTimingsDetailed(
   textLines: CaptionLine[],
   timingLines: CaptionLine[],
-  opts: { minScore?: number } = {},
-): CaptionLine[] {
-  const minScore = opts.minScore ?? 0.34;
+  opts: { words?: CaptionWord[] } = {},
+): CaptionAlignment {
   const lines = textLines ?? [];
   const timing = (timingLines ?? []).filter(
-    (line) => Number.isFinite(line?.startSec) && Number.isFinite(line?.endSec),
+    (line) =>
+      Number.isFinite(line?.startSec) &&
+      Number.isFinite(line?.endSec) &&
+      line.endSec >= line.startSec,
   );
-  if (lines.length === 0 || timing.length === 0) return lines.map((line) => ({ ...line }));
-
-  const timingTokens = timing.map((line) => captionMatchTokens(line.text));
-  const out: Array<CaptionLine | null> = lines.map(() => null);
-  let pointer = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const lineTokens = captionContentTokens(lines[i].text);
-    if (lineTokens.length === 0) continue;
-    // A janela vai até DOIS trechos do whisper: uma fala do modelo
-    // pode ter sido quebrada em dois (e só isso — uma janela maior
-    // inventa a fala vizinha). O salto de 1 trecho cobre o caso do
-    // whisper ter colado duas falas num trecho só: o trecho pulado é
-    // o da fala que o modelo não descreveu.
-    let best: { score: number; from: number; to: number } | null = null;
-    for (const skip of [0, 1]) {
-      const from = pointer + skip;
-      if (from >= timing.length) continue;
-      for (const to of [from, from + 1]) {
-        if (to >= timing.length) continue;
-        const windowTokens = timingTokens.slice(from, to + 1).flat();
-        const score = tokenOverlap(lineTokens, windowTokens) / lineTokens.length;
-        if (!best || score > best.score) best = { score, from, to };
-        if (score >= 1) break;
-      }
-      if (best && best.score >= 1) break;
-    }
-    if (!best || best.score < minScore) continue;
-    out[i] = {
-      startSec: timing[best.from].startSec,
-      endSec: timing[best.to].endSec,
-      text: lines[i].text,
+  if (lines.length === 0 || timing.length === 0) {
+    return {
+      lines: lines.map((line) => ({ ...line })),
+      order: lines.map((_, index) => index),
+      anchoredLines: 0,
+      totalLines: lines.length,
     };
-    pointer = best.to + 1;
   }
+
+  const modelTokens: CaptionAlignmentToken[] = [];
+  const modelTokenIndexes = new Map<number, number[]>();
+  lines.forEach((line, lineIndex) => {
+    const indexes: number[] = [];
+    for (const text of captionMatchTokens(line.text)) {
+      indexes.push(modelTokens.length);
+      modelTokens.push({ text, lineIndex });
+    }
+    modelTokenIndexes.set(lineIndex, indexes);
+  });
+
+  const timingWords = opts.words?.length
+    ? opts.words
+        .filter(
+          (word) =>
+            word &&
+            Number.isFinite(word.startSec) &&
+            Number.isFinite(word.endSec) &&
+            word.endSec >= word.startSec,
+        )
+        .flatMap((word, index) =>
+          captionMatchTokens(word.text).map((text) => ({
+            text,
+            startSec: word.startSec,
+            endSec: word.endSec,
+            sourceLine: index,
+          })),
+        )
+    : timingWordsFromLines(timing);
+  if (modelTokens.length === 0 || timingWords.length === 0) {
+    return {
+      lines: lines.map((line) => ({ ...line })),
+      order: lines.map((_, index) => index),
+      anchoredLines: 0,
+      totalLines: lines.length,
+    };
+  }
+
+  /**
+   * Âncoras de conteúdo: o LCS global casa as palavras que distinguem
+   * uma fala da outra. Stopwords (`tem`, `a`, `é`) NÃO são âncoras: elas
+   * aparecem em qualquer frase e já foram a causa de `tem nada` casar
+   * com o bloco `bigode`.
+   */
+  const modelContent = modelTokens
+    .map((token, index) => ({ token, index }))
+    .filter(({ token }) => captionContentTokens(token.text).length > 0);
+  const timingContent = timingWords
+    .map((word, index) => ({ word, index }))
+    .filter(({ word }) => captionContentTokens(word.text).length > 0);
+  const anchors = alignCaptionContentAnchors(modelContent, timingContent);
+
+  /**
+   * Tokens de uma linha que ficam entre duas âncoras globais. Quando a
+   * quantidade bate, eles são distribuídos na ordem; quando não bate,
+   * só uma palavra igual (geralmente uma stopword) muito próxima da
+   * âncora é aproveitada. Assim `tem` entra antes de `nada`, mas uma
+   * palavra solta não herda meia janela do áudio.
+   */
+  const timingForModel = new Map<number, number>();
+  const usedTimingIndexes = new Set<number>();
+  for (const anchor of anchors) {
+    timingForModel.set(anchor.modelIndex, anchor.timingIndex);
+    usedTimingIndexes.add(anchor.timingIndex);
+  }
+
+  const anchoredLines = new Set<number>();
+  for (const anchor of anchors) {
+    anchoredLines.add(modelTokens[anchor.modelIndex].lineIndex);
+  }
+
+  for (const [lineIndex, indexes] of modelTokenIndexes) {
+    if (!anchoredLines.has(lineIndex) || indexes.length === 0) continue;
+    const lineAnchors = anchors
+      .filter((anchor) => modelTokens[anchor.modelIndex].lineIndex === lineIndex)
+      .sort((a, b) => a.modelIndex - b.modelIndex);
+    const first = lineAnchors[0];
+    const last = lineAnchors[lineAnchors.length - 1];
+    const segments: Array<{
+      modelStart: number;
+      modelEnd: number;
+      edge: 'start' | 'middle' | 'end';
+      previous?: CaptionAlignmentPair;
+      next?: CaptionAlignmentPair;
+    }> = [];
+
+    if (first.modelIndex > indexes[0]) {
+      segments.push({
+        modelStart: indexes[0],
+        modelEnd: first.modelIndex - 1,
+        edge: 'start',
+        previous: previousCaptionAnchor(anchors, indexes[0]),
+        next: first,
+      });
+    }
+    for (let i = 1; i < lineAnchors.length; i++) {
+      const previous = lineAnchors[i - 1];
+      const next = lineAnchors[i];
+      if (next.modelIndex > previous.modelIndex + 1) {
+        segments.push({
+          modelStart: previous.modelIndex + 1,
+          modelEnd: next.modelIndex - 1,
+          edge: 'middle',
+          previous,
+          next,
+        });
+      }
+    }
+    if (last.modelIndex < indexes[indexes.length - 1]) {
+      segments.push({
+        modelStart: last.modelIndex + 1,
+        modelEnd: indexes[indexes.length - 1],
+        edge: 'end',
+        previous: last,
+        next: nextCaptionAnchor(anchors, indexes[indexes.length - 1]),
+      });
+    }
+
+    for (const segment of segments) {
+      const modelSegment = modelTokens.slice(segment.modelStart, segment.modelEnd + 1);
+      const timingStart = segment.previous
+        ? segment.previous.timingIndex + 1
+        : 0;
+      const timingEnd = segment.next
+        ? segment.next.timingIndex - 1
+        : timingWords.length - 1;
+      if (timingEnd < timingStart) continue;
+      const candidates = Array.from(
+        { length: timingEnd - timingStart + 1 },
+        (_, index) => timingStart + index,
+      ).filter((index) => !usedTimingIndexes.has(index));
+
+      if (candidates.length === modelSegment.length) {
+        modelSegment.forEach((_token, index) => {
+          timingForModel.set(segment.modelStart + index, candidates[index]);
+          usedTimingIndexes.add(candidates[index]);
+        });
+        continue;
+      }
+
+      // Quantidades diferentes: primeiro usa uma palavra igual e
+      // próxima da âncora. `tem` (39,0s) entra antes de `nada`
+      // (39,21s); o `a` de `a galera gosta` entra no `a` imediatamente
+      // anterior. A palavra que sobrou sem par fica na palavra mais
+      // próxima da borda do trecho, sem esticar a fala até o fim do
+      // bloco.
+      const used = new Set<number>();
+      for (const [offset, token] of modelSegment.entries()) {
+        const exact = candidates.filter(
+          (index) =>
+            !used.has(index) &&
+            timingWords[index].text === token.text &&
+            captionAnchorDistance(index, segment.previous, segment.next) <= 3,
+        );
+        const candidate = exact.length > 0 ? exact[exact.length - 1] : null;
+        if (candidate == null) continue;
+        used.add(candidate);
+        usedTimingIndexes.add(candidate);
+        timingForModel.set(segment.modelStart + offset, candidate);
+      }
+      for (const [offset, token] of modelSegment.entries()) {
+        if (timingForModel.has(segment.modelStart + offset)) continue;
+        const boundary =
+          segment.edge === 'end'
+            ? segment.previous?.timingIndex
+            : segment.next?.timingIndex;
+        if (boundary == null) continue;
+        const nearest = candidates
+          .filter(
+            (index) =>
+              !used.has(index) &&
+              captionTokenNear(token.text, timingWords[index].text),
+          )
+          .sort(
+            (a, b) =>
+              Math.abs(a - boundary) - Math.abs(b - boundary) ||
+              a - b,
+          )[0];
+        if (nearest == null || Math.abs(nearest - boundary) > 3) continue;
+        used.add(nearest);
+        usedTimingIndexes.add(nearest);
+        timingForModel.set(segment.modelStart + offset, nearest);
+      }
+    }
+  }
+
+  const out: Array<CaptionLine | null> = lines.map(() => null);
+  lines.forEach((line, lineIndex) => {
+    const indexes = modelTokenIndexes.get(lineIndex) ?? [];
+    const timingIndexes = indexes
+      .map((index) => timingForModel.get(index))
+      .filter((index): index is number => index != null);
+    const lineAnchors = anchors.filter(
+      (anchor) => modelTokens[anchor.modelIndex].lineIndex === lineIndex,
+    );
+    if (lineAnchors.length === 0 || timingIndexes.length === 0) return;
+    const startSec = Math.min(...timingIndexes.map((index) => timingWords[index].startSec));
+    const endSec = Math.max(...timingIndexes.map((index) => timingWords[index].endSec));
+    out[lineIndex] = {
+      startSec,
+      endSec: Math.max(startSec, endSec),
+      text: line.text,
+    };
+  });
+  const anchoredCount = out.filter((line) => line != null).length;
 
   // Fala sem par no whisper: fica no vão entre as vizinhas (o tempo do
   // modelo é chute; o vão é real). Sem vão, a fala é guardada com o
@@ -1951,13 +2356,120 @@ export function alignCaptionTimings(
   }
   // As falas não se sobrepõem e não voltam atrás (a legenda queimada
   // precisa disso: o bloco termina quando o próximo começa).
-  const sorted = out
-    .map((line, i) => line ?? { ...lines[i] })
-    .sort((a, b) => a.startSec - b.startSec);
-  for (let i = 0; i < sorted.length - 1; i++) {
-    if (sorted[i].endSec > sorted[i + 1].startSec) sorted[i].endSec = sorted[i + 1].startSec;
+  //
+  // A ordem CRONOLÓGICA é só para o ajuste de sobreposição: quem casa
+  // por posição usa o `order` (o índice de cada fala na ENTRADA) — sem
+  // ele, um empate ou um fallback não monotônico trocava o tempo entre
+  // duas falas.
+  const indexed = out
+    .map((line, i) => ({ line: line ?? { ...lines[i] }, index: i }))
+    .sort((a, b) => a.line.startSec - b.line.startSec);
+  for (let i = 0; i < indexed.length - 1; i++) {
+    if (indexed[i].line.endSec > indexed[i + 1].line.startSec) {
+      indexed[i].line.endSec = indexed[i + 1].line.startSec;
+    }
   }
-  return sorted;
+  return {
+    lines: indexed.map((item) => item.line),
+    order: indexed.map((item) => item.index),
+    anchoredLines: anchoredCount,
+    totalLines: lines.length,
+  };
+}
+
+/**
+ * Atalho que devolve só as linhas alinhadas.
+ *
+ * A versão detalhada expõe quantas falas ganharam uma âncora real; o
+ * guardrail do pipeline usa esse número para não queimar uma legenda em
+ * que o modelo e o áudio não se pareceram.
+ */
+export function alignCaptionTimings(
+  textLines: CaptionLine[],
+  timingLines: CaptionLine[],
+  opts: { words?: CaptionWord[] } = {},
+): CaptionLine[] {
+  return alignCaptionTimingsDetailed(textLines, timingLines, opts).lines;
+}
+
+/**
+ * Casa as palavras de conteúdo do modelo com as do áudio, em ordem.
+ *
+ * É um LCS ponderado: palavra igual vale 2 e grafia próxima vale 1.
+ * Stopwords ficam de fora porque, sozinhas, elas não distinguem uma
+ * fala da outra.
+ */
+function alignCaptionContentAnchors(
+  model: Array<{ token: CaptionAlignmentToken; index: number }>,
+  timing: Array<{ word: CaptionAlignmentWord; index: number }>,
+): CaptionAlignmentPair[] {
+  const n = model.length;
+  const m = timing.length;
+  if (n === 0 || m === 0) return [];
+  const dp = Array.from(
+    { length: n + 1 },
+    () => new Array<number>(m + 1).fill(0),
+  );
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      let best = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      if (captionTokensMatch(model[i - 1].token.text, timing[j - 1].word.text)) {
+        const weight = model[i - 1].token.text === timing[j - 1].word.text ? 2 : 1;
+        best = Math.max(best, dp[i - 1][j - 1] + weight);
+      }
+      dp[i][j] = best;
+    }
+  }
+
+  const out: CaptionAlignmentPair[] = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    const exact = model[i - 1].token.text === timing[j - 1].word.text;
+    const fuzzy = captionTokensMatch(model[i - 1].token.text, timing[j - 1].word.text);
+    if (fuzzy && dp[i][j] === dp[i - 1][j - 1] + (exact ? 2 : 1)) {
+      out.push({ modelIndex: model[i - 1].index, timingIndex: timing[j - 1].index });
+      i--;
+      j--;
+      continue;
+    }
+    if (dp[i - 1][j] >= dp[i][j - 1]) i--;
+    else j--;
+  }
+  return out.reverse();
+}
+
+/** Âncora global imediatamente anterior a um token do modelo. */
+function previousCaptionAnchor(
+  anchors: CaptionAlignmentPair[],
+  modelIndex: number,
+): CaptionAlignmentPair | undefined {
+  let found: CaptionAlignmentPair | undefined;
+  for (const anchor of anchors) {
+    if (anchor.modelIndex >= modelIndex) break;
+    found = anchor;
+  }
+  return found;
+}
+
+/** Âncora global imediatamente posterior a um token do modelo. */
+function nextCaptionAnchor(
+  anchors: CaptionAlignmentPair[],
+  modelIndex: number,
+): CaptionAlignmentPair | undefined {
+  return anchors.find((anchor) => anchor.modelIndex > modelIndex);
+}
+
+/** Distância de uma palavra até a borda mais próxima do trecho. */
+function captionAnchorDistance(
+  timingIndex: number,
+  previous?: CaptionAlignmentPair,
+  next?: CaptionAlignmentPair,
+): number {
+  const distances: number[] = [];
+  if (previous) distances.push(Math.abs(timingIndex - previous.timingIndex));
+  if (next) distances.push(Math.abs(timingIndex - next.timingIndex));
+  return distances.length > 0 ? Math.min(...distances) : Number.POSITIVE_INFINITY;
 }
 
 /**
@@ -1988,17 +2500,192 @@ export async function transcribeWithWhisperCpp(
     lines.push({ startSec: seg.startSec, endSec: seg.endSec, text });
   }
   if (lines.length === 0) return null;
-  return { lines, language: result.language ?? null, translated: false };
+  const words = (result.words ?? [])
+    .map((word) => ({
+      text: normalizeCaptionText(word.text),
+      startSec: word.startSec,
+      endSec: word.endSec,
+    }))
+    .filter(
+      (word) =>
+        word.text &&
+        Number.isFinite(word.startSec) &&
+        Number.isFinite(word.endSec),
+    );
+  return {
+    lines,
+    ...(words.length ? { words } : {}),
+    language: result.language ?? null,
+    translated: false,
+  };
+}
+
+/** Resultado do casamento entre o texto do modelo e o tempo do áudio. */
+export interface CaptionTimingProjection {
+  /** Linhas finais: o texto do modelo com o tempo real do áudio. */
+  lines: CaptionLine[];
+  /** Falas que casaram com o áudio. */
+  anchoredLines: number;
+  /** Total de falas do texto. */
+  totalLines: number;
+  /** O tempo veio do texto ORIGINAL e foi projetado no traduzido. */
+  projected: boolean;
+}
+
+/**
+ * Casa o texto do modelo com o TEMPO real do áudio (função PURA).
+ *
+ * O texto que casa com o áudio é o ORIGINAL (mesmo idioma da fala): o
+ * provider local transcreve no idioma do áudio (`-l auto`) e o texto do
+ * modelo pode estar TRADUZIDO (pt-BR) — texto em português não casa com
+ * palavras em inglês, o LCS não acha âncora e o alinhamento erra o
+ * tempo de todas as falas.
+ *
+ * A saída do Gemini traz as duas versões na MESMA ordem (`text` e
+ * `text_pt` são o mesmo instante): então o tempo é casado no original e
+ * PROJETADO na fala traduzida pelo índice.
+ *
+ * Sem original (ou com quantidades diferentes), o texto do modelo é
+ * alinhado direto — e o chamador decide se o casamento foi bom o
+ * suficiente (fail-closed no `alignWithTimingProvider`).
+ */
+export function projectCaptionTiming(
+  parsed: Pick<
+    ParsedTranscript,
+    'lines' | 'originalLines' | 'translated' | 'partialTranslation'
+  >,
+  timingLines: CaptionLine[],
+  opts: { words?: CaptionWord[] } = {},
+): CaptionTimingProjection {
+  const original = parsed.originalLines;
+  const projected =
+    (parsed.translated || parsed.partialTranslation === true) &&
+    Array.isArray(original) &&
+    original.length > 0 &&
+    original.length === parsed.lines.length;
+  const textForTiming = projected ? (original as CaptionLine[]) : parsed.lines;
+  const alignment = alignCaptionTimingsDetailed(textForTiming, timingLines, {
+    words: opts.words,
+  });
+  if (!projected) {
+    return {
+      lines: alignment.lines,
+      anchoredLines: alignment.anchoredLines,
+      totalLines: alignment.totalLines,
+      projected: false,
+    };
+  }
+  // O texto traduzido fica; o tempo vem do casamento do original.
+  //
+  // O alinhamento devolve as linhas em ordem CRONOLÓGICA: o índice de
+  // cada fala no texto original vem no `order`. Sem esse mapa, um
+  // empate de tempo (ou um fallback não monotônico) trocava o tempo
+  // entre duas falas — a legenda aparecia antes da voz.
+  const byInputIndex = new Map<number, CaptionLine>();
+  alignment.order.forEach((inputIndex, position) => {
+    const anchor = alignment.lines[position];
+    if (anchor) byInputIndex.set(inputIndex, anchor);
+  });
+  const lines = parsed.lines.map((line, index) => {
+    const anchor = byInputIndex.get(index);
+    if (!anchor) return { ...line };
+    return {
+      ...line,
+      startSec: anchor.startSec,
+      endSec: anchor.endSec,
+    };
+  });
+  return {
+    lines,
+    anchoredLines: alignment.anchoredLines,
+    totalLines: alignment.totalLines,
+    projected: true,
+  };
+}
+
+/**
+ * Erro que carrega a TRANSCRIÇÃO já paga.
+ *
+ * O alinhamento com o tempo real roda DEPOIS da transcrição: se ele
+ * falha, a transcrição (cota do Gemini) não pode ser perdida — a
+ * próxima rodada tem que refazer só o tempo.
+ */
+export class CaptionTranscriptError extends Error {
+  readonly transcript: CaptionTranscriptCache;
+  constructor(message: string, transcript: CaptionTranscriptCache) {
+    super(message);
+    this.name = 'CaptionTranscriptError';
+    this.transcript = transcript;
+  }
+}
+
+/**
+ * A transcrição que o erro carrega (a que JÁ foi paga).
+ *
+ * Puro: o chamador guarda essa transcrição no marker e a próxima
+ * rodada refaz só o tempo real — sem chamar o Gemini de novo.
+ */
+export function salvagedCaptionTranscript(
+  error: unknown,
+): CaptionTranscriptCache | null {
+  if (!error || typeof error !== 'object') return null;
+  const transcript = (error as { transcript?: CaptionTranscriptCache }).transcript;
+  if (!transcript || !Array.isArray(transcript.lines) || transcript.lines.length === 0) {
+    return null;
+  }
+  return transcript;
+}
+
+/**
+ * Transcrição crua no formato do cache do marker.
+ *
+ * O `rawLines` é o texto ANTES das correções e da revisão: é o que o
+ * re-render reaproveita (regra nova vale). A transcrição que veio do
+ * Gemini ainda não passou por nenhum passe — ela É o texto cru.
+ *
+ * Texto estrangeiro SEM tradução fica sem `rawLines`: as correções do
+ * dono são escritas em português e corromperiam o texto original.
+ */
+export function captionCacheFromParsed(
+  parsed: ParsedTranscript,
+  provider: CaptionProvider,
+): CaptionTranscriptCache {
+  const effective = captionEffectiveLanguage(
+    parsed.language,
+    parsed.lines.map((line) => line.text).join(' '),
+  );
+  const stillForeign = effective.needsTranslation && !parsed.translated;
+  return {
+    provider,
+    language: parsed.language ?? null,
+    translated: parsed.translated === true,
+    timingSource: parsed.timingSource ?? 'model',
+    lines: parsed.lines,
+    ...(parsed.originalLines?.length ? { originalLines: parsed.originalLines } : {}),
+    ...(stillForeign
+      ? {}
+      : { rawLines: parsed.lines.map((line) => ({ ...line })) }),
+    ...(stillForeign || !parsed.originalLines?.length
+      ? {}
+      : { rawOriginalLines: parsed.originalLines.map((line) => ({ ...line })) }),
+  };
 }
 
 /**
  * Casa o texto do modelo de linguagem com o TEMPO real do whisper
  * local.
  *
- * Sem provider de tempo (ou quando ele falha), a legenda sai como o
- * modelo falou — com o tempo inventado por ele. O provider de tempo é
- * uma ajuda, não um requisito: falhar nele NÃO pode derrubar a
- * legenda.
+ * Sem provider de tempo configurado, a legenda sai como o modelo falou
+ * — com o tempo inventado por ele.
+ *
+ * Quando o provider de tempo é pedido, ele é REQUIRED só no caso em
+ * que ele tem algo a dizer: se ele devolveu transcrição VAZIA (o
+ * whisper local é mudo no áudio, mas o Gemini ouviu a fala), a legenda
+ * segue com o tempo do modelo — perder o Short por causa do tempo é
+ * pior que um tempo imperfeito. Já quando o provider devolveu tempo,
+ * mas o texto do modelo não se parece com o áudio (poucas âncoras),
+ * os tempos reais não servem para este texto: aí o Short espera a
+ * próxima rodada.
  */
 async function alignWithTimingProvider(
   parsed: ParsedTranscript,
@@ -2019,19 +2706,67 @@ async function alignWithTimingProvider(
           model: opts.model,
           timeoutMs: opts.timeoutMs,
         });
-    if (!timing || timing.lines.length === 0) return parsed;
-    const lines = alignCaptionTimings(parsed.lines, timing.lines);
+    if (!timing || timing.lines.length === 0) {
+      // O provider de tempo NÃO achou fala no áudio. O tempo do modelo
+      // é imperfeito, mas o Short não pode ser perdido por isso: o
+      // silêncio do whisper local NÃO é final (o Gemini pode ter
+      // ouvido a fala) e o alinhamento roda o provider local de novo.
+      log.warn(
+        { tempo: opts.provider },
+        'provider de tempo não achou fala no áudio — a legenda segue com o tempo do modelo',
+      );
+      return { ...parsed, timingSource: parsed.timingSource ?? 'model' };
+    }
+    /**
+     * O TEXTO que casa com o áudio é o ORIGINAL (mesmo idioma da fala).
+     *
+     * O provider local transcreve no idioma do áudio (`-l auto`); o texto
+     * do modelo pode estar TRADUZIDO (pt-BR) — e texto em português não
+     * casa com palavras em inglês: o LCS não acha âncora e o alinhamento
+     * "erra" o tempo de todas as falas.
+     *
+     * A saída do Gemini traz as duas versões na MESMA ordem (`text` e
+     * `text_pt` são o mesmo instante): então o tempo é casado no original
+     * e projetado na fala traduzida pelo índice.
+     */
+    const projection = projectCaptionTiming(parsed, timing.lines, {
+      words: timing.words,
+    });
+    const matchRatio =
+      projection.totalLines > 0
+        ? projection.anchoredLines / projection.totalLines
+        : 0;
+    // Poucas âncoras significa que o texto do modelo e o áudio não se
+    // pareceram. Queimar os tempos do modelo nesse caso só troca um
+    // defeito por outro: o Short espera a próxima rodada.
+    if (matchRatio < 0.25) {
+      // A transcrição JÁ foi paga (cota do Gemini): ela viaja no erro
+      // para o cache do marker — a próxima rodada refaz só o tempo.
+      throw new CaptionTranscriptError(
+        `provider de tempo casou só ${projection.anchoredLines}/${projection.totalLines} falas`,
+        captionCacheFromParsed(parsed, 'gemini'),
+      );
+    }
     log.info(
-      { linhas: lines.length, tempo: opts.provider },
+      {
+        linhas: projection.lines.length,
+        ancoradas: projection.anchoredLines,
+        tempo: opts.provider,
+        projetado: projection.projected,
+      },
       'legenda alinhada com o tempo real do áudio',
     );
-    return { ...parsed, lines };
+    return {
+      ...parsed,
+      lines: projection.lines,
+      timingSource: 'whisper',
+    };
   } catch (e) {
     log.warn(
       { err: String(e).slice(0, 200) },
-      'não deu para alinhar o tempo da legenda — segue com o tempo do modelo',
+      'não deu para alinhar o tempo da legenda — o Short fica para a próxima rodada',
     );
-    return parsed;
+    throw e;
   }
 }
 
@@ -2108,6 +2843,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
                 timeoutMs,
                 context,
                 vocabulary,
+                attempts: opts.geminiAttempts,
+                retryDelayMs: opts.geminiRetryMs,
               })));
   const translator: CaptionTranslatorFn | null =
     opts.translate === false
@@ -2123,6 +2860,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
                 language,
                 context,
                 vocabulary,
+                attempts: opts.geminiAttempts,
+                retryDelayMs: opts.geminiRetryMs,
               })));
   const transcriber: CaptionTranscriber = async (
     audioPath: string,
@@ -2157,6 +2896,11 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
       let lines = parsed.lines;
       let translated = parsed.translated;
       let originalLines = parsed.originalLines;
+      const timingSource =
+        parsed.timingSource ??
+        (provider === 'whisper-cpp' || provider === 'huggingface'
+          ? 'whisper'
+          : 'model');
       // O idioma que vale é o do provider CONFIRMADO pelo texto: gíria
       // em inglês não faz o áudio ser inglês (e o provider que erra o
       // idioma não pode segurar Short bom).
@@ -2304,6 +3048,7 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
         language: parsed.language,
         translated,
         provider,
+        timingSource,
         // O texto CRU (antes das correções e da revisão) é o que o marker
         // guarda: é ele que permite regra nova/alterada no re-render.
         ...(rawLines ? { rawLines } : {}),
@@ -2319,10 +3064,16 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
     let lastError = '';
     let lastUnavailable = '';
     let lastSilentProvider: CaptionProvider | null = null;
-    // O provider LOCAL (whisper.cpp sem VAD) já respondeu (ou falhou) nesta
-    // rodada: chamá-lo de novo para dar o tempo seria rodar o modelo
-    // (~47s) duas vezes no mesmo áudio.
-    let localProviderDone = false;
+    /**
+     * Transcrição que JÁ foi paga e não pode ser perdida: ela sobrevive
+     * à falha do alinhamento (cota do Gemini não se repete).
+     */
+    let salvaged: CaptionTranscriptCache | undefined;
+    // O provider local pode ter falhado ANTES do Gemini e ainda assim
+    // é indispensável como provider de TEMPO. "Já foi tentado" não é
+    // "já entregou o tempo real": quando faltou o tempo, ele roda de
+    // novo. O custo de uma segunda passada é menor que queimar uma
+    // legenda com os tempos inventados pelo modelo.
     /**
      * Retoma do passo que falhou: com a transcrição guardada no marker
      * da rodada anterior, o provider de transcrição NÃO é chamado
@@ -2356,22 +3107,41 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
           },
           'reaproveitando a transcrição guardada na rodada anterior',
         );
+        const cachedProvider = captionProviderFrom(cached.provider);
+        const cachedParsed: ParsedTranscript = {
+          lines: cachedRaw ?? cachedLines,
+          language: cached.language ?? null,
+          translated: cached.translated === true,
+          // De onde veio o tempo das falas guardadas: com o tempo do
+          // whisper já queimado, o alinhamento NÃO roda de novo (o
+          // provider local leva ~47s e o resultado seria o mesmo).
+          ...(cached.timingSource ? { timingSource: cached.timingSource } : {}),
+          // O texto ORIGINAL (antes da tradução) vem junto do CRU: sem
+          // ele, o `.orig.txt` do re-render perderia o idioma de fora.
+          ...(cachedRaw
+            ? cached.rawOriginalLines?.length
+              ? { originalLines: cached.rawOriginalLines }
+              : {}
+            : cached.originalLines?.length
+              ? { originalLines: cached.originalLines }
+              : {}),
+        };
+        // O cache do Gemini pode ter sido gravado com os tempos
+        // inventados pelo modelo. O tempo real é refeito SEM chamar o
+        // Gemini de novo: só o provider local de tempo roda.
+        const timingJaReal = cached.timingSource === 'whisper';
+        const alignedCached =
+          cachedRaw && cachedProvider === 'gemini' && !timingJaReal
+            ? await alignWithTimingProvider(cachedParsed, sourcePath, {
+                provider: opts.timingProvider ?? null,
+                model: opts.timingModel ?? whisperModel,
+                timeoutMs,
+                transcriber: opts.transcribers?.['whisper-cpp'],
+              })
+            : cachedParsed;
         return await finalize(
-          {
-            lines: cachedRaw ?? cachedLines,
-            language: cached.language ?? null,
-            translated: cached.translated === true,
-            // O texto ORIGINAL (antes da tradução) vem junto do CRU: sem
-            // ele, o `.orig.txt` do re-render perderia o idioma de fora.
-            ...(cachedRaw
-              ? cached.rawOriginalLines?.length
-                ? { originalLines: cached.rawOriginalLines }
-                : {}
-              : cached.originalLines?.length
-                ? { originalLines: cached.originalLines }
-                : {}),
-          },
-          captionProviderFrom(cached.provider),
+          alignedCached,
+          cachedProvider,
           // O texto CRU está no tempo do áudio (sem o offset): o
           // deslocamento do silêncio inicial tem que ser aplicado de
           // novo. O texto já corrigido (marker antigo, sem `rawLines`)
@@ -2421,6 +3191,8 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
                   context,
                   vocabulary,
                   translate: opts.translate !== false,
+                  attempts: opts.geminiAttempts,
+                  retryDelayMs: opts.geminiRetryMs,
                 });
           } catch (e) {
             // Cota do free tier (20 generate_content/dia): o modelo
@@ -2461,8 +3233,7 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
             continue;
           }
           const aligned = await alignWithTimingProvider(parsed, sourcePath, {
-            provider:
-              localProviderDone ? null : (opts.timingProvider ?? null),
+            provider: opts.timingProvider ?? null,
             model: opts.timingModel ?? whisperModel,
             timeoutMs,
             transcriber: opts.transcribers?.['whisper-cpp'],
@@ -2487,7 +3258,6 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
                 model: whisperModel,
                 timeoutMs,
               });
-          localProviderDone = true;
           if (!parsed) {
             // O silêncio do LOCAL não é final (ver `silenceIsFinal`): o
             // provider seguinte é quem decide se havia fala.
@@ -2555,10 +3325,9 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
       } catch (e) {
         sawFailure = true;
         lastError = String(e).slice(0, 200);
-        // O provider local já foi tentado (falhou): chamá-lo de novo
-        // para dar o tempo seria rodar o modelo duas vezes no mesmo
-        // áudio.
-        if (provider === 'whisper-cpp') localProviderDone = true;
+        // A transcrição que JÁ foi paga (cota do Gemini) não pode ser
+        // perdida: ela viaja no erro até o cache do marker.
+        salvaged ??= salvagedCaptionTranscript(e) ?? undefined;
         log.warn(
           { provider, err: lastError },
           'provider de transcrição falhou',
@@ -2578,7 +3347,11 @@ export function createCaptionTranscriber(opts: CaptionAiOptions = {}): CaptionTr
     if (sawFailure) {
       // Falha de verdade (cota/chave/timeout/truncagem): o Short fica
       // marcado para nova tentativa na próxima rodada.
-      throw new Error(`nenhum provider de transcrição respondeu: ${lastError || 'erro'}`);
+      const message = `nenhum provider de transcrição respondeu: ${lastError || 'erro'}`;
+      // A transcrição que já foi paga viaja no erro: o marker a guarda e
+      // a próxima rodada refaz só o tempo real (sem chamar o Gemini).
+      if (salvaged) throw new CaptionTranscriptError(message, salvaged);
+      throw new Error(message);
     }
     // Todos os providers responderam "ninguém falou" (e ninguém falhou):
     // silêncio de verdade, estado final — o Short sai sem legenda.

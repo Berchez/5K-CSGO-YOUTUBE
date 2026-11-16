@@ -9,8 +9,10 @@ import {
   killLabel,
   normWeapon,
   prettyWeapon,
+  refreshRoundSummary,
   requiredKills,
   RoundTracker,
+  topKiller,
 } from '../src/detector/aceDetector.js';
 import type { KillEvent } from '../src/types.js';
 
@@ -19,6 +21,23 @@ const k = (killer: string, victim = 'v') => ({
   victim,
   round: 1,
   map: 'mirage',
+});
+
+describe('topKiller (diagnóstico do round sem multikill)', () => {
+  it('devolve o autor com mais kills, ignorando o limiar', () => {
+    const kills = ['a', 'a', 'a', 'a', 'b', 'b'].map((p) => k(p));
+    expect(topKiller(kills)).toEqual({ player: 'a', kills: 4 });
+  });
+
+  it('empate fica com quem apareceu primeiro', () => {
+    const kills = ['b', 'a', 'a', 'b'].map((p) => k(p));
+    expect(topKiller(kills)).toEqual({ player: 'b', kills: 2 });
+  });
+
+  it('ignora markers de round e devolve null sem kills', () => {
+    expect(topKiller([])).toBeNull();
+    expect(topKiller([k('Round over'), k('CT'), k('PLANTED')])).toBeNull();
+  });
 });
 
 describe('detectAceInRound', () => {
@@ -196,6 +215,7 @@ describe('RoundTracker', () => {
     expect(player).toBe('rain');
     expect(kills).toHaveLength(3);
     expect(kills.every((kk) => kk.victim === '')).toBe(true);
+    expect(kills.every((kk) => kk.atSource === 'placar')).toBe(true);
     expect(kills[0].at).toBeLessThanOrEqual(kills[2].at!);
   });
 
@@ -365,6 +385,25 @@ describe('RoundTracker', () => {
     expect(kills[1].assistBy).toBe('chopper');
   });
 
+  it('preserva origem e flags de qualidade do instante', () => {
+    const t = new RoundTracker('anubis', 9);
+    t.addKill('donk', 'a', {
+      at: 1234,
+      atSource: 'killfeed',
+      atVodSec: 12.5,
+      appearEstimated: true,
+      estimated: true,
+    });
+    const { kills } = t.closeRound(1);
+    expect(kills[0]).toMatchObject({
+      at: 1234,
+      atSource: 'killfeed',
+      atVodSec: 12.5,
+      appearEstimated: true,
+      estimated: true,
+    });
+  });
+
   it('carimba wall-clock em cada kill (ancora do clipe)', () => {
     const before = Date.now();
     const t = new RoundTracker();
@@ -401,7 +440,7 @@ describe('buildRoundSummary + describeAce', () => {
   ];
 
   it('resume armas, HS, assists, flashes e granadas', () => {
-    const s = buildRoundSummary('m0NESY', 'Falcons', 'Spirit', rich);
+    const s = buildRoundSummary({ player: 'm0NESY', team: 'Falcons', opponent: 'Spirit', map: 'mirage', round: 7, kills: rich });
     expect(s.mainWeapon).toBe('awp');
     expect(s.headshots).toBe(2);
     expect(s.victims).toEqual(['a', 'b', 'c', 'd', 'e']);
@@ -411,7 +450,7 @@ describe('buildRoundSummary + describeAce', () => {
   });
 
   it('describeAce narra tudo em PT-BR', () => {
-    const s = buildRoundSummary('m0NESY', 'Falcons', 'Spirit', rich);
+    const s = buildRoundSummary({ player: 'm0NESY', team: 'Falcons', opponent: 'Spirit', map: 'mirage', round: 7, kills: rich });
     const txt = describeAce(s, 'ESL Pro League Season 24');
     expect(txt).toContain('ACE! m0NESY (Falcons) fez 5K contra Spirit');
     expect(txt).toContain('de AWP');
@@ -424,7 +463,7 @@ describe('buildRoundSummary + describeAce', () => {
   });
 
   it('describeAce funciona sem time (modo live)', () => {
-    const s = buildRoundSummary('donk', '', 'Spirit vs Falcons', rich.slice(0, 5));
+    const s = buildRoundSummary({ player: 'donk', team: '', opponents: 'Spirit vs Falcons', map: 'mirage', round: 7, kills: rich.slice(0, 5) });
     expect(describeAce(s, 'EPL').split('\n')[0]).toContain(
       'ACE! donk fez 5K em Spirit vs Falcons',
     );
@@ -432,11 +471,54 @@ describe('buildRoundSummary + describeAce', () => {
 
   it('describeAce adapta selo e contagem p/ 4k', () => {
     const four = rich.slice(0, 4);
-    const s = buildRoundSummary('flameZ', 'Vitality', 'MOUZ', four);
+    const s = buildRoundSummary({ player: 'flameZ', team: 'Vitality', opponent: 'MOUZ', map: 'mirage', round: 7, kills: four });
     const txt = describeAce(s, 'ESL Pro League Season 24');
     expect(txt.split('\n')[0]).toContain('4K! flameZ (Vitality) fez 4K contra MOUZ');
     expect(txt).toContain('Arma principal: AWP (3/4 kills)');
     expect(txt).not.toContain('5K');
+  });
+});
+
+describe('refreshRoundSummary (o resumo é recalculado com as kills atuais)', () => {
+  it('pega arma, headshot e vítima que chegaram DEPOIS do fechamento', () => {
+    // O resumo nasce no fechamento do round (snapshot): o killfeed
+    // completa as kills depois. Sem recalcular, o título e a thumbnail
+    // saíam com o dado velho.
+    const kills: KillEvent[] = [
+      { killer: 'm0NESY', victim: '', round: 7, map: 'mirage' },
+      { killer: 'm0NESY', victim: '', round: 7, map: 'mirage' },
+    ];
+    const velho = buildRoundSummary({
+      player: 'm0NESY',
+      team: 'Falcons',
+      opponent: 'Spirit',
+      map: 'mirage',
+      round: 7,
+      kills,
+    });
+    expect(velho.mainWeapon).toBe('');
+    expect(velho.headshots).toBe(0);
+
+    // O killfeed chegou: arma, headshot e a vítima corrigida.
+    kills[0].weapon = 'awp';
+    kills[0].headshot = true;
+    kills[0].victim = 'r1nkle';
+    kills[1].weapon = 'awp';
+    kills[1].victim = 'NertZ';
+
+    const novo = refreshRoundSummary(velho, kills);
+    expect(novo.mainWeapon).toBe('awp');
+    expect(novo.headshots).toBe(1);
+    expect(novo.headshotsKnown).toBe(true);
+    expect(novo.victims).toEqual(['r1nkle', 'NertZ']);
+    // A identidade do round é a mesma.
+    expect(novo.player).toBe('m0NESY');
+    expect(novo.team).toBe('Falcons');
+    expect(novo.opponents).toBe('Spirit');
+    expect(novo.map).toBe('mirage');
+    expect(novo.round).toBe(7);
+    // O resumo velho NÃO muda (é um snapshot).
+    expect(velho.mainWeapon).toBe('');
   });
 });
 
