@@ -81,6 +81,9 @@
  *   --overlay-uppercase <on|off>  caixa alta forçada
  *   --overlay-y <0..1>  posição vertical do adesivo
  *   --cam-height <n>   altura da faixa da cam (default: .env)
+ *   --top <modo>       layout do Short: cam|text|center|blur (default: .env).
+ *                      `blur` = SEM faixa: o jogo com o mesmo recorte
+ *                      do `cam`, centralizado sobre o fundo desfocado.
  *   --caption-font-size <n>  fonte da legenda (default: .env)
  *   --caption-position <pos>  below-crosshair|game-top|bottom
  *   --link-video <id|url>
@@ -109,6 +112,7 @@ import {
 } from '../src/db.js';
 import { gb, getFreeBytes, isFreeSpaceOk } from '../src/diskSpace.js';
 import {
+  blurGameBandTop,
   camBoxToString,
   isStaleRender,
   isStaleWindow,
@@ -236,6 +240,8 @@ interface Args {
   camHeight: number | null;
   captionFontSize: number | null;
   captionPosition: string | null;
+  /** Layout do Short nesta execução (`cam|text|center|blur`). */
+  top: string | null;
   /** Vídeo relacionado (o clipe 16:9) que entra no rodapé da descrição. */
   linkVideo: string | null;
 }
@@ -346,6 +352,7 @@ function parseArgs(argv: string[]): Args {
     camHeight: null,
     captionFontSize: null,
     captionPosition: null,
+    top: null,
     linkVideo: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -437,6 +444,12 @@ function parseArgs(argv: string[]): Args {
       args.overlayY = parseNumberInRange(next(), name, 0, 1);
     } else if (name === '--cam-height') {
       args.camHeight = parseNumberInRange(next(), name, 160, 1800, true);
+    } else if (name === '--top') {
+      const raw = next().trim();
+      if (!['cam', 'text', 'center', 'blur'].includes(raw)) {
+        throw new Error(`--top inválido: ${raw} (use cam|text|center|blur)`);
+      }
+      args.top = raw;
     } else if (name === '--caption-font-size') {
       args.captionFontSize = parseNumberInRange(next(), name, 24, 160, true);
     } else if (name === '--caption-position') {
@@ -833,11 +846,18 @@ async function buildCaptionsForShort(
       cfg.SHORTS_CAPTION_POSITION === 'below-crosshair'
         ? captionCrosshairTopY(
             cfg.SHORTS_HEIGHT,
-            topMode === 'center' ? 0 : cfg.SHORTS_CAM_HEIGHT,
+            topMode === 'center' || topMode === 'blur' ? 0 : cfg.SHORTS_CAM_HEIGHT,
           )
         : topMode === 'center'
           ? 40
-          : cfg.SHORTS_CAM_HEIGHT + 8;
+          : topMode === 'blur'
+            ? blurGameBandTop(
+                cfg.SHORTS_WIDTH,
+                cfg.SHORTS_HEIGHT,
+                cfg.SHORTS_GAME_ASPECT,
+                cfg.SHORTS_CAM_HEIGHT,
+              ) + 8
+            : cfg.SHORTS_CAM_HEIGHT + 8;
     const ass = buildCaptionsAss(lines, {
       width: cfg.SHORTS_WIDTH,
       height: cfg.SHORTS_HEIGHT,
@@ -979,6 +999,11 @@ async function processCandidate(
     return null;
   }
   const plan = planShortWindow(positions, clipDurationSec, windowOpts);
+  if (plan.belowMin) {
+    console.warn(
+      `  ATENÇÃO: janela de ${plan.durSec}s ficou abaixo do mínimo de ${windowOpts.minSec}s — o material não tem cauda suficiente`,
+    );
+  }
   if (plan.durSec < 5) {
     console.log(`- ${name}: ignorado (janela de ${plan.durSec}s)`);
     return null;
@@ -1107,10 +1132,16 @@ async function processCandidate(
       ? 'center'
       : cfg.SHORTS_TOP === 'text'
         ? 'text'
-        : camBox
-          ? 'cam'
-          : 'text';
-  if (cfg.SHORTS_TOP === 'cam' && !camBox) {
+        : cfg.SHORTS_TOP === 'blur'
+          ? 'blur'
+          : camBox
+            ? 'cam'
+            : 'text';
+  if (cfg.SHORTS_TOP === 'blur') {
+    console.log(
+      '  topo: sem faixa — jogo com o recorte do cam, centralizado sobre o fundo desfocado',
+    );
+  } else if (cfg.SHORTS_TOP === 'cam' && !camBox) {
     console.log(
       `  topo: faixa com o título (canal ${streamName ? `"${streamName}"` : 'sem nome'} sem caixa de cam no SHORTS_CAM_BOX_BY_STREAM)`,
     );
@@ -1618,6 +1649,8 @@ async function processCandidate(
             durSec: plan.durSec,
             includedKills: plan.includedKills,
             droppedKills: plan.droppedKills,
+            belowMin: plan.belowMin,
+            minSec: windowOpts.minSec,
           }
         : (previous?.short.window ?? {
             startSec: plan.startSec,
@@ -1625,6 +1658,8 @@ async function processCandidate(
             durSec: plan.durSec,
             includedKills: plan.includedKills,
             droppedKills: plan.droppedKills,
+            belowMin: plan.belowMin,
+            minSec: windowOpts.minSec,
           }),
       kills: rendered ? includedKills : (previous?.short.kills ?? includedKills),
       // O marker descreve o ARQUIVO em disco: quando não houve render, o
@@ -1806,6 +1841,7 @@ async function main(): Promise<void> {
   // Geometria/legenda por flag valem só nesta execução (o .env manda
   // no resto); o painel continua sendo a fonte de verdade do bot.
   if (args.camHeight != null) cfg.SHORTS_CAM_HEIGHT = args.camHeight;
+  if (args.top != null) cfg.SHORTS_TOP = args.top as AppConfig['SHORTS_TOP'];
   if (args.captionFontSize != null) cfg.SHORTS_CAPTION_FONT_SIZE = args.captionFontSize;
   if (args.captionPosition != null) {
     cfg.SHORTS_CAPTION_POSITION = args.captionPosition as AppConfig['SHORTS_CAPTION_POSITION'];

@@ -790,6 +790,63 @@ describe('sidecar: confiança da âncora (diagnóstico da janela)', () => {
   });
 });
 
+describe('marker de Short: belowMin no round-trip', () => {
+  it('preserva belowMin:false no marker v2', () => {
+    const marker = normalizeShortMarker({
+      schemaVersion: 2,
+      kind: 'short',
+      short: {
+        startSec: 0,
+        kills: [],
+        window: {
+          startSec: 0,
+          endSec: 60,
+          durSec: 60,
+          includedKills: [],
+          droppedKills: [],
+          belowMin: false,
+          minSec: 60,
+        },
+      },
+    });
+    expect(marker?.short.window?.belowMin).toBe(false);
+  });
+
+  it('preserva belowMin:false no marker v1', () => {
+    const marker = normalizeShortMarker({
+      shortWindow: {
+        startSec: 0,
+        endSec: 60,
+        durSec: 60,
+        includedKills: [],
+        droppedKills: [],
+        belowMin: false,
+        minSec: 60,
+      },
+    });
+    expect(marker?.short.window?.belowMin).toBe(false);
+  });
+
+  it('ausência de belowMin continua ausente (marker legado)', () => {
+    const marker = normalizeShortMarker({
+      schemaVersion: 2,
+      kind: 'short',
+      short: {
+        startSec: 0,
+        kills: [],
+        window: {
+          startSec: 0,
+          endSec: 60,
+          durSec: 60,
+          includedKills: [],
+          droppedKills: [],
+        },
+      },
+    });
+    expect(marker?.short.window).not.toHaveProperty('belowMin');
+  });
+});
+
 describe('sidecar e marker: canal', () => {
   const ace: AceEvent = {
     channelId: 'br',
@@ -861,6 +918,8 @@ describe('sidecar e marker: canal', () => {
           durSec: 8,
           includedKills: [],
           droppedKills: [],
+          belowMin: true,
+          minSec: 60,
         },
         kills: [],
         render: null,
@@ -873,8 +932,10 @@ describe('sidecar e marker: canal', () => {
       lastAttemptAt: null,
     });
     expect(marker.channelId).toBe('en');
+    expect(marker.short.window).toMatchObject({ belowMin: true, minSec: 60 });
     const again = normalizeShortMarker(JSON.parse(JSON.stringify(marker)));
     expect(again?.channelId).toBe('en');
+    expect(again?.short.window).toMatchObject({ belowMin: true, minSec: 60 });
   });
 
   it('buildShortMarker sem canal grava br; marker antigo lê br', () => {

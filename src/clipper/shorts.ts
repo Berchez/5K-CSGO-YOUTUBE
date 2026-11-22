@@ -54,6 +54,26 @@ export const SHORT_DEFAULT_HEAD_SEC = 4;
 /** Folga DEPOIS da última kill (a reação/rolagem final). */
 export const SHORT_DEFAULT_TAIL_SEC = 4;
 
+/** Teto máximo de recuo antes da 1ª kill no gancho do Short (s). */
+export const MAX_HOOK_HEAD_SEC = 6;
+
+/**
+ * Posição Y do topo do jogo centralizado no layout blur (mesma caixa do cam).
+ * Usado pelo posicionamento da legenda e pelo cálculo do layout vertical.
+ */
+export function blurGameBandTop(
+  width: number,
+  height: number,
+  aspect: number,
+  camHeight: number,
+): number {
+  const boxHeight = height - camHeight;
+  const gameW = Math.min(width, boxHeight * aspect);
+  const gameH = Math.floor(gameW / Math.max(0.01, aspect));
+  const top = Math.floor((height - gameH) / 2);
+  return Math.max(0, top);
+}
+
 export interface ShortWindowOptions {
   maxSec?: number;
   minSec?: number;
@@ -131,6 +151,12 @@ export interface ShortWindow {
   truncated: boolean;
   /** Verdadeiro quando a janela foi esticada para a duração mínima. */
   padded: boolean;
+  /**
+   * A janela ficou abaixo de `minSec` mesmo depois do preenchimento
+   * possível (material curto ou folga do gancho insuficiente). O marker
+   * registra este sinal para o diagnóstico não ficar invisível.
+   */
+  belowMin: boolean;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -227,6 +253,7 @@ export function planShortWindow(
       droppedKills: kills,
       truncated: kills.length > 0,
       padded: false,
+      belowMin: dur < minSec,
     };
   }
 
@@ -255,9 +282,10 @@ export function planShortWindow(
     // o meio do Short e queimaria a retenção.
     const forward = Math.min(missing, Math.max(0, duration - end));
     end += forward;
-    const back = Math.min(missing - forward, start);
+    // Estica para trás apenas até o teto do gancho (não gerar dead air antes da kill).
+    const maxBack = Math.max(0, start - Math.max(0, first - Math.max(headSec, MAX_HOOK_HEAD_SEC)));
+    const back = Math.min(missing - forward, maxBack);
     start -= back;
-    end = Math.min(duration, end + (missing - forward - back));
   }
 
   start = clamp(round2(start), 0, Math.max(0, duration - 0.01));
@@ -279,6 +307,7 @@ export function planShortWindow(
     droppedKills,
     truncated: truncated || droppedKills.length > 0,
     padded,
+    belowMin: durSec < minSec,
   };
 }
 
@@ -399,7 +428,7 @@ export function isStaleWindow(
 }
 
 /** Layout do topo do Short. */
-export type ShortTopMode = 'cam' | 'text' | 'center';
+export type ShortTopMode = 'cam' | 'text' | 'center' | 'blur';
 
 /**
  * Como a cam preenche a largura (sem barras pretas):
@@ -702,6 +731,32 @@ export function buildShortLayout(opts: ShortLayoutOptions): ShortLayout {
       camBox: null,
       camFit: 'cover',
       gameFit,
+      gameAspect,
+    };
+  }
+
+  if (opts.top === 'blur') {
+    const filter = [
+      `[0:v]split=2[gamesplit0][gamesplit1]`,
+      `[gamesplit0]scale=${width}:${height}:force_original_aspect_ratio=increase:force_divisible_by=2,` +
+        `crop=${width}:${height},boxblur=40:3,setsar=1[gamebg]`,
+      `[gamesplit1]crop=${blurCropWidth}:${gameCropHeight}:${blurCropX}:${gameY},` +
+        `scale=${width}:${gameHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[gamefg]`,
+      `[gamebg][gamefg]overlay=(W-w)/2:(H-h)/2[game]`,
+      captionsFilter
+        ? `[game]${captionsFilter},format=yuv420p[v]`
+        : `[game]format=yuv420p[v]`,
+    ].join(';');
+    return {
+      filter,
+      width,
+      height,
+      topHeight: height,
+      gameHeight: height,
+      top: 'blur',
+      camBox: null,
+      camFit: 'cover',
+      gameFit: 'blur',
       gameAspect,
     };
   }
