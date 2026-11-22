@@ -23,3 +23,6 @@ latencia.txt
 session-*.md
 # scripts descartáveis de diagnóstico (ad-hoc, fora do repo)
 scripts/tmp-*.ts
+# cache do python (ferramentas em .agents/)
+__pycache__/
+*.pyc
