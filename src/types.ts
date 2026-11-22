@@ -25,6 +25,22 @@ export interface LiveMatch {
   watchlistedTeams?: string[];
   /** true quando entrou pelo override da watchlist (mesmo com 0-1★). */
   watchlisted?: boolean;
+  /** Rank HLTV dos times no momento da entrada (null/ausente = sem rank). */
+  team1Rank?: number;
+  team2Rank?: number;
+  /**
+   * A condição de rank foi ATENDIDA para esta partida (conforme
+   * `RANK_STARS_MODE`, sempre independente do `MIN_STARS`): o limiar
+   * `RANK_MIN_KILLS` vale para os times liberados.
+   */
+  rankQualified?: boolean;
+  /**
+   * A partida entrou SÓ pela regra de rank (não passou em estrelas nem na
+   * watchlist): só os times liberados geram clipe.
+   */
+  rankOnly?: boolean;
+  /** Times (nomes do listing) liberados pela regra de rank. */
+  rankAllowedTeams?: string[];
 }
 
 export interface KillEvent {

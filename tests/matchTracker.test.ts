@@ -133,6 +133,24 @@ describe('processPoll (ordem fecha-antes-de-limpar)', () => {
     expect(r.event).toBeNull();
   });
 
+  it('REGRESSÃO: round sem multikill não consulta a política com jogador vazio', () => {
+    // A política por time (watchlist/rank) responde "bloqueado" quando não há
+    // autor. Consultá-la com "" disparava o aviso "time do killer não
+    // resolvido" em TODA partida bloqueada (regra de rank entrava assim).
+    const asked: string[] = [];
+    const minKillsFor = (p: string) => {
+      asked.push(p);
+      return p ? 4 : Number.POSITIVE_INFINITY;
+    };
+    const tr = new RoundTracker('inferno', 7);
+    let last = -1;
+    let r = processPoll(tr, snap(3, 3, [{ name: 'x', kills: 1 }]), last, minKillsFor);
+    last = r.lastTotal;
+    r = processPoll(tr, snap(4, 3, [{ name: 'x', kills: 1 }]), last, minKillsFor);
+    expect(r.event).toBeNull();
+    expect(asked).not.toContain('');
+  });
+
   it('descarta multikill impossível (>5, gap corrompeu a base)', () => {
     expect(MAX_KILLS_PER_ROUND).toBe(5);
     const tr = new RoundTracker('inferno', 1);

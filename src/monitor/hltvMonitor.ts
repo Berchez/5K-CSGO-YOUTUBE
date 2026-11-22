@@ -5,10 +5,24 @@ import { getConfig } from '../config.js';
 import { trySolveChallenge } from '../clipper/stealthBrowser.js';
 import {
   resolveMatchRule,
+  watchlistStarsFloorMet,
   type MatchRuleResolution,
   type MatchTeamMatch,
   type WatchlistDoc,
 } from '../watchlist.js';
+import {
+  buildTeamRanking,
+  rankAllowedTeams,
+  rankMatchDecision,
+  rankOfTeam,
+  rankStarsModeAllows,
+  readRankingCache,
+  writeRankingCache,
+  type RankingEntry,
+  type RankMatchDecision,
+  type RankStarsMode,
+  type TeamRanking,
+} from './teamRanking.js';
 
 const OFFICIAL_HINTS = ['esl', 'blast', 'pgl', 'starladder', 'faceit', 'major', 'iem', 'eslcs'];
 
@@ -410,6 +424,15 @@ export interface UpcomingMatch {
   /** true quando entrou pelo override da watchlist. */
   watchlisted?: boolean;
   watchlistedTeams?: string[];
+  /** Rank HLTV dos times no momento da entrada (ausente = sem rank). */
+  team1Rank?: number;
+  team2Rank?: number;
+  /** A condição de rank foi atendida (o limiar de rank vale). */
+  rankQualified?: boolean;
+  /** Entrou SÓ pela regra de rank: só os times liberados geram clipe. */
+  rankOnly?: boolean;
+  /** Times (nomes do listing) liberados pela regra de rank. */
+  rankAllowedTeams?: string[];
 }
 
 /** Time da watchlist que casou com a partida, mas o piso de estrelas não deixou. */
@@ -524,6 +547,62 @@ export interface LiveMatchFilter {
   starredMinKills?: number;
   /** Limiar para partidas sem estrela (MIN_KILLS_NO_STARS). */
   unstarredMinKills?: number;
+  /**
+   * Ranking HLTV já carregado (null/ausente = regra de rank inativa neste
+   * poll). O I/O fica em `ensureTeamRanking`; `buildListing` segue puro.
+   */
+  ranking?: TeamRanking | null;
+  /** Regra de rank (X/Y/limiar). Ausente = desligada. */
+  rank?: RankFilterConfig | null;
+}
+
+/** Segundo fator de busca: rank dos times libera partida sem estrela. */
+export interface RankFilterConfig {
+  /** X: soma dos ranks ABAIXO disto libera os DOIS lados (0 = off). */
+  sumMax: number;
+  /** Y: rank de um time ABAIXO disto libera só ele (0 = off). */
+  strongMax: number;
+  /** Limiar de kills da partida que entrou SÓ pela regra de rank. */
+  minKills: number;
+  /**
+   * Piso de estrelas da PRÓPRIA regra de rank (0 = sem piso). Com 1+, a
+   * partida só entra pelo rank se o listing mostrar pelo menos isso — e
+   * 0★ (avaliação ausente) nunca satisfaz um piso acima de 0.
+   */
+  minStars: number;
+  /**
+   * Como a regra trata as estrelas: `below-general` (default) só vale para
+   * o que o filtro geral recusou — é o plano B que preenche os dias sem
+   * partida grande; `any` também vale para partida já aceita por estrelas.
+   * Independente do `MIN_STARS`.
+   */
+  starsMode?: RankStarsMode;
+}
+
+/** Rank efetivo da partida + decisão da regra (puro). */
+export interface MatchRankInfo {
+  rank1: number | null;
+  rank2: number | null;
+  decision: RankMatchDecision;
+}
+
+/**
+ * Aplica a regra de rank a uma partida (puro). null = regra desligada
+ * (sem config ou sem ranking carregado) — o chamador então não anota nada.
+ */
+export function rankDecisionForMatch(
+  match: Pick<LiveMatch, 'team1' | 'team2'>,
+  filter: LiveMatchFilter = {},
+): MatchRankInfo | null {
+  const rank = filter.rank;
+  if (!rank || (rank.sumMax <= 0 && rank.strongMax <= 0)) return null;
+  const rank1 = rankOfTeam(filter.ranking ?? null, match.team1);
+  const rank2 = rankOfTeam(filter.ranking ?? null, match.team2);
+  return {
+    rank1,
+    rank2,
+    decision: rankMatchDecision({ rank1, rank2, sumMax: rank.sumMax, strongMax: rank.strongMax }),
+  };
 }
 
 /**
@@ -938,6 +1017,13 @@ export async function fetchMatchListing(
         live: listing.liveTotal,
         kept: listing.live.length,
         watchlisted: listing.live.filter((m) => m.watchlisted).length,
+        ranked: listing.live.filter((m) => m.rankQualified).length,
+        ranking: filter.ranking
+          ? {
+              teams: Object.keys(filter.ranking.ranks).length,
+              ageH: Math.round((Date.now() - filter.ranking.fetchedAt) / 3_600_000),
+            }
+          : null,
         upcoming: listing.upcoming.length,
         upcomingTotal: listing.upcomingTotal,
         upcomingSeen: listing.upcomingSeen,
@@ -988,16 +1074,51 @@ export function buildListing(
     const m = cardToLiveMatch(card);
     const rule = effectiveMatchRule(m, filter);
     const decision = shouldKeepMatch(m, rule, minStars, topTierOnly);
+    // Regra de rank = segundo fator de BUSCA com estrelas PRÓPRIAS: o modo
+    // RANK_STARS_MODE decide se a condição vale para qualquer avaliação
+    // (`any`) ou só para o que o filtro geral recusou (`below-general`), e o
+    // limiar dela é RANK_MIN_KILLS — nunca o MIN_STARS global. O que muda é
+    // QUEM entra: se ela já passava por estrelas/top-tier ou watchlist,
+    // continua entrando por lá (a watchlist ainda bloqueia o adversário).
+    const rankInfo = rankDecisionForMatch(m, filter);
+    // Piso de estrelas da PRÓPRIA regra de rank (RANK_MIN_STARS): 0 = sem
+    // piso. Mesma semântica do piso da watchlist: 0★ (avaliação ausente)
+    // nunca satisfaz um piso acima de 0.
+    const rankFloorMet = watchlistStarsFloorMet(m.stars, filter.rank?.minStars ?? 0);
+    const rankStarsAllowed = rankStarsModeAllows(
+      filter.rank?.starsMode,
+      decision.passesGeneral,
+    );
+    const rankConditionMet =
+      rankInfo != null && rankInfo.decision.qualifies && rankFloorMet && rankStarsAllowed;
+    if (rankInfo) {
+      if (rankInfo.rank1 != null) m.team1Rank = rankInfo.rank1;
+      if (rankInfo.rank2 != null) m.team2Rank = rankInfo.rank2;
+    }
+    if (rankConditionMet && rankInfo) {
+      m.rankQualified = true;
+      m.rankAllowedTeams = rankAllowedTeams(rankInfo.decision, m.team1, m.team2);
+      // Entrou SÓ pelo rank (não por estrelas nem watchlist): é este caso
+      // que bloqueia o adversário (a política geral não libera ninguém).
+      m.rankOnly = !decision.keep;
+    }
     // O limiar EFETIVO da partida: o da watchlist só vale quando o override
-    // está ativo (algum time atendeu o piso). Sem override, vale o limiar
-    // geral — mostrar o do time (que nem se aplica) engana o log.
+    // está ativo (algum time atendeu o piso). Sem override, vale o menor
+    // entre a política geral e o limiar de rank (quando a condição de rank
+    // é atendida) — o rank nunca piora o limiar. Com override, o limiar
+    // explícito da watchlist vence (first hit wins); o rank só pode abrir
+    // o caminho de um time ainda bloqueado.
+    const generalThreshold = minKillsForStars(
+      m.stars,
+      filter.starredMinKills ?? 4,
+      filter.unstarredMinKills ?? 5,
+    );
+    const rankThreshold = filter.rank?.minKills ?? generalThreshold;
     m.minKills = decision.passesWatchlist
       ? rule.minKills
-      : minKillsForStars(
-          m.stars,
-          filter.starredMinKills ?? 4,
-          filter.unstarredMinKills ?? 5,
-        );
+      : rankConditionMet
+        ? Math.min(generalThreshold, rankThreshold)
+        : generalThreshold;
     if (rule.watchlisted) {
       // Time da lista: o override só vale se o piso de estrelas (minStars)
       // for atendido — `watchlisted` marca o override ATIVO.
@@ -1013,14 +1134,16 @@ export function buildListing(
         });
       }
     }
-    if (!decision.keep) continue;
+    if (!decision.keep && !rankConditionMet) continue;
     matches.push(m);
   }
   // Estrelas primeiro: com MAX_RECORDINGS limitado, elas não podem perder
-  // o slot para um jogo sem estrela. Watchlist desempata mesmas estrelas.
+  // o slot para um jogo sem estrela. Watchlist e, depois, rank desempatam.
   matches.sort(
     (a, b) =>
-      b.stars - a.stars || Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)),
+      b.stars - a.stars ||
+      Number(Boolean(b.watchlisted)) - Number(Boolean(a.watchlisted)) ||
+      Number(Boolean(b.rankQualified)) - Number(Boolean(a.rankQualified)),
   );
 
   // Próximas partidas: mesmo HTML do live, sem page-load extra. A página
@@ -1037,6 +1160,27 @@ export function buildListing(
   for (const m of deduped) {
     const rule = effectiveMatchRule(m, filter);
     const decision = shouldKeepMatch(m, rule, minStars, topTierOnly);
+    // Mesmo segundo fator das lives: agenda futura também pode entrar por
+    // rank (é o que faz o poll acordar antes do jogo começar). O modo de
+    // estrelas e o limiar seguem a mesma regra da live.
+    const rankInfo = rankDecisionForMatch(m, filter);
+    const rankFloorMet = watchlistStarsFloorMet(m.stars, filter.rank?.minStars ?? 0);
+    const rankStarsAllowed = rankStarsModeAllows(
+      filter.rank?.starsMode,
+      decision.passesGeneral,
+    );
+    const rankConditionMet =
+      rankInfo != null && rankInfo.decision.qualifies && rankFloorMet && rankStarsAllowed;
+    const rankEnters = !decision.keep && rankConditionMet;
+    if (rankInfo) {
+      if (rankInfo.rank1 != null) m.team1Rank = rankInfo.rank1;
+      if (rankInfo.rank2 != null) m.team2Rank = rankInfo.rank2;
+    }
+    if (rankConditionMet && rankInfo) {
+      m.rankQualified = true;
+      m.rankAllowedTeams = rankAllowedTeams(rankInfo.decision, m.team1, m.team2);
+      m.rankOnly = !decision.keep;
+    }
     if (rule.watchlisted) {
       m.watchlisted = decision.passesWatchlist;
       m.watchlistedTeams = rule.matchedTeams;
@@ -1050,7 +1194,7 @@ export function buildListing(
         });
       }
     }
-    if (!decision.keep) continue;
+    if (!decision.keep && !rankEnters) continue;
     upcoming.push(m);
   }
   upcoming.sort((a, b) => a.startsAt - b.startsAt);
@@ -1162,4 +1306,199 @@ export function parseViewers(text: string): number | undefined {
   }
   if (!Number.isFinite(n) || n > 10_000_000) return undefined;
   return n;
+}
+
+/**
+ * Extrai a tabela do ranking mundial (`/ranking/teams`, layout 2026).
+ *
+ * Cada time é um `div.ranked-team` com a posição em
+ * `.ranking-header .position` ("#18") e o nome em
+ * `.ranking-header .teamLine .name`. Nada além disso é lido: entrada sem
+ * posição/nome é descartada (o parser puro valida de novo).
+ */
+export async function extractTeamRankingEntries(page: Page): Promise<RankingEntry[]> {
+  return page.evaluate(() => {
+    const out: Array<{ position: string; name: string }> = [];
+    document.querySelectorAll('.ranked-team').forEach((root) => {
+      const position = (root.querySelector('.ranking-header .position')?.textContent ?? '').trim();
+      const name = (
+        root.querySelector('.ranking-header .teamLine .name')?.textContent ??
+        root.querySelector('.ranking-header .name')?.textContent ??
+        ''
+      ).trim();
+      if (position && name) out.push({ position, name });
+    });
+    return out;
+  });
+}
+
+let rankingMemory: TeamRanking | null = null;
+let rankingFileLoaded = false;
+let lastRankingAttemptAt = 0;
+let lastRankingWarnAt = 0;
+let rankingRefreshing: Promise<TeamRanking | null> | null = null;
+/** Falha do ranking é silenciosa por até 1h (o poll roda a cada 45s). */
+const RANKING_WARN_EVERY_MS = 3_600_000;
+/**
+ * Backoff entre tentativas de atualizar o ranking. O poll roda a cada 45s:
+ * sem isto, uma falha do Cloudflare viraria uma aba nova por poll (o HLTV
+ * punia). 5min é o intervalo mínimo entre duas tentativas.
+ */
+const RANKING_RETRY_MS = 300_000;
+/** Idade máxima tolerada para o fallback em cache (14 dias). Depois disso fail-closed. */
+const RANKING_MAX_STALE_MS = 14 * 86_400_000;
+
+export interface EnsureTeamRankingOptions {
+  /** Regra de rank ligada? Desligada = zero I/O (nem abre aba). */
+  enabled: boolean;
+  url: string;
+  cacheFile: string;
+  /** Idade máxima antes de buscar de novo. */
+  ttlMs: number;
+  /** Idade máxima tolerada para o fallback (ms). Default: 14 dias. */
+  maxStaleMs?: number;
+  now?: number;
+  /**
+   * Injeção do fetch (só teste): sem isto o refresh abre uma aba do Playwright.
+   * Deve devolver o ranking novo ou o fallback recebido.
+   */
+  fetchRanking?: (fallback: TeamRanking | null) => Promise<TeamRanking | null>;
+}
+
+/** Só para teste: esquece o cache em memória (disco é relido). */
+export function resetTeamRankingCache(): void {
+  rankingMemory = null;
+  rankingFileLoaded = false;
+  lastRankingWarnAt = 0;
+  lastRankingAttemptAt = 0;
+  rankingRefreshing = null;
+}
+
+async function fetchTeamRankingFromWeb(
+  opts: EnsureTeamRankingOptions,
+  fallback: TeamRanking | null,
+): Promise<TeamRanking | null> {
+  const log = getLogger();
+  let page: Page | null = null;
+  try {
+    page = await newTrackedPage();
+    await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    if (!(await waitForClearance(page))) {
+      throw new Error('Cloudflare não liberou a página do ranking');
+    }
+    await page.waitForTimeout(2000);
+    const entries = await extractTeamRankingEntries(page);
+    const ranking = buildTeamRanking(entries, Date.now());
+    if (Object.keys(ranking.ranks).length === 0) {
+      throw new Error('nenhum time extraído da página do ranking');
+    }
+    rankingMemory = ranking;
+    try {
+      writeRankingCache(opts.cacheFile, ranking);
+    } catch (e) {
+      log.warn({ err: String(e).slice(0, 300) }, 'falha ao gravar o cache do ranking');
+    }
+    log.info({ teams: Object.keys(ranking.ranks).length }, 'ranking de times atualizado');
+    return ranking;
+  } catch (e) {
+    const at = Date.now();
+    if (at - lastRankingWarnAt >= RANKING_WARN_EVERY_MS) {
+      lastRankingWarnAt = at;
+      log.warn(
+        {
+          err: String(e).slice(0, 300),
+          fallback: fallback ? 'cache' : 'nenhum (regra de rank inativa)',
+        },
+        'falha ao atualizar o ranking de times',
+      );
+    }
+    return fallback;
+  } finally {
+    if (page) await page.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Ranking de times para o poll (segundo fator de busca).
+ *
+ * - regra desligada → null, sem tocar no browser;
+ * - cache (memória/disco) dentro do TTL → usa sem page-load;
+ * - vencido → devolve o cache existente imediatamente (stale-while-revalidate)
+ *   e dispara refresh em background via single-flight sem bloquear o poll;
+ * - falha (Cloudflare/parsing) mantém o último bom e loga no máximo 1x/h;
+ * - depois de uma falha, a próxima tentativa só acontece 5min depois (o
+ *   poll roda a cada 45s e o HLTV pune quem abre aba demais);
+ * - cache mais velho que maxStaleMs (default 14 dias) expira por segurança (fail-closed);
+ * - primeiro boot sem cache espera até ~10s antes de seguir sem travar o poll por 72s.
+ *
+ * Fail-closed: nunca inventa rank — a política por estrelas/watchlist segue
+ * valendo normalmente quando o ranking não está disponível.
+ */
+export async function ensureTeamRanking(
+  opts: EnsureTeamRankingOptions,
+): Promise<TeamRanking | null> {
+  const now = opts.now ?? Date.now();
+  if (!opts.enabled) return null;
+  const log = getLogger();
+  if (!rankingFileLoaded) {
+    rankingFileLoaded = true;
+    const disk = readRankingCache(opts.cacheFile, now, opts.ttlMs);
+    if (disk.ranking) {
+      rankingMemory = disk.ranking;
+      log.info(
+        {
+          teams: Object.keys(disk.ranking.ranks).length,
+          ageH: disk.ageMs == null ? null : Math.round(disk.ageMs / 3_600_000),
+          stale: disk.stale,
+        },
+        'ranking de times carregado do cache do disco',
+      );
+    } else if (disk.error) {
+      log.warn({ err: disk.error }, 'cache do ranking de times inválido (vai buscar de novo)');
+    }
+  }
+
+  const maxStale = opts.maxStaleMs ?? RANKING_MAX_STALE_MS;
+  const isTooOld = rankingMemory ? now - rankingMemory.fetchedAt > maxStale : false;
+  if (isTooOld && rankingMemory) {
+    log.warn(
+      { ageDays: Math.round((now - rankingMemory.fetchedAt) / 86_400_000) },
+      'cache do ranking de times muito antigo (> 14 dias) — ignorado por segurança (fail-closed)',
+    );
+  }
+  const fallback = isTooOld ? null : rankingMemory;
+
+  if (rankingMemory && !isTooOld && now - rankingMemory.fetchedAt <= opts.ttlMs) {
+    return rankingMemory;
+  }
+
+  // Stale-while-revalidate: dispara refresh em segundo plano (single-flight)
+  if (!rankingRefreshing) {
+    if (!(lastRankingAttemptAt > 0 && now - lastRankingAttemptAt < RANKING_RETRY_MS)) {
+      lastRankingAttemptAt = now;
+      const refresh = opts.fetchRanking ?? ((fb) => fetchTeamRankingFromWeb(opts, fb));
+      rankingRefreshing = refresh(fallback).finally(() => {
+        rankingRefreshing = null;
+      });
+    }
+  }
+
+  // Se já temos cache válido/stale, devolve imediatamente sem bloquear o poll
+  if (fallback) return fallback;
+
+  // Sem cache prévio (primeiro boot): espera até 10s para tentar pegar
+  // o ranking sem travar o loop de poll por 72s
+  if (rankingRefreshing) {
+    try {
+      const quick = await Promise.race([
+        rankingRefreshing,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+      ]);
+      if (quick) return quick;
+    } catch {
+      // segue fail-closed
+    }
+  }
+
+  return null;
 }

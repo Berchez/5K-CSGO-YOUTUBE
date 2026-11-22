@@ -200,6 +200,34 @@ describe('metadados do painel', () => {
       expect(ConfigSchema.shape[key as keyof typeof ConfigSchema.shape]).toBeDefined();
     }
   });
+
+  it('os limiares de rank (X/Y/kills/estrelas/modo) são editáveis e validados', () => {
+    const result = validateConfigPatch({
+      RANK_SUM_MAX: '70',
+      RANK_STRONG_MAX: '30',
+      RANK_MIN_KILLS: '4',
+      RANK_MIN_STARS: '0',
+      RANK_STARS_MODE: 'below-general',
+    });
+    expect(result).toEqual({
+      ok: true,
+      values: {
+        RANK_SUM_MAX: '70',
+        RANK_STRONG_MAX: '30',
+        RANK_MIN_KILLS: '4',
+        RANK_MIN_STARS: '0',
+        RANK_STARS_MODE: 'below-general',
+      },
+    });
+    // Fora da faixa do campo (e do schema): recusado, não gravado.
+    expect(validateConfigPatch({ RANK_SUM_MAX: '999' }).ok).toBe(false);
+    expect(validateConfigPatch({ RANK_MIN_KILLS: '9' }).ok).toBe(false);
+    expect(validateConfigPatch({ RANK_MIN_KILLS: '1' }).ok).toBe(false);
+    expect(validateConfigPatch({ RANK_MIN_STARS: '6' }).ok).toBe(false);
+    expect(validateConfigPatch({ RANK_MIN_STARS: '-1' }).ok).toBe(false);
+    // Modo de estrelas é um enum: valor fora da lista não é gravado.
+    expect(validateConfigPatch({ RANK_STARS_MODE: 'qualquer' }).ok).toBe(false);
+  });
 });
 
 describe('panelConfigValues', () => {

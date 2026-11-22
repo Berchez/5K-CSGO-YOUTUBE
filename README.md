@@ -14,7 +14,7 @@ HLTV /matches (Playwright, 45s base; ocioso espera até 30min conforme a próxim
   → uploader: YouTube Data API videos.insert (private) + SQLite dedup + log em arquivo
 ```
 
-Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal clips + optional Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records below `MIN_STARS` with its own threshold (and its own star floor), and in a match that only qualified through the watchlist the opponent is not recorded (see below).
+Scope (as chosen): **4k+ in starred matches / 5k in unstarred matches, horizontal clips + optional Shorts, no Discord, log only**. `MIN_KILLS` and `MIN_KILLS_NO_STARS` in `.env` set both thresholds. Teams/players in the **watchlist** are the exception: a listed team records below `MIN_STARS` with its own threshold (and its own star floor), and in a match that only qualified through the watchlist the opponent is not recorded (see below). The **team ranking** is a second, optional exception: a 0★ match between ranked teams enters by the sum of the ranks (both sides) or by one strong team (that side only), at `RANK_MIN_KILLS` (see below).
 
 ## Prerequisites (Windows)
 
@@ -173,6 +173,72 @@ how many kills got a weapon from the scorebot killfeed.
 The same information is in the panel: each match card shows the threshold with
 its **origin** (`4k · 3★`, `5k · watchlist (Imperial)`, `4k · só times da lista
 (paiN)` — the last one means the opponent does not generate clips).
+
+## Second search factor: team ranking
+
+Stars are HLTV's rating of the **event**, not of the teams. A 0★ match between
+two ranked teams (e.g. BIG vs Ninjas in Pyjamas at *Stake Ranked Episode 6*)
+is otherwise invisible when `MIN_STARS≥1`. The rank rule is an **additive**
+fallback tier with its **own** star handling (`RANK_STARS_MODE`, independent
+of `MIN_STARS`); it never changes when the general stars/watchlist filter
+accepts a match:
+
+- **Sum** (`RANK_SUM_MAX`, X): the match enters when `rank(team1) + rank(team2)`
+  is **below** X. Both sides can generate clips. `70` accepts NIP #18 + BIG
+  #34 (52) and rejects #30 + #45.
+- **Strong team** (`RANK_STRONG_MAX`, Y, expected `< X`): when the sum does not
+  pass, the match still enters if **one** team is ranked below Y. `30` lets
+  NIP #18 in against a lower-ranked opponent.
+- **The rank has its own stars** (`RANK_STARS_MODE`, independent of
+  `MIN_STARS`). The rank rule is a **fallback tier**: it exists to fill the
+  days without a big match, not to reclassify matches the stars already
+  accepted.
+  - `below-general` (default): the rank strictly applies to the match the
+    general stars/top-tier filter **rejected**. A 0★/1★ ranked match enters
+    with `RANK_MIN_KILLS` (4K). A 2★ ranked match that `MIN_STARS` already
+    accepts keeps the general threshold (5K with `MIN_KILLS=5`) — the rank
+    does not lower it. No redundancy: a match enters by exactly one reason
+    (stars/watchlist **or** rank), and that reason sets the threshold.
+  - `any` (opt-in): the rank also applies to matches already accepted by
+    the general filter, lowering their threshold to `RANK_MIN_KILLS`
+    (2★ ranked → 4K). More clips, but it weakens the "big match = 5K" bar.
+    It never changes *whether* a starred match enters (it was already in).
+- **Who is blocked:** the opponent is blocked **only** when the match entered
+  *exclusively* through the rank rule (it did not pass the general filter and
+  was not accepted by the watchlist). With the sum rule both sides clip; with
+  the strong-team rule only the strong team clips in that case. A watchlist
+  override still blocks the opponent (it comes before the rank).
+- **Precedence for *entering*:** stars/top-tier → watchlist → rank. The rank
+  is an additional way in when the match did **not** pass the general filter
+  and was **not** accepted by the watchlist. Recorders are created in that
+  order and only while `MAX_RECORDINGS` slots are free, so in a poll with
+  enough big matches a ranked match does not get a slot.
+- **Star floor:** the rank rule has its own floor, `RANK_MIN_STARS`
+  (default `0` = no floor, so it applies to any rating, including 0★). It is
+  independent of the general `MIN_STARS`: with `RANK_MIN_STARS=1` a match
+  only enters by rank when the listing shows at least 1★ — and a 0★ listing
+  (rating absent) never satisfies a floor above 0, exactly like the watchlist
+  team floors.
+- **Defaults are off:** `RANK_SUM_MAX=0` and `RANK_STRONG_MAX=0` disable the
+  rule (zero I/O — the ranking page is not even opened).
+
+The rank comes from `https://www.hltv.org/ranking/teams` (the listing does not
+expose it), read in the same stealth browser and cached in
+`RANKING_CACHE_FILE` for `RANKING_CACHE_HOURS` (12h, atomic write). The cache
+survives restarts and is the fallback when a refresh fails (Cloudflare,
+layout); a failure is logged at most once per hour and the next attempt waits
+5min (the poll runs every 45s — the HLTV punishes one tab per poll).
+
+**Fail-closed:** if the ranking is unavailable, **or** either team is not in
+the list (name mismatch, unranked team), the rank rule does not apply to that
+match — stars and watchlist keep working exactly as before. The rule never
+invents a rank. The ranking also feeds the future schedule, so the adaptive
+poll wakes up for a 0★ ranked match before it goes live.
+
+The panel shows the origin of the threshold (`4k · rank (BIG, NIP)`), and
+`npm run explain -- --match <id>` prints the rank rule for the match
+(`rank [34 x 18] (BIG, Ninjas in Pyjamas)` + whether it entered *only* by
+rank).
 
 ## Adaptive polling (idle backoff)
 

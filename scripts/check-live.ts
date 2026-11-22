@@ -5,6 +5,7 @@
  */
 import {
   closeBrowser,
+  ensureTeamRanking,
   fetchMatchListing,
   selectNextUpcoming,
 } from '../src/monitor/hltvMonitor.js';
@@ -14,7 +15,16 @@ import { loadWatchlistFile } from '../src/watchlist.js';
 import { repoPath } from '../src/paths.js';
 
 const cfg = getConfig();
-const watchlist = loadWatchlistFile(repoPath('data', 'watchlist.json'));
+const watchlistFile = cfg.WATCHLIST_FILE ? repoPath(cfg.WATCHLIST_FILE) : repoPath('data', 'watchlist.json');
+const watchlist = loadWatchlistFile(watchlistFile);
+// Segundo fator de busca: ranking de times (0 = regra desligada).
+const rankEnabled = cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0;
+const teamRanking = await ensureTeamRanking({
+  enabled: rankEnabled,
+  url: cfg.RANKING_URL,
+  cacheFile: cfg.RANKING_CACHE_FILE,
+  ttlMs: cfg.RANKING_CACHE_HOURS * 3_600_000,
+});
 const result = await fetchMatchListing(
   cfg.HLTV_MATCHES_URL,
   cfg.MIN_STARS,
@@ -23,6 +33,16 @@ const result = await fetchMatchListing(
     watchlist: watchlist.doc,
     starredMinKills: cfg.MIN_KILLS,
     unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
+    ranking: teamRanking,
+    rank: rankEnabled
+      ? {
+          sumMax: cfg.RANK_SUM_MAX,
+          strongMax: cfg.RANK_STRONG_MAX,
+          minKills: cfg.RANK_MIN_KILLS,
+          minStars: cfg.RANK_MIN_STARS,
+          starsMode: cfg.RANK_STARS_MODE,
+        }
+      : null,
   },
 );
 if (!result.ok) {
@@ -41,8 +61,11 @@ if (!result.ok) {
     );
   }
   for (const m of listing.live) {
+    const rank = m.rankQualified
+      ? ` | rank #${m.team1Rank ?? '?'} vs #${m.team2Rank ?? '?'} → ${(m.rankAllowedTeams ?? []).join(', ')}`
+      : '';
     console.log(
-      `- [${m.matchId}] ${m.team1} vs ${m.team2} | ${m.event} | stars=${m.stars} topTier=${m.isTopTierGuess} | ${m.matchPageUrl}`,
+      `- [${m.matchId}] ${m.team1} vs ${m.team2} | ${m.event} | stars=${m.stars} topTier=${m.isTopTierGuess}${rank} | ${m.matchPageUrl}`,
     );
   }
   console.log(

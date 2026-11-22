@@ -1,6 +1,7 @@
 import '../src/env.js';
 import path from 'node:path';
 import { repoPath } from '../src/paths.js';
+import { getConfig } from '../src/config.js';
 import { matchPassesFilter } from '../src/monitor/hltvMonitor.js';
 import {
   loadWatchlistFile,
@@ -20,7 +21,9 @@ function envInt(value: string | undefined, fallback: number): number {
 }
 
 const fileArg = argValue('--file=');
-const file = fileArg ? path.resolve(fileArg) : repoPath('data', 'watchlist.json');
+const cfg = getConfig();
+const defaultFile = cfg.WATCHLIST_FILE ? repoPath(cfg.WATCHLIST_FILE) : repoPath('data', 'watchlist.json');
+const file = fileArg ? path.resolve(fileArg) : defaultFile;
 const starsRaw = Number(argValue('--stars=') ?? '0');
 const stars = Number.isFinite(starsRaw) ? Math.max(0, Math.min(5, Math.trunc(starsRaw))) : 0;
 const teams = process.argv.slice(2).filter((value) => !value.startsWith('--'));

@@ -469,7 +469,10 @@ export function processPoll(
     // Fica registrado no sidecar — sem isso o `null` só apareceria meses
     // depois, no thumb.
     // Mesma regra usada na detecção: resolver inválido exige 5, não NaN.
-    const required = requiredKills(minKills, player ?? '');
+    // A política só é consultada quando existe AUTOR: perguntar por um nome
+    // vazio não responde nada e ainda dispara o aviso de "time do killer não
+    // resolvido" em toda partida bloqueada (regra de rank/watchlist).
+    const required = player ? requiredKills(minKills, player) : 0;
     if (player && kills.length >= required) {
       const firstAt = kills[0]?.at;
       const closedAtMs = Date.now();

@@ -42,6 +42,9 @@ describe('explainMatchLog', () => {
       passesGeneral: false,
       watchlisted: true,
       teams: ['Imperial'],
+      rankTeams: [],
+      rankOnly: null,
+      rankRanks: null,
     });
     expect(result.rounds).toHaveLength(2);
     expect(result.rounds[0]).toMatchObject({
@@ -92,6 +95,26 @@ describe('explainMatchLog', () => {
     expect(result.policy).toBeNull();
     expect(result.rounds).toEqual([]);
     expect(formatExplain(result)).toContain('sem registro no log');
+  });
+
+  it('mostra a regra de rank: times liberados, ranks e "entrou só pelo rank"', () => {
+    const lines: ExplainLogLine[] = [
+      line({
+        msg: 'iniciando tracker de multikill',
+        matchId: '2400445',
+        stars: 1,
+        minKills: 4,
+        passaGeral: false,
+        watchlisted: false,
+        rank: 'BIG, Ninjas in Pyjamas',
+        times: '34 x 18',
+        rankOnly: true,
+      }),
+    ];
+    const text = formatExplain(explainMatchLog(lines, '2400445'));
+    expect(text).toContain('limiar 4k');
+    expect(text).toContain('rank [34 x 18] (BIG, Ninjas in Pyjamas)');
+    expect(text).toContain('entrou só pelo rank');
   });
 });
 

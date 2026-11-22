@@ -26,6 +26,12 @@ export interface ExplainPolicy {
   passesGeneral: boolean | null;
   watchlisted: boolean | null;
   teams: string[];
+  /** Times liberados pela regra de rank (string separada por ', ' no log). */
+  rankTeams: string[];
+  /** true = a partida entrou SÓ pela regra de rank. */
+  rankOnly: boolean | null;
+  /** Ranks dos times no formato do log ("34 x 18"). */
+  rankRanks: string | null;
 }
 
 export interface ExplainRound {
@@ -134,6 +140,9 @@ export function explainMatchLog(
         passesGeneral: typeof line.passaGeral === 'boolean' ? line.passaGeral : null,
         watchlisted: typeof line.watchlisted === 'boolean' ? line.watchlisted : null,
         teams: teamList(line.teams),
+        rankTeams: teamList(line.rank),
+        rankOnly: typeof line.rankOnly === 'boolean' ? line.rankOnly : null,
+        rankRanks: str(line.times),
       };
       events.push({ at: iso(line.time), msg });
       continue;
@@ -176,7 +185,14 @@ export function formatExplain(result: ExplainMatch): string {
     const override = p.watchlisted
       ? ` · override da watchlist${p.teams.length > 0 ? ` (${p.teams.join(', ')})` : ''}`
       : '';
-    out.push(`política: ${stars} · limiar ${p.minKills ?? '?'}k · ${filtro}${override}`);
+    // A regra de rank: a condição de rank (times liberados + ranks) e se a
+    // partida entrou SÓ por ela (adversário bloqueado).
+    const rank =
+      p.rankTeams.length > 0
+        ? ` · rank${p.rankRanks ? ` [${p.rankRanks}]` : ''} (${p.rankTeams.join(', ')})` +
+          (p.rankOnly ? ' · entrou só pelo rank' : '')
+        : '';
+    out.push(`política: ${stars} · limiar ${p.minKills ?? '?'}k · ${filtro}${override}${rank}`);
   } else {
     out.push('política: sem registro no log (o tracker não iniciou nesta partida)');
   }
