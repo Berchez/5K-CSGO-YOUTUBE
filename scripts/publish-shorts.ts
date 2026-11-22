@@ -92,6 +92,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import {
   getConfig,
   invalidShortsOverlayEnvs,
@@ -916,6 +917,15 @@ async function processCandidate(
 ): Promise<CandidateResult | null> {
   const { cfg, args, privacy, published, shortsDir } = ctx;
   const { sidecar: side, name, mp4Path } = candidate;
+  // O script ainda é BR-only: sem token/config por canal, processar um
+  // sidecar EN aqui poderia publicar com as credenciais do BR. A
+  // descoberta já filtra o canal; este guard é a defesa final.
+  if (side.channelId !== DEFAULT_CHANNEL_ID) {
+    console.log(
+      `- ${name}: ignorado (canal ${side.channelId}; publish-shorts ainda processa somente o canal ${DEFAULT_CHANNEL_ID})`,
+    );
+    return null;
+  }
   const clipStartMs = side.clip.startMs;
   const clipDurationSec = side.clip.durationSec;
   const killVideoOffsetMs = side.sync?.killVideoOffsetMs ?? null;
@@ -1581,6 +1591,7 @@ async function processCandidate(
   }
 
   const marker = buildShortMarker({
+    channelId: side.channelId,
     // O marker descreve o ARQUIVO GRAVADO: quando o vertical não foi
     // re-renderizado, a janela e as kills continuam as do mp4 em disco
     // (reescrever com a janela nova faria o marker mentir).
@@ -1661,7 +1672,7 @@ async function processCandidate(
   if (videoId) {
     // `insertAce` é idempotente: registra o ace se ainda não existir e
     // devolve o id (o Short sempre fica registrado no banco).
-    const aceId = insertAce(cfg.DB_PATH, ace);
+    const aceId = insertAce(cfg.DB_PATH, ace, side.channelId);
     insertClip(cfg.DB_PATH, aceId, outMp4, privacy, videoId, {
       format: 'shorts',
       width: cfg.SHORTS_WIDTH,
@@ -1709,6 +1720,7 @@ function recordFailedAttempt(shortsDir: string, candidate: Candidate): void {
     const marker: ShortMarkerV2 = previous
       ? { ...previous, attempts: previous.attempts + 1, lastAttemptAt: now }
       : buildShortMarker({
+          channelId: candidate.sidecar.channelId,
           source: {
             clipFile: path.basename(candidate.mp4Path),
             sidecarFile: path.basename(candidate.sidecarPath),
@@ -1861,8 +1873,20 @@ async function main(): Promise<void> {
   }
 
   try {
-    const published = findPublishedShorts(cfg.DB_PATH);
-    const all = discoverCandidates(clipsDir, args);
+    // O lote é do canal default (BR) — o guard em processCandidate
+    // recusa clipes de outros canais antes de qualquer publicação.
+    const published = findPublishedShorts(cfg.DB_PATH, DEFAULT_CHANNEL_ID);
+    const discovered = discoverCandidates(clipsDir, args);
+    // O script ainda é BR-only: um sidecar de outro canal não entra nem
+    // no dedup/cota do BR nem no limite de `--last` (caso contrário, ele
+    // consumiria uma vaga e poderia deixar um clipe BR legítimo de fora).
+    const all = discovered.filter((candidate) => {
+      if (candidate.sidecar.channelId === DEFAULT_CHANNEL_ID) return true;
+      console.log(
+        `- ${candidate.name}: ignorado (canal ${candidate.sidecar.channelId}; publish-shorts ainda processa somente o canal ${DEFAULT_CHANNEL_ID})`,
+      );
+      return false;
+    });
     // `--last N` conta os clipes AINDA NÃO publicados: sem isso, os N
     // mais recentes saíam todos no lote anterior e o comando não
     // publicava nada. Clipe no BACKOFF também não conta: senão o `--last
@@ -1949,6 +1973,7 @@ async function main(): Promise<void> {
         countPublishedClips(
           cfg.DB_PATH,
           startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE),
+          DEFAULT_CHANNEL_ID,
         ) * QUOTA_UNITS_PER_UPLOAD,
       window,
       captionRulesHash: captionRulesHash(),

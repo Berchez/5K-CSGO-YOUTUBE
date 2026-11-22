@@ -8,6 +8,7 @@ import type { AceEvent } from '../src/types.js';
 import type { ReferenceImages } from '../src/clipper/referenceImages.js';
 
 const ace: AceEvent = {
+  channelId: 'br',
   matchId: 'm1',
   map: 'Anubis',
   round: 9,

@@ -7,8 +7,8 @@ data/
 logs/
 .env
 .env.bak
-token.json
-client_secrets.json
+token*.json
+client_secret*.json
 # bins portáteis de teste + scripts/JSONs de diagnóstico local (ad-hoc)
 .tools/
 playwright-report/

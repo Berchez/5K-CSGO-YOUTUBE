@@ -17,6 +17,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig } from '../src/config.js';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import { getLogger } from '../src/logger.js';
 import { getDb, hasAce, insertAce, insertClip } from '../src/db.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
@@ -210,6 +211,7 @@ async function main(): Promise<void> {
     ? (pteam === team1 ? team2 : team1)
     : `${team1} vs ${team2}`;
   const ace: AceEvent = {
+    channelId: DEFAULT_CHANNEL_ID,
     matchId: `test-vod-${stamp}`,
     map,
     round,
@@ -307,8 +309,9 @@ async function main(): Promise<void> {
     }),
   );
   getDb(cfg.DB_PATH);
-  if (!hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player)) {
-    const aceId = insertAce(cfg.DB_PATH, ace);
+  const channelId = ace.channelId;
+  if (!hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player, channelId)) {
+    const aceId = insertAce(cfg.DB_PATH, ace, channelId);
     if (!doUpload) {
       insertClip(cfg.DB_PATH, aceId, outPath, 'local-test');
     }
@@ -333,7 +336,7 @@ async function main(): Promise<void> {
     defaultTags: cfg.YT_DEFAULT_TAGS,
     thumbnailPath: thumbExists,
   });
-  const aceId = insertAce(cfg.DB_PATH, ace);
+  const aceId = insertAce(cfg.DB_PATH, ace, channelId);
   insertClip(cfg.DB_PATH, aceId, outPath, cfg.YT_PRIVACY, videoId);
   console.log(`\nUPLOAD OK (private): https://youtu.be/${videoId}`);
 }

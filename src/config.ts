@@ -1,5 +1,13 @@
 import './env.js';
+import path from 'node:path';
 import { z } from 'zod';
+import {
+  DEFAULT_CHANNEL_ID,
+  channelEnvPrefix,
+  isChannelId,
+  isDefaultChannel,
+  normalizeChannelId,
+} from './channels.js';
 import { parseLatencyMap } from './monitor/streamLatency.js';
 import { parseCropList, parseCropMap } from './clipper/scoreboardSync.js';
 import { PROVIDER_IDS } from './transcription/registry.js';
@@ -128,6 +136,31 @@ export function normalizeShortsHashtag(value: string | undefined): string {
 }
 
 export const ConfigSchema = z.object({
+  /**
+   * Canais do processo (multi-canal), separados por vírgula.
+   *
+   * O canal DEFAULT usa as chaves sem prefixo (o `.env` atual continua
+   * valendo para o BR); os demais usam `EN_*`, `ES_*`... (ver
+   * CHANNEL_SCOPED_KEYS). Default `br` = bot single-tenant de hoje.
+   *
+   * O canal default é SEMPRE `br` (constante `DEFAULT_CHANNEL_ID`): os
+   * dados legados (banco, sidecar, token) são do BR. Não existe env para
+   * trocar isso — dois "canais default" seriam duas configs do mesmo canal.
+   */
+  CHANNELS: z
+    .string()
+    .default(DEFAULT_CHANNEL_ID)
+    .transform((v) => {
+      const list = v
+        .split(',')
+        .map((s) => normalizeChannelId(s))
+        .filter(Boolean);
+      return list.length > 0 ? list : [DEFAULT_CHANNEL_ID];
+    }),
+  /** Nome de exibição do canal (vazio = branding genérico). */
+  CHANNEL_NAME: z.string().default(''),
+  /** Idioma da copy do canal. pt-BR = comportamento atual. */
+  CHANNEL_LANGUAGE: z.enum(['pt-BR', 'en']).default('pt-BR'),
   HLTV_MATCHES_URL: z.string().url().default('https://www.hltv.org/matches'),
   /** Perfil persistente do browser do monitor (guarda clearance do Cloudflare). */
   HLTV_PROFILE: z.string().default('./data/hltv-profile'),
@@ -206,7 +239,21 @@ export const ConfigSchema = z.object({
   STREAM_PRIORITY: z.string().default('official,en'),
   STREAM_PREFERRED_COUNTRY: z.string().default(''),
   STREAM_PREFERRED_MIN_VIEWERS: z.coerce.number().min(0).max(10_000_000).default(0),
+  /**
+   * Fallback implícito para o Gaules quando `official`/`en` está na
+   * prioridade e não há oficial no ar. Default true = comportamento do BR.
+   * O EN desliga para cair em streamers EN em vez do Gaules.
+   */
+  STREAM_GAULES_FALLBACK: boolEnvField('STREAM_GAULES_FALLBACK', true),
+  /**
+   * Países (códigos do HLTV, vírgula) que contam como "EN" no fallback.
+   * Vazio = desligado (default; o BR fica idêntico). O EN liga com
+   * US,GB,AU,CA,IE,NZ,WORLD.
+   */
+  STREAM_EN_COUNTRIES: z.string().default(''),
   MAX_RECORDINGS: z.coerce.number().min(1).max(4).default(2),
+  /** Teto GLOBAL de recorders (soma dos canais). */
+  MAX_TOTAL_RECORDINGS: z.coerce.number().int().min(1).max(16).default(6),
   BUFFER_DIR: z.string().default('./data/buffer'),
   SEGMENT_TIME_SEC: z.coerce.number().min(5).max(30).default(10),
   // 24 × 10s = 240s: round longo (~140s) + contexto + espera do fim ancorado.
@@ -941,6 +988,393 @@ export const ConfigSchema = z.object({
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
+
+/**
+ * Chaves que podem ser sobrescritas por canal (`EN_KEY`).
+ *
+ * Fora desta lista ficam as chaves de PROCESSO (banco, perfil do browser,
+ * log, estado de latência, teto global, chaves de IA): um `EN_DB_PATH`
+ * não pode fazer o EN gravar em outro banco sem o runtime saber.
+ */
+export const CHANNEL_SCOPED_KEYS = [
+  // captura
+  'MIN_STARS',
+  'TOP_TIER_ONLY',
+  'MIN_KILLS',
+  'MIN_KILLS_NO_STARS',
+  'RANK_SUM_MAX',
+  'RANK_STRONG_MAX',
+  'RANK_MIN_KILLS',
+  'RANK_MIN_STARS',
+  'RANK_STARS_MODE',
+  'MAX_RECORDINGS',
+  'WATCHLIST_FILE',
+  // stream
+  'STREAM_PRIORITY',
+  'STREAM_PREFERRED_COUNTRY',
+  'STREAM_PREFERRED_MIN_VIEWERS',
+  'STREAM_GAULES_FALLBACK',
+  'STREAM_EN_COUNTRIES',
+  // pastas
+  'CLIPS_DIR',
+  'BUFFER_DIR',
+  'SHORTS_DIR',
+  // publicação
+  'YT_UPLOAD',
+  'YT_PRIVACY',
+  'YT_CLIENT_SECRETS',
+  'YT_TOKEN_PATH',
+  'YT_CATEGORY_ID',
+  'YT_DEFAULT_TAGS',
+  'YT_BRAND',
+  'YT_DESC_CTA',
+  'YT_QUOTA_UNITS_PER_DAY',
+  'YT_META_MODE',
+  'YT_META_AI_ORDER',
+  'YT_META_AI_TIMEOUT_MS',
+  'YT_META_GEMINI_MODEL',
+  'YT_META_HF_MODEL',
+  // copy
+  'CHANNEL_NAME',
+  'CHANNEL_LANGUAGE',
+  // Shorts
+  'SHORTS_ENABLED',
+  'SHORTS_PRIVACY',
+  'SHORTS_OVERLAY_CONFIG',
+  'SHORTS_HASHTAG',
+  'SHORTS_CAPTIONS',
+  'SHORTS_CAPTION_AI_ORDER',
+  'SHORTS_CAPTION_DEDICATED_MODEL',
+  'SHORTS_CAPTION_FONT_FAMILY',
+  'SHORTS_CAPTION_FONT_SIZE',
+  'SHORTS_CAPTION_GEMINI_MODEL',
+  'SHORTS_CAPTION_GEMINI_RETRIES',
+  'SHORTS_CAPTION_GEMINI_RETRY_MS',
+  'SHORTS_CAPTION_HF_MODEL',
+  'SHORTS_CAPTION_POSITION',
+  'SHORTS_CAPTION_REFINE',
+  'SHORTS_CAPTION_SILENCE_FINAL',
+  'SHORTS_CAPTION_TIMEOUT_MS',
+  'SHORTS_CAPTION_TIMING',
+  'SHORTS_CAPTION_TRANSLATE',
+  'SHORTS_CAPTION_WHISPER_MODEL',
+  'SHORTS_MIN_KILLS',
+  'SHORTS_MIN_SEC',
+  'SHORTS_MAX_SEC',
+  'SHORTS_WIDTH',
+  'SHORTS_HEIGHT',
+  'SHORTS_HEAD_SEC',
+  'SHORTS_TAIL_SEC',
+  'SHORTS_TOP',
+  'SHORTS_CROP_X',
+  'SHORTS_CAM_ANCHOR',
+  'SHORTS_CAM_BOX',
+  'SHORTS_CAM_FIT',
+  'SHORTS_CAM_HEIGHT',
+  'SHORTS_GAME_ASPECT',
+  'SHORTS_GAME_CROP',
+  'SHORTS_GAME_FIT',
+  'SHORTS_GAME_Y',
+  'SHORTS_OVERLAY_TEXT',
+  'SHORTS_OVERLAY_PRESET',
+  'SHORTS_OVERLAY_STYLE',
+  'SHORTS_OVERLAY_FONT',
+  'SHORTS_OVERLAY_UPPERCASE',
+  'SHORTS_OVERLAY_HOLD_SEC',
+  'SHORTS_OVERLAY_FADE_SEC',
+  'SHORTS_OVERLAY_Y',
+  'SHORTS_OVERLAY_BACKGROUND',
+  'SHORTS_OVERLAY_COLOR',
+  'SHORTS_OVERLAY_BORDER_COLOR',
+  'SHORTS_OVERLAY_BORDER_PX',
+  'SHORTS_OVERLAY_SHADOW_COLOR',
+  'SHORTS_OVERLAY_SHADOW_PX',
+  'SHORTS_OVERLAY_SHADOW_BLUR_PX',
+  'SHORTS_OVERLAY_TILT_DEG',
+  'SHORTS_OVERLAY_TAG',
+] as const satisfies readonly (keyof AppConfig)[];
+
+const channelConfigCache = new Map<string, AppConfig>();
+
+/**
+ * Chaves que o canal NÃO pode herdar do default.
+ *
+ * Token/secrets, as três pastas, a watchlist e o overlay são do canal: se
+ * faltarem (ou vierem com o mesmo valor do BR), o EN grava por cima do
+ * BR — ou o `auth:youtube --channel en` sobrescreve o token do BR.
+ */
+export const CHANNEL_ISOLATED_KEYS = [
+  'YT_CLIENT_SECRETS',
+  'YT_TOKEN_PATH',
+  'CLIPS_DIR',
+  'BUFFER_DIR',
+  'SHORTS_DIR',
+  'WATCHLIST_FILE',
+  'SHORTS_OVERLAY_CONFIG',
+] as const satisfies readonly (keyof AppConfig)[];
+
+/**
+ * Isoladas + o idioma da copy: o EN não pode herdar `pt-BR` (a copy
+ * errada no canal errado é pior do que nenhum canal).
+ */
+export const CHANNEL_REQUIRED_KEYS = [
+  ...CHANNEL_ISOLATED_KEYS,
+  'CHANNEL_LANGUAGE',
+] as const satisfies readonly (keyof AppConfig)[];
+
+/**
+ * Chaves que NÃO herdam: para canal não-default, AUSÊNCIA = desligado.
+ *
+ * `YT_UPLOAD`/`SHORTS_ENABLED` defaultam para ligado no schema (o BR
+ * publica). Um canal novo que não manda o valor não publica até o dono
+ * ligar de propósito — fail-closed.
+ */
+export const CHANNEL_FAIL_CLOSED_KEYS = [
+  'YT_UPLOAD',
+  'SHORTS_ENABLED',
+] as const satisfies readonly (keyof AppConfig)[];
+
+/** Texto em que vazio É um override válido (limpar o valor herdado). */
+const EMPTY_OVERRIDE_KEYS = new Set<string>([
+  'YT_BRAND',
+  'YT_DESC_CTA',
+  'CHANNEL_NAME',
+]);
+
+/** Chaves que são caminho: a comparação de isolamento resolve o path. */
+const PATH_LIKE_KEYS = new Set<string>([
+  ...CHANNEL_ISOLATED_KEYS,
+]);
+
+function isFailClosedKey(key: string): boolean {
+  return (CHANNEL_FAIL_CLOSED_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * Env efetivo de um canal: `EN_KEY` vence `KEY`.
+ *
+ * - `undefined` = herda o valor global (o `.env` do BR continua valendo
+ *   para o EN quando ele não sobrescreve);
+ * - string vazia = AUSENTE (não é override): `EN_MIN_STARS=` viraria 0
+ *   (sem filtro de estrela) e `EN_MAX_RECORDINGS=` derrubaria o boot.
+ *   Exceção: a allowlist textual (`YT_BRAND`, `YT_DESC_CTA`,
+ *   `CHANNEL_NAME`), onde vazio = "limpa o herdado";
+ * - chaves fora de {@link CHANNEL_SCOPED_KEYS} nunca são sobrescritas;
+ * - o canal DEFAULT não tem prefixo: `BR_*` é ignorado (o canal default
+ *   é o BR, lido nas chaves sem prefixo).
+ */
+export function resolveChannelEnv(
+  channelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const id = normalizeChannelId(channelId);
+  // O canal default lê as chaves SEM prefixo: `getChannelConfig('br')` e
+  // `getConfig()` têm que ser a MESMA config.
+  if (isDefaultChannel(id)) return { ...env };
+  const prefix = channelEnvPrefix(id);
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const key of CHANNEL_SCOPED_KEYS) {
+    const scoped = env[`${prefix}${key}`];
+    const failClosed = isFailClosedKey(key);
+    if (scoped === undefined) {
+      // Fail-closed: canal novo não publica até mandar explicitamente.
+      if (failClosed) out[key] = 'false';
+      continue;
+    }
+    if (String(scoped).trim() === '' && !EMPTY_OVERRIDE_KEYS.has(key)) {
+      if (failClosed) out[key] = 'false';
+      continue;
+    }
+    if (failClosed && parseBoolEnv(scoped) === null) {
+      // Kill-switch com valor INVÁLIDO ("flase"): o default do schema é
+      // LIGADO, mas fail-closed é DESLIGADO (o aviso de "valor não
+      // reconhecido" sai no boot).
+      out[key] = 'false';
+      continue;
+    }
+    out[key] = scoped;
+  }
+  return out;
+}
+
+/**
+ * Config efetiva de um canal (global + `EN_*`).
+ *
+ * O cache só vale para `process.env`: teste/painel que passa um env
+ * próprio recebe uma leitura nova.
+ */
+export function getChannelConfig(
+  channelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AppConfig {
+  const id = normalizeChannelId(channelId);
+  if (!isChannelId(id)) {
+    throw new Error(`canal inválido: "${channelId}" (use letra inicial e [a-z0-9_])`);
+  }
+  const useCache = env === process.env;
+  if (useCache) {
+    const hit = channelConfigCache.get(id);
+    if (hit) return hit;
+  }
+  const { config } = parseConfigEnv(resolveChannelEnv(id, env));
+  // Canal não registrado = erro: a config de um canal inexistente é
+  // herança silenciosa do BR (pasta/token/cota do outro canal).
+  if (!config.CHANNELS.includes(id)) {
+    const sugerido = [...config.CHANNELS, id].join(',');
+    throw new Error(
+      `canal "${id}" não está em CHANNELS (registre: CHANNELS=${sugerido})`,
+    );
+  }
+  if (useCache) channelConfigCache.set(id, config);
+  return config;
+}
+
+/** Limpa o cache de config por canal (testes/hot-reload do `.env`). */
+export function resetChannelConfigCache(): void {
+  channelConfigCache.clear();
+}
+
+/**
+ * Dois valores são "o mesmo" quando batem como texto ou como caminho
+ * (`./token.json` e `token.json` são o mesmo arquivo).
+ */
+function sameValue(scoped: string, inherited: string, key: string): boolean {
+  const a = scoped.trim();
+  const b = inherited.trim();
+  if (a === b) return true;
+  if (!PATH_LIKE_KEYS.has(key)) return false;
+  try {
+    const resA = path.resolve(a);
+    const resB = path.resolve(b);
+    if (resA === resB) return true;
+    // Detecta se uma pasta está aninhada dentro da outra (evita ./data/clips/en dentro de ./data/clips)
+    const relAB = path.relative(resA, resB);
+    const relBA = path.relative(resB, resA);
+    const isNested =
+      (!relAB.startsWith('..') && !path.isAbsolute(relAB)) ||
+      (!relBA.startsWith('..') && !path.isAbsolute(relBA));
+    return isNested;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Erros de ISOLAMENTO do canal: chaves obrigatórias que faltam e
+ * chaves que apontam para o mesmo caminho do canal default.
+ *
+ * O canal default não tem erro nenhum (é a origem da herança).
+ */
+export function channelIsolationErrors(
+  channelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const id = normalizeChannelId(channelId);
+  if (!isChannelId(id)) return [`canal inválido: "${channelId}"`];
+  if (isDefaultChannel(id)) return [];
+  const prefix = channelEnvPrefix(id);
+  const errors: string[] = [];
+  const defaults = ConfigSchema.parse({});
+  for (const key of CHANNEL_REQUIRED_KEYS) {
+    const scoped = env[`${prefix}${key}`];
+    if (scoped === undefined || String(scoped).trim() === '') {
+      errors.push(
+        `${prefix}${key} é obrigatória para o canal "${id}" (não herda do ${DEFAULT_CHANNEL_ID})`,
+      );
+      continue;
+    }
+    // CHANNEL_LANGUAGE é obrigatório mas pode ter o mesmo idioma do BR (ex: 2º canal pt-BR)
+    if (key === 'CHANNEL_LANGUAGE') continue;
+
+    const inherited = env[key] ?? defaults[key];
+    if (sameValue(String(scoped), String(inherited), key)) {
+      errors.push(
+        `${prefix}${key} aponta para o mesmo caminho ou pasta aninhada do canal ${DEFAULT_CHANNEL_ID} ("${String(inherited)}") — o canal "${id}" não pode compartilhar`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * Avisos da config efetiva do canal: valor booleano inválido e valor de
+ * adesivo inválido NAS VARIÁVEIS DO PRÓPRIO CANAL (`EN_*`).
+ *
+ * Sem isso, `EN_YT_UPLOAD=flase` cai no default do schema (ligado) e o
+ * EN publica sem ninguém ter ligado.
+ */
+export function channelConfigWarnings(
+  channelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const id = normalizeChannelId(channelId);
+  if (!isChannelId(id)) return [`canal inválido: "${channelId}"`];
+  const prefix = channelEnvPrefix(id);
+  const scoped: NodeJS.ProcessEnv = {};
+  for (const key of [...BOOL_ENV_KEYS, ...SHORTS_OVERLAY_ENV_KEYS]) {
+    const raw = env[`${prefix}${key}`];
+    if (raw !== undefined) scoped[key] = raw;
+  }
+  return [...invalidShortsOverlayEnvs(scoped), ...invalidBoolEnvs(scoped)];
+}
+
+/**
+ * Variáveis `EN_*` (ou `BR_*`) que o bot IGNORA: chave global (não é por
+ * canal) ou chave que não existe no schema.
+ *
+ * `EN_DB_PATH`/`EN_ENABLED` no `.env` não fariam nada — sem aviso, o dono
+ * acha que configurou.
+ */
+export function unknownChannelEnvVars(
+  channelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const id = normalizeChannelId(channelId);
+  if (!isChannelId(id)) return [];
+  const prefix = channelEnvPrefix(id);
+  const out: string[] = [];
+  for (const [key, raw] of Object.entries(env)) {
+    if (!key.startsWith(prefix)) continue;
+    if (raw == null || String(raw).trim() === '') continue;
+    const suffix = key.slice(prefix.length);
+    if ((CHANNEL_SCOPED_KEYS as readonly string[]).includes(suffix)) continue;
+    if (suffix in ConfigSchema.shape) {
+      out.push(`${key} (chave global: não muda por canal)`);
+    } else {
+      out.push(`${key} (chave desconhecida)`);
+    }
+  }
+  return out.sort();
+}
+
+/**
+ * Erros do registro de canais (`CHANNELS`).
+ *
+ * Puro: o boot decide o que fazer (falhar alto) e o painel usa a mesma
+ * regra para recusar a gravação.
+ */
+export function channelRegistryErrors(
+  cfg: Pick<AppConfig, 'CHANNELS'>,
+): string[] {
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  if (cfg.CHANNELS.length === 0) errors.push('CHANNELS está vazio');
+  for (const raw of cfg.CHANNELS) {
+    const id = normalizeChannelId(raw);
+    if (!isChannelId(id)) {
+      errors.push(`CHANNELS: id inválido "${raw}"`);
+      continue;
+    }
+    if (seen.has(id)) errors.push(`CHANNELS: id duplicado "${id}"`);
+    seen.add(id);
+  }
+  if (!seen.has(DEFAULT_CHANNEL_ID)) {
+    errors.push(
+      `CHANNELS não contém o canal default "${DEFAULT_CHANNEL_ID}" (dados legados e o runtime BR dependem dele)`,
+    );
+  }
+  return errors;
+}
 
 let cached: AppConfig | null = null;
 

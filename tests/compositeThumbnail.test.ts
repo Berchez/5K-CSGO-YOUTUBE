@@ -13,6 +13,7 @@ import {
 import { cutoutCacheKey } from '../src/clipper/thumbCutout.js';
 
 const ace: AceEvent = {
+  channelId: 'br',
   matchId: 'm1',
   map: 'Inferno',
   round: 16,

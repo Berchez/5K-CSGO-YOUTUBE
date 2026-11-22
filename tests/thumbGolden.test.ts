@@ -17,6 +17,7 @@ import type { ReferenceImages } from '../src/clipper/referenceImages.js';
  */
 
 const ace: AceEvent = {
+  channelId: 'br',
   matchId: '2400005',
   map: 'Inferno',
   round: 16,

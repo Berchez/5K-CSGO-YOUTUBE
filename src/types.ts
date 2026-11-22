@@ -154,6 +154,11 @@ export interface RoundSummary {
 }
 
 export interface AceEvent {
+  /**
+   * Canal que produziu o evento. É obrigatório: dedup, banco, sidecar e
+   * marcador precisam preservar a mesma origem do evento.
+   */
+  channelId: string;
   matchId: string;
   map: string;
   round: number;

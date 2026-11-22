@@ -6,6 +6,7 @@ import sharp from 'sharp';
 import { buildThumbnail, thumbnailOverlay } from '../src/clipper/thumbnail.js';
 
 const ace = {
+  channelId: 'br',
   matchId: 'm1',
   map: 'mirage',
   round: 12,
