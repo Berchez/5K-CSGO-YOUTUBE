@@ -490,6 +490,13 @@ configurada por `streamName` em `SHORTS_CAM_BOX_BY_STREAM`. Canal sem
 caixa mapeada cai na faixa de texto (`SHORTS_TOP=text`), com o título do
 Short no lugar da cam.
 
+Transmissão **sem cam** (a oficial da HLTV, por exemplo): `SHORTS_TOP=blur`
+não reserva faixa nenhuma — o jogo entra com o **mesmo recorte e tamanho
+do layout `cam`** (`SHORTS_GAME_ASPECT` na caixa de `SHORTS_HEIGHT -
+SHORTS_CAM_HEIGHT`), só que **centralizado** no vertical, sobre um fundo
+desfocado mais forte da própria cena. O blur ocupa o topo e a base; nada
+do jogo é cortado.
+
 As caixas medidas (fração do frame 16:9; em px de um frame 1920x1080):
 
 | canal | caixa | px (x, y, w, h) |
@@ -838,10 +845,10 @@ no código):
 | --- | --- | --- |
 | `SHORTS_ENABLED` | `false` | só publicar exige esta chave ligada |
 | `SHORTS_MAX_SEC` | `90` | duração máxima do Short (o YouTube aceita até 180s) |
-| `SHORTS_MIN_SEC` | `60` | duração mínima (jogada curta é esticada para frente) |
+| `SHORTS_MIN_SEC` | `60` | duração mínima (jogada curta é esticada para frente; antes da 1ª kill o máximo é 6s, para o gancho não se perder) |
 | `SHORTS_HEAD_SEC` / `SHORTS_TAIL_SEC` | `4` / `4` | folga antes da 1ª kill e depois da última |
 | `SHORTS_WIDTH` / `SHORTS_HEIGHT` | `1080` / `1920` | saída do vertical |
-| `SHORTS_TOP` | `cam` | topo do vertical: `cam`, `text` (faixa com o título) ou `center` (crop 9:16 antigo) |
+| `SHORTS_TOP` | `cam` | topo do vertical: `cam`, `text` (faixa com o título), `center` (crop 9:16 antigo) ou `blur` (SEM faixa: o jogo com o mesmo recorte do `cam`, centralizado sobre o fundo desfocado — transmissão sem cam) |
 | `SHORTS_CAM_HEIGHT` | `600` | altura da faixa da cam em px (o jogo fica com o resto) |
 | `SHORTS_CAM_FIT` | `cover` | `cover` = a cam é zoomada até preencher a faixa (sem barras pretas); `blur` = cam inteira sobre fundo desfocado |
 | `SHORTS_CAM_ANCHOR` | `0.35` | âncora vertical do corte da cam (0 = topo, 0.5 = centro, 1 = base) — o corte tem que pegar o rosto |

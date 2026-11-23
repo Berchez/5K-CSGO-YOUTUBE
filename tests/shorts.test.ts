@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  blurGameBandTop,
   buildShortLayout,
   camBoxToString,
   isStaleRender,
@@ -41,6 +42,7 @@ describe('planShortWindow', () => {
     expect(w.startSec).toBe(13);
     expect(w.endSec).toBe(56);
     expect(w.durSec).toBe(43);
+    expect(w.belowMin).toBe(false);
     expect(w.includedKills).toEqual([15, 18, 21, 24, 52]);
     expect(w.droppedKills).toEqual([]);
     expect(w.truncated).toBe(false);
@@ -104,12 +106,45 @@ describe('planShortWindow', () => {
     expect(w.durSec).toBe(60);
   });
 
-  it('a 1ª kill no fim do clipe: fica o último minuto do material', () => {
+  it('a 1ª kill no fim do clipe: abre perto dela (teto do gancho)', () => {
+    // Antes ficava o "último minuto" e a kill aparecia aos 58s — o
+    // gancho tem que estar no começo. O teto (6s) manda; o Short é
+    // mais curto que o mínimo porque o clipe não tem cauda.
     const w = planShortWindow([118], 120, { maxSec: 60, headSec: 2, tailSec: 4 });
     expect(w.endSec).toBe(120);
-    expect(w.durSec).toBe(60);
-    expect(w.startSec).toBe(60);
+    expect(w.durSec).toBe(8);
+    expect(w.belowMin).toBe(true);
+    expect(w.startSec).toBe(112);
+    expect(w.includedKills).toEqual([118]);
     expect(w.droppedKills).toEqual([]);
+    expect(w.padded).toBe(true);
+  });
+
+  it('clipe curto: não abre 18s antes da 1ª kill (dead air)', () => {
+    // Caso real 2400359_Ancient_r13_KusMe: ace de 18s a 25,2s num clipe
+    // de 38s. Com o mínimo em 60s, a janela antiga voltava para 0 e a
+    // 1ª kill só aparecia aos 18s.
+    const kills = [18, 20.5, 22, 23.5, 25.2];
+    const w = planShortWindow(kills, 38.07, {
+      minSec: 60,
+      maxSec: 90,
+      headSec: 4,
+      tailSec: 4,
+    });
+    // Vai para frente até o fim do clipe e só 2s para trás.
+    expect(w.startSec).toBe(12);
+    expect(w.endSec).toBe(38.07);
+    expect(kills[0] - w.startSec).toBeLessThanOrEqual(6);
+    expect(w.includedKills).toEqual(kills);
+    // Com o mínimo menor, abre na folga do gancho (4s antes da 1ª kill).
+    const tight = planShortWindow(kills, 38.07, {
+      minSec: 16,
+      maxSec: 90,
+      headSec: 4,
+      tailSec: 4,
+    });
+    expect(tight.startSec).toBe(14);
+    expect(tight.durSec).toBe(16);
   });
 
   it('esticado para a duração mínima (Short de 8s perde retenção)', () => {
@@ -408,6 +443,44 @@ describe('buildShortLayout (cam no topo + jogo embaixo)', () => {
     expect(layout.filter).toContain('vstack=inputs=2');
     // O jogo continua centralizado no layout de texto.
     expect(layout.filter).toContain('crop=803:1026:559:27');
+  });
+
+  it('topo "blur" (sem cam): MESMA proporção do layout cam, centralizado', () => {
+    const layout = buildShortLayout({ ...base, top: 'blur' });
+    expect(layout.top).toBe('blur');
+    expect(layout.gameFit).toBe('blur');
+    // Sem faixa: o vertical inteiro é o jogo + o fundo desfocado.
+    expect(layout.topHeight).toBe(1920);
+    expect(layout.gameHeight).toBe(1920);
+    expect(layout.filter).not.toContain('vstack');
+    // O recorte é o mesmo do `cam` (proporção pedida, não a da fonte).
+    expect(layout.gameAspect).toBeCloseTo(4 / 3, 4);
+    // 0.95 da altura = 1026; 1026 * 4/3 = 1368; x = (1920-1368)/2 = 276.
+    expect(layout.filter).toContain('crop=1368:1026:276:27');
+    // O encaixe usa a caixa da faixa do jogo do `cam` (540 de cam):
+    // 1080x1380 -> o jogo 4:3 vira 1080x810; o fundo cobre o vertical todo.
+    expect(layout.filter).toContain('scale=1080:1380:force_original_aspect_ratio=decrease');
+    expect(layout.filter).toContain('scale=1080:1920:force_original_aspect_ratio=increase');
+    // A área desfocada (topo E base) usa um blur mais forte que a faixa.
+    expect(layout.filter).toContain('boxblur=40:3');
+    expect(layout.filter).toContain('overlay=(W-w)/2:(H-h)/2[game]');
+    expect(layout.filter.endsWith('[game]format=yuv420p[v]')).toBe(true);
+  });
+
+  it('topo "blur" com legenda: o ass entra DEPOIS do jogo', () => {
+    const layout = buildShortLayout({ ...base, top: 'blur', captionsAssPath: 'x.ass' });
+    expect(layout.filter).toContain('[game]ass=filename=');
+  });
+
+  it('blurGameBandTop: mesma caixa do cam, centralizada no vertical', () => {
+    // Caixa do jogo = 1080 x (1920-600). Quadrado: 1080x1080 -> 420 em cima.
+    expect(blurGameBandTop(1080, 1920, 1, 600)).toBe(420);
+    // 4:3: 1080x810 -> 555 em cima.
+    expect(blurGameBandTop(1080, 1920, 4 / 3, 600)).toBe(555);
+    // 16:9: 1080x607 -> 656 em cima.
+    expect(blurGameBandTop(1080, 1920, 16 / 9, 600)).toBe(656);
+    // Proporção absurda é limitada (não gera topo negativo).
+    expect(blurGameBandTop(1080, 1920, 99, 600)).toBeGreaterThanOrEqual(0);
   });
 
   it('center mantém o filtro antigo (rotulado para o filter_complex)', () => {

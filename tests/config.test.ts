@@ -403,6 +403,7 @@ describe('layout dos Shorts (cam no topo)', () => {
   it('topo inválido é recusado pelo schema', () => {
     expect(ConfigSchema.safeParse({ SHORTS_TOP: 'sticker' }).success).toBe(false);
     expect(ConfigSchema.safeParse({ SHORTS_TOP: 'text' }).success).toBe(true);
+    expect(ConfigSchema.safeParse({ SHORTS_TOP: 'blur' }).success).toBe(true);
   });
 
   it('preenchimento da cam inválido é recusado', () => {

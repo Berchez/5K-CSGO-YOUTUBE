@@ -246,6 +246,10 @@ export interface ShortWindowV2 {
   includedKills: number[];
   /** Posições das kills que ficaram de fora. */
   droppedKills: number[];
+  /** A janela ficou abaixo do mínimo pedido (marker novo; ausente = legado). */
+  belowMin?: boolean;
+  /** Mínimo pedido no momento do render (marker novo; opcional). */
+  minSec?: number;
 }
 
 export interface ShortMarkerV2 {
@@ -1410,6 +1414,8 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
     const short = obj(r.short);
     const publication = obj(r.publication);
     const windowRaw = obj(short.window);
+    const windowMinSec = num(windowRaw.minSec);
+    const windowBelowMin = bool(windowRaw.belowMin);
     return {
       schemaVersion: SIDECAR_VERSION,
       kind: 'short',
@@ -1438,6 +1444,8 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
               durSec: num(windowRaw.durSec) ?? 0,
               includedKills: numArray(windowRaw.includedKills),
               droppedKills: numArray(windowRaw.droppedKills),
+              ...(windowBelowMin != null ? { belowMin: windowBelowMin } : {}),
+              ...(windowMinSec != null ? { minSec: windowMinSec } : {}),
             }
           : null,
         kills: normalizeKills(short.kills, null, null, null),
@@ -1465,6 +1473,8 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
   }
   // v1: o marker era o sidecar espalhado + campos do Short por cima.
   const shortWindow = obj(r.shortWindow);
+  const shortMinSec = num(shortWindow.minSec);
+  const shortBelowMin = bool(shortWindow.belowMin);
   const startSec = num(shortWindow.startSec) ?? 0;
   const absoluteStart = num(r.clipStartMs);
   const sourceClipStartMs =
@@ -1500,6 +1510,8 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
             durSec: num(shortWindow.durSec) ?? 0,
             includedKills: numArray(shortWindow.includedKills),
             droppedKills: numArray(shortWindow.droppedKills),
+            ...(shortBelowMin != null ? { belowMin: shortBelowMin } : {}),
+            ...(shortMinSec != null ? { minSec: shortMinSec } : {}),
           }
         : null,
       kills: normalizeKills(r.kills, null, null, null),

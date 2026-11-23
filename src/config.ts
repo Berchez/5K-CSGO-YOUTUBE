@@ -629,9 +629,13 @@ export const ConfigSchema = z.object({
    * - `cam` (padrão): a cam do STREAMER (caixa por canal) num painel no
    *   topo, jogo embaixo. Canal sem caixa mapeada cai na faixa de texto;
    * - `text`: faixa escura com o título do vídeo (substitui a cam);
-   * - `center`: o crop central 9:16 antigo (fallback/comparação).
+   * - `center`: o crop central 9:16 antigo (fallback/comparação);
+   * - `blur`: SEM faixa de cam — o jogo entra com o MESMO recorte e tamanho
+   *   do layout `cam` (`SHORTS_GAME_ASPECT` na caixa de `SHORTS_HEIGHT -
+   *   SHORTS_CAM_HEIGHT`), centralizado, sobre um fundo desfocado da cena.
+   *   O blur ocupa o topo e a base. É o layout de transmissão sem cam.
    */
-  SHORTS_TOP: z.enum(['cam', 'text', 'center']).default('cam'),
+  SHORTS_TOP: z.enum(['cam', 'text', 'center', 'blur']).default('cam'),
   /**
    * Altura (px) da faixa do topo. O resto da saída é o jogo.
    * Default 600 (31% de 1920): a cam do streamer ocupa um pouco menos
