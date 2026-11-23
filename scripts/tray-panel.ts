@@ -17,6 +17,7 @@ import {
   loadWatchlistFile,
   validateWatchlistDoc,
 } from '../src/watchlist.js';
+import { resolveWatchlistFilePath } from '../src/paths.js';
 
 const PANEL_VERSION = '1.1.0';
 const DEFAULT_PORT = 38475;
@@ -44,10 +45,36 @@ const ENV_FILE = path.join(ROOT, '.env');
 const BOT_STATUS_FILE = path.join(DATA_DIR, 'tray-status.json');
 const PANEL_INFO_FILE = path.join(DATA_DIR, 'tray-panel.json');
 const INTENT_FILE = path.join(DATA_DIR, 'tray-intent.json');
-const WATCHLIST_FILE = path.join(DATA_DIR, 'watchlist.json');
-const WATCHLIST_BACKUP = `${WATCHLIST_FILE}.bak`;
 const PANEL_LOG_FILE = path.join(LOGS_DIR, 'tray-panel.log');
 const PANEL_HTML = path.join(ROOT, 'scripts', 'tray-panel.html');
+
+/**
+ * Caminho da watchlist efetivamente configurada no `.env`.
+ *
+ * É resolvido a cada operação: o painel pode ficar vivo enquanto o dono
+ * troca `WATCHLIST_FILE`; usar uma constante no start deixaria o painel
+ * editando o arquivo antigo depois da troca.
+ */
+function watchlistPaths(): {
+  file: string;
+  backup: string;
+  display: string;
+  backupDisplay: string;
+} {
+  const configured = readEnvFile(ENV_FILE).values.WATCHLIST_FILE;
+  const file = resolveWatchlistFilePath(configured);
+  const relative = path.relative(ROOT, file);
+  const display =
+    relative && !relative.startsWith('..') && !path.isAbsolute(relative)
+      ? relative.split(path.sep).join('/')
+      : file;
+  return {
+    file,
+    backup: `${file}.bak`,
+    display,
+    backupDisplay: `${display}.bak`,
+  };
+}
 
 interface PanelInfo {
   version: number;
@@ -582,18 +609,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   if (pathname === '/api/watchlist') {
+    const watchlist = watchlistPaths();
     if (req.method === 'GET') {
-      const exists = fs.existsSync(WATCHLIST_FILE);
+      const exists = fs.existsSync(watchlist.file);
       // Lê mesmo ausente: o cache guarda a última versão boa durante o grace.
-      const loaded = loadWatchlistFile(WATCHLIST_FILE);
+      const loaded = loadWatchlistFile(watchlist.file);
       sendJson(res, 200, {
         ok: true,
-        file: 'data/watchlist.json',
+        file: watchlist.display,
         exists,
         stale: loaded.stale,
         doc: loaded.doc,
         error: loaded.error,
-        backup: fs.existsSync(WATCHLIST_BACKUP) ? 'data/watchlist.json.bak' : null,
+        backup: fs.existsSync(watchlist.backup) ? watchlist.backupDisplay : null,
       });
       return;
     }
@@ -620,14 +648,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     // Backup da versão anterior ANTES de gravar; a gravação atômica garante
     // que o bot nunca lê um arquivo pela metade.
     try {
-      if (fs.existsSync(WATCHLIST_FILE)) {
-        fs.copyFileSync(WATCHLIST_FILE, WATCHLIST_BACKUP);
+      if (fs.existsSync(watchlist.file)) {
+        fs.copyFileSync(watchlist.file, watchlist.backup);
       }
     } catch (e) {
       log(`falha no backup da watchlist: ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (!writeJsonAtomic(WATCHLIST_FILE, validation.value)) {
-      sendJson(res, 500, { ok: false, error: 'Falha ao gravar data/watchlist.json.' });
+    if (!writeJsonAtomic(watchlist.file, validation.value)) {
+      sendJson(res, 500, { ok: false, error: `Falha ao gravar ${watchlist.display}.` });
       return;
     }
     log(
@@ -635,9 +663,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     );
     sendJson(res, 200, {
       ok: true,
+      file: watchlist.display,
       doc: validation.value,
       applied: 'next-parts',
-      backup: fs.existsSync(WATCHLIST_BACKUP) ? 'data/watchlist.json.bak' : null,
+      backup: fs.existsSync(watchlist.backup) ? watchlist.backupDisplay : null,
     });
     return;
   }
@@ -707,12 +736,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return;
     }
     if (action === 'open-watchlist') {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      if (!fs.existsSync(WATCHLIST_FILE)) {
-        writeJsonAtomic(WATCHLIST_FILE, defaultWatchlistDoc());
+      const watchlist = watchlistPaths();
+      fs.mkdirSync(path.dirname(watchlist.file), { recursive: true });
+      if (!fs.existsSync(watchlist.file)) {
+        writeJsonAtomic(watchlist.file, defaultWatchlistDoc());
       }
-      openNotepad(WATCHLIST_FILE);
-      sendJson(res, 200, { ok: true, file: 'data/watchlist.json' });
+      openNotepad(watchlist.file);
+      sendJson(res, 200, { ok: true, file: watchlist.display });
       return;
     }
     sendJson(res, 400, { ok: false, error: `Ação desconhecida: ${action}` });

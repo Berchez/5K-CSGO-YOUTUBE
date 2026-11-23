@@ -135,6 +135,54 @@ export const ConfigSchema = z.object({
   HLTV_HEADLESS: boolEnvField('HLTV_HEADLESS', false),
   MIN_STARS: z.coerce.number().min(0).max(5).default(0),
   TOP_TIER_ONLY: boolEnvField('TOP_TIER_ONLY', false),
+  /**
+   * Segundo fator de busca (ranking de times): a partida SEM estrela entra
+   * quando a SOMA dos ranks dos dois times fica ABAIXO deste X.
+   * 0 = desligado. Ex.: 70 aceita NIP #18 + BIG #34 (52) e recusa #30 + #45.
+   */
+  RANK_SUM_MAX: z.coerce.number().int().min(0).max(500).default(0),
+  /**
+   * Segundo fator de busca: a partida entra quando UM dos times tem rank
+   * ABAIXO deste Y. Quando X e Y estão ligados, Y precisa ser menor que
+   * X; para usar só o time forte, deixe X=0. Numa partida que entrou SÓ
+   * pelo rank, só o time forte gera clipe (o adversário fica bloqueado).
+   * 0 = desligado.
+   */
+  RANK_STRONG_MAX: z.coerce.number().int().min(0).max(500).default(0),
+  /**
+   * Kills mínimas quando a CONDIÇÃO de rank é atendida (4 = 4k/5k). O
+   * limiar não vem do `MIN_STARS`: vale para o time liberado pelo rank na
+   * partida que ele fez entrar (no default `below-general`, só o que as
+   * estrelas/watchlist recusaram).
+   */
+  RANK_MIN_KILLS: z.coerce.number().int().min(2).max(5).default(4),
+  /**
+   * Piso de estrelas da PRÓPRIA regra de rank (independe do `MIN_STARS`
+   * geral). 0 = sem piso (a regra vale para qualquer avaliação, inclusive
+   * 0★). Com 1+, a partida só entra pelo rank se o listing mostrar pelo
+   * menos esse número de estrelas — e 0★ (avaliação ausente) nunca
+   * satisfaz um piso acima de 0.
+   */
+  RANK_MIN_STARS: z.coerce.number().int().min(0).max(5).default(0),
+  /**
+   * Como a regra de rank trata as estrelas (independe do `MIN_STARS`):
+   * `below-general` (default) = só para a partida que o filtro geral
+   * recusou — o rank é o plano B que preenche os dias sem partida grande;
+   * `any` = vale para qualquer avaliação (0★..5★) e também baixa o limiar
+   * de partida já aceita por estrelas.
+   */
+  RANK_STARS_MODE: z.enum(['any', 'below-general']).default('below-general'),
+  /** Página do ranking mundial do HLTV usado pela regra de rank. */
+  RANKING_URL: z.string().url().default('https://www.hltv.org/ranking/teams'),
+  /**
+   * Cache em disco do ranking (sobrevive a restart e a uma falha do
+   * Cloudflare). É o fallback quando a página não puder ser lida.
+   */
+  RANKING_CACHE_FILE: z.string().default('./data/team-ranking.json'),
+  /** Idade máxima do ranking antes de buscar de novo (horas). */
+  RANKING_CACHE_HOURS: z.coerce.number().min(1).max(168).default(12),
+  /** Watchlist do canal (times/jogadores e pisos). */
+  WATCHLIST_FILE: z.string().default('./data/watchlist.json'),
   POLL_INTERVAL_MS: z.coerce.number().min(5000).default(45000),
   /**
    * Poll adaptativo (idle backoff): true = ocioso espera metade do tempo
@@ -949,6 +997,29 @@ export function shortsCrossFieldErrors(values: {
     });
   }
   return errors;
+}
+
+/**
+ * Regras cruzadas da regra de rank.
+ *
+ * X e Y são regras independentes: X=0 com Y>0 é uma configuração válida
+ * (somente "time forte"). Quando as DUAS estão ligadas, porém, Y precisa
+ * ser menor que X para continuar sendo o critério mais seletivo do time
+ * forte; Y>=X é quase sempre um erro de digitação que transformaria a
+ * regra de fallback em um filtro mais largo que a soma.
+ */
+export function rankCrossFieldErrors(values: {
+  sumMax: number;
+  strongMax: number;
+}): ConfigCrossFieldError[] {
+  if (values.sumMax <= 0 || values.strongMax <= 0) return [];
+  if (values.strongMax < values.sumMax) return [];
+  return [
+    {
+      key: 'RANK_STRONG_MAX',
+      message: `RANK_STRONG_MAX (${values.strongMax}) precisa ser menor que RANK_SUM_MAX (${values.sumMax}) quando as duas regras estão ligadas`,
+    },
+  ];
 }
 
 /** Valida as regras cruzadas e LANÇA na primeira inconsistência. */

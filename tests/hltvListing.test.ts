@@ -4,6 +4,7 @@ import {
   buildListing,
   dedupeUpcoming,
   extractListingCards,
+  extractTeamRankingEntries,
   shouldStopRecorder,
   type ListingCards,
   type MatchCard,
@@ -11,6 +12,7 @@ import {
   type UpcomingMatch,
 } from '../src/monitor/hltvMonitor.js';
 import { computePollDecision } from '../src/monitor/pollSchedule.js';
+import { buildTeamRanking } from '../src/monitor/teamRanking.js';
 import { validateWatchlistDoc } from '../src/watchlist.js';
 
 /**
@@ -570,6 +572,402 @@ describe('buildListing (piso de estrelas da watchlist)', () => {
     expect(listing.discarded).toEqual([
       { section: 'live', team: 'FURIA', stars: 1, minStars: 2, enteredByGeneral: false },
     ]);
+  });
+});
+
+describe('buildListing (regra de rank: segundo fator de busca)', () => {
+  function rawLive(matchId: string, team1: string, team2: string, stars: number): MatchCard {
+    return {
+      matchId,
+      href: `/matches/${matchId}/x-vs-y`,
+      teamNames: [team1, team2],
+      event: 'Stake Ranked Episode 6',
+      stage: '',
+      isLive: true,
+      stars,
+    };
+  }
+
+  const now = Date.parse('2026-11-19T12:00:00.000Z');
+  const ranking = buildTeamRanking(
+    [
+      { position: '#5', name: 'FURIA' },
+      { position: '#18', name: 'Ninjas in Pyjamas' },
+      { position: '#34', name: 'BIG' },
+      { position: '#60', name: 'MIBR' },
+      { position: '#62', name: 'Legacy' },
+    ],
+    now,
+  );
+  // X=70 / Y=30, limiar da partida que entrou por rank = 4, sem piso de estrelas.
+  const rank = { sumMax: 70, strongMax: 30, minKills: 4, minStars: 0 };
+  const base = { ranking, rank, starredMinKills: 4, unstarredMinKills: 5 };
+
+  it('0★ com a soma abaixo de X entra e libera os DOIS lados', () => {
+    // NIP #18 + BIG #34 = 52 < 70 (o caso real).
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      4, // MIN_STARS: não passaria pelo filtro geral
+      false,
+      base,
+    );
+    expect(listing.live).toHaveLength(1);
+    const m = listing.live[0];
+    expect(m.rankQualified).toBe(true);
+    expect(m.team1Rank).toBe(34);
+    expect(m.team2Rank).toBe(18);
+    expect(m.rankAllowedTeams).toEqual(['BIG', 'Ninjas in Pyjamas']);
+    // Limiar da regra de rank (4), não o 5 de partida 0★.
+    expect(m.minKills).toBe(4);
+  });
+
+  it('MIN_STARS=0 + below-general: o rank fica inerte porque o geral aceita tudo', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      0,
+      false,
+      { ...base, rank: { ...rank, starsMode: 'below-general' } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('below-general: RANK_MIN_STARS>=MIN_STARS deixa o rank sem faixa elegível', () => {
+    // 1★ é recusada pelo geral, mas não atinge o piso 2★ do rank; 2★ passa
+    // pelo geral e, em below-general, o rank não age sobre ela.
+    const listing = buildListing(
+      rawCards({
+        live: [
+          rawLive('1', 'BIG', 'Ninjas in Pyjamas', 1),
+          rawLive('2', 'BIG', 'Ninjas in Pyjamas', 2),
+        ],
+      }),
+      2,
+      false,
+      { ...base, rank: { ...rank, minStars: 2, starsMode: 'below-general' } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].stars).toBe(2);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+  });
+
+  it('partida que entra só pelo rank usa o limiar de rank, mesmo maior que o geral', () => {
+    // 1★ < MIN_STARS=2: o filtro geral recusa, então o rank é o único
+    // limiar válido no runtime. O painel não pode mostrar o 4k geral.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 1)] }),
+      2,
+      false,
+      { ...base, rank: { ...rank, minKills: 5 } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankOnly).toBe(true);
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('sem a soma, o time abaixo de Y entra — e SÓ ele gera clipe', () => {
+    // #18 + #60 = 78 (não passa na soma); NIP #18 < 30.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'Ninjas in Pyjamas', 'MIBR', 0)] }),
+      4,
+      false,
+      base,
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBe(true);
+    expect(listing.live[0].rankAllowedTeams).toEqual(['Ninjas in Pyjamas']);
+    expect(listing.live[0].minKills).toBe(4);
+  });
+
+  it('soma e ranks fora do limite: não entra', () => {
+    // #60 + #62 = 122 e nenhum abaixo de 30.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'MIBR', 'Legacy', 0)] }),
+      4,
+      false,
+      base,
+    );
+    expect(listing.live).toHaveLength(0);
+  });
+
+  it('time fora do ranking não entra (fail-closed)', () => {
+    // "Team Sem Rank" não está no ranking: não soma e não libera.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'FURIA', 'Team Sem Rank', 0)] }),
+      4,
+      false,
+      base,
+    );
+    expect(listing.live).toHaveLength(0);
+    // Anotação do rank conhecido fica no objeto mesmo sem entrar? Não:
+    // a partida descartada não vira LiveMatch.
+  });
+
+  it('com a regra desligada (X=Y=0) nada é anotado', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      0,
+      false,
+      { ranking, rank: { sumMax: 0, strongMax: 0, minKills: 4, minStars: 0 } },
+    );
+    expect(listing.live).toHaveLength(1); // MIN_STARS=0 já deixa entrar
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].team1Rank).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5); // 0★: segue o limiar geral
+  });
+
+  it('sem ranking carregado a regra não age (fail-closed)', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      4,
+      false,
+      { ...base, ranking: null },
+    );
+    expect(listing.live).toHaveLength(0);
+  });
+
+  it('RANK_STARS_MODE=any: partida que já passa por estrelas NÃO é bloqueada pelo rank', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 5)] }),
+      4,
+      false,
+      { ...base, rank: { ...rank, starsMode: 'any' } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankOnly).toBe(false);
+    // No modo any a condição de rank é atendida (o limiar de rank vale), mas
+    // a partida NÃO entrou só por ele: os dois lados seguem liberados.
+    expect(listing.live[0].rankQualified).toBe(true);
+    expect(listing.live[0].rankAllowedTeams).toEqual(['BIG', 'Ninjas in Pyjamas']);
+    expect(listing.live[0].minKills).toBe(4);
+  });
+
+  it('RANK_STARS_MODE=any: 2★ com o geral em 5k vira 4k', () => {
+    // A partida passa por estrelas (2★ ≥ MIN_STARS=2), mas no modo any a
+    // condição de rank também é atendida → o limiar de rank (4) vence o
+    // geral (5). É o opt-in "mais clipes".
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 2)] }),
+      2,
+      false,
+      { ...base, rank: { ...rank, starsMode: 'any' }, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    const m = listing.live[0];
+    expect(m.rankQualified).toBe(true);
+    expect(m.rankOnly).toBe(false);
+    expect(m.minKills).toBe(4);
+  });
+
+  it('sem o modo (default below-general) a partida 2★ já aceita NÃO vira 4k', () => {
+    // Mesmo caso do teste acima, sem `starsMode`: o default é o plano B, e
+    // o rank não rebaixa o limiar de uma partida que as estrelas aceitaram.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 2)] }),
+      2,
+      false,
+      { ...base, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('sem a condição de rank, as estrelas seguem mandando no limiar', () => {
+    // MIBR #60 + Legacy #62: soma 122 e nenhum abaixo de 30 → sem rank.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'MIBR', 'Legacy', 2)] }),
+      2,
+      false,
+      { ...base, starredMinKills: 5, unstarredMinKills: 5 },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('RANK_STARS_MODE=below-general: a partida que o geral aceitou segue o limiar geral', () => {
+    // 2★ ≥ MIN_STARS=2 e o geral pede 5k. Em below-general o rank é só o
+    // segundo fator: não rebaixa o limiar nem marca rankQualified.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 2)] }),
+      2,
+      false,
+      {
+        ...base,
+        rank: { ...rank, starsMode: 'below-general' },
+        starredMinKills: 5,
+        unstarredMinKills: 5,
+      },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].rankAllowedTeams).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('RANK_STARS_MODE=below-general: a partida que o geral recusou continua entrando por rank', () => {
+    // 0★ < MIN_STARS=2: o rank é o segundo fator e vale (4k), como antes.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      2,
+      false,
+      {
+        ...base,
+        rank: { ...rank, starsMode: 'below-general' },
+        starredMinKills: 5,
+        unstarredMinKills: 5,
+      },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBe(true);
+    expect(listing.live[0].rankOnly).toBe(true);
+    expect(listing.live[0].minKills).toBe(4);
+  });
+
+  it('RANK_STARS_MODE=below-general também vale para a agenda futura', () => {
+    const upcoming: UpcomingCard = {
+      matchId: '2',
+      href: '/matches/2/big-vs-nip',
+      teamNames: ['BIG', 'Ninjas in Pyjamas'],
+      event: 'Stake Ranked Episode 6',
+      stage: '',
+      isLive: false,
+      stars: 2,
+      startUnix: String(now + 3_600_000),
+    };
+    const listing = buildListing(
+      rawCards({ upcoming: [upcoming], upcomingSeen: 1 }),
+      2,
+      false,
+      {
+        ...base,
+        rank: { ...rank, starsMode: 'below-general' },
+        starredMinKills: 5,
+        unstarredMinKills: 5,
+      },
+    );
+    // Passa no geral (continua na agenda), mas SEM a regra de rank.
+    expect(listing.upcoming).toHaveLength(1);
+    expect(listing.upcoming[0].rankQualified).toBeUndefined();
+  });
+
+  it('a agenda futura também entra por rank (o poll acorda para o jogo)', () => {
+    const upcoming: UpcomingCard = {
+      matchId: '2',
+      href: '/matches/2/big-vs-nip',
+      teamNames: ['BIG', 'Ninjas in Pyjamas'],
+      event: 'Stake Ranked Episode 6',
+      stage: '',
+      isLive: false,
+      stars: 0,
+      startUnix: String(now + 3_600_000),
+    };
+    const listing = buildListing(
+      rawCards({ upcoming: [upcoming], upcomingSeen: 1 }),
+      4,
+      false,
+      base,
+    );
+    expect(listing.upcoming).toHaveLength(1);
+    expect(listing.upcoming[0].rankQualified).toBe(true);
+    expect(listing.upcoming[0].rankAllowedTeams).toEqual(['BIG', 'Ninjas in Pyjamas']);
+  });
+
+  it('piso de estrelas da própria regra de rank (RANK_MIN_STARS)', () => {
+    // Piso 1: a partida 0★ (avaliação ausente) NÃO satisfaz → não entra.
+    const comPiso = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      4,
+      false,
+      { ...base, rank: { ...rank, minStars: 1 } },
+    );
+    expect(comPiso.live).toHaveLength(0);
+
+    // Piso 1 e a partida com 2 estrelas: entra pelo rank.
+    const comEstrelas = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 2)] }),
+      4,
+      false,
+      { ...base, rank: { ...rank, minStars: 1 } },
+    );
+    expect(comEstrelas.live).toHaveLength(1);
+    expect(comEstrelas.live[0].rankQualified).toBe(true);
+
+    // Piso 2 e a partida com 1 estrela: não entra.
+    const curto = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 1)] }),
+      4,
+      false,
+      { ...base, rank: { ...rank, minStars: 2 } },
+    );
+    expect(curto.live).toHaveLength(0);
+
+    // Piso 0 (default): sem piso — a partida 0★ entra.
+    const semPiso = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      4,
+      false,
+      base,
+    );
+    expect(semPiso.live).toHaveLength(1);
+    expect(semPiso.live[0].rankQualified).toBe(true);
+  });
+});
+
+describe('extração do ranking (/ranking/teams, fixture HTML do HLTV)', () => {
+  it('lê posição e nome de cada ranked-team', async (ctx) => {
+    if (!browser) return ctx.skip();
+    const page: Page = await browser.newPage();
+    try {
+      await page.setContent(
+        `<!DOCTYPE html><html><body>
+           <div class="ranked-team standard-box"><div class="bg-holder">
+             <div class="ranking-header">
+               <span class="position wide-position">#18</span>
+               <div class="relative"><div class="teamLine sectionTeamPlayers"><span class="name">Ninjas in Pyjamas</span></div></div>
+             </div>
+           </div></div>
+           <div class="ranked-team standard-box"><div class="bg-holder">
+             <div class="ranking-header">
+               <span class="position wide-position">#34</span>
+               <div class="relative"><div class="teamLine sectionTeamPlayers"><span class="name">BIG</span></div></div>
+             </div>
+           </div></div>
+         </body></html>`,
+        { waitUntil: 'domcontentloaded' },
+      );
+      const entries = await extractTeamRankingEntries(page);
+      expect(entries).toEqual([
+        { position: '#18', name: 'Ninjas in Pyjamas' },
+        { position: '#34', name: 'BIG' },
+      ]);
+    } finally {
+      await page.close().catch(() => undefined);
+    }
+  });
+
+  it('descarta bloco sem posição e aceita .name direto no header', async (ctx) => {
+    if (!browser) return ctx.skip();
+    const page: Page = await browser.newPage();
+    try {
+      await page.setContent(
+        `<!DOCTYPE html><html><body>
+           <div class="ranked-team"><div class="ranking-header">
+             <span class="name">FURIA</span><span class="position">#1</span>
+           </div></div>
+           <div class="ranked-team"><div class="ranking-header">
+             <span class="position">#2</span>
+           </div></div>
+         </body></html>`,
+        { waitUntil: 'domcontentloaded' },
+      );
+      const entries = await extractTeamRankingEntries(page);
+      expect(entries).toEqual([{ position: '#1', name: 'FURIA' }]);
+    } finally {
+      await page.close().catch(() => undefined);
+    }
   });
 });
 

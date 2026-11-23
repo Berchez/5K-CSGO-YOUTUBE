@@ -116,6 +116,42 @@ describe('describeMinKillsPolicy (origem do limiar no painel)', () => {
       describeMinKillsPolicy({ minKills: 5, stars: 0, minKillsSource: 'watchlist' }),
     ).toBe('5k · watchlist');
   });
+
+  it('rank mostra os times liberados e avisa que só eles geram clipe', () => {
+    // Soma liberando os dois lados: ambos podem gerar clipe.
+    expect(
+      describeMinKillsPolicy({
+        minKills: 4,
+        stars: 0,
+        minKillsSource: 'rank',
+        passesGeneralFilter: false,
+        rankTeams: ['BIG', 'Ninjas in Pyjamas'],
+      }),
+    ).toBe('4k · rank (BIG, Ninjas in Pyjamas)');
+    // Regra do time forte numa partida que entrou SÓ pelo rank: só um lado.
+    expect(
+      describeMinKillsPolicy({
+        minKills: 4,
+        stars: 0,
+        minKillsSource: 'rank',
+        passesGeneralFilter: false,
+        rankOnly: true,
+        rankTeams: ['Ninjas in Pyjamas'],
+      }),
+    ).toBe('4k · rank (Ninjas in Pyjamas) · só esse time');
+    // A mesma partida, mas entrou por estrelas: o rank só ajusta o limiar —
+    // o adversário NÃO está bloqueado.
+    expect(
+      describeMinKillsPolicy({
+        minKills: 4,
+        stars: 2,
+        minKillsSource: 'rank',
+        passesGeneralFilter: true,
+        rankOnly: false,
+        rankTeams: ['Ninjas in Pyjamas'],
+      }),
+    ).toBe('4k · rank (Ninjas in Pyjamas)');
+  });
 });
 
 describe('trayStatus writer', () => {

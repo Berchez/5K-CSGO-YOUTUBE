@@ -15,11 +15,12 @@ export interface TrayStatusMatch {
   stars: number;
   minKills: number;
   /**
-   * De onde veio o limiar: `general` (política por estrelas) ou `watchlist`
-   * (override de time/jogador). O painel mostra a fonte junto do número —
-   * sem isso "Mín. 5 kills" não diz se o 5 é do time da lista ou do 0★.
+   * De onde veio o limiar: `general` (política por estrelas), `watchlist`
+   * (override de time/jogador) ou `rank` (partida que só entrou pela regra
+   * de ranking). O painel mostra a fonte junto do número — sem isso
+   * "Mín. 5 kills" não diz se o 5 é do time da lista ou do 0★.
    */
-  minKillsSource?: 'general' | 'watchlist';
+  minKillsSource?: 'general' | 'watchlist' | 'rank';
   /**
    * false = a partida NÃO passa na política geral (entrou só pela
    * watchlist): os jogadores do adversário são bloqueados e não geram
@@ -28,6 +29,16 @@ export interface TrayStatusMatch {
   passesGeneralFilter?: boolean;
   /** Times da watchlist que casaram com a partida. */
   watchlistedTeams?: string[];
+  /**
+   * Times liberados pela regra de rank (partida que entrou SÓ por ela).
+   * Com a soma liberando os dois lados, traz os dois.
+   */
+  rankTeams?: string[];
+  /**
+   * A partida entrou SÓ pela regra de rank (não passou em estrelas nem na
+   * watchlist): aí o adversário NÃO liberado fica bloqueado.
+   */
+  rankOnly?: boolean;
   /**
    * Rótulo pronto do limiar ("5k · watchlist (Imperial)"), calculado por
    * `describeMinKillsPolicy`. O painel só renderiza — a regra fica numa
@@ -149,14 +160,30 @@ export function phaseForMatches(matches: TrayStatusMatch[]): TrayPhase {
 export function describeMinKillsPolicy(match: {
   minKills: number;
   stars: number;
-  minKillsSource?: 'general' | 'watchlist';
+  minKillsSource?: 'general' | 'watchlist' | 'rank';
   passesGeneralFilter?: boolean;
   watchlistedTeams?: string[];
+  /** Times liberados pela regra de rank (partida que entrou por ela). */
+  rankTeams?: string[];
+  /** A partida entrou SÓ pela regra de rank (adversário bloqueado). */
+  rankOnly?: boolean;
 }): string {
   const teams = (match.watchlistedTeams ?? [])
     .map((team) => team.trim())
     .filter((team) => team.length > 0);
   const suffix = teams.length > 0 ? ` (${teams.join(', ')})` : '';
+  // Regra de rank: a condição de rank foi atendida (o limiar de rank vale,
+  // qualquer que seja o número de estrelas). Com a SOMA liberando, os DOIS
+  // lados geram clipe; com o time forte, só ele — e o bloqueio do
+  // adversário só existe quando a partida entrou SÓ pelo rank.
+  if (match.minKillsSource === 'rank') {
+    const rankTeams = (match.rankTeams ?? [])
+      .map((team) => team.trim())
+      .filter((team) => team.length > 0);
+    const who = rankTeams.length > 0 ? ` (${rankTeams.join(', ')})` : '';
+    const blocked = match.rankOnly === true && rankTeams.length === 1 ? ' · só esse time' : '';
+    return `${match.minKills}k · rank${who}${blocked}`;
+  }
   // Partida que NÃO passa na política geral: entrou pela watchlist e o
   // adversário não gera clipe nenhum.
   if (match.passesGeneralFilter === false) {

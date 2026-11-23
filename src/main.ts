@@ -1,7 +1,7 @@
 import './env.js';
 import fs from 'node:fs';
 import path from 'node:path';
-import { repoPath } from './paths.js';
+import { repoPath, resolveWatchlistFilePath } from './paths.js';
 import {
   cappedLatencyChannels,
   deprecatedEnvVars,
@@ -9,6 +9,7 @@ import {
   getConfig,
   invalidBoolEnvs,
   invalidShortsOverlayEnvs,
+  rankCrossFieldErrors,
 } from './config.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
@@ -18,6 +19,7 @@ import { discardAce, getDb, hasAce, insertAce, insertClip, recordDiscardedEvent 
 import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
+  ensureTeamRanking,
   fetchMatchListing,
   fetchMatchStreams,
   matchPassesFilter,
@@ -27,6 +29,11 @@ import {
   shouldStopRecorder,
   type UpcomingMatch,
 } from './monitor/hltvMonitor.js';
+import {
+  applyRankThreshold,
+  rankSearchIsInert,
+  rankThresholdIsBinding,
+} from './monitor/teamRanking.js';
 import {
   computePollDecision,
   pollForceReasons,
@@ -214,17 +221,16 @@ let activeWatchlist: WatchlistDoc | null = null;
 // dentro do poll — um poll que lança exceção não vira hot-loop) e o
 // sleep usa a hora para debounce (um salvamento = um poll, não um por
 // toque de arquivo).
-const WATCHLIST_FILE = repoPath('data', 'watchlist.json');
 const watchlistSignal = createWatchlistSignal();
 
-function startWatchlistWatcher(): void {
-  fs.watchFile(WATCHLIST_FILE, { interval: 2000, persistent: false }, () => {
+function startWatchlistWatcher(watchlistFile: string): void {
+  fs.watchFile(watchlistFile, { interval: 2000, persistent: false }, () => {
     notifyWatchlistChanged(watchlistSignal);
   });
 }
 
-function stopWatchlistWatcher(): void {
-  fs.unwatchFile(WATCHLIST_FILE);
+function stopWatchlistWatcher(watchlistFile: string): void {
+  fs.unwatchFile(watchlistFile);
 }
 
 // Agenda conhecida (matchId → horário marcado no HLTV): serve para medir
@@ -395,12 +401,30 @@ function trayMatchesFrom(
     const minKills =
       m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
     // A fonte do limiar vai junto do número: o painel precisa dizer se o
-    // 5 veio da watchlist, da política por estrelas ou de uma partida
-    // que só entrou pela lista (adversário bloqueado).
+    // 5 veio da watchlist, da política por estrelas ou da regra de rank.
+    // "rank" quando o limiar de rank é o efetivo: numa partida exclusiva
+    // do rank vale RANK_MIN_KILLS mesmo se maior; nos demais casos, o
+    // limiar mais permissivo entre política e rank vence.
+    const generalThreshold = minKillsForStars(
+      m.stars,
+      cfg.MIN_KILLS,
+      cfg.MIN_KILLS_NO_STARS,
+    );
+    const rankIsBinding = rankThresholdIsBinding({
+      rankQualified: m.rankQualified === true,
+      watchlisted: m.watchlisted === true,
+      rankOnly: m.rankOnly === true,
+      rankMinKills: cfg.RANK_MIN_KILLS,
+      generalMinKills: generalThreshold,
+    });
     const policy = {
       minKills,
       stars: m.stars,
-      minKillsSource: (m.watchlisted ? 'watchlist' : 'general') as 'general' | 'watchlist',
+      minKillsSource: (m.watchlisted
+        ? 'watchlist'
+        : rankIsBinding
+          ? 'rank'
+          : 'general') as 'general' | 'watchlist' | 'rank',
       passesGeneralFilter: matchPassesFilter(
         m.stars,
         m.isTopTierGuess,
@@ -408,6 +432,8 @@ function trayMatchesFrom(
         cfg.TOP_TIER_ONLY,
       ),
       watchlistedTeams: m.watchlistedTeams,
+      rankTeams: m.rankAllowedTeams,
+      rankOnly: m.rankOnly === true,
     };
     return {
       matchId: m.matchId,
@@ -419,6 +445,8 @@ function trayMatchesFrom(
       minKillsSource: policy.minKillsSource,
       passesGeneralFilter: policy.passesGeneralFilter,
       watchlistedTeams: policy.watchlistedTeams,
+      rankTeams: policy.rankTeams,
+      rankOnly: policy.rankOnly,
       minKillsLabel: describeMinKillsPolicy(policy),
       matchPageUrl: m.matchPageUrl,
       state,
@@ -2267,7 +2295,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
   // Watchlist: hot-reload por mtime (barato a cada poll). JSON inválido
   // mantém a última versão boa; arquivo ausente mantém a última versão por
   // até 1 min (save/rename do editor) e depois cai na política por estrelas.
-  const watchlist = loadWatchlistFile(WATCHLIST_FILE);
+  const watchlist = loadWatchlistFile(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
   activeWatchlist = watchlist.doc;
   const watchlistStale = watchlist.missing && watchlist.stale;
   if (watchlist.changed) {
@@ -2289,6 +2317,23 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
     }
   }
 
+  // Ranking HLTV (segundo fator de busca): partida SEM estrela entra quando
+  // a soma dos ranks é baixa ou um dos times é forte. Sem rank legível a
+  // regra fica INATIVA (fail-closed) e estrelas/watchlist seguem normais.
+  const rankConfigErrors = rankCrossFieldErrors({
+    sumMax: cfg.RANK_SUM_MAX,
+    strongMax: cfg.RANK_STRONG_MAX,
+  });
+  const rankEnabled =
+    rankConfigErrors.length === 0 &&
+    (cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0);
+  const teamRanking = await ensureTeamRanking({
+    enabled: rankEnabled,
+    url: cfg.RANKING_URL,
+    cacheFile: cfg.RANKING_CACHE_FILE,
+    ttlMs: cfg.RANKING_CACHE_HOURS * 3_600_000,
+  });
+
   const result = await fetchMatchListing(
     cfg.HLTV_MATCHES_URL,
     cfg.MIN_STARS,
@@ -2297,6 +2342,16 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
       watchlist: watchlist.doc,
       starredMinKills: cfg.MIN_KILLS,
       unstarredMinKills: cfg.MIN_KILLS_NO_STARS,
+      ranking: teamRanking,
+      rank: rankEnabled
+        ? {
+            sumMax: cfg.RANK_SUM_MAX,
+            strongMax: cfg.RANK_STRONG_MAX,
+            minKills: cfg.RANK_MIN_KILLS,
+            minStars: cfg.RANK_MIN_STARS,
+            starsMode: cfg.RANK_STARS_MODE,
+          }
+        : null,
     },
   );
   if (!result.ok) {
@@ -2528,6 +2583,13 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
         cfg.TOP_TIER_ONLY,
       );
       const generalMinKills = minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
+      // Regra de rank: a CONDIÇÃO de rank vale independente das estrelas.
+      // Se ela foi atendida, os times liberados têm o limiar de rank
+      // (RANK_MIN_KILLS) — a partida rende 4k/5k mesmo com 1★/2★. Quem
+      // NÃO é liberado pelo rank continua na política normal (e, se a
+      // partida entrou só pelo rank, fica bloqueado).
+      const rankQualified = m.rankQualified === true;
+      const rankAllowedTeams = m.rankAllowedTeams ?? [];
       let warnedUnknownTeam = false;
       const minKillsFor = (player: string, team: string | null): number => {
         // Recalcula a CADA round: o hot-reload da watchlist vale para a
@@ -2544,10 +2606,23 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
           generalMinKills,
         });
         const resolved = policy.killer(player, team);
+        // Aplica a regra de rank sobre a política (o mais permissivo vence;
+        // a watchlist com override ativo continua mandando no bloqueio).
+        const canonical = matchTeamAlias(team, [m.team1, m.team2]) ?? team;
+        const effective = applyRankThreshold({
+          base: { minKills: resolved.minKills, source: resolved.source },
+          rank: rankQualified
+            ? { minKills: cfg.RANK_MIN_KILLS, allowedTeams: rankAllowedTeams }
+            : null,
+          team: canonical,
+          watchlistOverride: policy.overrideActive,
+        });
         // Time do killer DESCONHECIDO (o placar não casou com o listing) e
         // round bloqueado: se o jogador for do time monitorado, o clipe foi
         // perdido em silêncio. Avisa UMA vez por partida (log + toast).
-        if (resolved.source === 'blocked' && !team && !warnedUnknownTeam) {
+        // Só quando existe AUTOR: uma consulta diagnóstica com nome vazio
+        // (round sem multikill) não é clip perdido — é diagnóstico.
+        if (effective.source === 'blocked' && !team && player.trim().length > 0 && !warnedUnknownTeam) {
           warnedUnknownTeam = true;
           log.warn(
             { matchId: m.matchId, player, team1: m.team1, team2: m.team2 },
@@ -2558,8 +2633,8 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
             `${m.team1} vs ${m.team2}: o placar não deixou descobrir de qual time é ${player}. O round foi bloqueado sem clipe.`,
           );
         }
-        // null = bloqueado (adversário em partida só da watchlist).
-        return resolved.minKills ?? Number.POSITIVE_INFINITY;
+        // null = bloqueado (adversário em partida só da watchlist/rank).
+        return effective.minKills ?? Number.POSITIVE_INFINITY;
       };
       const token = Symbol(m.matchId);
       activeTrackers.set(m.matchId, token);
@@ -2571,6 +2646,16 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
           passaGeral: passesGeneral,
           watchlisted: m.watchlisted ?? false,
           teams: m.watchlistedTeams?.join(', ') || undefined,
+          rank: m.rankQualified ? (m.rankAllowedTeams ?? []).join(', ') || undefined : undefined,
+          times: m.rankQualified
+            ? [m.team1Rank ?? '?', m.team2Rank ?? '?'].join(' x ')
+            : undefined,
+          // "Entrou só pelo rank" = o adversário fica bloqueado; com estrelas
+          // a partida entra por lá e o rank só ajusta o limiar.
+          rankOnly: m.rankOnly === true,
+          // Modo de estrelas da regra (any/below-general): explica por que o
+          // limiar de rank não apareceu numa partida que passou pelo geral.
+          rankMode: m.rankQualified ? cfg.RANK_STARS_MODE : undefined,
         },
         'iniciando tracker de multikill',
       );
@@ -2745,7 +2830,7 @@ async function main(): Promise<void> {
   await ensureDirs(cfg);
   initTrayStatus(cfg);
   startTrayStatusHeartbeat();
-  startWatchlistWatcher();
+  startWatchlistWatcher(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
   setTrayStatusPhase('monitoring');
   const log = getLogger();
   /**
@@ -2828,6 +2913,42 @@ async function main(): Promise<void> {
     // best-effort
   }
   const loggedOut = loadLoggedOut();
+  // A regra de rank muda o limiar de 4k quando a condição é atendida (não
+  // importa o número de estrelas) — o log de boot precisa dizer isso.
+  const rankConfigErrors = rankCrossFieldErrors({
+    sumMax: cfg.RANK_SUM_MAX,
+    strongMax: cfg.RANK_STRONG_MAX,
+  });
+  const rankEnabled =
+    rankConfigErrors.length === 0 &&
+    (cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0);
+  if (rankConfigErrors.length > 0) {
+    log.warn(
+      { errors: rankConfigErrors.map((error) => error.message) },
+      'configuração inválida da regra de ranking — a regra foi desligada; a captura principal continua normal',
+    );
+  }
+  if (
+    rankConfigErrors.length === 0 &&
+    rankSearchIsInert({
+      sumMax: cfg.RANK_SUM_MAX,
+      strongMax: cfg.RANK_STRONG_MAX,
+      minStars: cfg.MIN_STARS,
+      rankMinStars: cfg.RANK_MIN_STARS,
+      topTierOnly: cfg.TOP_TIER_ONLY,
+      starsMode: cfg.RANK_STARS_MODE,
+    })
+  ) {
+    log.warn(
+      {
+        minStars: cfg.MIN_STARS,
+        rankMinStars: cfg.RANK_MIN_STARS,
+        topTierOnly: cfg.TOP_TIER_ONLY,
+        rankStarsMode: cfg.RANK_STARS_MODE,
+      },
+      'regra de ranking inerte: em below-general sem top-tier, nenhuma faixa de estrelas pode ser recusada pelo filtro geral e aceita pelo piso do rank — ajuste MIN_STARS/RANK_MIN_STARS ou use RANK_STARS_MODE=any',
+    );
+  }
   log.info(
     {
       minStars: cfg.MIN_STARS,
@@ -2844,8 +2965,10 @@ async function main(): Promise<void> {
         : 'ok',
       upload: cfg.YT_UPLOAD,
       maxRec: cfg.MAX_RECORDINGS,
+      rankStarsMode: rankEnabled ? cfg.RANK_STARS_MODE : undefined,
+      rankMinKills: rankEnabled ? cfg.RANK_MIN_KILLS : undefined,
     },
-    `bot iniciado (multikills ${cfg.MIN_KILLS}k+ com estrela / ${cfg.MIN_KILLS_NO_STARS}k sem estrela live, 16:9, log em arquivo)`,
+    `bot iniciado (multikills ${cfg.MIN_KILLS}k+ com estrela / ${cfg.MIN_KILLS_NO_STARS}k sem estrela live${rankEnabled ? ` / ${cfg.RANK_MIN_KILLS}k quando a condição de rank passa (${cfg.RANK_STARS_MODE})` : ''}, 16:9, log em arquivo)`,
   );
   // Envs que o bot IGNORA: o zod aceita qualquer coisa e o dono acaba
   // achando que a configuração velha ainda vale (a depreciação silenciosa
@@ -2947,7 +3070,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     stopping = true;
-    stopWatchlistWatcher();
+    stopWatchlistWatcher(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
     shutdownTrayStatus();
     for (const recorder of activeRecorders.values()) {
       await recorder.stop().catch(() => undefined);
