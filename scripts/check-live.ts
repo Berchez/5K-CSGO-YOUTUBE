@@ -10,15 +10,26 @@ import {
   selectNextUpcoming,
 } from '../src/monitor/hltvMonitor.js';
 import { computePollDecision, POLL_START_GRACE_MS } from '../src/monitor/pollSchedule.js';
-import { getConfig } from '../src/config.js';
+import { getConfig, rankCrossFieldErrors } from '../src/config.js';
 import { loadWatchlistFile } from '../src/watchlist.js';
-import { repoPath } from '../src/paths.js';
+import { resolveWatchlistFilePath } from '../src/paths.js';
 
 const cfg = getConfig();
-const watchlistFile = cfg.WATCHLIST_FILE ? repoPath(cfg.WATCHLIST_FILE) : repoPath('data', 'watchlist.json');
+const watchlistFile = resolveWatchlistFilePath(cfg.WATCHLIST_FILE);
 const watchlist = loadWatchlistFile(watchlistFile);
 // Segundo fator de busca: ranking de times (0 = regra desligada).
-const rankEnabled = cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0;
+const rankConfigErrors = rankCrossFieldErrors({
+  sumMax: cfg.RANK_SUM_MAX,
+  strongMax: cfg.RANK_STRONG_MAX,
+});
+if (rankConfigErrors.length > 0) {
+  console.error(
+    `RANK=desligado por configuração inválida: ${rankConfigErrors.map((error) => error.message).join('; ')}`,
+  );
+}
+const rankEnabled =
+  rankConfigErrors.length === 0 &&
+  (cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0);
 const teamRanking = await ensureTeamRanking({
   enabled: rankEnabled,
   url: cfg.RANKING_URL,

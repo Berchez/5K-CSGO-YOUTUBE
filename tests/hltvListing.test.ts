@@ -621,6 +621,51 @@ describe('buildListing (regra de rank: segundo fator de busca)', () => {
     expect(m.minKills).toBe(4);
   });
 
+  it('MIN_STARS=0 + below-general: o rank fica inerte porque o geral aceita tudo', () => {
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 0)] }),
+      0,
+      false,
+      { ...base, rank: { ...rank, starsMode: 'below-general' } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
+  it('below-general: RANK_MIN_STARS>=MIN_STARS deixa o rank sem faixa elegível', () => {
+    // 1★ é recusada pelo geral, mas não atinge o piso 2★ do rank; 2★ passa
+    // pelo geral e, em below-general, o rank não age sobre ela.
+    const listing = buildListing(
+      rawCards({
+        live: [
+          rawLive('1', 'BIG', 'Ninjas in Pyjamas', 1),
+          rawLive('2', 'BIG', 'Ninjas in Pyjamas', 2),
+        ],
+      }),
+      2,
+      false,
+      { ...base, rank: { ...rank, minStars: 2, starsMode: 'below-general' } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].stars).toBe(2);
+    expect(listing.live[0].rankQualified).toBeUndefined();
+  });
+
+  it('partida que entra só pelo rank usa o limiar de rank, mesmo maior que o geral', () => {
+    // 1★ < MIN_STARS=2: o filtro geral recusa, então o rank é o único
+    // limiar válido no runtime. O painel não pode mostrar o 4k geral.
+    const listing = buildListing(
+      rawCards({ live: [rawLive('1', 'BIG', 'Ninjas in Pyjamas', 1)] }),
+      2,
+      false,
+      { ...base, rank: { ...rank, minKills: 5 } },
+    );
+    expect(listing.live).toHaveLength(1);
+    expect(listing.live[0].rankOnly).toBe(true);
+    expect(listing.live[0].minKills).toBe(5);
+  });
+
   it('sem a soma, o time abaixo de Y entra — e SÓ ele gera clipe', () => {
     // #18 + #60 = 78 (não passa na soma); NIP #18 < 30.
     const listing = buildListing(

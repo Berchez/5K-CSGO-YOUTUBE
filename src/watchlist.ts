@@ -6,7 +6,7 @@ import fs from 'node:fs';
  *   limiar próprio e um piso de estrelas próprio (minStars).
  * - Jogador na lista → o limiar do jogador vence o do time naquele round.
  * O arquivo é lido pelo bot a cada poll (hot-reload por mtime) e editado
- * pelo painel em data/watchlist.json.
+ * pelo painel no arquivo configurado em WATCHLIST_FILE.
  */
 
 export interface WatchlistDefaults {

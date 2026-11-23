@@ -10,6 +10,7 @@ import {
   normalizeShortsHashtag,
   parseBoolEnv,
   parseConfigEnv,
+  rankCrossFieldErrors,
   shortsCrossFieldErrors,
   validateConfigCrossFields,
 } from '../src/config.js';
@@ -480,5 +481,21 @@ describe('cota: fuso do dia', () => {
       true,
     );
     expect(ConfigSchema.parse({}).YT_QUOTA_TIMEZONE).toBe('America/Los_Angeles');
+  });
+});
+
+describe('config da regra de rank', () => {
+  it('RANK_MIN_KILLS precisa ser inteiro', () => {
+    expect(ConfigSchema.safeParse({ RANK_MIN_KILLS: '4' }).success).toBe(true);
+    expect(ConfigSchema.safeParse({ RANK_MIN_KILLS: '4.5' }).success).toBe(false);
+  });
+
+  it('Y só precisa ser menor que X quando as duas regras estão ligadas', () => {
+    expect(rankCrossFieldErrors({ sumMax: 0, strongMax: 0 })).toEqual([]);
+    expect(rankCrossFieldErrors({ sumMax: 0, strongMax: 30 })).toEqual([]);
+    expect(rankCrossFieldErrors({ sumMax: 70, strongMax: 0 })).toEqual([]);
+    expect(rankCrossFieldErrors({ sumMax: 70, strongMax: 30 })).toEqual([]);
+    expect(rankCrossFieldErrors({ sumMax: 70, strongMax: 70 })).toHaveLength(1);
+    expect(rankCrossFieldErrors({ sumMax: 70, strongMax: 80 })).toHaveLength(1);
   });
 });

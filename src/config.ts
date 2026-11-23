@@ -143,8 +143,10 @@ export const ConfigSchema = z.object({
   RANK_SUM_MAX: z.coerce.number().int().min(0).max(500).default(0),
   /**
    * Segundo fator de busca: a partida entra quando UM dos times tem rank
-   * ABAIXO deste Y (esperado Y < X). Numa partida que entrou SÓ pelo rank,
-   * só o time forte gera clipe (o adversário fica bloqueado). 0 = desligado.
+   * ABAIXO deste Y. Quando X e Y estão ligados, Y precisa ser menor que
+   * X; para usar só o time forte, deixe X=0. Numa partida que entrou SÓ
+   * pelo rank, só o time forte gera clipe (o adversário fica bloqueado).
+   * 0 = desligado.
    */
   RANK_STRONG_MAX: z.coerce.number().int().min(0).max(500).default(0),
   /**
@@ -153,7 +155,7 @@ export const ConfigSchema = z.object({
    * partida que ele fez entrar (no default `below-general`, só o que as
    * estrelas/watchlist recusaram).
    */
-  RANK_MIN_KILLS: z.coerce.number().min(2).max(5).default(4),
+  RANK_MIN_KILLS: z.coerce.number().int().min(2).max(5).default(4),
   /**
    * Piso de estrelas da PRÓPRIA regra de rank (independe do `MIN_STARS`
    * geral). 0 = sem piso (a regra vale para qualquer avaliação, inclusive
@@ -995,6 +997,29 @@ export function shortsCrossFieldErrors(values: {
     });
   }
   return errors;
+}
+
+/**
+ * Regras cruzadas da regra de rank.
+ *
+ * X e Y são regras independentes: X=0 com Y>0 é uma configuração válida
+ * (somente "time forte"). Quando as DUAS estão ligadas, porém, Y precisa
+ * ser menor que X para continuar sendo o critério mais seletivo do time
+ * forte; Y>=X é quase sempre um erro de digitação que transformaria a
+ * regra de fallback em um filtro mais largo que a soma.
+ */
+export function rankCrossFieldErrors(values: {
+  sumMax: number;
+  strongMax: number;
+}): ConfigCrossFieldError[] {
+  if (values.sumMax <= 0 || values.strongMax <= 0) return [];
+  if (values.strongMax < values.sumMax) return [];
+  return [
+    {
+      key: 'RANK_STRONG_MAX',
+      message: `RANK_STRONG_MAX (${values.strongMax}) precisa ser menor que RANK_SUM_MAX (${values.sumMax}) quando as duas regras estão ligadas`,
+    },
+  ];
 }
 
 /** Valida as regras cruzadas e LANÇA na primeira inconsistência. */

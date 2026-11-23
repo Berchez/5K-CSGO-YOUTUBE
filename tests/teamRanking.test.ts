@@ -4,16 +4,23 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   applyRankThreshold,
+  assessTeamRankingRefresh,
   buildTeamRanking,
+  isCompleteTeamRanking,
+  MIN_TEAM_RANKING_ENTRIES,
   parseRankingCache,
   rankAllowsTeam,
   rankAllowedTeams,
   rankMatchDecision,
   rankOfTeam,
+  rankSearchIsInert,
   rankStarsModeAllows,
+  rankThresholdIsBinding,
   readRankingCache,
   writeRankingCache,
 } from '../src/monitor/teamRanking.js';
+import { ensureTeamRanking, resetTeamRankingCache } from '../src/monitor/hltvMonitor.js';
+import { resolveRoundPolicy, type WatchlistDoc } from '../src/watchlist.js';
 
 const tmpDirs: string[] = [];
 
@@ -28,6 +35,17 @@ afterAll(() => {
 });
 
 const NOW = Date.parse('2026-11-19T12:00:00.000Z');
+
+/** Ranking completo no formato da página do HLTV (posições contíguas). */
+function completeRanking(fetchedAt = NOW, firstName = 'FURIA') {
+  return buildTeamRanking(
+    Array.from({ length: MIN_TEAM_RANKING_ENTRIES }, (_, index) => ({
+      position: `#${index + 1}`,
+      name: index === 0 ? firstName : `Team ${index + 1}`,
+    })),
+    fetchedAt,
+  );
+}
 
 describe('buildTeamRanking (parser puro da página do ranking)', () => {
   it('aceita "#18" e "18" e normaliza o nome do time', () => {
@@ -76,6 +94,100 @@ describe('buildTeamRanking (parser puro da página do ranking)', () => {
     expect(rankOfTeam(ranking, 'MIBR')).toBeNull();
     expect(rankOfTeam(ranking, '')).toBeNull();
     expect(rankOfTeam(null, 'FURIA')).toBeNull();
+  });
+});
+
+describe('isCompleteTeamRanking (proteção contra coleta parcial)', () => {
+  it('aceita as posições contíguas da página do HLTV', () => {
+    expect(isCompleteTeamRanking(completeRanking())).toBe(true);
+  });
+
+  it('rejeita uma coleta que caiu para menos da metade do cache anterior', () => {
+    const entries = (count: number) =>
+      buildTeamRanking(
+        Array.from({ length: count }, (_, index) => ({
+          position: `#${index + 1}`,
+          name: `Team ${index + 1}`,
+        })),
+        NOW,
+      );
+    expect(isCompleteTeamRanking(entries(100), MIN_TEAM_RANKING_ENTRIES, 248)).toBe(false);
+    expect(isCompleteTeamRanking(entries(124), MIN_TEAM_RANKING_ENTRIES, 248)).toBe(true);
+  });
+
+  it('rejeita ranking truncado, posição duplicada e posição com buraco', () => {
+    const truncated = buildTeamRanking(
+      Array.from({ length: MIN_TEAM_RANKING_ENTRIES - 1 }, (_, index) => ({
+        position: `#${index + 1}`,
+        name: `Team ${index + 1}`,
+      })),
+      NOW,
+    );
+    expect(isCompleteTeamRanking(truncated)).toBe(false);
+
+    const duplicatePosition = completeRanking();
+    duplicatePosition.ranks['outro time'] = 1;
+    expect(isCompleteTeamRanking(duplicatePosition)).toBe(false);
+
+    const gap = completeRanking();
+    gap.ranks['team 30'] = 31;
+    expect(isCompleteTeamRanking(gap)).toBe(false);
+  });
+});
+
+describe('assessTeamRankingRefresh (decisão usada pelo refresh real)', () => {
+  const entries = (count: number) =>
+    buildTeamRanking(
+      Array.from({ length: count }, (_, index) => ({
+        position: `#${index + 1}`,
+        name: `Team ${index + 1}`,
+      })),
+      NOW,
+    );
+  const previous = entries(248);
+
+  it('rejeita 123/248 e aceita 124/248 usando o fallback anterior', () => {
+    const rejected = assessTeamRankingRefresh(entries(123), {
+      fallback: previous,
+      memory: previous,
+    });
+    expect(rejected).toEqual({
+      complete: false,
+      entryCount: 123,
+      previousEntryCount: 248,
+    });
+
+    const accepted = assessTeamRankingRefresh(entries(124), {
+      fallback: previous,
+      memory: previous,
+    });
+    expect(accepted).toEqual({
+      complete: true,
+      entryCount: 124,
+      previousEntryCount: 248,
+    });
+  });
+
+  it('usa a memória como referência quando o cache expirou e não serve mais como fallback', () => {
+    const rejected = assessTeamRankingRefresh(entries(123), {
+      fallback: null,
+      memory: previous,
+    });
+    expect(rejected).toEqual({
+      complete: false,
+      entryCount: 123,
+      previousEntryCount: 248,
+    });
+
+    const accepted = assessTeamRankingRefresh(entries(124), {
+      fallback: null,
+      memory: previous,
+    });
+    expect(accepted).toEqual({
+      complete: true,
+      entryCount: 124,
+      previousEntryCount: 248,
+    });
   });
 });
 
@@ -173,6 +285,62 @@ describe('rankStarsModeAllows (estrelas PRÓPRIAS da regra de rank)', () => {
     expect(rankStarsModeAllows(undefined, false)).toBe(true);
     expect(rankStarsModeAllows(null, true)).toBe(false);
     expect(rankStarsModeAllows(null, false)).toBe(true);
+  });
+});
+
+describe('rankSearchIsInert (aviso de configuração sem efeito)', () => {
+  it('detecta MIN_STARS=0 + below-general sem top-tier', () => {
+    expect(
+      rankSearchIsInert({
+        sumMax: 70,
+        strongMax: 0,
+        minStars: 0,
+        rankMinStars: 0,
+        topTierOnly: false,
+        starsMode: 'below-general',
+      }),
+    ).toBe(true);
+  });
+
+  it('detecta quando o piso do rank só aceita estrelas que já passam no geral', () => {
+    // MIN_STARS=2 e RANK_MIN_STARS=2: 0★/1★ não atingem o piso do rank;
+    // 2★+ já passa no filtro geral. Em below-general, nenhuma partida entra
+    // exclusivamente pelo rank.
+    expect(
+      rankSearchIsInert({
+        sumMax: 70,
+        strongMax: 0,
+        minStars: 2,
+        rankMinStars: 2,
+        topTierOnly: false,
+        starsMode: 'below-general',
+      }),
+    ).toBe(true);
+    // Com RANK_MIN_STARS=1, a faixa de 1★ ainda é elegível.
+    expect(
+      rankSearchIsInert({
+        sumMax: 70,
+        strongMax: 0,
+        minStars: 2,
+        rankMinStars: 1,
+        topTierOnly: false,
+        starsMode: 'below-general',
+      }),
+    ).toBe(false);
+  });
+
+  it('não avisa quando top-tier pode recusar, o modo é any ou o rank está off', () => {
+    const base = {
+      sumMax: 70,
+      strongMax: 0,
+      minStars: 2,
+      rankMinStars: 2,
+      topTierOnly: false,
+      starsMode: 'below-general' as const,
+    };
+    expect(rankSearchIsInert({ ...base, topTierOnly: true })).toBe(false);
+    expect(rankSearchIsInert({ ...base, starsMode: 'any' })).toBe(false);
+    expect(rankSearchIsInert({ ...base, sumMax: 0, strongMax: 0 })).toBe(false);
   });
 });
 
@@ -286,21 +454,117 @@ describe('applyRankThreshold (a condição de rank atravessa as estrelas)', () =
   });
 });
 
+describe('rankThresholdIsBinding (origem do limiar no painel)', () => {
+  it('partida exclusiva do rank usa o limiar de rank mesmo se maior que o geral', () => {
+    expect(
+      rankThresholdIsBinding({
+        rankQualified: true,
+        watchlisted: false,
+        rankOnly: true,
+        rankMinKills: 5,
+        generalMinKills: 4,
+      }),
+    ).toBe(true);
+  });
+
+  it('fora da partida exclusiva, o rank só vale se baixar o limiar geral', () => {
+    expect(
+      rankThresholdIsBinding({
+        rankQualified: true,
+        watchlisted: false,
+        rankOnly: false,
+        rankMinKills: 3,
+        generalMinKills: 4,
+      }),
+    ).toBe(true);
+    expect(
+      rankThresholdIsBinding({
+        rankQualified: true,
+        watchlisted: false,
+        rankOnly: false,
+        rankMinKills: 4,
+        generalMinKills: 4,
+      }),
+    ).toBe(false);
+  });
+
+  it('a watchlist explícita tem precedência sobre a origem do rank', () => {
+    expect(
+      rankThresholdIsBinding({
+        rankQualified: true,
+        watchlisted: true,
+        rankOnly: true,
+        rankMinKills: 5,
+        generalMinKills: 4,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('applyRankThreshold + resolveRoundPolicy (precedência real)', () => {
+  it('a origem explícita da watchlist continua vencendo o rank', () => {
+    const doc: WatchlistDoc = {
+      version: 1,
+      enabled: true,
+      defaults: { minKills: 4, minStars: 0, clutch: false },
+      teams: [{ names: ['FURIA'], minKills: 5, enabled: true }],
+      players: [{ names: ['donk'], minKills: 5, enabled: true }],
+    };
+    const policy = resolveRoundPolicy({
+      doc,
+      stars: 1,
+      teams: ['FURIA', 'Opponent'],
+      passesGeneral: true,
+      generalMinKills: 4,
+    });
+    expect(policy.overrideActive).toBe(true);
+
+    const playerBase = policy.killer('donk', 'FURIA');
+    expect(playerBase.source).toBe('player');
+    expect(
+      applyRankThreshold({
+        base: playerBase,
+        rank: { minKills: 4, allowedTeams: ['FURIA'] },
+        team: 'FURIA',
+        watchlistOverride: policy.overrideActive,
+      }),
+    ).toEqual(playerBase);
+
+    const teamBase = policy.killer('jogador sem regra', 'FURIA');
+    expect(teamBase.source).toBe('team');
+    expect(
+      applyRankThreshold({
+        base: teamBase,
+        rank: { minKills: 4, allowedTeams: ['FURIA'] },
+        team: 'FURIA',
+        watchlistOverride: policy.overrideActive,
+      }),
+    ).toEqual(teamBase);
+  });
+});
+
 describe('cache do ranking em disco', () => {
   it('grava e lê de volta com idade/TTL', () => {
     const file = path.join(tmpDir(), 'team-ranking.json');
-    const ranking = buildTeamRanking([{ position: '#18', name: 'Ninjas in Pyjamas' }], NOW);
+    const ranking = completeRanking();
     writeRankingCache(file, ranking);
 
     const fresh = readRankingCache(file, NOW + 3_600_000, 12 * 3_600_000);
     expect(fresh.error).toBeNull();
-    expect(fresh.ranking?.ranks['ninjas in pyjamas']).toBe(18);
+    expect(fresh.ranking?.ranks['furia']).toBe(1);
     expect(fresh.ageMs).toBe(3_600_000);
     expect(fresh.stale).toBe(false);
 
     const stale = readRankingCache(file, NOW + 13 * 3_600_000, 12 * 3_600_000);
     expect(stale.stale).toBe(true);
-    expect(stale.ranking?.ranks['ninjas in pyjamas']).toBe(18);
+    expect(stale.ranking?.ranks['furia']).toBe(1);
+  });
+
+  it('não grava uma coleta parcial no cache', () => {
+    const file = path.join(tmpDir(), 'parcial.json');
+    const partial = buildTeamRanking([{ position: '#1', name: 'FURIA' }], NOW);
+    expect(() => writeRankingCache(file, partial)).toThrow(/incompleto/);
+    expect(fs.existsSync(file)).toBe(false);
   });
 
   it('arquivo ausente não é erro; JSON inválido é', () => {
@@ -315,19 +579,17 @@ describe('cache do ranking em disco', () => {
     expect(read.error).not.toBeNull();
   });
 
-  it('parseRankingCache rejeita formato sem ranks/fetchedAt', () => {
+  it('parseRankingCache rejeita formato sem ranks/fetchedAt ou coleta parcial', () => {
     expect(parseRankingCache(null)).toBeNull();
     expect(parseRankingCache({ fetchedAt: NOW, ranks: {} })).toBeNull();
     expect(parseRankingCache({ ranks: { furia: 1 } })).toBeNull();
     expect(parseRankingCache({ fetchedAt: NOW, ranks: { '#1 FURIA': 0 } })).toBeNull();
-    expect(parseRankingCache({ fetchedAt: NOW, ranks: { FURIA: 1 } })).toEqual({
-      fetchedAt: NOW,
-      ranks: { furia: 1 },
-    });
+    expect(parseRankingCache({ fetchedAt: NOW, ranks: { FURIA: 1 } })).toBeNull();
+
+    const complete = completeRanking();
+    expect(parseRankingCache({ fetchedAt: NOW, ranks: complete.ranks })).toEqual(complete);
   });
 });
-
-import { ensureTeamRanking, resetTeamRankingCache } from '../src/monitor/hltvMonitor.js';
 
 describe('ensureTeamRanking (stale-while-revalidate e limites de cache)', () => {
   it('desligado (enabled=false) devolve null e não toca em disco nem rede', async () => {
@@ -345,7 +607,7 @@ describe('ensureTeamRanking (stale-while-revalidate e limites de cache)', () => 
     resetTeamRankingCache();
     const dir = tmpDir();
     const file = path.join(dir, 'ranking.json');
-    writeRankingCache(file, buildTeamRanking([{ position: '#1', name: 'FURIA' }], NOW));
+    writeRankingCache(file, completeRanking());
 
     const res = await ensureTeamRanking({
       enabled: true,
@@ -357,11 +619,33 @@ describe('ensureTeamRanking (stale-while-revalidate e limites de cache)', () => 
     expect(res?.ranks['furia']).toBe(1);
   });
 
+  it('refresh rejeitado não vira unhandledRejection e mantém o fallback', async () => {
+    resetTeamRankingCache();
+    const dir = tmpDir();
+    const file = path.join(dir, 'ranking.json');
+    writeRankingCache(file, completeRanking());
+
+    const res = await ensureTeamRanking({
+      enabled: true,
+      url: 'https://example.com',
+      cacheFile: file,
+      ttlMs: 3_600_000,
+      now: NOW + 2 * 3_600_000,
+      fetchRanking: async () => {
+        throw new Error('falha injetada');
+      },
+    });
+    expect(res?.ranks['furia']).toBe(1);
+    // Dá tempo para a promise detached resolver; sem catch, o Vitest
+    // reportaria a rejeição como unhandled.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
+
   it('cache vencido (>14 dias) é descartado por segurança (fail-closed)', async () => {
     resetTeamRankingCache();
     const dir = tmpDir();
     const file = path.join(dir, 'ranking-antigo.json');
-    writeRankingCache(file, buildTeamRanking([{ position: '#1', name: 'FURIA' }], NOW));
+    writeRankingCache(file, completeRanking());
 
     // Fetch injetado: teste puro (sem Playwright/rede). O refresh é disparado,
     // mas não há cache aceitável para devolver.

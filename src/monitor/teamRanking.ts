@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeName } from '../watchlist.js';
+import type { KillerRuleSource } from '../watchlist.js';
 
 /**
  * Ranking de times do HLTV (`/ranking/teams`).
@@ -28,6 +29,80 @@ export interface TeamRanking {
   fetchedAt: number;
   /** Nome normalizado -> rank (1 = melhor). */
   ranks: Record<string, number>;
+}
+
+/**
+ * Mínimo de times para aceitar uma coleta do ranking.
+ *
+ * A página `/ranking/teams` lista muitos times (o markup atual tem mais
+ * de 200 posições; a meta-description da página ainda fala em 30). Um
+ * layout quebrado pode devolver só alguns cards; aceitar esse resultado
+ * parcial sobrescreveria o cache bom e faria a regra fail-closed sem
+ * sinal. O piso de 20 rejeita a extração claramente truncada; além
+ * dele, as posições precisam ser contíguas e uma coleta não pode ter
+ * menos da metade dos times do último cache bom.
+ */
+export const MIN_TEAM_RANKING_ENTRIES = 20;
+
+/** A coleta tem todos os times e as posições esperados? */
+export function isCompleteTeamRanking(
+  ranking: TeamRanking | null | undefined,
+  minimumEntries = MIN_TEAM_RANKING_ENTRIES,
+  previousEntries?: number,
+): boolean {
+  const minimum = Math.max(1, Math.trunc(minimumEntries));
+  const ranks = Object.values(ranking?.ranks ?? {});
+  if (ranks.length < minimum) return false;
+  if (
+    previousEntries != null &&
+    Number.isFinite(previousEntries) &&
+    previousEntries > 0 &&
+    ranks.length < Math.ceil(previousEntries / 2)
+  ) {
+    return false;
+  }
+  const positions = [...ranks].sort((a, b) => a - b);
+  return positions.every((position, index) => position === index + 1);
+}
+
+/** Resultado da validação de uma coleta durante o refresh do ranking. */
+export interface TeamRankingRefreshAssessment {
+  /** A coleta pode substituir o ranking anterior? */
+  complete: boolean;
+  /** Quantas entradas a coleta tinha. */
+  entryCount: number;
+  /** Quantas entradas o ranking anterior tinha (null = sem referência). */
+  previousEntryCount: number | null;
+}
+
+/**
+ * Avalia uma coleta no MESMO caminho usado pelo refresh de produção.
+ *
+ * O fallback é a referência preferida. Quando ele já expirou e foi
+ * descartado, o cache ainda presente em memória continua servindo como
+ * referência de tamanho: uma coleta muito menor não pode substituir um
+ * ranking amplo que já era conhecido.
+ */
+export function assessTeamRankingRefresh(
+  ranking: TeamRanking | null | undefined,
+  previous: {
+    fallback?: TeamRanking | null;
+    memory?: TeamRanking | null;
+  },
+  minimumEntries = MIN_TEAM_RANKING_ENTRIES,
+): TeamRankingRefreshAssessment {
+  const entryCount = Object.keys(ranking?.ranks ?? {}).length;
+  const previousEntryCount =
+    Object.keys((previous.fallback ?? previous.memory)?.ranks ?? {}).length || null;
+  return {
+    complete: isCompleteTeamRanking(
+      ranking,
+      minimumEntries,
+      previousEntryCount ?? undefined,
+    ),
+    entryCount,
+    previousEntryCount,
+  };
 }
 
 /** Lados liberados pela regra de rank quando a soma não passa. */
@@ -223,10 +298,90 @@ export function rankStarsModeAllows(
   return !passesGeneral;
 }
 
+/**
+ * A configuração do rank está inerte?
+ *
+ * No modo `below-general`, o rank só age numa partida que o filtro geral
+ * recusou E que satisfaz o piso `RANK_MIN_STARS`. Sem top-tier, duas
+ * combinações não deixam nenhuma faixa de estrelas elegível:
+ *
+ * - `MIN_STARS=0`: todas as partidas passam no filtro geral;
+ * - `RANK_MIN_STARS >= MIN_STARS`: toda estrela aceita pelo piso do rank
+ *   também passa no filtro geral (e 0★ nunca satisfaz um piso > 0).
+ *
+ * O aviso evita que a feature pareça quebrada sem explicar a combinação
+ * incompatível.
+ */
+export function rankSearchIsInert(params: {
+  /** X: soma máxima (0 = desligado). */
+  sumMax: number;
+  /** Y: rank de um time só (0 = desligado). */
+  strongMax: number;
+  /** Piso geral de estrelas. */
+  minStars: number;
+  /** Piso de estrelas próprio da regra de rank. */
+  rankMinStars: number;
+  /** Só eventos top-tier? */
+  topTierOnly: boolean;
+  /** Modo de estrelas da regra de rank. */
+  starsMode: RankStarsMode | null | undefined;
+}): boolean {
+  const enabled = params.sumMax > 0 || params.strongMax > 0;
+  const mode = params.starsMode ?? 'below-general';
+  if (!enabled || mode !== 'below-general' || params.topTierOnly) return false;
+  return params.minStars <= 0 || params.rankMinStars >= params.minStars;
+}
+
+/**
+ * O limiar efetivo da partida vem do rank?
+ *
+ * Numa partida exclusiva do rank, o limiar de rank é o único válido — pode
+ * ser maior que o geral. Nos demais casos, o rank só é a origem quando ele
+ * realmente baixa o limiar. A watchlist explícita sempre tem precedência.
+ */
+export function rankThresholdIsBinding(params: {
+  rankQualified: boolean;
+  watchlisted: boolean;
+  rankOnly: boolean;
+  rankMinKills: number;
+  generalMinKills: number;
+}): boolean {
+  if (!params.rankQualified || params.watchlisted) return false;
+  return params.rankOnly || params.rankMinKills < params.generalMinKills;
+}
+
+/** Origem do limiar depois de combinar a política normal com o rank. */
+export type RankThresholdSource = KillerRuleSource | 'rank';
+
 /** Limiar da política normal (null = bloqueado). */
 export interface RankThresholdBase {
   minKills: number | null;
-  source: string;
+  source: RankThresholdSource;
+}
+
+/**
+ * A origem veio de uma escolha EXPLICITA da watchlist (jogador/time)?
+ *
+ * O `switch` é exaustivo de propósito: se `KillerRuleSource` ganhar um
+ * novo valor no futuro, o TypeScript passa a apontar este ponto em vez
+ * de deixar a precedência silenciosamente errada.
+ */
+function isExplicitWatchlistSource(
+  source: RankThresholdSource,
+): source is Extract<KillerRuleSource, 'player' | 'team'> {
+  switch (source) {
+    case 'player':
+    case 'team':
+      return true;
+    case 'general':
+    case 'blocked':
+    case 'rank':
+      return false;
+    default: {
+      const exhaustive: never = source;
+      return exhaustive;
+    }
+  }
 }
 
 /**
@@ -266,7 +421,7 @@ export function applyRankThreshold(params: {
   // minKills escolhido para um jogador/time não pode ser rebaixado pelo
   // rank sem que o dono perceba. O rank ainda pode abrir uma partida
   // bloqueada (base null), mas não mexe num limiar explícito.
-  if (base.source === 'player' || base.source === 'team') return base;
+  if (isExplicitWatchlistSource(base.source)) return base;
   if (!rankAllowsTeam(rank.allowedTeams, team)) return base;
   if (base.minKills == null) {
     // Bloqueado pela política geral: o rank abre o caminho — mas só sem
@@ -308,8 +463,9 @@ export function parseRankingCache(raw: unknown): TeamRanking | null {
     if (!key || !Number.isFinite(rank) || rank <= 0) continue;
     ranks[key] = Math.trunc(rank);
   }
-  if (Object.keys(ranks).length === 0) return null;
-  return { fetchedAt: Math.trunc(fetchedAt), ranks };
+  const ranking = { fetchedAt: Math.trunc(fetchedAt), ranks };
+  if (!isCompleteTeamRanking(ranking)) return null;
+  return ranking;
 }
 
 /**
@@ -338,6 +494,9 @@ export function readRankingCache(
 
 /** Grava o cache de forma atômica (tmp + rename): leitura nunca vê meio JSON. */
 export function writeRankingCache(file: string, ranking: TeamRanking): void {
+  if (!isCompleteTeamRanking(ranking)) {
+    throw new Error('cache do ranking incompleto: não grava uma coleta parcial');
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(ranking, null, 2)}\n`, 'utf8');

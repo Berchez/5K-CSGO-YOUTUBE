@@ -893,16 +893,17 @@
       function renderWatchlist() {
         const wl = state.watchlist || watchlistFromDoc(null);
         const file = state.watchlistFile || {};
+        const watchlistFile = esc(file.file || 'arquivo da watchlist');
         const banner = $('#watchlistBanner');
         if (file.error) {
           banner.className = 'banner error';
           banner.innerHTML = '<div><strong>Arquivo inválido:</strong> ' + esc(file.error) + ' O bot está usando a última versão boa; salve para corrigir.</div>';
         } else if (file && file.exists === false && file.stale) {
           banner.className = 'banner';
-          banner.innerHTML = '<div><strong>Watchlist ausente no disco.</strong> O bot está usando a última versão boa por até 1 min; salve para recriar data/watchlist.json.</div>';
+          banner.innerHTML = '<div><strong>Watchlist ausente no disco.</strong> O bot está usando a última versão boa por até 1 min; salve para recriar ' + watchlistFile + '.</div>';
         } else if (file && file.exists === false) {
           banner.className = 'banner';
-          banner.innerHTML = '<div><strong>Sem watchlist no disco.</strong> Adicione um time e salve para criar data/watchlist.json.</div>';
+          banner.innerHTML = '<div><strong>Sem watchlist no disco.</strong> Adicione um time e salve para criar ' + watchlistFile + '.</div>';
         } else {
           banner.className = 'banner hidden';
         }
@@ -1044,7 +1045,7 @@
           });
           state.watchlistFile = {
             ok: true,
-            file: 'data/watchlist.json',
+            file: result.file || (state.watchlistFile && state.watchlistFile.file) || 'watchlist.json',
             exists: true,
             doc: result.doc,
             error: null,

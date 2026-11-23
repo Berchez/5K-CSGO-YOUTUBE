@@ -11,7 +11,9 @@ import {
   type WatchlistDoc,
 } from '../watchlist.js';
 import {
+  assessTeamRankingRefresh,
   buildTeamRanking,
+  MIN_TEAM_RANKING_ENTRIES,
   rankAllowedTeams,
   rankMatchDecision,
   rankOfTeam,
@@ -1105,9 +1107,12 @@ export function buildListing(
     // O limiar EFETIVO da partida: o da watchlist só vale quando o override
     // está ativo (algum time atendeu o piso). Sem override, vale o menor
     // entre a política geral e o limiar de rank (quando a condição de rank
-    // é atendida) — o rank nunca piora o limiar. Com override, o limiar
-    // explícito da watchlist vence (first hit wins); o rank só pode abrir
-    // o caminho de um time ainda bloqueado.
+    // é atendida) — o rank nunca piora o limiar. Se a partida entrou SÓ
+    // pelo rank, porém, o limiar de rank é o único válido: o runtime
+    // substitui o bloqueio geral por ele, mesmo quando for mais alto que
+    // o limiar que o listing exibiria. Com override, o limiar explícito da
+    // watchlist vence (first hit wins); o rank só pode abrir o caminho de
+    // um time ainda bloqueado.
     const generalThreshold = minKillsForStars(
       m.stars,
       filter.starredMinKills ?? 4,
@@ -1117,7 +1122,9 @@ export function buildListing(
     m.minKills = decision.passesWatchlist
       ? rule.minKills
       : rankConditionMet
-        ? Math.min(generalThreshold, rankThreshold)
+        ? m.rankOnly
+          ? rankThreshold
+          : Math.min(generalThreshold, rankThreshold)
         : generalThreshold;
     if (rule.watchlisted) {
       // Time da lista: o override só vale se o piso de estrelas (minStars)
@@ -1336,6 +1343,7 @@ let rankingMemory: TeamRanking | null = null;
 let rankingFileLoaded = false;
 let lastRankingAttemptAt = 0;
 let lastRankingWarnAt = 0;
+let lastRankingStaleWarnAt = 0;
 let rankingRefreshing: Promise<TeamRanking | null> | null = null;
 /** Falha do ranking é silenciosa por até 1h (o poll roda a cada 45s). */
 const RANKING_WARN_EVERY_MS = 3_600_000;
@@ -1370,6 +1378,7 @@ export function resetTeamRankingCache(): void {
   rankingMemory = null;
   rankingFileLoaded = false;
   lastRankingWarnAt = 0;
+  lastRankingStaleWarnAt = 0;
   lastRankingAttemptAt = 0;
   rankingRefreshing = null;
 }
@@ -1389,8 +1398,19 @@ async function fetchTeamRankingFromWeb(
     await page.waitForTimeout(2000);
     const entries = await extractTeamRankingEntries(page);
     const ranking = buildTeamRanking(entries, Date.now());
-    if (Object.keys(ranking.ranks).length === 0) {
-      throw new Error('nenhum time extraído da página do ranking');
+    const assessment = assessTeamRankingRefresh(
+      ranking,
+      { fallback, memory: rankingMemory },
+      MIN_TEAM_RANKING_ENTRIES,
+    );
+    if (!assessment.complete) {
+      throw new Error(
+        `ranking parcial (${assessment.entryCount} times; mínimo ${MIN_TEAM_RANKING_ENTRIES}${
+          assessment.previousEntryCount == null
+            ? ''
+            : ` e metade de ${assessment.previousEntryCount}`
+        })`,
+      );
     }
     rankingMemory = ranking;
     try {
@@ -1461,10 +1481,19 @@ export async function ensureTeamRanking(
   const maxStale = opts.maxStaleMs ?? RANKING_MAX_STALE_MS;
   const isTooOld = rankingMemory ? now - rankingMemory.fetchedAt > maxStale : false;
   if (isTooOld && rankingMemory) {
-    log.warn(
-      { ageDays: Math.round((now - rankingMemory.fetchedAt) / 86_400_000) },
-      'cache do ranking de times muito antigo (> 14 dias) — ignorado por segurança (fail-closed)',
-    );
+    // O poll roda a cada 45s: sem throttle, o mesmo cache velho produziria
+    // um aviso novo a cada ciclo. Uma vez por hora basta para lembrar o
+    // dono sem enterrar o log.
+    if (now - lastRankingStaleWarnAt >= RANKING_WARN_EVERY_MS) {
+      lastRankingStaleWarnAt = now;
+      log.warn(
+        {
+          ageDays: Math.round((now - rankingMemory.fetchedAt) / 86_400_000),
+          maxStaleDays: Math.ceil(maxStale / 86_400_000),
+        },
+        'cache do ranking de times muito antigo — ignorado por segurança (fail-closed)',
+      );
+    }
   }
   const fallback = isTooOld ? null : rankingMemory;
 
@@ -1477,9 +1506,21 @@ export async function ensureTeamRanking(
     if (!(lastRankingAttemptAt > 0 && now - lastRankingAttemptAt < RANKING_RETRY_MS)) {
       lastRankingAttemptAt = now;
       const refresh = opts.fetchRanking ?? ((fb) => fetchTeamRankingFromWeb(opts, fb));
-      rankingRefreshing = refresh(fallback).finally(() => {
-        rankingRefreshing = null;
-      });
+      // O refresh fica detached quando há cache: uma rejeição não pode
+      // virar `unhandledRejection` num daemon 24/7. O fallback já foi
+      // devolvido ao chamador; a promise só atualiza o cache em memória.
+      rankingRefreshing = Promise.resolve()
+        .then(() => refresh(fallback))
+        .catch((error) => {
+          log.warn(
+            { err: String(error).slice(0, 300) },
+            'falha inesperada no refresh do ranking de times',
+          );
+          return fallback;
+        })
+        .finally(() => {
+          rankingRefreshing = null;
+        });
     }
   }
 

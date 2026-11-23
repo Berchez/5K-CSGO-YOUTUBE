@@ -1,7 +1,7 @@
 import './env.js';
 import fs from 'node:fs';
 import path from 'node:path';
-import { repoPath } from './paths.js';
+import { repoPath, resolveWatchlistFilePath } from './paths.js';
 import {
   cappedLatencyChannels,
   deprecatedEnvVars,
@@ -9,6 +9,7 @@ import {
   getConfig,
   invalidBoolEnvs,
   invalidShortsOverlayEnvs,
+  rankCrossFieldErrors,
 } from './config.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
@@ -28,7 +29,11 @@ import {
   shouldStopRecorder,
   type UpcomingMatch,
 } from './monitor/hltvMonitor.js';
-import { applyRankThreshold } from './monitor/teamRanking.js';
+import {
+  applyRankThreshold,
+  rankSearchIsInert,
+  rankThresholdIsBinding,
+} from './monitor/teamRanking.js';
 import {
   computePollDecision,
   pollForceReasons,
@@ -216,19 +221,6 @@ let activeWatchlist: WatchlistDoc | null = null;
 // dentro do poll — um poll que lança exceção não vira hot-loop) e o
 // sleep usa a hora para debounce (um salvamento = um poll, não um por
 // toque de arquivo).
-/**
- * Caminho da watchlist do canal default (BR).
- *
- * `WATCHLIST_FILE` no `.env` (relativo à raiz do repo ou absoluto). O
- * default continua `./data/watchlist.json` — o mesmo arquivo de sempre;
- * um caminho relativo é resolvido a partir da raiz do repo (não do CWD),
- * como os outros caminhos do runtime.
- */
-function watchlistFilePath(cfg: { WATCHLIST_FILE: string }): string {
-  const raw = cfg.WATCHLIST_FILE;
-  return path.isAbsolute(raw) ? raw : repoPath(raw);
-}
-
 const watchlistSignal = createWatchlistSignal();
 
 function startWatchlistWatcher(watchlistFile: string): void {
@@ -410,15 +402,21 @@ function trayMatchesFrom(
       m.minKills ?? minKillsForStars(m.stars, cfg.MIN_KILLS, cfg.MIN_KILLS_NO_STARS);
     // A fonte do limiar vai junto do número: o painel precisa dizer se o
     // 5 veio da watchlist, da política por estrelas ou da regra de rank.
-    // "rank" só quando o limiar de rank é o que vale (o mais permissivo
-    // entre política e rank vence).
+    // "rank" quando o limiar de rank é o efetivo: numa partida exclusiva
+    // do rank vale RANK_MIN_KILLS mesmo se maior; nos demais casos, o
+    // limiar mais permissivo entre política e rank vence.
     const generalThreshold = minKillsForStars(
       m.stars,
       cfg.MIN_KILLS,
       cfg.MIN_KILLS_NO_STARS,
     );
-    const rankIsBinding =
-      m.rankQualified === true && !m.watchlisted && cfg.RANK_MIN_KILLS <= generalThreshold;
+    const rankIsBinding = rankThresholdIsBinding({
+      rankQualified: m.rankQualified === true,
+      watchlisted: m.watchlisted === true,
+      rankOnly: m.rankOnly === true,
+      rankMinKills: cfg.RANK_MIN_KILLS,
+      generalMinKills: generalThreshold,
+    });
     const policy = {
       minKills,
       stars: m.stars,
@@ -2297,7 +2295,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
   // Watchlist: hot-reload por mtime (barato a cada poll). JSON inválido
   // mantém a última versão boa; arquivo ausente mantém a última versão por
   // até 1 min (save/rename do editor) e depois cai na política por estrelas.
-  const watchlist = loadWatchlistFile(watchlistFilePath(cfg));
+  const watchlist = loadWatchlistFile(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
   activeWatchlist = watchlist.doc;
   const watchlistStale = watchlist.missing && watchlist.stale;
   if (watchlist.changed) {
@@ -2322,7 +2320,13 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
   // Ranking HLTV (segundo fator de busca): partida SEM estrela entra quando
   // a soma dos ranks é baixa ou um dos times é forte. Sem rank legível a
   // regra fica INATIVA (fail-closed) e estrelas/watchlist seguem normais.
-  const rankEnabled = cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0;
+  const rankConfigErrors = rankCrossFieldErrors({
+    sumMax: cfg.RANK_SUM_MAX,
+    strongMax: cfg.RANK_STRONG_MAX,
+  });
+  const rankEnabled =
+    rankConfigErrors.length === 0 &&
+    (cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0);
   const teamRanking = await ensureTeamRanking({
     enabled: rankEnabled,
     url: cfg.RANKING_URL,
@@ -2826,7 +2830,7 @@ async function main(): Promise<void> {
   await ensureDirs(cfg);
   initTrayStatus(cfg);
   startTrayStatusHeartbeat();
-  startWatchlistWatcher(watchlistFilePath(cfg));
+  startWatchlistWatcher(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
   setTrayStatusPhase('monitoring');
   const log = getLogger();
   /**
@@ -2911,7 +2915,40 @@ async function main(): Promise<void> {
   const loggedOut = loadLoggedOut();
   // A regra de rank muda o limiar de 4k quando a condição é atendida (não
   // importa o número de estrelas) — o log de boot precisa dizer isso.
-  const rankEnabled = cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0;
+  const rankConfigErrors = rankCrossFieldErrors({
+    sumMax: cfg.RANK_SUM_MAX,
+    strongMax: cfg.RANK_STRONG_MAX,
+  });
+  const rankEnabled =
+    rankConfigErrors.length === 0 &&
+    (cfg.RANK_SUM_MAX > 0 || cfg.RANK_STRONG_MAX > 0);
+  if (rankConfigErrors.length > 0) {
+    log.warn(
+      { errors: rankConfigErrors.map((error) => error.message) },
+      'configuração inválida da regra de ranking — a regra foi desligada; a captura principal continua normal',
+    );
+  }
+  if (
+    rankConfigErrors.length === 0 &&
+    rankSearchIsInert({
+      sumMax: cfg.RANK_SUM_MAX,
+      strongMax: cfg.RANK_STRONG_MAX,
+      minStars: cfg.MIN_STARS,
+      rankMinStars: cfg.RANK_MIN_STARS,
+      topTierOnly: cfg.TOP_TIER_ONLY,
+      starsMode: cfg.RANK_STARS_MODE,
+    })
+  ) {
+    log.warn(
+      {
+        minStars: cfg.MIN_STARS,
+        rankMinStars: cfg.RANK_MIN_STARS,
+        topTierOnly: cfg.TOP_TIER_ONLY,
+        rankStarsMode: cfg.RANK_STARS_MODE,
+      },
+      'regra de ranking inerte: em below-general sem top-tier, nenhuma faixa de estrelas pode ser recusada pelo filtro geral e aceita pelo piso do rank — ajuste MIN_STARS/RANK_MIN_STARS ou use RANK_STARS_MODE=any',
+    );
+  }
   log.info(
     {
       minStars: cfg.MIN_STARS,
@@ -3033,7 +3070,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     stopping = true;
-    stopWatchlistWatcher(watchlistFilePath(cfg));
+    stopWatchlistWatcher(resolveWatchlistFilePath(cfg.WATCHLIST_FILE));
     shutdownTrayStatus();
     for (const recorder of activeRecorders.values()) {
       await recorder.stop().catch(() => undefined);

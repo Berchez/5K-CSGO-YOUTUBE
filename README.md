@@ -186,9 +186,11 @@ accepts a match:
 - **Sum** (`RANK_SUM_MAX`, X): the match enters when `rank(team1) + rank(team2)`
   is **below** X. Both sides can generate clips. `70` accepts NIP #18 + BIG
   #34 (52) and rejects #30 + #45.
-- **Strong team** (`RANK_STRONG_MAX`, Y, expected `< X`): when the sum does not
-  pass, the match still enters if **one** team is ranked below Y. `30` lets
-  NIP #18 in against a lower-ranked opponent.
+- **Strong team** (`RANK_STRONG_MAX`, Y): when the sum does not
+  pass, the match still enters if **one** team is ranked below Y. When both
+  rules are enabled, Y must be smaller than X; a strong-team-only setup is
+  valid with `RANK_SUM_MAX=0`. `30` lets NIP #18 in against a lower-ranked
+  opponent.
 - **The rank has its own stars** (`RANK_STARS_MODE`, independent of
   `MIN_STARS`). The rank rule is a **fallback tier**: it exists to fill the
   days without a big match, not to reclassify matches the stars already
@@ -221,6 +223,14 @@ accepts a match:
   team floors.
 - **Defaults are off:** `RANK_SUM_MAX=0` and `RANK_STRONG_MAX=0` disable the
   rule (zero I/O — the ranking page is not even opened).
+- **Inert combinations:** `below-general` requires a match rejected by the
+  general filter **and** accepted by `RANK_MIN_STARS`. Without top-tier, no
+  star range is eligible when `MIN_STARS=0` (everything passes the general
+  filter) or when `RANK_MIN_STARS>=MIN_STARS` (every star accepted by the
+  rank floor already passes the general filter). The bot logs a warning at
+  startup. For the rank fallback, use `MIN_STARS>=1` and
+  `RANK_MIN_STARS<MIN_STARS`, or use `RANK_STARS_MODE=any` when lowering the
+  threshold is the intended goal.
 
 The rank comes from `https://www.hltv.org/ranking/teams` (the listing does not
 expose it), read in the same stealth browser and cached in

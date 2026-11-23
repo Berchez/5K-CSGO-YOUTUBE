@@ -1,6 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { boolEnv, ConfigSchema, parseBoolEnv, shortsCrossFieldErrors } from './config.js';
+import {
+  boolEnv,
+  ConfigSchema,
+  parseBoolEnv,
+  rankCrossFieldErrors,
+  shortsCrossFieldErrors,
+} from './config.js';
 import type { AppConfig } from './config.js';
 import { providerSelectOptions } from './transcription/registry.js';
 
@@ -109,7 +115,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'RANK_STRONG_MAX',
     group: 'capture',
     label: 'Rank: time forte (Y)',
-    help: 'Com 0★, a partida entra quando UM time tem rank abaixo deste Y (esperado Y < X) — e só esse time gera clipe. 0 = desligado.',
+    help: 'Com 0★, a partida entra quando UM time tem rank abaixo deste Y — e só esse time gera clipe. Quando X e Y estão ligados, Y precisa ser menor que X; para usar só Y, deixe X=0. 0 = desligado.',
     type: 'number',
     min: 0,
     max: 500,
@@ -129,7 +135,7 @@ export const EDITABLE_FIELDS: ConfigField[] = [
     key: 'RANK_MIN_STARS',
     group: 'capture',
     label: 'Piso de estrelas — partida que entrou por rank',
-    help: 'Independente do MIN_STARS geral: 0 = sem piso (a regra de rank vale para qualquer avaliação, inclusive 0★). Com 1+, a partida só entra pelo rank se o listing mostrar pelo menos esse número de estrelas.',
+    help: 'Independente do MIN_STARS geral: 0 = sem piso (a regra de rank vale para qualquer avaliação, inclusive 0★). Com 1+, a partida só entra pelo rank se o listing mostrar pelo menos esse número de estrelas. Em below-general sem top-tier, use um valor menor que MIN_STARS para existir uma faixa elegível.',
     type: 'number',
     min: 0,
     max: 5,
@@ -1269,5 +1275,28 @@ export function validateConfigPatch(
       camHeight: effective('SHORTS_CAM_HEIGHT'),
     }),
   );
+  const effectiveRank = (key: 'RANK_SUM_MAX' | 'RANK_STRONG_MAX'): number => {
+    const raw = values[key] ?? current[key];
+    if (raw != null && String(raw).trim() !== '') {
+      const n = Number(String(raw).trim());
+      if (Number.isFinite(n)) return n;
+    }
+    const parsed = ConfigSchema.shape[key].safeParse(undefined);
+    return parsed.success ? Number(parsed.data) : 0;
+  };
+  // X/Y só entram na validação cruzada quando o patch ALTERA o rank.
+  // Uma configuração legada inválida no `.env` não pode bloquear uma
+  // alteração sem relação; o runtime já a trata como ranking desligado.
+  const rankTouched =
+    Object.prototype.hasOwnProperty.call(values, 'RANK_SUM_MAX') ||
+    Object.prototype.hasOwnProperty.call(values, 'RANK_STRONG_MAX');
+  if (rankTouched) {
+    errors.push(
+      ...rankCrossFieldErrors({
+        sumMax: effectiveRank('RANK_SUM_MAX'),
+        strongMax: effectiveRank('RANK_STRONG_MAX'),
+      }),
+    );
+  }
   return errors.length > 0 ? { ok: false, errors } : { ok: true, values };
 }

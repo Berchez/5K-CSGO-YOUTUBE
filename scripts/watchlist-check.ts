@@ -1,6 +1,6 @@
 import '../src/env.js';
 import path from 'node:path';
-import { repoPath } from '../src/paths.js';
+import { resolveWatchlistFilePath } from '../src/paths.js';
 import { getConfig } from '../src/config.js';
 import { matchPassesFilter } from '../src/monitor/hltvMonitor.js';
 import {
@@ -22,7 +22,7 @@ function envInt(value: string | undefined, fallback: number): number {
 
 const fileArg = argValue('--file=');
 const cfg = getConfig();
-const defaultFile = cfg.WATCHLIST_FILE ? repoPath(cfg.WATCHLIST_FILE) : repoPath('data', 'watchlist.json');
+const defaultFile = resolveWatchlistFilePath(cfg.WATCHLIST_FILE);
 const file = fileArg ? path.resolve(fileArg) : defaultFile;
 const starsRaw = Number(argValue('--stars=') ?? '0');
 const stars = Number.isFinite(starsRaw) ? Math.max(0, Math.min(5, Math.trunc(starsRaw))) : 0;
