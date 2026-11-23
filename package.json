@@ -13,6 +13,7 @@
     "grok:login": "tsx scripts/grok-login.ts",
     "gemini:probe": "tsx scripts/gemini-probe.ts",
     "check:youtube": "tsx scripts/check-youtube.ts",
+    "db:migrate": "tsx scripts/migrate-db.ts",
     "check:meta": "tsx scripts/check-metadata.ts",
     "check:live": "tsx scripts/check-live.ts",
     "test:vod": "tsx scripts/test-vod.ts",

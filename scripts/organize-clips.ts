@@ -14,6 +14,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import { getConfig } from '../src/config.js';
 import { getDb } from '../src/db.js';
 
@@ -32,6 +34,47 @@ function groupKey(stem: string, stemsInRoot: Set<string>): string {
 function splitStored(p: string): { sep: string; parts: string[] } {
   const sep = p.includes('\\') ? '\\' : '/';
   return { sep, parts: p.split(/[\\/]/) };
+}
+
+/** Linha do banco que pode ser atualizada ao mover um arquivo. */
+export interface ClipPathRow {
+  id: number;
+  filePath: string;
+  channelId: string;
+}
+
+/**
+ * Chave canônica de um caminho. O Windows não diferencia maiúsculas de
+ * minúsculas; os demais sistemas mantêm a diferença.
+ */
+export function canonicalPathKey(filePath: string, baseDir = process.cwd()): string {
+  const resolved = path.resolve(baseDir, filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/**
+ * Seleciona somente as linhas que apontam EXATAMENTE para o arquivo que
+ * será movido na raiz configurada. Não usar apenas o basename: outra raiz
+ * (ou outro canal) pode ter um arquivo com o mesmo nome.
+ */
+export function rowsForClipPath(
+  rows: readonly ClipPathRow[],
+  clipsDir: string,
+  fileName: string,
+  channelId = DEFAULT_CHANNEL_ID,
+): ClipPathRow[] {
+  const expected = canonicalPathKey(path.join(clipsDir, fileName));
+  return rows.filter(
+    (row) =>
+      row.channelId === channelId && canonicalPathKey(row.filePath) === expected,
+  );
+}
+
+/** Caminho da linha depois de colocar o arquivo na pasta do clipe. */
+export function movedFilePath(storedPath: string, folder: string): string {
+  const { sep, parts } = splitStored(storedPath);
+  if (parts.length < 2) return storedPath;
+  return [...parts.slice(0, -1), folder, parts[parts.length - 1]].join(sep);
 }
 
 async function main(): Promise<void> {
@@ -62,25 +105,18 @@ async function main(): Promise<void> {
 
   const db = getDb(cfg.DB_PATH);
   const rows = db
-    .prepare('SELECT id, file_path AS filePath FROM clips')
-    .all() as Array<{ id: number; filePath: string }>;
-  // Índice: nome-do-arquivo (minúsculo) -> linhas (só as que apontam p/ a raiz de clips)
-  const byName = new Map<string, Array<{ id: number; filePath: string }>>();
-  for (const r of rows) {
-    const { parts } = splitStored(r.filePath);
-    if (parts.length < 2) continue;
-    const parent = parts[parts.length - 2].toLowerCase();
-    if (parent !== 'clips') continue;
-    const key = parts[parts.length - 1].toLowerCase();
-    const list = byName.get(key) ?? [];
-    list.push(r);
-    byName.set(key, list);
-  }
-
+    .prepare(
+      `SELECT id, file_path AS filePath, channel_id AS channelId
+       FROM clips WHERE channel_id=?`,
+    )
+    .all(DEFAULT_CHANNEL_ID) as ClipPathRow[];
   let movedFiles = 0;
   let movedWithDb = 0;
   let movedOrphan = 0;
-  const upd = db.prepare('UPDATE clips SET file_path = ? WHERE id = ?');
+  const upd = db.prepare(
+    `UPDATE clips SET file_path = ?
+     WHERE id=? AND file_path=? AND channel_id=?`,
+  );
 
   if (apply) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -104,14 +140,21 @@ async function main(): Promise<void> {
       const to = path.join(destDir, name);
       moveOne(from, to);
       if (name.toLowerCase().endsWith('.mp4')) {
-        const candidates = byName.get(name.toLowerCase()) ?? [];
+        const candidates = rowsForClipPath(rows, clipsDir, name);
+        const touchedBefore = dbTouched.length;
         for (const c of candidates) {
-          const { sep, parts } = splitStored(c.filePath);
-          const next = [...parts.slice(0, -1), folder, parts[parts.length - 1]].join(sep);
-          if (apply) upd.run(next, c.id);
-          dbTouched.push(c.id);
+          const next = movedFilePath(c.filePath, folder);
+          if (apply) {
+            const changed = upd.run(next, c.id, c.filePath, DEFAULT_CHANNEL_ID).changes;
+            if (changed > 0) dbTouched.push(c.id);
+            else {
+              console.warn(
+                `  linha #${c.id} mudou durante a organização — não foi atualizada`,
+              );
+            }
+          } else dbTouched.push(c.id);
         }
-        if (candidates.length > 0) movedWithDb++;
+        if (dbTouched.length > touchedBefore) movedWithDb++;
         else movedOrphan++;
       }
       movedFiles++;
@@ -128,7 +171,20 @@ async function main(): Promise<void> {
   if (!apply) console.log('rode com --apply para executar (com backup automático do banco).');
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+/** Executa a organização somente quando o arquivo é chamado diretamente. */
+const isMain = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(entry) === path.resolve(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
