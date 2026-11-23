@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildClipSidecar,
+  buildShortMarker,
   normalizeClipSidecar,
   normalizeShortMarker,
   omitNullFields,
@@ -183,6 +184,7 @@ describe('sidecar v2: escrita e round-trip', () => {
     },
   ];
   const ace: AceEvent = {
+    channelId: 'br',
     matchId: '2399851',
     map: 'Mirage',
     round: 1,
@@ -559,6 +561,7 @@ describe('sidecar v1 em disco: backup na 1ª migração', () => {
     writeShortMarker(file, {
       schemaVersion: 2,
       kind: 'short',
+      channelId: 'br',
       createdAt: new Date().toISOString(),
       attempts: 0,
       lastAttemptAt: null,
@@ -617,6 +620,7 @@ describe('sidecar: as stats vêm das KILLS (o resumo do round é obsoleto)', () 
       },
     ];
     return {
+      channelId: 'br',
       matchId: '2399851',
       map: 'Mirage',
       round: 1,
@@ -673,6 +677,7 @@ describe('sidecar: posição da kill no clipe vindo do VOD', () => {
   it('VOD sem epoch: videoSec = atVodSec − vod.atSec', () => {
     const side = buildClipSidecar({
       ace: {
+        channelId: 'br',
         matchId: '2399851',
         map: 'Mirage',
         round: 1,
@@ -707,6 +712,7 @@ describe('sidecar: posição da kill no clipe vindo do VOD', () => {
   it('sem `vod.atSec` a posição continua desconhecida (não inventa)', () => {
     const side = buildClipSidecar({
       ace: {
+        channelId: 'br',
         matchId: '2399851',
         map: 'Mirage',
         round: 1,
@@ -739,6 +745,7 @@ describe('sidecar: confiança da âncora (diagnóstico da janela)', () => {
   it('o ace escreve a confiança no sidecar', () => {
     const side = buildClipSidecar({
       ace: {
+        channelId: 'br',
         matchId: '2399851',
         map: 'Mirage',
         round: 1,
@@ -758,6 +765,7 @@ describe('sidecar: confiança da âncora (diagnóstico da janela)', () => {
   it('sobrevive ao round-trip (v2 -> normalize -> v2 -> ace)', () => {
     const side = buildClipSidecar({
       ace: {
+        channelId: 'br',
         matchId: '2399851',
         map: 'Mirage',
         round: 1,
@@ -779,5 +787,129 @@ describe('sidecar: confiança da âncora (diagnóstico da janela)', () => {
   it('ausente no sidecar v1 fica null (não inventa confiança)', () => {
     const side = normalizeClipSidecar(v1Sidecar());
     expect(side?.anchorConfidence).toBeNull();
+  });
+});
+
+describe('sidecar e marker: canal', () => {
+  const ace: AceEvent = {
+    channelId: 'br',
+    matchId: '2399851',
+    map: 'Mirage',
+    round: 1,
+    player: 'FalleN',
+    team1: 'Legacy',
+    team2: 'FURIA',
+    event: 'IEM Rio 2026',
+    detectedAt: new Date(CLIP_START_MS).toISOString(),
+    kills: [],
+  };
+
+  it('sidecar antigo sem channelId é do canal default (br)', () => {
+    expect(normalizeClipSidecar(v1Sidecar()).channelId).toBe('br');
+  });
+
+  it('normaliza o channelId gravado (trim + minúsculo)', () => {
+    expect(normalizeClipSidecar({ ...v1Sidecar(), channelId: ' EN ' }).channelId).toBe('en');
+  });
+
+  it('channelId inválido é erro (não vira br: o clipe EN iria para o BR)', () => {
+    expect(() => normalizeClipSidecar({ ...v1Sidecar(), channelId: '???' })).toThrow(
+      /channelId inválido/,
+    );
+  });
+
+  it('buildClipSidecar grava o canal e sobrevive ao round-trip', () => {
+    const side = buildClipSidecar({
+      ace: { ...ace, channelId: 'en' },
+      clip: { file: 'clip.mp4', startMs: CLIP_START_MS, durationSec: 30 },
+    });
+    expect(side.channelId).toBe('en');
+    const again = normalizeClipSidecar(JSON.parse(JSON.stringify(side)));
+    expect(again.channelId).toBe('en');
+  });
+
+  it('buildClipSidecar sem canal grava br (writer antigo)', () => {
+    const side = buildClipSidecar({
+      ace,
+      clip: { file: 'clip.mp4', startMs: CLIP_START_MS, durationSec: 30 },
+    });
+    expect(side.channelId).toBe('br');
+  });
+
+  it('buildShortMarker grava o canal e o normalize o mantém', () => {
+    const marker = buildShortMarker({
+      channelId: 'en',
+      source: {
+        clipFile: 'clip.mp4',
+        sidecarFile: 'clip.json',
+        matchId: '2399851',
+        map: 'Mirage',
+        round: 1,
+        player: 'FalleN',
+        clipStartMs: CLIP_START_MS,
+        clipDurationSec: 30,
+      },
+      short: {
+        file: 'short.mp4',
+        width: 1080,
+        height: 1920,
+        startSec: 0,
+        durationSec: 30,
+        window: {
+          startSec: 0,
+          endSec: 8,
+          durSec: 8,
+          includedKills: [],
+          droppedKills: [],
+        },
+        kills: [],
+        render: null,
+        captions: null,
+        overlaySpec: null,
+      },
+      metadata: null,
+      publication: { youtubeId: null, publishedAt: null, privacy: null },
+      attempts: 0,
+      lastAttemptAt: null,
+    });
+    expect(marker.channelId).toBe('en');
+    const again = normalizeShortMarker(JSON.parse(JSON.stringify(marker)));
+    expect(again?.channelId).toBe('en');
+  });
+
+  it('buildShortMarker sem canal grava br; marker antigo lê br', () => {
+    const marker = buildShortMarker({
+      channelId: 'br',
+      source: {
+        clipFile: null,
+        sidecarFile: null,
+        matchId: '1',
+        map: 'Dust2',
+        round: 1,
+        player: 'x',
+        clipStartMs: null,
+        clipDurationSec: null,
+      },
+      short: {
+        file: null,
+        width: null,
+        height: null,
+        startSec: 0,
+        durationSec: null,
+        window: null,
+        kills: [],
+        render: null,
+        captions: null,
+        overlaySpec: null,
+      },
+      metadata: null,
+      publication: { youtubeId: null, publishedAt: null, privacy: null },
+      attempts: 0,
+      lastAttemptAt: null,
+    });
+    expect(marker.channelId).toBe('br');
+    expect(
+      normalizeShortMarker({ matchId: '1', map: 'Dust2', round: 1, player: 'x' })?.channelId,
+    ).toBe('br');
   });
 });

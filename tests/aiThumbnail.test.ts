@@ -16,6 +16,7 @@ import { buildClipSidecar } from '../src/clipper/sidecar.js';
 import { makeSmartThumbnail } from '../src/clipper/thumbnail.js';
 
 const ace = {
+  channelId: 'br',
   matchId: 'm1',
   map: 'anubis',
   round: 9,

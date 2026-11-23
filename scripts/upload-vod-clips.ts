@@ -13,8 +13,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import { getConfig } from '../src/config.js';
-import { getDb, insertClip } from '../src/db.js';
+import { getDb, insertAce, insertClip } from '../src/db.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
 import { buildVideoMetadataSafe } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
@@ -56,6 +58,92 @@ function buildAce(side: ClipSidecarV2): AceEvent {
   return ace;
 }
 
+/** Linha do clipe VOD já registrada para este ace (se existir). */
+export interface VodClipRow {
+  filePath: string;
+  youtubeVideoId: string | null;
+  title: string | null;
+  publishedAt: string | null;
+}
+
+/**
+ * Procura o registro VOD pelo mesmo ace do sidecar. O formato `vod` é
+ * separado do formato do clipe live para não sobrescrever o vídeo já
+ * publicado pelo bot.
+ */
+export function findVodClip(dbFile: string, ace: AceEvent): VodClipRow | null {
+  const row = getDb(dbFile)
+    .prepare(
+      `SELECT c.file_path AS filePath,
+              c.youtube_video_id AS youtubeVideoId,
+              c.title AS title,
+              c.published_at AS publishedAt
+       FROM clips c
+       JOIN ace_events e ON e.id = c.ace_id
+       WHERE e.channel_id=? AND e.match_id=? AND e.map=? AND e.round=? AND e.player=?
+         AND c.channel_id=? AND COALESCE(c.format, '')=?
+       ORDER BY c.id DESC
+       LIMIT 1`,
+    )
+    .get(
+      ace.channelId,
+      ace.matchId,
+      ace.map,
+      ace.round,
+      ace.player,
+      ace.channelId,
+      'vod',
+    ) as VodClipRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Garante que o ace e o clipe VOD existam no banco. É idempotente: pode
+ * ser chamada para reconciliar um sidecar que já tem `youtubeId`, sem
+ * reenviar o vídeo.
+ */
+export function registerVodClip(
+  dbFile: string,
+  ace: AceEvent,
+  filePath: string,
+  privacy: string,
+  videoId: string,
+  options: { title?: string | null; publishedAt?: string | null } = {},
+): number {
+  const existing = findVodClip(dbFile, ace);
+  if (existing?.youtubeVideoId && existing.youtubeVideoId !== videoId) {
+    throw new Error(
+      `vídeo VOD já registrado (${existing.youtubeVideoId}) não confere com o sidecar (${videoId})`,
+    );
+  }
+  const aceId = insertAce(dbFile, ace, ace.channelId);
+  insertClip(dbFile, aceId, filePath, privacy, videoId, {
+    format: 'vod',
+    // Na reconciliação, não apaga o título/data que já estavam no banco.
+    title: options.title ?? existing?.title ?? null,
+    publishedAt:
+      options.publishedAt ?? existing?.publishedAt ?? new Date().toISOString(),
+  });
+  return aceId;
+}
+
+/** Persiste a publicação no sidecar sem apagar metadados de thumbnail. */
+function persistPublication(
+  sidecarPath: string,
+  videoId: string,
+  publishedAt: string,
+  thumbnailAi?: boolean,
+  thumbnailPath?: string | null,
+): boolean {
+  return updateClipSidecar(sidecarPath, (s) => {
+    s.publication ??= { youtubeId: null, publishedAt: null, thumbnailAi: false };
+    s.publication.youtubeId = videoId;
+    s.publication.publishedAt = publishedAt;
+    if (thumbnailAi !== undefined) s.publication.thumbnailAi = thumbnailAi;
+    if (thumbnailPath) s.clip.thumbnailFile = path.basename(thumbnailPath);
+  });
+}
+
 async function main(): Promise<void> {
   const cfg = getConfig();
   const targets = process.argv.slice(2).length
@@ -85,17 +173,66 @@ async function main(): Promise<void> {
       console.error(`${name}: sidecar inválido — pulando`);
       continue;
     }
-    if (side.publication?.youtubeId) {
-      console.log(`${name}: já enviado (https://youtu.be/${side.publication.youtubeId}) — pulando`);
+    // Este script ainda usa as credenciais e a config do canal default.
+    // Não processar um sidecar de outro canal: publicá-lo aqui poderia
+    // mandar um clipe EN para a conta do BR.
+    if (side.channelId !== DEFAULT_CHANNEL_ID) {
+      console.error(
+        `${name}: canal ${side.channelId} — upload-vod-clips ainda processa somente o canal ${DEFAULT_CHANNEL_ID}`,
+      );
       continue;
     }
     const mp4 = path.join(dir, side.clip.file ?? `${name}.mp4`);
+    const ace = buildAce(side);
+    const existingVod = findVodClip(cfg.DB_PATH, ace);
+
+    // O sidecar pode ter o youtubeId de uma execução anterior enquanto a
+    // escrita no banco falhou (ou foi feita por uma versão antiga do
+    // script). Reconciliar o registro NÃO reenvia o vídeo.
+    if (side.publication?.youtubeId) {
+      const videoId = side.publication.youtubeId;
+      const publishedAt =
+        side.publication.publishedAt ?? existingVod?.publishedAt ?? new Date().toISOString();
+      try {
+        registerVodClip(cfg.DB_PATH, ace, mp4, cfg.YT_PRIVACY, videoId, {
+          publishedAt,
+        });
+      } catch (e) {
+        throw new Error(
+          `falha ao reconciliar o clipe VOD ${videoId} no banco: ${String(e)}`,
+        );
+      }
+      console.log(
+        `${name}: já enviado (https://youtu.be/${videoId}) — registro no banco reconciliado`,
+      );
+      continue;
+    }
+
+    // O inverso também pode acontecer: o banco foi gravado e o sidecar
+    // ficou sem o youtubeId. Recupera o sidecar e não duplica o upload.
+    if (existingVod?.youtubeVideoId) {
+      const videoId = existingVod.youtubeVideoId;
+      const publishedAt = existingVod.publishedAt ?? new Date().toISOString();
+      if (!persistPublication(sidecarPath, videoId, publishedAt)) {
+        throw new Error(
+          `falha ao reconciliar o youtubeId ${videoId} no sidecar (${sidecarPath})`,
+        );
+      }
+      console.log(
+        `${name}: já enviado (https://youtu.be/${videoId}) — sidecar reconciliado`,
+      );
+      continue;
+    }
+
     if (!fs.existsSync(mp4)) {
       console.error(`${name}: mp4 ausente (${mp4}) — pulando`);
       continue;
     }
+    // O ace precisa existir antes do upload: se a publicação falhar no
+    // meio, a próxima execução encontra o evento e pode reconciliar o
+    // registro em vez de criar um segundo clipe.
+    insertAce(cfg.DB_PATH, ace, ace.channelId);
     console.log(`\n== ${name} ==`);
-    const ace = buildAce(side);
 
     // Referências (foto do player, logos, mapa) — cache em data/clips/refs.
     let refs: ReferenceImages = {};
@@ -180,43 +317,55 @@ async function main(): Promise<void> {
     console.log(`  ✓ https://youtu.be/${videoId} (${cfg.YT_PRIVACY})`);
 
     // Registro no banco (mesmo ace_event do bot) + sidecar atualizado.
-    // O sidecar é gravado ANTES do insert: se o banco falhar, o
-    // youtubeId já está no disco e o script não reenvia o vídeo.
-    //
-    // A falha de escrita NÃO pode passar em silêncio: sem o youtubeId no
-    // sidecar, a próxima rodada REENVIA o vídeo (o canal ganha dois
-    // vídeos do mesmo clipe). O lote para aqui para o dono resolver.
-    const saved = updateClipSidecar(sidecarPath, (s) => {
-      s.publication ??= { youtubeId: null, publishedAt: null, thumbnailAi: false };
-      s.publication.youtubeId = videoId;
-      s.publication.publishedAt = new Date().toISOString();
-      s.publication.thumbnailAi = thumbPath != null;
-      if (thumbPath) s.clip.thumbnailFile = path.basename(thumbPath);
-    });
+    // Primeiro persistimos o banco e depois o sidecar. Se uma das escritas
+    // falhar, a próxima execução reconcilia a outra pelo videoId — sem
+    // reenviar o vídeo.
+    const publishedAt = new Date().toISOString();
+    let registrationError: unknown = null;
+    try {
+      registerVodClip(cfg.DB_PATH, ace, mp4, cfg.YT_PRIVACY, videoId, {
+        title: metadata?.title ?? null,
+        publishedAt,
+      });
+    } catch (e) {
+      // Ainda tentamos gravar o sidecar: com o youtubeId em disco, a
+      // próxima rodada consegue reparar o banco sem duplicar o upload.
+      registrationError = e;
+    }
+    const saved = persistPublication(
+      sidecarPath,
+      videoId,
+      publishedAt,
+      thumbPath != null,
+      thumbPath,
+    );
     if (!saved) {
       throw new Error(
         `falha ao gravar o youtubeId no sidecar (${sidecarPath}) — o vídeo JÁ foi enviado (${videoId}); lote interrompido para não reenviar`,
       );
     }
-
-    const db = getDb(cfg.DB_PATH);
-    const row = db
-      .prepare('SELECT id FROM ace_events WHERE match_id=? AND map=? AND round=? AND player=?')
-      .get(ace.matchId, ace.map, ace.round, ace.player) as { id: number } | undefined;
-    // `format: 'vod'` é obrigatório: sem ele, o clipe do VOD cairia na
-    // MESMA linha do clipe do bot (mesmo ace, formato vazio) e
-    // sobrescreveria o `youtube_video_id` do vídeo já publicado.
-    if (row) {
-      insertClip(cfg.DB_PATH, row.id, mp4, cfg.YT_PRIVACY, videoId, {
-        format: 'vod',
-        title: metadata?.title ?? null,
-        publishedAt: new Date().toISOString(),
-      });
-    } else console.warn('  ace_event não encontrado no banco — clipe não registrado');
+    if (registrationError) {
+      throw new Error(
+        `falha ao registrar o clipe VOD ${videoId} no banco: ${String(registrationError)}`,
+      );
+    }
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+/** Executa o pipeline somente quando o arquivo é chamado diretamente. */
+const isMain = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(entry) === path.resolve(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

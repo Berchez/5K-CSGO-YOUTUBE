@@ -23,6 +23,7 @@ import { waitForClearance } from '../src/monitor/hltvMonitor.js';
 import { upscaleClip } from '../src/clipper/clipBuilder.js';
 import { buildClipSidecar, writeClipSidecar } from '../src/clipper/sidecar.js';
 import { buildRoundSummary } from '../src/detector/aceDetector.js';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import type { AceEvent, KillEvent } from '../src/types.js';
 
 const require = createRequire(import.meta.url);
@@ -343,6 +344,7 @@ async function main(): Promise<void> {
       }
       fs.renameSync(tmpPath, finalPath);
       const ace: AceEvent = {
+        channelId: DEFAULT_CHANNEL_ID,
         matchId,
         matchUrl,
         map,

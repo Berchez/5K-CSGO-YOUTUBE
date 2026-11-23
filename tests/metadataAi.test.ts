@@ -11,6 +11,7 @@ import { buildMetadataContext } from '../src/uploader/videoMetadata.js';
 import type { AceEvent } from '../src/types.js';
 
 const ace: AceEvent = {
+  channelId: 'br',
   matchId: '1',
   map: 'Mirage',
   round: 12,

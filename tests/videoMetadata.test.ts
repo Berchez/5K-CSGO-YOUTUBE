@@ -40,7 +40,9 @@ function makeKills(count: number, weapon = 'ak47'): KillEvent[] {
 
 function makeAce(overrides: Partial<AceEvent> = {}): AceEvent {
   const kills = overrides.kills ?? makeKills(5);
+  const { channelId = 'br', ...otherOverrides } = overrides;
   return {
+    channelId,
     matchId: '2399745',
     map: 'Mirage',
     round: 12,
@@ -51,7 +53,7 @@ function makeAce(overrides: Partial<AceEvent> = {}): AceEvent {
     detectedAt: '2026-10-27T16:48:50.654Z',
     kills,
     score: '3-6',
-    ...overrides,
+    ...otherOverrides,
   };
 }
 

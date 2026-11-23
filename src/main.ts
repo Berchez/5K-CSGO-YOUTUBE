@@ -4,13 +4,19 @@ import path from 'node:path';
 import { repoPath, resolveWatchlistFilePath } from './paths.js';
 import {
   cappedLatencyChannels,
+  channelConfigWarnings,
+  channelIsolationErrors,
+  channelRegistryErrors,
   deprecatedEnvVars,
   divergentLatencyEnvs,
+  getChannelConfig,
   getConfig,
   invalidBoolEnvs,
   invalidShortsOverlayEnvs,
   rankCrossFieldErrors,
+  unknownChannelEnvVars,
 } from './config.js';
+import { DEFAULT_CHANNEL_ID } from './channels.js';
 import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
 import { ensureTray } from './tray.js';
@@ -699,7 +705,12 @@ async function handleAce(
   cfg: ReturnType<typeof getConfig>,
 ): Promise<void> {
   const log = getLogger();
-  if (hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player)) {
+  const channelId = ace.channelId;
+  if (!channelId) {
+    log.error({ matchId, player: ace.player }, 'ace sem channelId — descartado antes do banco');
+    return;
+  }
+  if (hasAce(cfg.DB_PATH, ace.matchId, ace.map, ace.round, ace.player, channelId)) {
     log.info('ace duplicado, ignorando');
     return;
   }
@@ -812,7 +823,7 @@ async function handleAce(
       player: ace.player,
       reason: motivo,
       detectedAt: ace.detectedAt,
-    });
+    }, channelId);
     return;
   }
   /**
@@ -857,7 +868,7 @@ async function handleAce(
       player: ace.player,
       reason: motivo,
       detectedAt: ace.detectedAt,
-    });
+    }, channelId);
     return;
   }
   if (spreadCheck.warning) {
@@ -876,7 +887,7 @@ async function handleAce(
       'dispersão das kills acima do normal — seguindo (sem descarte)',
     );
   }
-  const aceId = insertAce(cfg.DB_PATH, ace);
+  const aceId = insertAce(cfg.DB_PATH, ace, channelId);
   addPendingClip(matchId);
   // Guarda de restart (tray/painel) lê o status: publica já, sem esperar
   // o fim do poll — a janela logo após a detecção é a mais crítica.
@@ -2693,6 +2704,7 @@ async function pollOnce(watchlistVersion: number): Promise<PollOutcome> {
           );
           return handleAce(
             {
+              channelId: DEFAULT_CHANNEL_ID,
               matchId: m.matchId,
               map: a.map,
               round: a.round,
@@ -2822,8 +2834,16 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
-  ensureTray();
   const cfg = getConfig();
+  const channelErrors = channelRegistryErrors(cfg);
+  if (channelErrors.length > 0) {
+    getLogger().error(
+      { errors: channelErrors },
+      'registro de canais inválido (CHANNELS) — encerrando',
+    );
+    process.exit(1);
+  }
+  ensureTray();
   // Bins vendored (.tools/) no PATH: o clipper resolve o ffmpeg pelo caminho,
   // mas o yt-dlp (binário externo) procura o ffmpeg pelo PATH. Igual ao test-vod.
   process.env.PATH = `${path.resolve('.tools')}${path.delimiter}${process.env.PATH ?? ''}`;
@@ -2970,6 +2990,87 @@ async function main(): Promise<void> {
     },
     `bot iniciado (multikills ${cfg.MIN_KILLS}k+ com estrela / ${cfg.MIN_KILLS_NO_STARS}k sem estrela live${rankEnabled ? ` / ${cfg.RANK_MIN_KILLS}k quando a condição de rank passa (${cfg.RANK_STARS_MODE})` : ''}, 16:9, log em arquivo)`,
   );
+  /**
+   * Config EFETIVA por canal (global + `EN_*`). O log global acima mostra
+   * o BR; aqui cada canal aparece com o prefixo já resolvido — sem isso,
+   * uma chave `EN_*` digitada errada passaria despercebida.
+   *
+   * Canal fora do padrão (não-`br`): erro de config DESABILITA só ele e
+   * o BR segue normal (invariante "erro de um canal não derruba o outro").
+   * O canal default com config inválida é fatal: sem ele o bot não roda.
+   */
+  for (const channelId of cfg.CHANNELS) {
+    const isDefault = channelId === DEFAULT_CHANNEL_ID;
+    const errors: string[] = [];
+    let channel: ReturnType<typeof getChannelConfig> | null = null;
+    try {
+      channel = getChannelConfig(channelId);
+    } catch (e) {
+      errors.push(String(e).slice(0, 400));
+    }
+    if (channel) errors.push(...channelIsolationErrors(channelId));
+    const warnings = channelConfigWarnings(channelId);
+    if (warnings.length > 0) {
+      log.warn(
+        { channel: channelId, vars: warnings },
+        'valor de env do canal não reconhecido (ligado/desligado) ou adesivo inválido — YT_UPLOAD/SHORTS_ENABLED ficam DESLIGADOS, o resto usa o default',
+      );
+    }
+    const ignored = unknownChannelEnvVars(channelId);
+    if (ignored.length > 0) {
+      log.warn(
+        { channel: channelId, vars: ignored },
+        'envs do canal IGNORADAS pelo bot (chave global ou desconhecida)',
+      );
+    }
+    if (errors.length > 0 || !channel) {
+      if (isDefault) {
+        log.error(
+          { channel: channelId, errors },
+          'config do canal default inválida — encerrando',
+        );
+        process.exit(1);
+      }
+      log.error(
+        { channel: channelId, errors },
+        'config do canal inválida — canal DESABILITADO (o BR segue normal)',
+      );
+      notifyWindows(
+        '5K Bot: canal inválido',
+        `Canal "${channelId}" desabilitado: ${errors[0] ?? 'config inválida'}`,
+      );
+      continue;
+    }
+    log.info(
+      {
+        channel: channelId,
+        default: isDefault,
+        name: channel.CHANNEL_NAME || '(sem nome)',
+        language: channel.CHANNEL_LANGUAGE,
+        minStars: channel.MIN_STARS,
+        topTierOnly: channel.TOP_TIER_ONLY,
+        minKills: channel.MIN_KILLS,
+        minKillsNoStars: channel.MIN_KILLS_NO_STARS,
+        stream: channel.STREAM_PRIORITY,
+        gaulesFallback: channel.STREAM_GAULES_FALLBACK,
+        enCountries: channel.STREAM_EN_COUNTRIES || '(off)',
+        clipsDir: channel.CLIPS_DIR,
+        bufferDir: channel.BUFFER_DIR,
+        watchlist: channel.WATCHLIST_FILE,
+        upload: channel.YT_UPLOAD,
+        privacy: channel.YT_PRIVACY,
+        token: channel.YT_TOKEN_PATH,
+        shorts: channel.SHORTS_ENABLED,
+      },
+      'config do canal',
+    );
+    if (!isDefault) {
+      log.warn(
+        { channel: channelId },
+        'canal configurado mas INATIVO — o runtime multi-canal (fase 2) ainda não sobe',
+      );
+    }
+  }
   // Envs que o bot IGNORA: o zod aceita qualquer coisa e o dono acaba
   // achando que a configuração velha ainda vale (a depreciação silenciosa
   // já custou um .env inteiro de ajustes de A/V).
@@ -3066,6 +3167,19 @@ async function main(): Promise<void> {
     log.warn(
       'ffmpeg/yt-dlp ausentes (nem no PATH nem em .tools/). Sem eles não há buffer local — o bot só detecta, sem cortar clipes.',
     );
+  }
+
+  // Inicialização e migração do banco com fail-fast no boot:
+  // se o SQLite estiver corrompido ou o rebuild falhar, aborta logo no boot
+  // com log fatal e notificação do Windows em vez de falhar repetidamente
+  // a cada 45s no loop de poll enquanto o pm2 reporta "online".
+  try {
+    getDb(cfg.DB_PATH);
+  } catch (e) {
+    const msg = `Falha fatal ao inicializar/migrar o banco de dados (${cfg.DB_PATH}): ${String(e)}`;
+    log.fatal({ err: String(e), dbPath: cfg.DB_PATH }, 'falha na inicialização do banco');
+    notifyWindows('5K Bot: erro no banco de dados', msg);
+    process.exit(1);
   }
 
   const shutdown = async (): Promise<void> => {

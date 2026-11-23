@@ -48,6 +48,37 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
   team1-team2: os times trocam de lado no halftime. O `round.winner` só é
   preenchido quando a origem sabe (VOD/demo) — não derive do placar CT-T.
 
+---
+
+## Multi-canal (BR + EN) — fases 0/1 prontas, runtime EN ainda não
+
+- O canal default é **sempre `br`** (`DEFAULT_CHANNEL_ID`): dados legados,
+  sidecar v1 e o runtime BR são do `br`. **Não existe env para trocar o
+  default** (era `DEFAULT_CHANNEL`, removido).
+- `CHANNELS=br,en` registra os canais; canal **fora** da lista é erro
+  (`getChannelConfig`). O canal default lê as chaves **sem prefixo**
+  (`BR_*` é ignorado).
+- Canal **não-default** é fail-closed: `YT_UPLOAD`/`SHORTS_ENABLED` só
+  ligam com valor explícito e **válido**; `YT_TOKEN_PATH`,
+  `YT_CLIENT_SECRETS`, `CLIPS_DIR`, `BUFFER_DIR`, `SHORTS_DIR`,
+  `WATCHLIST_FILE`, `SHORTS_OVERLAY_CONFIG` e `CHANNEL_LANGUAGE` são
+  **obrigatórios** e não podem apontar para o caminho do BR
+  (`channelIsolationErrors`). Canal inválido é **desabilitado**, o BR
+  segue normal.
+- Banco: `channel_id` em `ace_events`/`clips`/`discarded_events`; o
+  `clips.channel_id` é **derivado do ace** (`insertClip`), não vem do
+  chamador. Dedup, cota e Shorts publicados são por canal.
+- Sidecar/marker: `channelId` obrigatório na leitura — ausente = `br`,
+  **inválido = erro** (não vira `br`).
+- Migração do banco: rebuild de `ace_events` com backup automático
+  (`<db>.pre-channel.bak`), `tx.immediate()`, contagem e
+  `foreign_key_check`. `npm run db:migrate` = dry-run; `--apply` migra.
+- **As fases 2+ não existem ainda**: canal configurado além do BR só é
+  logado ("inativo"), não captura nem publica nada.
+- Plano completo: `docs/multi-canal.md`.
+
+---
+
 ## Shorts
 
 - Adesivo (sticker) por clipe: `config/shorts-overlays.json` (chave = pasta do

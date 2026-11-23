@@ -618,6 +618,7 @@ describe.skipIf(!ffmpegOk)('trava de saída do render (nunca shippar vazio)', ()
         '-f', 'mpegts', seg,
       ]);
       const ace = {
+        channelId: 'br',
         matchId: 'voidclip', map: 'Cache', round: 1, player: 'x',
         team1: 'A', team2: 'B', event: 'E',
         detectedAt: new Date().toISOString(),
@@ -785,6 +786,7 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           segs.push(f);
         }
         const ace = {
+          channelId: 'br',
           matchId: 'bb', map: 'Cache', round: 3, player: 'x',
           team1: 'A', team2: 'B', event: 'E',
           detectedAt: new Date().toISOString(),
@@ -898,6 +900,7 @@ describe.skipIf(!ffmpegOk)('makeClipThumbnail (F4: thumb depois do upload)', () 
         clipPath,
       ]);
       const ace = {
+        channelId: 'br',
         matchId: 'm1', map: 'Mirage', round: 3, player: 'x',
         team1: 'A', team2: 'B', event: 'E',
         detectedAt: new Date().toISOString(),

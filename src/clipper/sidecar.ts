@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import { getLogger } from '../logger.js';
+import { channelIdOrDefault } from '../channels.js';
 import type {
   AceEvent,
   AnchorConfidence,
@@ -155,6 +157,11 @@ export interface ClipKillfeedV2 {
 export interface ClipSidecarV2 {
   schemaVersion: typeof SIDECAR_VERSION;
   kind: 'clip';
+  /**
+   * Canal que gerou o clipe (multi-canal). Sidecar antigo (v1) não tem o
+   * campo: o normalize preenche com o canal default (`br`).
+   */
+  channelId: string;
   createdAt: string;
   detectedAt: string;
   startedAt: string | null;
@@ -244,6 +251,11 @@ export interface ShortWindowV2 {
 export interface ShortMarkerV2 {
   schemaVersion: typeof SIDECAR_VERSION;
   kind: 'short';
+  /**
+   * Canal que gerou o Short. Marker antigo (v1) não tem o campo: o
+   * normalize preenche com o canal default (`br`).
+   */
+  channelId: string;
   createdAt: string;
   source: {
     clipFile: string | null;
@@ -762,7 +774,8 @@ function normalizeKillfeed(raw: Obj): ClipKillfeedV2 | null {
 
 /**
  * Converte qualquer sidecar (v1 flat ou v2) no formato canônico v2.
- * Nunca lança: campos ausentes viram null/default.
+ * Preenche campos ausentes com null/default; lança erro se `channelId`
+ * for inválido (fail-closed: sidecar com canal corrompido).
  */
 export function normalizeClipSidecar(raw: unknown): ClipSidecarV2 {
   const r = obj(raw);
@@ -806,6 +819,7 @@ export function normalizeClipSidecar(raw: unknown): ClipSidecarV2 {
   return {
     schemaVersion: SIDECAR_VERSION,
     kind: 'clip',
+    channelId: channelIdOrDefault(r.channelId),
     createdAt,
     detectedAt: iso(r.detectedAt) ?? createdAt,
     startedAt: iso(r.startedAt),
@@ -938,6 +952,7 @@ export function buildClipSidecar(input: BuildClipSidecarInput): ClipSidecarV2 {
   return {
     schemaVersion: SIDECAR_VERSION,
     kind: 'clip',
+    channelId: channelIdOrDefault(ace.channelId),
     createdAt,
     detectedAt: ace.detectedAt || createdAt,
     startedAt: ace.startedAt ?? null,
@@ -1150,7 +1165,11 @@ export function readClipSidecar(file: string): ClipSidecarV2 | null {
   if (!fs.existsSync(file)) return null;
   try {
     return normalizeClipSidecar(JSON.parse(fs.readFileSync(file, 'utf8')));
-  } catch {
+  } catch (e) {
+    getLogger().warn(
+      { err: String(e).slice(0, 200), file },
+      'falha ao ler/normalizar sidecar do clipe',
+    );
     return null;
   }
 }
@@ -1267,6 +1286,7 @@ export function sidecarToAce(side: ClipSidecarV2, killsOverride?: ClipKillV2[]):
   };
   const sync = side.sync;
   return {
+    channelId: side.channelId,
     matchId: side.match.id,
     map: side.round.map,
     round: side.round.number,
@@ -1346,6 +1366,8 @@ export function sidecarToAce(side: ClipSidecarV2, killsOverride?: ClipKillV2[]):
 
 export interface BuildShortMarkerInput {
   createdAt?: string;
+  /** Canal que gerou o Short. */
+  channelId: string;
   source: ShortMarkerV2['source'];
   short: ShortMarkerV2['short'];
   metadata: ShortMarkerV2['metadata'];
@@ -1358,6 +1380,7 @@ export function buildShortMarker(input: BuildShortMarkerInput): ShortMarkerV2 {
   return {
     schemaVersion: SIDECAR_VERSION,
     kind: 'short',
+    channelId: channelIdOrDefault(input.channelId),
     createdAt: input.createdAt ?? new Date().toISOString(),
     source: input.source,
     short: input.short,
@@ -1390,6 +1413,7 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
     return {
       schemaVersion: SIDECAR_VERSION,
       kind: 'short',
+      channelId: channelIdOrDefault(r.channelId),
       createdAt: iso(r.createdAt) ?? new Date(0).toISOString(),
       source: {
         clipFile: str(source.clipFile),
@@ -1450,6 +1474,7 @@ export function normalizeShortMarker(raw: unknown): ShortMarkerV2 | null {
   return {
     schemaVersion: SIDECAR_VERSION,
     kind: 'short',
+    channelId: channelIdOrDefault(r.channelId),
     createdAt:
       iso(r.createdAt) ?? iso(r.publishedAt) ?? iso(r.lastAttemptAt) ?? new Date(0).toISOString(),
     source: {
@@ -1506,7 +1531,11 @@ export function readShortMarker(file: string): ShortMarkerV2 | null {
   if (!fs.existsSync(file)) return null;
   try {
     return normalizeShortMarker(JSON.parse(fs.readFileSync(file, 'utf8')));
-  } catch {
+  } catch (e) {
+    getLogger().warn(
+      { err: String(e).slice(0, 200), file },
+      'falha ao ler/normalizar marker do Short',
+    );
     return null;
   }
 }

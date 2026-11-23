@@ -23,6 +23,7 @@ import {
   readClipSidecar,
   writeClipSidecar,
 } from '../src/clipper/sidecar.js';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import type { AceEvent, KillEvent } from '../src/types.js';
 
 const require = createRequire(import.meta.url);
@@ -906,6 +907,7 @@ async function main(): Promise<void> {
     }
     const mainWeapon = [...weaponCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
     const ace: AceEvent = {
+      channelId: DEFAULT_CHANNEL_ID,
       matchId: MATCH_ID,
       matchUrl: MATCH_URL,
       map: mapName,

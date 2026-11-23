@@ -12,9 +12,11 @@ import path from 'node:path';
 import { getConfig } from '../src/config.js';
 import { buildAiBackground } from '../src/clipper/aiThumbnail.js';
 import type { AiProvider } from '../src/clipper/aiThumbnail.js';
+import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import type { AceEvent } from '../src/types.js';
 
 const sample: AceEvent = {
+  channelId: DEFAULT_CHANNEL_ID,
   matchId: 'probe',
   map: 'Cache',
   round: 10,
