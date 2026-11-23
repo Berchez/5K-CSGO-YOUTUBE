@@ -4,21 +4,43 @@ Bot que monitora partidas ao vivo na HLTV, grava um buffer local da stream,
 detecta multikills (4K/5K), corta o clipe, publica no YouTube (privado por
 padrão) e grava o SQLite. O `index.py` é o legado de 2021 — não é o runtime.
 
-Arquitetura e convenções de código: `.github/copilot-instructions.md`.
+Arquitetura completa e mapa de módulos: `ARCHITECTURE.md`.
 Operação (envs, latência, Shorts, thumbs): `README.md`.
+Arquitetura de código e convenções: `.github/copilot-instructions.md`.
+Bugs conhecidos e melhorias pendentes: `BUGS.md`.
+Scripts utilitários: `SCRIPTS.md`.
 
-## Comandos (rode da raiz do repo)
+---
 
-- Antes de terminar: `npm run lint` (`tsc --noEmit`), `npm test` (vitest) e
-  `npm run build` (`tsc -p tsconfig.build.json` → `dist/`). Os três têm que
-  passar.
-- Um teste: `npm test -- tests/arquivo.test.ts`.
-- O `lint` typechecka `src/`, `scripts/` e `tests/` — o vitest não checa tipos,
-  então é ele que pega o erro de tipo no teste.
-- Produção: pm2 `5k-bot` → `dist/src/main.js` (cwd fixo no
-  `ecosystem.config.cjs`); depois de `npm run build`, `pm2 restart 5k-bot`.
-- One-off: `npx tsx scripts/x.ts --flag` (no Windows `npm run x -- --flag` às
-  vezes engole as flags).
+## Comandos essenciais (rode da raiz do repo)
+
+```powershell
+# Antes de terminar qualquer sessão de edição:
+npm run lint        # tsc --noEmit: typechecka src/, scripts/ e tests/
+npm test            # vitest (puro, sem rede/credenciais/binários)
+npm run build       # tsc -p tsconfig.build.json → dist/
+
+# Rodar um teste específico:
+npm test -- tests/aceDetector.test.ts
+npm test -- tests/aceDetector.test.ts -t "nome do teste"
+
+# Scripts one-off (preferir npx tsx no Windows — o npm run engole flags):
+npx tsx scripts/diag-clip-window.ts -- data/clips/<pasta>
+npx tsx scripts/explain.ts --match <matchId>
+npx tsx scripts/enrich-clip.ts --clip data/clips/<pasta>  # dry-run
+npx tsx scripts/enrich-clip.ts --clip data/clips/<pasta> --apply
+
+# Produção:
+npm run build
+pm2 restart 5k-bot   # cwd fixo via ecosystem.config.cjs → dist/src/main.js
+```
+
+> [!IMPORTANT]
+> `lint` typechecka os tipos. O `vitest` **não** checa tipos — um erro de tipo
+> no teste só aparece no `lint`. Os três (`lint`, `test`, `build`) têm que
+> passar antes de qualquer commit.
+
+---
 
 ## Killfeed do scorebot (dado, não relógio)
 
@@ -32,6 +54,8 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
 - Backfill de clipe já gravado: `npx tsx scripts/enrich-clip.ts --clip <pasta>`
   (dry-run; `--apply` grava). O filtro é **estrito**: kill sem round (`round: 0`)
   ou sem mapa NÃO entra.
+
+---
 
 ## Sidecar (v2 em disco)
 
@@ -97,25 +121,7 @@ Operação (envs, latência, Shorts, thumbs): `README.md`.
 - Retry do Gemini: só 5xx/`UNAVAILABLE`/"high demand" repetem; **429 de cota
   não**. `SHORTS_CAPTION_GEMINI_RETRIES` = tentativas no TOTAL (default 3).
 
-## Regras do projeto
-
-- **Comentários, logs e mensagens em português.** Código (funções/variáveis)
-  em inglês.
-- **Copy em português:** é "na Dust2" (com A), não "no Dust2" — vale para
-  adesivo, título, descrição e legenda.
-- **Funções puras + teste.** Regra de negócio em função pura testável; o
-  efeito colateral fica no chamador. Testes são puros (sem rede, credenciais
-  ou binários externos).
-- ESM/NodeNext: import relativo leva `.js` (`import './env.js'`).
-- Config é uma fonte só: schema Zod/defaults em `src/config.ts`; o painel
-  (`src/trayConfig.ts`) e os validadores leem dela — não duplique regra.
-- Playwright `page.evaluate` roda na página: o `tsx` injeta `__name` nas
-  funções nomeadas e a página não tem esse helper (o `getBrowser` injeta um
-  shim identidade). Arrow anônima como argumento (`.filter((e) => …)`) é
-  seguro; binding nomeado dentro do callback não é.
-- **Nunca commitar/pushar** sem pedido explícito. `.env`, `token.json`,
-  `client_secrets.json` e perfis de login não são versionados.
-- **Não mexer em `data/`, `logs/`** (artefatos de produção) sem pedido.
+---
 
 ## A janela do clipe (leia antes de mexer no corte)
 
@@ -137,6 +143,35 @@ npm run diag:clip -- --match <matchId> --ocr
 npm run explain -- --match <matchId>   # política de kills + o que faltou em cada round (só log)
 ```
 
+---
+
+## Regras do projeto
+
+- **Comentários, logs e mensagens em português.** Código (funções/variáveis)
+  em inglês.
+- **Copy em português:** é "na Dust2" (com A), não "no Dust2" — vale para
+  adesivo, título, descrição e legenda.
+- **Funções puras + teste.** Regra de negócio em função pura testável; o
+  efeito colateral fica no chamador. Testes são puros (sem rede, credenciais
+  ou binários externos).
+- ESM/NodeNext: import relativo leva `.js` (`import './env.js'`).
+- Config é uma fonte só: schema Zod/defaults em `src/config.ts`; o painel
+  (`src/trayConfig.ts`) e os validadores leem dela — não duplique regra.
+- Playwright `page.evaluate` roda na página: o `tsx` injeta `__name` nas
+  funções nomeadas e a página não tem esse helper (o `getBrowser` injeta um
+  shim identidade). Arrow anônima como argumento (`.filter((e) => …)`) é
+  seguro; binding nomeado dentro do callback não é.
+- **Nunca commitar/pushar** sem pedido explícito. `.env`, `token.json`,
+  `client_secrets.json` e perfis de login não são versionados.
+- **Não mexer em `data/`, `logs/`** (artefatos de produção) sem pedido.
+- Escrita de sidecar/marker: **sempre via `writeClipSidecar()`/`writeShortMarker()`**
+  (`src/clipper/sidecar.ts`) — escrita atômica com `.tmp`+`rename`. Nunca
+  use `fs.writeFileSync` diretamente no sidecar ou marker.
+- Binários externos: **nunca chame `ffmpeg`/`ffprobe` pelo nome**. Use
+  `resolveFfmpegBin()`/`resolveFfprobeBin()` de `src/clipper/segmentProbe.ts`.
+
+---
+
 ## Ambiente
 
 - `ffmpeg`, `ffprobe` e `yt-dlp` ficam em `.tools/` (gitignored; o boot avisa
@@ -152,3 +187,21 @@ npm run explain -- --match <matchId>   # política de kills + o que faltou em ca
 - PowerShell: `node -e` perde aspas duplas (use here-string
   `@'...'@ | node --input-type=module -`) e `Set-Content` grava BOM (edite com
   as ferramentas de arquivo).
+- Node.js ≥ 22 obrigatório (`engines.node >= 22` no `package.json`).
+  Playwright: `npx playwright install chromium` uma vez após `npm install`.
+
+---
+
+## Notas para agentes de IA
+
+- **Não modifique `data/` nem `logs/`** sem pedido explícito — são artefatos de
+  produção.
+- **Não commite nem dê push** sem autorização explícita do usuário. Nunca
+  versione `.env`, `token.json`, `client_secrets.json` ou perfis do browser.
+- Antes de opinar sobre a janela do clipe, **rode o harness**
+  (`npm run diag:clip`) e leia `docs/janela-do-clipe.md`.
+- O `tsconfig.json` inclui `tests/` para o editor; o `tsconfig.build.json`
+  exclui `tests/` — só o `lint` garante tipos em testes.
+- `session-ses_e58c.md` e `.opencode/` são gitignored e contêm estado de
+  sessões de agentes anteriores — úteis para contexto histórico, mas não são
+  parte do código.
