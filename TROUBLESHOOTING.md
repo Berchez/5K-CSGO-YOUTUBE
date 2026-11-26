@@ -65,7 +65,7 @@ npx tsx scripts/check-youtube.ts
 Select-String -LiteralPath logs/bot.log -Pattern "quota"
 ```
 
-- Cota: `YT_QUOTA_UNITS_PER_DAY` (default 10000; cada upload = 1600 units)
+- Cota de uploads: `YT_UPLOADS_PER_DAY` (default 100; cada `videos.insert` = 1 chamada; 2 reservadas para uso manual por padrão)
 - Dia começa no fuso `YT_QUOTA_TIMEZONE` (padrão: Pacífico)
 - **Elevar o teto é MANUAL** — o código só lê o `.env`, não escreve nele
 

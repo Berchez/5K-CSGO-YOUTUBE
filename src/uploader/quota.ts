@@ -1,22 +1,22 @@
 /**
  * Guarda de cota do YouTube (puro).
  *
- * Cada `videos.insert` custa 1600 units do limite diário do projeto de
- * API. A decisão é isolada aqui (função pura) para poder ser testada
+ * `videos.insert` tem um bucket próprio, separado das units dos demais
+ * endpoints. A decisão é isolada aqui (função pura) para poder ser testada
  * sem tocar no banco nem na rede.
  */
 
-export const QUOTA_UNITS_PER_UPLOAD = 1600;
+export const UPLOAD_CALLS_PER_VIDEO = 1;
 
 export interface QuotaDecision {
   /** Pode subir agora? */
   allowed: boolean;
-  /** Units já consumidas no dia. */
+  /** Uploads já consumidos no dia. */
   used: number;
-  /** Teto do dia. */
+  /** Limite diário de chamadas `videos.insert`. */
   limit: number;
-  /** Units que o upload atual consumiria. */
-  units: number;
+  /** Chamadas usadas depois do upload atual. */
+  uploads: number;
   /** Motivo da recusa (quando `allowed` é false). */
   reason?: string;
 }
@@ -24,27 +24,29 @@ export interface QuotaDecision {
 /**
  * Decide se o upload cabe na cota do dia.
  *
- * O limite e o consumo são configuráveis (o padrão do YouTube é 10000,
- * mas o projeto pode ter cota ampliada) e o dia é o do fuso configurado
- * — ver `src/timeZone.ts`.
+ * O limite padrão é 100 chamadas por dia. O dia usa o fuso configurado
+ * em `src/timeZone.ts`; a reserva manual não pode ser consumida pelo bot.
  */
 export function quotaDecision(input: {
   used: number;
   limit: number;
   perUpload?: number;
+  reservedUploads?: number;
 }): QuotaDecision {
-  const perUpload = input.perUpload ?? QUOTA_UNITS_PER_UPLOAD;
+  const perUpload = input.perUpload ?? UPLOAD_CALLS_PER_VIDEO;
   const used = Math.max(0, Number(input.used) || 0);
   const limit = Math.max(0, Number(input.limit) || 0);
-  const units = used + perUpload;
-  if (units > limit) {
+  const reservedUploads = Math.max(0, Math.floor(Number(input.reservedUploads) || 0));
+  const uploads = used + perUpload;
+  const automatedLimit = Math.max(0, limit - reservedUploads * perUpload);
+  if (uploads > automatedLimit) {
     return {
       allowed: false,
       used,
       limit,
-      units,
-      reason: `cota diária do YouTube esgotada (${used} units usados; cada upload custa ${perUpload} de ${limit})`,
+      uploads,
+      reason: `limite diário de uploads do YouTube: ${used} usados; ${reservedUploads} reservado(s) para publicação manual (${limit} no total)`,
     };
   }
-  return { allowed: true, used, limit, units };
+  return { allowed: true, used, limit, uploads };
 }

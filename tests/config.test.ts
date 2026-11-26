@@ -489,6 +489,8 @@ describe('cota: fuso do dia', () => {
       true,
     );
     expect(ConfigSchema.parse({}).YT_QUOTA_TIMEZONE).toBe('America/Los_Angeles');
+    expect(ConfigSchema.parse({}).YT_UPLOADS_PER_DAY).toBe(100);
+    expect(ConfigSchema.parse({}).YT_MANUAL_UPLOAD_RESERVE).toBe(2);
   });
 });
 

@@ -15,6 +15,8 @@ import {
   insertAce,
   insertClip,
   recordDiscardedEvent,
+  releaseYouTubeUploadReservation,
+  reserveYouTubeUpload,
 } from '../src/db.js';
 import type { AceEvent } from '../src/types.js';
 
@@ -275,6 +277,24 @@ describe('cota: contagem de publicações do dia', () => {
     db.prepare("UPDATE clips SET created_at='2026-11-14 12:00:00' WHERE youtube_video_id=?")
       .run('vid-sem-data');
     expect(countPublishedClips(file, '2026-11-14 08:00:00', 'br')).toBe(1);
+  });
+
+  it('reserva vagas atomicamente e preserva o espaço para dois uploads manuais', () => {
+    const file = tmpDb();
+    const first = reserveYouTubeUpload(file, '2026-11-14 08:00:00', '2026-11-14 08:00:00', 'br', 4, 2);
+    const second = reserveYouTubeUpload(file, '2026-11-14 08:00:00', '2026-11-14 08:00:00', 'br', 4, 2);
+    const third = reserveYouTubeUpload(file, '2026-11-14 08:00:00', '2026-11-14 08:00:00', 'br', 4, 2);
+
+    expect(first.allowed).toBe(true);
+    expect(second.allowed).toBe(true);
+    expect(third.allowed).toBe(false);
+
+    if (first.allowed) {
+      releaseYouTubeUploadReservation(file, first.reservationId);
+    }
+    expect(
+      reserveYouTubeUpload(file, '2026-11-14 08:00:00', '2026-11-14 08:00:00', 'br', 4, 2).allowed,
+    ).toBe(true);
   });
 });
 

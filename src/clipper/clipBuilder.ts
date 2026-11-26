@@ -118,6 +118,8 @@ function slug(s: string): string {
 export interface ClipOptions {
   bufferDir: string;
   clipsDir: string;
+  /** Sufixo exclusivo para renders candidatos; preserva o MP4 anterior. */
+  outputSuffix?: string;
   preRollSec: number;
   postRollSec: number;
   segmentTimeSec: number;
@@ -874,7 +876,7 @@ export async function buildClip(
     `${ace.matchId}_${slug(ace.map)}_r${ace.round}_${slug(ace.player)}`,
   );
   fs.mkdirSync(clipDir, { recursive: true });
-  const outPath = path.join(clipDir, `${base}.mp4`);
+  const outPath = path.join(clipDir, `${base}${opts.outputSuffix ?? ''}.mp4`);
   const sidecarPath = path.join(clipDir, `${base}.json`);
   /** Remove a pasta do clipe se vazia (falha antes de gerar artefatos). */
   const dropEmptyClipDir = (): void => {
@@ -1377,6 +1379,26 @@ export function patchSidecarAudit(
     coversLastKill?: boolean | null;
     startsAfterRoundEnd?: boolean | null;
     liveMaterialAvailable?: boolean | null;
+    killfeedValidation?: {
+      status: 'verified' | 'incomplete' | 'unverifiable';
+      expectedKills: number;
+      matchedKillIndexes: number[];
+      detectedKillIndexes: number[];
+      expectedKillAtSec: Array<number | null>;
+      occurrences: Array<{ killIndex: number; atSec: number }>;
+      replayOccurrences?: Array<{ killIndex: number; atSec: number }>;
+      endCorrectionMs?: number;
+      frames: number;
+      crop: string | null;
+      error?: string;
+    };
+    openingScoreValidation?: {
+      status: 'verified' | 'late' | 'unverifiable';
+      observedScores: string[];
+      retryable: boolean;
+      crop: string;
+      startCorrectionMs?: number;
+    };
   },
 ): void {
   const ok = updateClipSidecar(sidecarPath, (side) => {

@@ -32,6 +32,7 @@ import {
   auditClipWindow,
   killMaxGapMs,
   killSpreadMs,
+  replayStartsWithinOpening,
   trustedRoundEndVideoMs,
 } from '../src/clipper/clipWindowAudit.js';
 import { ocrClipWindow, summarizeKillfeedOcr } from '../src/clipper/clipWindowOcr.js';
@@ -192,8 +193,9 @@ async function auditOne(sidecarPath: string, wantOcr: boolean): Promise<void> {
       );
     }
     if (ocr.replayAtSec.length > 0) {
+      const opensInsideReplay = replayStartsWithinOpening(ocr.replayAtSec);
       console.log(
-        `   REPLAY        : banner visto em ${ocr.replayAtSec.map((sec) => `${sec.toFixed(1)}s`).join(', ')} — o clipe abre DENTRO de uma reexibição`,
+        `   REPLAY        : banner visto em ${ocr.replayAtSec.map((sec) => `${sec.toFixed(1)}s`).join(', ')} — ${opensInsideReplay ? 'abertura dentro de uma reexibição' : 'banner posterior; abertura fora do replay detectado'}`,
       );
     }
   } else if (wantOcr) {

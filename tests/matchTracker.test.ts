@@ -406,6 +406,21 @@ describe('roundEndedAt (fim real do round no relógio do jogo)', () => {
     r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, null);
     expect(r.event?.roundEndedAt).toBeUndefined();
   });
+  it('usa snap.score quando o round terminou NO MESMO round das kills', () => {
+    // Cenário: round 12 termina com 3 kills de nilo, placar final 6-5
+    const tr = new RoundTracker('inferno', 11);
+    const before = snap(5, 5, [{ name: 'nilo', kills: 10 }]);
+
+    let r = processPoll(tr, before, -1, 3, 10_000, before);
+
+    // Virada: 5-5 → 6-5, nilo da 3ª kill (10→13)
+    const after = snap(6, 5, [{ name: 'nilo', kills: 13 }]);
+
+    // roundEnded tem o MESMO round das kills (12), então usa snap.score
+    r = processPoll(tr, after, r.lastTotal, 3, 10_000, before, { round: 12, atMs: 0 });
+
+    expect(r.event?.scoreAfter).toBe('6-5');
+  });
 });
 
 describe('anchorConfidence (confiança na 1ª kill)', () => {
