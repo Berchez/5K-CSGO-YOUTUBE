@@ -818,6 +818,18 @@ describe.skipIf(!ffmpegOk)('buildClip (passada única: emenda A/V realinhada)', 
           minDurationSec: 0.5,
         });
         expect(Array.isArray(sidecar.window?.freeze?.intervals)).toBe(true);
+        const originalBytes = fs.readFileSync(out.filePath);
+        const candidate = await buildClip(ace, segs, {
+          bufferDir: dir,
+          clipsDir,
+          outputSuffix: '_attempt-1',
+          preRollSec: 60,
+          postRollSec: 15,
+          segmentTimeSec: 10,
+        });
+        expect(candidate.filePath).toBe(path.join(clipsDir, 'bb_Cache_r3_x', 'bb_Cache_r3_x_attempt-1.mp4'));
+        expect(fs.existsSync(candidate.filePath)).toBe(true);
+        expect(fs.readFileSync(out.filePath)).toEqual(originalBytes);
         // saída precisa ter vídeo E áudio (emenda realinhada)
         let err = '';
         try {

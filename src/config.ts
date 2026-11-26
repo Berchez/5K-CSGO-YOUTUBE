@@ -912,11 +912,14 @@ export const ConfigSchema = z.object({
   /**
    * Teto da cota diária do YouTube (units do projeto de API).
    *
-   * O padrão do YouTube é 10000 (6 uploads), mas o projeto pode ter
-   * cota ampliada — por isso é configurável. A guarda local usava o
-   * valor fixo e o dia UTC: ela bloqueava publicações legítimas.
+   * Bucket geral de endpoints (não é o limite de `videos.insert`).
+   * O limite do bucket de uploads é YT_UPLOADS_PER_DAY.
    */
   YT_QUOTA_UNITS_PER_DAY: z.coerce.number().min(1000).max(1_000_000).default(10_000),
+  /** Limite diário do bucket separado de `videos.insert` (chamadas/dia). */
+  YT_UPLOADS_PER_DAY: z.coerce.number().int().min(1).max(10_000).default(100),
+  /** Vagas que a automação preserva para uploads manuais no mesmo canal. */
+  YT_MANUAL_UPLOAD_RESERVE: z.coerce.number().int().min(0).max(9_999).default(2),
   /**
    * Fuso do dia de cota. A cota do YouTube zera à meia-noite do
    * Pacífico, não à meia-noite UTC.
@@ -1033,6 +1036,8 @@ export const CHANNEL_SCOPED_KEYS = [
   'YT_BRAND',
   'YT_DESC_CTA',
   'YT_QUOTA_UNITS_PER_DAY',
+  'YT_UPLOADS_PER_DAY',
+  'YT_MANUAL_UPLOAD_RESERVE',
   'YT_META_MODE',
   'YT_META_AI_ORDER',
   'YT_META_AI_TIMEOUT_MS',

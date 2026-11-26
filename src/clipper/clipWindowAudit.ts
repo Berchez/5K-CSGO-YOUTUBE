@@ -114,6 +114,201 @@ export interface ClipWindowVerdict {
   liveMaterialAvailable: boolean | null;
 }
 
+export interface KillfeedCoverage {
+  status: 'verified' | 'incomplete' | 'unverifiable';
+  matchedKillIndexes: number[];
+}
+
+export interface OpeningScoreCoverage {
+  status: 'verified' | 'late' | 'unverifiable';
+  observedScores: string[];
+  /** Há leitura de placar utilizável; uma tentativa mais cedo pode sanar a ambiguidade. */
+  retryable: boolean;
+}
+
+export const OPENING_SCORE_RETRY_STEP_MS = 15_000;
+export const OPENING_SCORE_RETRY_MAX_MS = 60_000;
+
+/** Publicação automática nunca pode desligar a validação visual da janela. */
+export function clipWindowValidationRequired(
+  uploadEnabled: boolean,
+  mode: 'off' | 'shadow' | 'on',
+): boolean {
+  return uploadEnabled || mode === 'on';
+}
+
+/** Só pula a medição quando o upload está desligado e o modo é `off`. */
+export function clipWindowValidationShouldRun(
+  uploadEnabled: boolean,
+  mode: 'off' | 'shadow' | 'on',
+): boolean {
+  return uploadEnabled || mode !== 'off';
+}
+
+/** Move a late or ambiguous opening earlier in bounded steps when OCR has usable evidence. */
+export function nextOpeningScoreRetryOffsetMs(
+  status: OpeningScoreCoverage['status'],
+  currentOffsetMs: number,
+  retryable = false,
+): number | null {
+  if (
+    (status !== 'late' && !(status === 'unverifiable' && retryable)) ||
+    currentOffsetMs >= OPENING_SCORE_RETRY_MAX_MS
+  ) return null;
+  return Math.min(OPENING_SCORE_RETRY_MAX_MS, currentOffsetMs + OPENING_SCORE_RETRY_STEP_MS);
+}
+
+/** Próxima tentativa de início mais cedo quando o próprio MP4 mostra replay antes da kill ao vivo. */
+export function nextClipStartCorrectionMs(currentOffsetMs: number): number | null {
+  if (currentOffsetMs >= OPENING_SCORE_RETRY_MAX_MS) return null;
+  return Math.min(OPENING_SCORE_RETRY_MAX_MS, currentOffsetMs + OPENING_SCORE_RETRY_STEP_MS);
+}
+
+/** Próxima tentativa com mais cauda quando a última kill ficou junto ao fim do MP4. */
+export function nextClipEndCorrectionMs(currentOffsetMs: number): number | null {
+  return nextClipStartCorrectionMs(currentOffsetMs);
+}
+
+/** Só considera replay na abertura quando há duas leituras próximas nos primeiros 10s. */
+export function replayStartsWithinOpening(replayAtSec: number[]): boolean {
+  const opening = replayAtSec
+    .filter((sec) => Number.isFinite(sec) && sec >= 0 && sec <= 10)
+    .sort((a, b) => a - b);
+  return opening.some((sec, index) => index > 0 && sec - opening[index - 1] <= 1.5);
+}
+
+/** Decide se a evidência do MP4 justifica reconstruir o início mais cedo. */
+export function clipStartCorrectionReason(input: {
+  openingScoreStatus: OpeningScoreCoverage['status'];
+  openingScoreRetryable: boolean;
+  matchedKillIndexes: number[];
+  firstExpectedKillAtSec: number | null;
+  replayKillIndexes: number[];
+}): string | null {
+  if (input.openingScoreStatus === 'late') return 'placar do round seguinte na abertura';
+  if (input.openingScoreStatus === 'unverifiable' && input.openingScoreRetryable) {
+    return 'placar de abertura ambíguo';
+  }
+  if (
+    !input.matchedKillIndexes.includes(0) &&
+    input.firstExpectedKillAtSec != null &&
+    Number.isFinite(input.firstExpectedKillAtSec) &&
+    input.firstExpectedKillAtSec <= 15
+  ) {
+    return 'primeira kill encostada no início do clipe';
+  }
+  if (input.replayKillIndexes.some((index) => !input.matchedKillIndexes.includes(index))) {
+    return 'kill esperada só apareceu durante replay';
+  }
+  return null;
+}
+
+/** Decide se vale estender o render para incluir a última kill prevista. */
+export function clipEndCorrectionReason(input: {
+  expectedKills: number;
+  matchedKillIndexes: number[];
+  expectedLastKillAtSec: number | null;
+  clipDurationSec: number | null;
+  replayKillIndexes: number[];
+}): string | null {
+  const lastKillIndex = input.expectedKills - 1;
+  if (lastKillIndex < 0 || input.matchedKillIndexes.includes(lastKillIndex)) return null;
+  if (input.replayKillIndexes.includes(lastKillIndex)) return 'última kill só apareceu durante replay';
+  if (
+    input.expectedLastKillAtSec != null &&
+    Number.isFinite(input.expectedLastKillAtSec) &&
+    input.clipDurationSec != null &&
+    Number.isFinite(input.clipDurationSec) &&
+    input.expectedLastKillAtSec >= input.clipDurationSec - 15
+  ) return 'última kill prevista encostada no fim do clipe';
+  return null;
+}
+
+/** Publicação exige as duas confirmações visuais, inclusive para Shorts. */
+export function clipWindowValidationPassed(
+  killfeedStatus: string | null | undefined,
+  openingScoreStatus: string | null | undefined,
+  windowAction?: ClipWindowAction | string | null,
+): boolean {
+  return (
+    killfeedStatus === 'verified' &&
+    openingScoreStatus === 'verified' &&
+    windowAction !== 'discard' &&
+    windowAction !== 'replay-only'
+  );
+}
+
+/** Confirma se os primeiros segundos ainda mostram o placar anterior ao round alvo. */
+export function assessOpeningScoreCoverage(input: {
+  expectedBefore: string | null | undefined;
+  expectedAfter: string | null | undefined;
+  observations: Array<{ atSec: number; score: string }>;
+  error?: string | null;
+}): OpeningScoreCoverage {
+  const key = (value: string | null | undefined): string | null => {
+    const pair = (value ?? '').match(/^(\d{1,2})[-:](\d{1,2})$/);
+    return pair ? [Number(pair[1]), Number(pair[2])].sort((a, b) => a - b).join('-') : null;
+  };
+  const before = key(input.expectedBefore);
+  const after = key(input.expectedAfter);
+  const early = input.observations
+    .filter((item) => item.atSec >= 0 && item.atSec <= 10)
+    .sort((a, b) => a.atSec - b.atSec);
+  const readable = early.filter((item) => key(item.score) != null);
+  const firstReadableScore = readable.length > 0 ? key(readable[0].score) : null;
+  const firstFiveSec = readable.filter((item) => item.atSec <= 5);
+  const beforeReads = before ? firstFiveSec.filter((item) => key(item.score) === before).length : 0;
+  const afterReads = after ? readable.filter((item) => key(item.score) === after).length : 0;
+  if (input.error || early.length === 0 || before == null || after == null) {
+    return { status: 'unverifiable', observedScores: early.map((item) => item.score), retryable: false };
+  }
+  if (firstReadableScore === before && beforeReads >= 2) {
+    return { status: 'verified', observedScores: early.map((item) => item.score), retryable: false };
+  }
+  if (firstReadableScore === after && afterReads >= 2) {
+    return { status: 'late', observedScores: early.map((item) => item.score), retryable: true };
+  }
+  return {
+    status: 'unverifiable',
+    observedScores: early.map((item) => item.score),
+    retryable: readable.length > 0,
+  };
+}
+
+/** Cobertura OCR do MP4: sem frames válidos é inconclusiva, nunca aprovada. */
+export function assessKillfeedCoverage(input: {
+  expectedKills: number;
+  matchedKillIndexes: number[];
+  occurrences?: Array<{ killIndex: number; atSec: number }>;
+  expectedKillAtSec?: number[];
+  timingToleranceSec?: number;
+  frames: number;
+  error?: string | null;
+}): KillfeedCoverage {
+  const detected = [...new Set(input.matchedKillIndexes)]
+    .filter((index) => Number.isInteger(index) && index >= 0 && index < input.expectedKills)
+    .sort((a, b) => a - b);
+  const expectedTimes = input.expectedKillAtSec;
+  const matchedKillIndexes =
+    input.occurrences && expectedTimes
+      ? detected.filter((index) =>
+          input.occurrences!.some(
+            (occurrence) =>
+              occurrence.killIndex === index &&
+              Number.isFinite(expectedTimes[index]) &&
+              Math.abs(occurrence.atSec - expectedTimes[index]) <= (input.timingToleranceSec ?? 15),
+          ),
+        )
+      : detected;
+  if (input.error || input.frames <= 0 || input.expectedKills <= 0) {
+    return { status: 'unverifiable', matchedKillIndexes };
+  }
+  return {
+    status: matchedKillIndexes.length === input.expectedKills ? 'verified' : 'incomplete',
+    matchedKillIndexes,
+  };
+}
+
 /** Instantes observados das kills (ordenados), sem os indefinidos. */
 export function killTimesMs(kills: KillEvent[]): number[] {
   return kills

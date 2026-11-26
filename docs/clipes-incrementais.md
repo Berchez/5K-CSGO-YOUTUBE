@@ -134,9 +134,10 @@ rank continua fora.
 | `CLIP_MAX_BIG_PER_MATCH` (grande) | 3 | idem |
 | `CLIP_MAX_PER_DAY` | 6 | idem |
 
-`CLIP_MAX_PER_DAY = 6` **não é arbitrário**: cada `videos.insert` custa
-1600 units e o teto padrão do YouTube é 10000/dia. 6 × 1600 = 9600. Quem
-subir `YT_QUOTA_UNITS_PER_DAY` pode subir este teto na mesma proporção.
+`CLIP_MAX_PER_DAY = 6` limita a carga diária de clipes ao vivo. Em paralelo,
+a guarda de uploads limita `videos.insert` a 98 chamadas automáticas no padrão,
+preservando duas vagas para uso manual. Subir `YT_UPLOADS_PER_DAY` não altera
+este teto independente de clipes.
 
 ---
 

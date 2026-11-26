@@ -87,7 +87,7 @@ Este documento mapeia os problemas confirmados, edge cases perigosos, inconsist�
 
 ### 3.2. Exaustão de Cota na Thumbnail pós-Upload (`youtubeUploader.ts`)
 - **Arquivo:** `src/uploader/youtubeUploader.ts` (linhas ~110-123)
-- **Problema:** A função `applyThumbnail` roda após `uploadClip`. O upload consome 1600 units da cota do YouTube. Se o saldo de cota do dia estiver entre 1600 e 1649 units, o upload do vídeo terá sucesso, mas a chamada `thumbnails.set` (custo: 50 units) lançará erro de cota 403 `quotaExceeded`.
+- **Problema:** A função `applyThumbnail` roda após `uploadClip`. `videos.insert` usa o bucket próprio de uploads; `thumbnails.set` usa o bucket geral de units. Se o saldo do bucket geral for menor que o custo da thumbnail, o vídeo poderá subir e a chamada de thumbnail falhar com 403 `quotaExceeded`.
 - **Impacto:** O vídeo fica publicado como privado, porém sem thumbnail personalizada (permanece com o frame automático do YouTube). O erro é capturado e registrado como warning, sem retry automático posterior quando a cota resetar.
 - **Recomendação:** Registrar no SQLite (`clips.thumbnail_pending = 1`) para permitir um script de retry de thumbnail nos clipes do dia seguinte.
 

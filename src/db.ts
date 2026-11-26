@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -7,6 +8,7 @@ import {
 } from './channels.js';
 import type { AceEvent } from './types.js';
 import { getLogger } from './logger.js';
+import { quotaDecision } from './uploader/quota.js';
 
 let db: Database.Database | null = null;
 let dbPath = '';
@@ -56,6 +58,12 @@ export function getDb(dbFile: string): Database.Database {
         reason TEXT NOT NULL,
         detected_at TEXT NOT NULL,
         discarded_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS youtube_upload_reservations (
+        reservation_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        quota_day TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
     // Ordem importa: o rebuild de `ace_events` preserva os ids, então as
@@ -650,9 +658,8 @@ export function findPublishedShorts(
  *
  * `sinceSql` no formato do SQLite ('YYYY-MM-DD HH:MM:SS') — o mesmo
  * formato de `created_at`/`published_at` da tabela `clips`. Serve para a
- * guarda de cota: cada `videos.insert` custa 1600 units do limite diário
- * do YouTube, e o bot live e o script de Shorts dividem a mesma cota do
- * projeto de API.
+ * guarda de cota: cada `videos.insert` consome uma chamada do bucket diário
+ * de uploads do YouTube, compartilhado pelo bot live e pelo script de Shorts.
  *
  * A contagem é pelo `published_at` (quando o vídeo SUBIU), não pelo
  * `created_at` (quando o clipe foi gravado): um clipe antigo publicado
@@ -680,4 +687,53 @@ export function countPublishedClips(
     )
     .get(channelOf(channelId), sinceSql) as { n: number } | undefined;
   return Number(row?.n ?? 0);
+}
+
+/** Reserva atomicamente uma vaga de `videos.insert` para este dia/canal. */
+export function reserveYouTubeUpload(
+  dbFile: string,
+  sinceSql: string,
+  quotaDay: string,
+  channelId: string,
+  limit: number,
+  reservedUploads: number,
+):
+  | { allowed: true; reservationId: string; used: number }
+  | { allowed: false; reason: string; used: number } {
+  const d = getDb(dbFile);
+  const canonicalChannel = channelOf(channelId);
+  const reserve = d.transaction(() => {
+    d.prepare('DELETE FROM youtube_upload_reservations WHERE quota_day < ?').run(quotaDay);
+    const published = d.prepare(
+      `SELECT COUNT(*) AS n FROM clips
+       WHERE youtube_video_id IS NOT NULL AND channel_id = ?
+         AND datetime(COALESCE(published_at, created_at)) >= datetime(?)`,
+    ).get(canonicalChannel, sinceSql) as { n: number };
+    const pending = d.prepare(
+      `SELECT COUNT(*) AS n FROM youtube_upload_reservations
+       WHERE channel_id = ? AND quota_day = ?`,
+    ).get(canonicalChannel, quotaDay) as { n: number };
+    const used = Number(published.n) + Number(pending.n);
+    const decision = quotaDecision({ used, limit, reservedUploads });
+    if (!decision.allowed) {
+      return {
+        allowed: false as const,
+        reason: decision.reason ?? 'limite diário de uploads atingido',
+        used,
+      };
+    }
+    const reservationId = crypto.randomUUID();
+    d.prepare(
+      'INSERT INTO youtube_upload_reservations (reservation_id, channel_id, quota_day) VALUES (?, ?, ?)',
+    ).run(reservationId, canonicalChannel, quotaDay);
+    return { allowed: true as const, reservationId, used };
+  });
+  return reserve.immediate();
+}
+
+/** Libera a vaga depois do registro do vídeo ou de uma falha de upload. */
+export function releaseYouTubeUploadReservation(dbFile: string, reservationId: string): void {
+  getDb(dbFile)
+    .prepare('DELETE FROM youtube_upload_reservations WHERE reservation_id = ?')
+    .run(reservationId);
 }

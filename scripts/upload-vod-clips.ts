@@ -16,8 +16,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import { getConfig } from '../src/config.js';
-import { getDb, insertAce, insertClip } from '../src/db.js';
+import {
+  getDb,
+  insertAce,
+  insertClip,
+  releaseYouTubeUploadReservation,
+  reserveYouTubeUpload,
+} from '../src/db.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
+import { startOfDaySql } from '../src/timeZone.js';
 import { buildVideoMetadataSafe } from '../src/uploader/videoMetadata.js';
 import { createMetadataAi } from '../src/uploader/metadataAi.js';
 import { makeClipThumbnail } from '../src/clipper/clipBuilder.js';
@@ -305,15 +312,31 @@ async function main(): Promise<void> {
     console.log(`  metadados: ${metadata ? `${metadata.source} — "${metadata.title}"` : 'LEGADO (template)'}`);
 
     // Upload (unlisted) + thumbnail aplicada no vídeo.
-    const videoId = await uploadClip(ace, mp4, {
-      clientSecretsPath: cfg.YT_CLIENT_SECRETS,
-      tokenPath: cfg.YT_TOKEN_PATH,
-      privacy: cfg.YT_PRIVACY,
-      categoryId: cfg.YT_CATEGORY_ID,
-      defaultTags: cfg.YT_DEFAULT_TAGS,
-      metadata,
-      thumbnailPath: thumbPath ?? undefined,
-    });
+    const quotaDay = startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE);
+    const reservation = reserveYouTubeUpload(
+      cfg.DB_PATH,
+      quotaDay,
+      quotaDay,
+      ace.channelId,
+      cfg.YT_UPLOADS_PER_DAY,
+      cfg.YT_MANUAL_UPLOAD_RESERVE,
+    );
+    if (!reservation.allowed) throw new Error(reservation.reason);
+    let videoId: string;
+    try {
+      videoId = await uploadClip(ace, mp4, {
+        clientSecretsPath: cfg.YT_CLIENT_SECRETS,
+        tokenPath: cfg.YT_TOKEN_PATH,
+        privacy: cfg.YT_PRIVACY,
+        categoryId: cfg.YT_CATEGORY_ID,
+        defaultTags: cfg.YT_DEFAULT_TAGS,
+        metadata,
+        thumbnailPath: thumbPath ?? undefined,
+      });
+    } catch (error) {
+      releaseYouTubeUploadReservation(cfg.DB_PATH, reservation.reservationId);
+      throw error;
+    }
     console.log(`  ✓ https://youtu.be/${videoId} (${cfg.YT_PRIVACY})`);
 
     // Registro no banco (mesmo ace_event do bot) + sidecar atualizado.
@@ -327,6 +350,7 @@ async function main(): Promise<void> {
         title: metadata?.title ?? null,
         publishedAt,
       });
+      releaseYouTubeUploadReservation(cfg.DB_PATH, reservation.reservationId);
     } catch (e) {
       // Ainda tentamos gravar o sidecar: com o youtubeId em disco, a
       // próxima rodada consegue reparar o banco sem duplicar o upload.

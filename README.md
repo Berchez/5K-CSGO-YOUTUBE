@@ -917,20 +917,19 @@ muda quando a chave não está no `.env`. Atenção: quem tinha só
 de copyright ativo): se os Shorts estiverem sendo barrados, baixe o
 `SHORTS_MIN_SEC` (45s é um valor seguro).
 
-A cota do YouTube é do **projeto de API** (10 000 units/dia, 1600 por
-`videos.insert`) e é dividida com o bot: o script conta os vídeos já
-enviados no dia e recusa o lote quando a cota estourar. O dia da cota é o
-do **Pacífico** (`YT_QUOTA_TIMEZONE`, default `America/Los_Angeles`) — é
-lá que a cota zera, não em UTC — e o teto é configurável
-(`YT_QUOTA_UNITS_PER_DAY`, default `10 000`; o projeto pode subir para
-`100 000`).
+O YouTube separa `videos.insert` em um bucket próprio: cada upload consome
+uma chamada, com limite padrão de 100 por dia. A automação conta os vídeos
+registrados no banco, reserva a vaga atomicamente antes de cada envio e
+preserva duas chamadas para uploads manuais (`YT_MANUAL_UPLOAD_RESERVE=2`).
+O limite configurável é `YT_UPLOADS_PER_DAY=100`. O dia é contado no fuso
+do **Pacífico** (`YT_QUOTA_TIMEZONE`, default `America/Los_Angeles`). O
+bucket geral de 10 000 units (`YT_QUOTA_UNITS_PER_DAY`) é separado e cobre
+outros endpoints, como a aplicação de thumbnails.
 
-O cálculo é puro (`src/uploader/quota.ts` + `src/timeZone.ts`): a guarda
-libera o upload enquanto ele **cabe** na cota (o limite é inclusivo) e
-**recusa** o lote quando estoura. O teto vem do `.env`
-(`YT_QUOTA_UNITS_PER_DAY`) — **a guarda não altera o `.env`**: subir o
-teto para a publicação e voltar ao valor normal é um procedimento
-MANUAL do dono (o código só lê o valor).
+O limite inclusivo e a reserva são aplicados tanto no bot ao vivo quanto
+no publicador de Shorts. Reservas simultâneas ficam no SQLite para impedir
+que dois processos consumam a mesma última vaga. A cota e o limite do
+canal para envios manuais pelo Studio são regras distintas do YouTube.
 
 O YouTube aceita Shorts de **até 3 minutos** (180s) desde 15/out/2024 (vertical
 ou quadrado). Mas **acima de 1 minuto um Short com claim de copyright ativo

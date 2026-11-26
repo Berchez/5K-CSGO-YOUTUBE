@@ -109,6 +109,8 @@ import {
   findPublishedShorts,
   insertAce,
   insertClip,
+  releaseYouTubeUploadReservation,
+  reserveYouTubeUpload,
 } from '../src/db.js';
 import { gb, getFreeBytes, isFreeSpaceOk } from '../src/diskSpace.js';
 import {
@@ -159,6 +161,9 @@ import {
   resolveShortOverlayText,
 } from '../src/clipper/shortOverlay.js';
 import {
+  clipWindowValidationPassed,
+} from '../src/clipper/clipWindowAudit.js';
+import {
   markerOverlaySpec,
   mergeShortOverlaySources,
   overlaySpecForMarker,
@@ -167,7 +172,7 @@ import {
   type ShortOverlayConfig,
   type ShortOverlaySpec,
 } from '../src/clipper/shortOverlayConfig.js';
-import { quotaDecision, QUOTA_UNITS_PER_UPLOAD } from '../src/uploader/quota.js';
+import { UPLOAD_CALLS_PER_VIDEO } from '../src/uploader/quota.js';
 import { startOfDaySql } from '../src/timeZone.js';
 import { loadThumbFont, measureThumbText } from '../src/clipper/thumbText.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
@@ -1585,6 +1590,7 @@ async function processCandidate(
   const failedNow = captionsOn && isRetryableCaptionFailure(captionStatus) && !verdict.publish;
 
   let videoId: string | null = null;
+  let quotaReservationId: string | null = null;
   if (args.publish && !verdict.publish) {
     // A legenda foi pedida e QUEBROU: publicar assim entrega ao canal um
     // Short sem legenda que nunca mais seria refeito (o marker recebe o
@@ -1594,28 +1600,36 @@ async function processCandidate(
       `  (${verdict.reason}) — o Short NÃO vai ao ar; rode de novo para tentar a legenda de novo (ou --allow-no-captions para publicar sem ela)`,
     );
   } else if (args.publish) {
-    // Guarda de cota: cada `videos.insert` custa 1600 units do limite
-    // diário do projeto de API — o mesmo que o bot live usa. O teto e o
-    // dia (fuso do Pacífico) vêm da config.
-    const quota = quotaDecision({
-      used: ctx.quotaUsed,
-      limit: cfg.YT_QUOTA_UNITS_PER_DAY,
-    });
-    if (!quota.allowed) {
-      throw new Error(quota.reason ?? 'cota diária do YouTube esgotada');
+    // `videos.insert` usa um bucket próprio: reserve duas vagas para uploads manuais.
+    const quotaDay = startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE);
+    const reservation = reserveYouTubeUpload(
+      cfg.DB_PATH,
+      quotaDay,
+      quotaDay,
+      side.channelId,
+      cfg.YT_UPLOADS_PER_DAY,
+      cfg.YT_MANUAL_UPLOAD_RESERVE,
+    );
+    if (!reservation.allowed) throw new Error(reservation.reason);
+    quotaReservationId = reservation.reservationId;
+    try {
+      videoId = await uploadClip(ace, outMp4, {
+        clientSecretsPath: cfg.YT_CLIENT_SECRETS,
+        tokenPath: cfg.YT_TOKEN_PATH,
+        privacy,
+        categoryId: cfg.YT_CATEGORY_ID,
+        defaultTags: cfg.YT_DEFAULT_TAGS,
+        metadata,
+        isShorts: true,
+        shortsHashtag: cfg.SHORTS_HASHTAG,
+        madeForKids: false,
+      });
+      ctx.quotaUsed = reservation.used + 1;
+    } catch (error) {
+      releaseYouTubeUploadReservation(cfg.DB_PATH, quotaReservationId);
+      quotaReservationId = null;
+      throw error;
     }
-    videoId = await uploadClip(ace, outMp4, {
-      clientSecretsPath: cfg.YT_CLIENT_SECRETS,
-      tokenPath: cfg.YT_TOKEN_PATH,
-      privacy,
-      categoryId: cfg.YT_CATEGORY_ID,
-      defaultTags: cfg.YT_DEFAULT_TAGS,
-      metadata,
-      isShorts: true,
-      shortsHashtag: cfg.SHORTS_HASHTAG,
-      madeForKids: false,
-    });
-    ctx.quotaUsed = quota.units;
     console.log(`  ✓ https://youtu.be/${videoId} (${privacy})`);
   } else {
     console.log('  (dry-run: nada publicado)');
@@ -1717,6 +1731,7 @@ async function processCandidate(
       title: metadata?.title ?? null,
       publishedAt: new Date().toISOString(),
     });
+    if (quotaReservationId) releaseYouTubeUploadReservation(cfg.DB_PATH, quotaReservationId);
   }
 
   return {
@@ -1923,12 +1938,32 @@ async function main(): Promise<void> {
       );
       return false;
     });
+    const publishable = all.filter((candidate) => {
+      if (!args.publish) return true;
+      const audit = candidate.sidecar.window?.audit;
+      const record = audit != null && typeof audit === 'object'
+        ? audit as Record<string, unknown>
+        : {};
+      const killfeed = record.killfeedValidation != null && typeof record.killfeedValidation === 'object'
+        ? record.killfeedValidation as Record<string, unknown>
+        : {};
+      const openingScore = record.openingScoreValidation != null && typeof record.openingScoreValidation === 'object'
+        ? record.openingScoreValidation as Record<string, unknown>
+        : {};
+      if (clipWindowValidationPassed(
+        typeof killfeed.status === 'string' ? killfeed.status : undefined,
+        typeof openingScore.status === 'string' ? openingScore.status : undefined,
+        typeof record.action === 'string' ? record.action : undefined,
+      )) return true;
+      console.log(`- ${candidate.name}: publicação do Short bloqueada (janela sem validação visual completa)`);
+      return false;
+    });
     // `--last N` conta os clipes AINDA NÃO publicados: sem isso, os N
     // mais recentes saíam todos no lote anterior e o comando não
     // publicava nada. Clipe no BACKOFF também não conta: senão o `--last
     // N` fica preso no mesmo clipe quebrado e o lote novo não sai.
     const pending = args.last
-      ? all
+      ? publishable
           .filter((candidate) => {
             const key = aceKey(
               candidate.sidecar.match.id,
@@ -1957,7 +1992,7 @@ async function main(): Promise<void> {
             }).skip;
           })
           .slice(0, args.last)
-      : all;
+      : publishable;
 
     const useAi = metadataMode(cfg, args) === 'ai';
     const metadataAi = useAi
@@ -2010,14 +2045,14 @@ async function main(): Promise<void> {
           cfg.DB_PATH,
           startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE),
           DEFAULT_CHANNEL_ID,
-        ) * QUOTA_UNITS_PER_UPLOAD,
+        ) * UPLOAD_CALLS_PER_VIDEO,
       window,
       captionRulesHash: captionRulesHash(),
       overlayConfig: loadOverlayConfig(cfg.SHORTS_OVERLAY_CONFIG),
     };
     if (ctx.quotaUsed > 0) {
       console.log(
-        `cota do dia: ${ctx.quotaUsed} units já usadas (${ctx.quotaUsed / QUOTA_UNITS_PER_UPLOAD} vídeo(s))`,
+        `uploads do dia: ${ctx.quotaUsed} chamada(s) já usada(s)`,
       );
     }
     await runBatch(ctx, pending, lock.touch);

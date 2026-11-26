@@ -21,7 +21,16 @@ import { loadLoggedOut, loginScriptFor } from './clipper/providerStatus.js';
 import { notifyWindows } from './notify.js';
 import { ensureTray } from './tray.js';
 import { getLogger } from './logger.js';
-import { discardAce, getDb, hasAce, insertAce, insertClip, recordDiscardedEvent } from './db.js';
+import {
+  discardAce,
+  getDb,
+  hasAce,
+  insertAce,
+  insertClip,
+  recordDiscardedEvent,
+  releaseYouTubeUploadReservation,
+  reserveYouTubeUpload,
+} from './db.js';
 import { killAll } from './procRegistry.js';
 import {
   closeBrowser,
@@ -83,9 +92,26 @@ import { SegmentFreezer } from './clipper/segmentFreezer.js';
 import { computeClipAnchors, resolveClipStartAnchor, type ScoreboardEndReason } from './clipper/clipAnchors.js';
 import { cropCandidatesForStream, scanRoundEndForScoreboard } from './clipper/scoreboardSync.js';
 import { scanKillfeedForLatency, resolveReplayCrop, type KillfeedSyncResult } from './clipper/killfeedSync.js';
-import { auditClipWindow, suspectKillsSpread, trustedRoundEndVideoMs } from './clipper/clipWindowAudit.js';
-import { ocrClipWindow } from './clipper/clipWindowOcr.js';
+import {
+  assessKillfeedCoverage,
+  assessOpeningScoreCoverage,
+  clipWindowValidationPassed,
+  clipWindowValidationRequired,
+  clipWindowValidationShouldRun,
+  OPENING_SCORE_RETRY_MAX_MS,
+  clipStartCorrectionReason,
+  clipEndCorrectionReason,
+  nextClipEndCorrectionMs,
+  nextClipStartCorrectionMs,
+  replayStartsWithinOpening,
+  nextOpeningScoreRetryOffsetMs,
+  auditClipWindow,
+  suspectKillsSpread,
+  trustedRoundEndVideoMs,
+} from './clipper/clipWindowAudit.js';
+import { focusedScoreCrop, ocrClipWindow } from './clipper/clipWindowOcr.js';
 import { uploadClip, applyThumbnail } from './uploader/youtubeUploader.js';
+import { startOfDaySql } from './timeZone.js';
 import { buildVideoMetadataSafe, buildMetadataContext } from './uploader/videoMetadata.js';
 import { createMetadataAi } from './uploader/metadataAi.js';
 import type { MetadataAiFn } from './uploader/videoMetadata.js';
@@ -666,7 +692,7 @@ async function measureClipReplayBanner(
   clip: { filePath: string },
   cfg: ReturnType<typeof getConfig>,
   streamName?: string,
-): Promise<{ opensInsideReplay: boolean | null; detail: string | null }> {
+): Promise<{ opensInsideReplay: boolean | null; detail: string | null; crop: string | null }> {
   const { crop, warnings } = resolveReplayCrop({
     globalCrop: cfg.CLIP_KILLFEED_REPLAY_CROP,
     byStreamRaw: cfg.CLIP_KILLFEED_REPLAY_CROP_BY_STREAM,
@@ -674,7 +700,7 @@ async function measureClipReplayBanner(
   });
   const log = getLogger();
   for (const warning of warnings) log.warn({ clip: clip.filePath }, warning);
-  if (crop == null) return { opensInsideReplay: null, detail: null };
+  if (crop == null) return { opensInsideReplay: null, detail: null, crop: null };
   try {
     const ocr = await ocrClipWindow({
       file: clip.filePath,
@@ -687,15 +713,66 @@ async function measureClipReplayBanner(
     });
     if (ocr.error != null) {
       log.warn({ clip: clip.filePath, erro: ocr.error }, 'não foi possível ler o banner de replay');
-      return { opensInsideReplay: null, detail: ocr.error };
+      return { opensInsideReplay: null, detail: ocr.error, crop };
     }
     const seconds = ocr.replayAtSec.map((sec) => Number(sec.toFixed(1)));
-    const consecutive = seconds.some((sec, index) => index > 0 && sec - seconds[index - 1] <= 1.5);
+    const opensInsideReplay = replayStartsWithinOpening(seconds);
     const detail = seconds.length > 0 ? `REPLAY em ${seconds.join(', ')}s` : null;
-    return { opensInsideReplay: consecutive, detail };
+    return { opensInsideReplay, detail, crop };
   } catch (e) {
     log.warn({ clip: clip.filePath, err: String(e).slice(0, 120) }, 'falha ao ler o banner de replay');
-    return { opensInsideReplay: null, detail: null };
+    return { opensInsideReplay: null, detail: null, crop };
+  }
+}
+
+/** Confirma no MP4 renderizado se todas as kills aparecem no killfeed. */
+async function measureClipKillfeed(
+  clip: { filePath: string },
+  ace: AceEvent,
+  crop: string | undefined,
+  replayCrop: string | null,
+): Promise<Awaited<ReturnType<typeof ocrClipWindow>>> {
+  if (!crop) {
+    return { frames: 0, hits: [], replayAtSec: [], error: 'crop de killfeed indisponível' };
+  }
+  try {
+    return await ocrClipWindow({
+      file: clip.filePath,
+      killfeedCrop: crop,
+      replayCrop,
+      kills: ace.kills,
+      sampleFps: 1,
+    });
+  } catch (error) {
+    return { frames: 0, hits: [], replayAtSec: [], error: String(error).slice(0, 160) };
+  }
+}
+
+async function measureClipOpeningScore(
+  clip: { filePath: string },
+  expectedBefore: string | null | undefined,
+  expectedAfter: string | null | undefined,
+  crop: string,
+): Promise<ReturnType<typeof assessOpeningScoreCoverage>> {
+  try {
+    const ocr = await ocrClipWindow({
+      file: clip.filePath,
+      killfeedCrop: null,
+      replayCrop: null,
+      scoreboardCrop: crop,
+      kills: [],
+      fromSec: 0,
+      toSec: 10,
+      sampleFps: 1,
+    });
+    return assessOpeningScoreCoverage({
+      expectedBefore,
+      expectedAfter,
+      observations: ocr.scoreboard ?? [],
+      error: ocr.error,
+    });
+  } catch (error) {
+    return assessOpeningScoreCoverage({ expectedBefore, expectedAfter, observations: [], error: String(error) });
   }
 }
 
@@ -1837,9 +1914,14 @@ async function handleAce(
     // preservando mtime (seleção/trim são mtime-driven).
     let coverageDiscarded = false;
     let coverageDiscardReason = 'nenhuma kill do ace no buffer';
-    const buildClipFromBuffer = async (): Promise<ClipResult | null> => {
+    let renderAttemptNumber = 0;
+    const buildClipFromBuffer = async (
+      startCorrectionMs = 0,
+      endCorrectionMs = 0,
+    ): Promise<ClipResult | null> => {
       const sourceSegments = segments;
       const sourceEndMs = aceEndMs;
+      const correctedVideoEndMs = sourceEndMs != null ? sourceEndMs + endCorrectionMs : undefined;
       if (sourceSegments.length === 0) {
         log.warn({ matchId }, 'sem segmentos para montar o clipe');
         return null;
@@ -1943,13 +2025,15 @@ async function handleAce(
           'âncora fora do buffer — clipe com abertura incompleta (truncatedStart)',
         );
       }
+      const correctedVideoStartMs =
+        videoStartMs != null ? videoStartMs - startCorrectionMs : undefined;
       const picked = pickSegments(sourceSegments, {
         segmentTimeSec: cfg.SEGMENT_TIME_SEC,
         preRollSec: cfg.CLIP_PRE_ROLL_SEC,
         postRollSec: cfg.CLIP_POST_ROLL_SEC,
         contextSec: contextSec + startMarginSec,
-        aceStartMs: videoStartMs,
-        aceEndMs: sourceEndMs,
+        aceStartMs: correctedVideoStartMs,
+        aceEndMs: correctedVideoEndMs,
       });
       let renderSegments: string[];
       let snapDir: string | null = null;
@@ -1973,13 +2057,14 @@ async function handleAce(
         return await buildClip(clipAce, renderSegments, {
           bufferDir: snapDir ?? (picked[0] != null ? path.dirname(picked[0]) : cfg.BUFFER_DIR),
           clipsDir: cfg.CLIPS_DIR,
+          outputSuffix: renderAttemptNumber++ === 0 ? '' : `_attempt-${renderAttemptNumber - 1}`,
           preRollSec: cfg.CLIP_PRE_ROLL_SEC,
           postRollSec: cfg.CLIP_POST_ROLL_SEC,
           segmentTimeSec: cfg.SEGMENT_TIME_SEC,
           contextSec,
           startMarginSec,
-          aceStartMs: videoStartMs,
-          aceEndMs: sourceEndMs,
+          aceStartMs: correctedVideoStartMs,
+          aceEndMs: correctedVideoEndMs,
           replayAware: cfg.REPLAY_AWARE,
           frozenSource: freezer != null,
           diskMinFreeBytes: cfg.DISK_MIN_FREE_GB * 1024 ** 3,
@@ -2015,7 +2100,7 @@ async function handleAce(
       }
     };
 
-    const clipBuilt = await buildClipFromBuffer();
+    let clipBuilt = await buildClipFromBuffer();
     /**
      * GUARDRAIL DA JANELA: depois de renderizar, o clipe é conferido
      * contra as invariantes antes de ir para o YouTube.
@@ -2038,7 +2123,67 @@ async function handleAce(
      * senão "publicado marcado" é só uma promessa no log.
      */
     let replayOnly = false;
-    if (clipBuilt != null && cfg.CLIP_VALIDATE !== 'off') {
+    let blockUploadForWindowValidation = false;
+    let clipKillfeedValidationStatus = 'unverifiable';
+    let clipOpeningScoreValidationStatus = 'unverifiable';
+    // Upload automático sempre exige validação, mesmo se alguém configurar
+    // `off`/`shadow`: esses modos podem observar, mas não podem liberar vídeo.
+    const enforceClipWindowValidation = clipWindowValidationRequired(cfg.YT_UPLOAD, cfg.CLIP_VALIDATE);
+    const runClipWindowValidation = clipWindowValidationShouldRun(cfg.YT_UPLOAD, cfg.CLIP_VALIDATE);
+    if (clipBuilt != null && runClipWindowValidation) {
+      const openingScoreCrop = cropCandidatesForStream({
+        globalCrop: cfg.CLIP_SCOREBOARD_CROP,
+        byStream: cfg.CLIP_SCOREBOARD_CROP_BY_STREAM,
+        streamName,
+        fallbacks: cfg.CLIP_SCOREBOARD_CROP_FALLBACKS,
+      })[0];
+      const focusedOpeningScoreCrop = focusedScoreCrop(openingScoreCrop) ?? openingScoreCrop;
+      let startCorrectionMs = 0;
+      let correctionAttempts = 0;
+      const maxCorrectionAttempts = 2;
+      let openingScore = await measureClipOpeningScore(
+        clipBuilt,
+        ace.scoreBefore,
+        ace.scoreAfter,
+        focusedOpeningScoreCrop,
+      );
+      while (runClipWindowValidation) {
+        const nextCorrectionMs = nextOpeningScoreRetryOffsetMs(
+          openingScore.status,
+          startCorrectionMs,
+          openingScore.retryable,
+        );
+        if (nextCorrectionMs == null) break;
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            round: ace.round,
+            openingScoreStatus: openingScore.status,
+            scoreBefore: ace.scoreBefore,
+            scoreAfter: ace.scoreAfter,
+            correctionMs: nextCorrectionMs,
+          },
+          'abertura sem confirmação suficiente — reconstruindo mais cedo para enquadrar o round',
+        );
+        const correctedClip = await buildClipFromBuffer(nextCorrectionMs);
+        if (!correctedClip) break;
+        clipBuilt = correctedClip;
+        startCorrectionMs = nextCorrectionMs;
+        openingScore = await measureClipOpeningScore(
+          clipBuilt,
+          ace.scoreBefore,
+          ace.scoreAfter,
+          focusedOpeningScoreCrop,
+        );
+        if (openingScore.status === 'verified') {
+          log.info(
+            { matchId, player: ace.player, round: ace.round, correctionMs: startCorrectionMs },
+            'abertura do clipe corrigida pelo placar — retomando a validação visual',
+          );
+        }
+      }
+      clip = clipBuilt;
       /**
        * FIM DE ROUND CONFIÁVEL: só o motivo `confident` (placar com o
        * ANTES e o DEPOIS legíveis no vídeo) é medida de verdade.
@@ -2064,7 +2209,163 @@ async function handleAce(
        * MP4 renderizado; só conta como evidência se aparecer em DOIS
        * frames seguidos (proteção contra leitura suja).
        */
-      const replayCheck = await measureClipReplayBanner(clipBuilt, cfg, streamName);
+      let replayCheck = await measureClipReplayBanner(clipBuilt, cfg, streamName);
+      const killfeedCrop =
+        killfeedResult?.crop ??
+        cropCandidatesForStream({
+          globalCrop: cfg.CLIP_KILLFEED_CROP,
+          byStream: cfg.CLIP_KILLFEED_CROP_BY_STREAM,
+          streamName,
+          fallbacks: cfg.CLIP_KILLFEED_CROP_FALLBACKS,
+        })[0];
+      const inspectClipKillfeed = async (targetClip: ClipResult) => {
+        const check = await measureClipKillfeed(targetClip, ace, killfeedCrop, replayCheck.crop);
+        const isReplayHit = (atSec: number): boolean =>
+          check.replayAtSec.some((replayAtSec) => Math.abs(replayAtSec - atSec) <= 0.5);
+        const liveHits = check.hits.filter((hit) => !isReplayHit(hit.atSec));
+        const replayHits = check.hits.filter((hit) => isReplayHit(hit.atSec));
+        const clipStart = targetClip.clipStartMs ?? Date.now();
+        const expectedTimes = ace.kills.map((kill) =>
+          kill.at != null && Number.isFinite(kill.at)
+            ? (kill.at + killVideoOffsetMs - clipStart) / 1000
+            : Number.NaN,
+        );
+        const occurrences = liveHits.flatMap((hit) =>
+          hit.killIndexes.map((killIndex) => ({ killIndex, atSec: hit.atSec })),
+        );
+        const replayOccurrences = replayHits.flatMap((hit) =>
+          hit.killIndexes.map((killIndex) => ({ killIndex, atSec: hit.atSec })),
+        );
+        const coverage = assessKillfeedCoverage({
+          expectedKills: ace.kills.length,
+          matchedKillIndexes: liveHits.flatMap((hit) => hit.killIndexes),
+          occurrences,
+          expectedKillAtSec: expectedTimes,
+          timingToleranceSec: 15,
+          frames: check.frames,
+          error: check.error,
+        });
+        const retryReason = clipStartCorrectionReason({
+          openingScoreStatus: openingScore.status,
+          openingScoreRetryable: openingScore.retryable,
+          matchedKillIndexes: coverage.matchedKillIndexes,
+          firstExpectedKillAtSec: Number.isFinite(expectedTimes[0]) ? expectedTimes[0] : null,
+          replayKillIndexes: [...new Set(replayOccurrences.map((occurrence) => occurrence.killIndex))],
+        });
+        const endRetryReason = clipEndCorrectionReason({
+          expectedKills: ace.kills.length,
+          matchedKillIndexes: coverage.matchedKillIndexes,
+          expectedLastKillAtSec: Number.isFinite(expectedTimes.at(-1)) ? expectedTimes.at(-1)! : null,
+          clipDurationSec: targetClip.durationSec,
+          replayKillIndexes: [...new Set(replayOccurrences.map((occurrence) => occurrence.killIndex))],
+        });
+        return {
+          check,
+          coverage,
+          expectedTimes,
+          occurrences,
+          replayOccurrences,
+          needsEarlierStart: retryReason != null,
+          retryReason,
+          needsLaterEnd: endRetryReason != null,
+          endRetryReason,
+        };
+      };
+      let killfeedInspection = await inspectClipKillfeed(clipBuilt);
+      while (
+        runClipWindowValidation &&
+        correctionAttempts < maxCorrectionAttempts &&
+        killfeedInspection.needsEarlierStart &&
+        startCorrectionMs < OPENING_SCORE_RETRY_MAX_MS
+      ) {
+        const nextCorrectionMs = nextClipStartCorrectionMs(startCorrectionMs);
+        if (nextCorrectionMs == null) break;
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            round: ace.round,
+            reason: killfeedInspection.retryReason,
+            correctionMs: nextCorrectionMs,
+          },
+          'a janela não capturou o início ao vivo com segurança — renderizando mais contexto anterior',
+        );
+        correctionAttempts += 1;
+        const correctedClip = await buildClipFromBuffer(nextCorrectionMs);
+        if (!correctedClip) break;
+        clipBuilt = correctedClip;
+        clip = correctedClip;
+        startCorrectionMs = nextCorrectionMs;
+        openingScore = await measureClipOpeningScore(
+          clipBuilt,
+          ace.scoreBefore,
+          ace.scoreAfter,
+          focusedOpeningScoreCrop,
+        );
+        replayCheck = await measureClipReplayBanner(clipBuilt, cfg, streamName);
+        killfeedInspection = await inspectClipKillfeed(clipBuilt);
+      }
+      let endCorrectionMs = 0;
+      const availableEndCorrectionMs =
+        aceEndMs != null
+          ? Math.max(0, newestSegmentEndMs(segments) - aceEndMs)
+          : 0;
+      const maxAvailableEndCorrectionMs = Math.min(OPENING_SCORE_RETRY_MAX_MS, availableEndCorrectionMs);
+      while (
+        runClipWindowValidation &&
+        correctionAttempts < maxCorrectionAttempts &&
+        killfeedInspection.needsLaterEnd &&
+        endCorrectionMs < maxAvailableEndCorrectionMs &&
+        aceEndMs != null
+      ) {
+        const nextCorrectionMs = Math.min(
+          nextClipEndCorrectionMs(endCorrectionMs) ?? maxAvailableEndCorrectionMs,
+          maxAvailableEndCorrectionMs,
+        );
+        if (nextCorrectionMs == null) break;
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            round: ace.round,
+            reason: killfeedInspection.endRetryReason,
+            correctionMs: nextCorrectionMs,
+          },
+          'a última kill ficou no limite do corte — renderizando mais cauda para enquadrá-la',
+        );
+        correctionAttempts += 1;
+        const correctedClip = await buildClipFromBuffer(startCorrectionMs, nextCorrectionMs);
+        if (!correctedClip) break;
+        const previousDurationSec = clipBuilt.durationSec;
+        clipBuilt = correctedClip;
+        clip = correctedClip;
+        endCorrectionMs = nextCorrectionMs;
+        killfeedInspection = await inspectClipKillfeed(clipBuilt);
+        if (correctedClip.durationSec <= previousDurationSec + 1) {
+          log.warn(
+            { matchId, player: ace.player, round: ace.round, correctionMs: nextCorrectionMs },
+            'fim do clipe não avançou com o material congelado — encerrando reconstruções',
+          );
+          break;
+        }
+      }
+      const { check: killfeedCheck, coverage, expectedTimes: expectedKillAtSec, occurrences, replayOccurrences } =
+        killfeedInspection;
+      clipKillfeedValidationStatus = coverage.status;
+      clipOpeningScoreValidationStatus = openingScore.status;
+      const killfeedValidation = {
+        status: coverage.status,
+        expectedKills: ace.kills.length,
+        matchedKillIndexes: coverage.matchedKillIndexes,
+        detectedKillIndexes: [...new Set(killfeedCheck.hits.flatMap((hit) => hit.killIndexes))],
+        expectedKillAtSec: expectedKillAtSec.map((sec) => Number.isFinite(sec) ? Number(sec.toFixed(1)) : null),
+        occurrences,
+        replayOccurrences,
+        endCorrectionMs,
+        frames: killfeedCheck.frames,
+        crop: killfeedCrop,
+        ...(killfeedCheck.error ? { error: killfeedCheck.error } : {}),
+      };
       const verdict = auditClipWindow({
         kills: ace.kills,
         clipStartMs: clipBuilt.clipStartMs ?? null,
@@ -2082,6 +2383,9 @@ async function handleAce(
         killsGapMaxMs: cfg.CLIP_KILLS_GAP_MAX_SEC * 1000,
         opensInsideReplay: replayCheck.opensInsideReplay,
       });
+      blockUploadForWindowValidation =
+        enforceClipWindowValidation &&
+        !clipWindowValidationPassed(coverage.status, openingScore.status, verdict.action);
       patchSidecarAudit(clipBuilt.sidecarPath, {
         action: verdict.action,
         violations: verdict.violations,
@@ -2089,11 +2393,26 @@ async function handleAce(
         coversLastKill: verdict.coversLastKill,
         startsAfterRoundEnd: verdict.startsAfterRoundEnd,
         liveMaterialAvailable: verdict.liveMaterialAvailable,
+        killfeedValidation,
+        openingScoreValidation: { ...openingScore, crop: focusedOpeningScoreCrop, startCorrectionMs },
         reason:
           verdict.violations.length > 0
             ? `janela fora das invariantes: ${verdict.violations.join(', ')}`
             : 'janela dentro das invariantes',
       });
+      if (blockUploadForWindowValidation) {
+        log.warn(
+          {
+            matchId,
+            player: ace.player,
+            clip: clipBuilt.filePath,
+            windowAction: verdict.action,
+            killfeedValidation,
+            openingScoreValidation: { ...openingScore, crop: focusedOpeningScoreCrop, startCorrectionMs },
+          },
+          'janela sem confirmação do placar inicial ou das kills no MP4 — upload bloqueado; clipe mantido local',
+        );
+      }
       if (verdict.action === 'discard') {
         log.warn(
           {
@@ -2166,8 +2485,18 @@ async function handleAce(
     }
     if (clip) {
       let videoId: string | undefined;
+      let quotaReservationId: string | undefined;
       if (!cfg.YT_UPLOAD) {
         log.info({ clip: clip.filePath }, 'upload desativado (YT_UPLOAD=false) — clipe mantido local');
+      } else if (blockUploadForWindowValidation) {
+        log.warn(
+          {
+            clip: clip.filePath,
+            killfeedValidation: clipKillfeedValidationStatus,
+            openingScoreValidation: clipOpeningScoreValidationStatus,
+          },
+          'upload bloqueado pela validação visual da janela — clipe mantido local para revisão',
+        );
       } else {
         try {
           // Composição final: usa o clipe REAL (início e duração do
@@ -2197,6 +2526,17 @@ async function handleAce(
                   // (o marcador precisa existir para o espectador).
                   replayOnly,
                 });
+          const quotaDay = startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE);
+          const reservation = reserveYouTubeUpload(
+            cfg.DB_PATH,
+            quotaDay,
+            quotaDay,
+            DEFAULT_CHANNEL_ID,
+            cfg.YT_UPLOADS_PER_DAY,
+            cfg.YT_MANUAL_UPLOAD_RESERVE,
+          );
+          if (!reservation.allowed) throw new Error(reservation.reason);
+          quotaReservationId = reservation.reservationId;
           videoId = await uploadClip(ace, clip.filePath, {
             clientSecretsPath: cfg.YT_CLIENT_SECRETS,
             tokenPath: cfg.YT_TOKEN_PATH,
@@ -2207,13 +2547,22 @@ async function handleAce(
             replayOnly,
           });
         } catch (e) {
+          if (quotaReservationId) {
+            releaseYouTubeUploadReservation(cfg.DB_PATH, quotaReservationId);
+            quotaReservationId = undefined;
+          }
           log.error({ err: String(e) }, 'falha no upload YT — clipe mantido local para retry manual');
         }
       }
       // Registro no banco ANTES da thumbnail: se o processo cair na
       // geração da thumb (minutos com IA), o vídeo já está no YouTube e
       // o clipe precisa estar no banco com o videoId (cenário zorte).
-      insertClip(cfg.DB_PATH, aceId, clip.filePath, cfg.YT_PRIVACY, videoId);
+      insertClip(cfg.DB_PATH, aceId, clip.filePath, cfg.YT_PRIVACY, videoId, {
+        publishedAt: videoId ? new Date().toISOString() : undefined,
+      });
+      if (quotaReservationId && videoId) {
+        releaseYouTubeUploadReservation(cfg.DB_PATH, quotaReservationId);
+      }
       setTrayStatusClip({
         at: new Date().toISOString(),
         matchId: ace.matchId,
@@ -2984,6 +3333,7 @@ async function main(): Promise<void> {
         ? Object.keys(loggedOut).map((p) => `${p}=LOGOUT!`).join(',')
         : 'ok',
       upload: cfg.YT_UPLOAD,
+      clipValidate: cfg.CLIP_VALIDATE,
       maxRec: cfg.MAX_RECORDINGS,
       rankStarsMode: rankEnabled ? cfg.RANK_STARS_MODE : undefined,
       rankMinKills: rankEnabled ? cfg.RANK_MIN_KILLS : undefined,

@@ -671,17 +671,20 @@ export async function trackMatch(
       // placar — sem isso o último kill do round cai no round seguinte ou
       // some, e um 5k vira "4k"). 10s é seguro: rounds duram ~100s+.
       const total = snap.ctScore + snap.tScore;
-      if (lastTotal >= 0 && total !== lastTotal) {
+      const wasVirada = lastTotal >= 0 && total !== lastTotal;
+      if (wasVirada) {
         await page.waitForTimeout(10000);
         const fresh = await readMatchSnapshot(page);
         if (fresh) {
+          // As colunas de kills podem assentar durante a espera; use o
+          // snapshot atualizado para detectar a última kill do round.
           snap = fresh;
           // O "Round over" pode ter aparecido só depois da virada do
           // placar. Se ele ainda não tinha sido observado antes da
           // espera, atribui o instante ao poll que viu a VIRADA (o round
           // já havia acabado), não ao "agora" 10s depois — assim a
           // medição não carrega o atraso artificial do assentamento.
-          noteTimer(snap, snapshotAtMs);
+          noteTimer(fresh, snapshotAtMs);
         }
       }
       // Apagão longo ou rounds pulados: reancora sem emitir (evita falsos

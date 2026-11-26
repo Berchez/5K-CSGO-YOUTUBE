@@ -19,8 +19,16 @@ import path from 'node:path';
 import { getConfig } from '../src/config.js';
 import { DEFAULT_CHANNEL_ID } from '../src/channels.js';
 import { getLogger } from '../src/logger.js';
-import { getDb, hasAce, insertAce, insertClip } from '../src/db.js';
+import {
+  getDb,
+  hasAce,
+  insertAce,
+  insertClip,
+  releaseYouTubeUploadReservation,
+  reserveYouTubeUpload,
+} from '../src/db.js';
 import { uploadClip } from '../src/uploader/youtubeUploader.js';
+import { startOfDaySql } from '../src/timeZone.js';
 import type { AceEvent } from '../src/types.js';
 
 const execFileAsync = promisify(execFile);
@@ -328,16 +336,35 @@ async function main(): Promise<void> {
     );
   }
   const thumbExists = fs.existsSync(thumbPath) ? thumbPath : undefined;
-  const videoId = await uploadClip({ ...ace, event: `[TESTE] ${ace.event}` }, outPath, {
-    clientSecretsPath: cfg.YT_CLIENT_SECRETS,
-    tokenPath: cfg.YT_TOKEN_PATH,
-    privacy: cfg.YT_PRIVACY,
-    categoryId: cfg.YT_CATEGORY_ID,
-    defaultTags: cfg.YT_DEFAULT_TAGS,
-    thumbnailPath: thumbExists,
-  });
+  const quotaDay = startOfDaySql(new Date(), cfg.YT_QUOTA_TIMEZONE);
+  const reservation = reserveYouTubeUpload(
+    cfg.DB_PATH,
+    quotaDay,
+    quotaDay,
+    channelId,
+    cfg.YT_UPLOADS_PER_DAY,
+    cfg.YT_MANUAL_UPLOAD_RESERVE,
+  );
+  if (!reservation.allowed) throw new Error(reservation.reason);
+  let videoId: string;
+  try {
+    videoId = await uploadClip({ ...ace, event: `[TESTE] ${ace.event}` }, outPath, {
+      clientSecretsPath: cfg.YT_CLIENT_SECRETS,
+      tokenPath: cfg.YT_TOKEN_PATH,
+      privacy: cfg.YT_PRIVACY,
+      categoryId: cfg.YT_CATEGORY_ID,
+      defaultTags: cfg.YT_DEFAULT_TAGS,
+      thumbnailPath: thumbExists,
+    });
+  } catch (error) {
+    releaseYouTubeUploadReservation(cfg.DB_PATH, reservation.reservationId);
+    throw error;
+  }
   const aceId = insertAce(cfg.DB_PATH, ace, channelId);
-  insertClip(cfg.DB_PATH, aceId, outPath, cfg.YT_PRIVACY, videoId);
+  insertClip(cfg.DB_PATH, aceId, outPath, cfg.YT_PRIVACY, videoId, {
+    publishedAt: new Date().toISOString(),
+  });
+  releaseYouTubeUploadReservation(cfg.DB_PATH, reservation.reservationId);
   console.log(`\nUPLOAD OK (private): https://youtu.be/${videoId}`);
 }
 

@@ -3,6 +3,7 @@ import type { KillEvent } from '../types.js';
 import { matchKillfeedText } from './killfeedSync.js';
 import { looksLikeReplay } from './killfeedSync.js';
 import { resolveFfmpegBin } from './segmentProbe.js';
+import { parseScoreboardText } from './scoreboardSync.js';
 
 /**
  * MEDIÇÃO DA JANELA NO CLIPE RENDERIZADO (OCR).
@@ -41,6 +42,7 @@ export interface ClipWindowOcr {
   hits: ClipKillfeedHit[];
   /** Segundos em que o banner "REPLAY" foi visto. */
   replayAtSec: number[];
+  scoreboard?: Array<{ atSec: number; text: string; score: string }>;
   /** Erro (se a leitura não deu certo). */
   error?: string;
 }
@@ -53,6 +55,7 @@ export interface ClipWindowOcrOptions {
   killfeedCrop: string | null;
   /** Crop do banner "REPLAY" (vazio = não lê o banner). */
   replayCrop?: string | null;
+  scoreboardCrop?: string | null;
   /** Kills do ace (para casar as linhas). */
   kills: KillEvent[];
   /** Segundo inicial (default 0). */
@@ -79,6 +82,26 @@ export function parseFractionCrop(raw: string): { x: number; y: number; w: numbe
     return null;
   }
   return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
+}
+
+/** Isola os dígitos centrais do placar dentro do crop largo configurado. */
+export function focusedScoreCrop(raw: string): string | null {
+  const crop = parseFractionCrop(raw);
+  if (!crop) return null;
+  const x = crop.x + crop.w * 0.337;
+  const y = Math.max(0, crop.y - 0.04 * crop.h);
+  const w = crop.w * 0.352;
+  const h = crop.h * 0.93;
+  return [x, y, w, h].map((value) => value.toFixed(4)).join(':');
+}
+
+export function parseFocusedScoreText(text: string): string | null {
+  const compactPair = text.match(/^\s*(\d{1,2})\s*[xX]\s*(\d{1,2})\s*$/);
+  const noisyPair = compactPair ?? text.match(/^\s*(\d{1,2})\s*[.:=|]{1,3}\s*(\d{1,2})\s*$/);
+  if (!noisyPair) return null;
+  const left = Number(noisyPair[1]);
+  const right = Number(noisyPair[2]);
+  return left <= 20 && right <= 20 ? `${left}-${right}` : null;
 }
 
 /**
@@ -167,7 +190,11 @@ export async function ocrClipWindow(options: ClipWindowOcrOptions): Promise<Clip
       error: `crop de replay inválido: ${options.replayCrop}`,
     };
   }
-  if (killfeed == null && replay == null) {
+  const scoreboardCrop = options.scoreboardCrop != null ? parseFractionCrop(options.scoreboardCrop) : null;
+  if (options.scoreboardCrop != null && options.scoreboardCrop.trim() !== '' && scoreboardCrop == null) {
+    return { frames: 0, hits: [], replayAtSec: [], error: `crop do placar inválido: ${options.scoreboardCrop}` };
+  }
+  if (killfeed == null && replay == null && scoreboardCrop == null) {
     return { frames: 0, hits: [], replayAtSec: [], error: 'nenhum crop informado' };
   }
   const ffmpeg = resolveFfmpegBin();
@@ -225,9 +252,10 @@ export async function ocrClipWindow(options: ClipWindowOcrOptions): Promise<Clip
     const { default: sharp } = await import('sharp');
     const { createWorker, PSM } = await import('tesseract.js');
     const worker = await createWorker('eng');
-    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK, user_defined_dpi: '150' });
     const hits: ClipKillfeedHit[] = [];
     const replayAtSec: number[] = [];
+    const scoreboardReads: NonNullable<ClipWindowOcr['scoreboard']> = [];
     try {
       for (let i = 0; i < frames.length; i++) {
         const atSec = from + i / fps;
@@ -268,11 +296,28 @@ export async function ocrClipWindow(options: ClipWindowOcrOptions): Promise<Clip
           const replayRead = await worker.recognize(replayImage);
           if (looksLikeReplay(String(replayRead.data.text ?? ''))) replayAtSec.push(atSec);
         }
+        if (scoreboardCrop != null) {
+          const scoreboardImage = await image
+            .clone()
+            .extract(extractRect(width, height, scoreboardCrop))
+            .resize({ width: 2400 })
+            .grayscale()
+            .normalize()
+            .png()
+            .toBuffer();
+          const scoreboardRead = await worker.recognize(scoreboardImage);
+          const text = String(scoreboardRead.data.text ?? '').replace(/\s+/g, ' ').trim();
+          const parsed = parseScoreboardText(text);
+          const score = parsed
+            ? `${parsed.score.left}-${parsed.score.right}`
+            : parseFocusedScoreText(text);
+          if (text) scoreboardReads.push({ atSec, text, score: score ?? '' });
+        }
       }
     } finally {
       await worker.terminate();
     }
-    return { frames: frames.length, hits, replayAtSec };
+    return { frames: frames.length, hits, replayAtSec, scoreboard: scoreboardReads };
   } catch (e) {
     return { frames: frames.length, hits: [], replayAtSec: [], error: `ocr: ${String(e).slice(0, 160)}` };
   }
